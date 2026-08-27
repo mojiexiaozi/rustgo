@@ -220,3 +220,54 @@ All commands exited 0. Rustgoc passed 19 tests: one control-session unit test, f
 - The active write timeout is intentionally the configured heartbeat interval, providing a finite bound without adding a new V0.1 configuration field. Handshake writes remain covered by the existing ten-second whole-handshake timeout.
 - The internal boxed I/O seam is private and exists to exercise blocking stream semantics; it does not expose or add a payload transport and does not alter TLS use in production.
 - Concrete TCP/UDP payload children remain Task 8/9 work. P2P remains excluded.
+
+---
+
+## Review fix round 2 (2026-08-28)
+
+### Status and commit
+
+- Status: the remaining receive-starvation finding is resolved with deterministic deadline and join coverage.
+- Follow-up: `fix: make client heartbeat deadline traffic-proof` (the follow-up commit containing this appendix).
+
+### RED / GREEN evidence
+
+RED commands:
+
+```text
+cargo test -p rustgoc --lib queued_business_frames_cannot_starve_the_heartbeat_deadline_or_child_join -- --nocapture
+cargo test -p rustgoc --lib valid_ack_resets_a_future_deadline_but_cannot_revive_an_expired_one -- --nocapture
+```
+
+The first regression created one pre-deadline child, queued 64 alternating `OpenTcpStream`/`OpenUdpChannel` frames, advanced exactly to the two-interval timeout, and manually polled the session with receive and timeout both ready. RED showed 65 child requests rather than 1: the biased receive branch drained every queued business frame before the heartbeat-tick branch could check elapsed time. The second regression queued an otherwise valid acknowledgement exactly at an already-reset deadline; RED remained pending because receive processed the acknowledgement first and revived the generation.
+
+GREEN replaces the tick-coupled elapsed-time check with a pinned `sleep_until(last_valid_ack + heartbeat_timeout)`. Selection priority is now explicit and deterministic:
+
+1. external shutdown wins;
+2. an already-ready heartbeat deadline ends the generation;
+3. heartbeat tick/write, completed children, and inbound frames follow.
+
+The active-write sub-select also watches the same heartbeat deadline. A valid ordered acknowledgement processed strictly before expiry resets the pinned sleep to `acknowledged_at + heartbeat_timeout`. If an acknowledgement and the deadline are both ready in one poll, the deadline wins and the acknowledgement cannot revive the expired generation.
+
+Both regressions now pass. At expiry the queued business frames produce no new children, active state is cleared, the one pre-existing child observes cancellation, and `run_generation` returns only after its `JoinSet` is empty. The earlier real-TLS heartbeat, business-frame flood, backpressured-write, slow-drain, registration-order, and generation-isolation tests remain green.
+
+### Added invariant
+
+Heartbeat expiry is represented by an independent timer future, not opportunistically checked by heartbeat-send progress. No continuously-ready receive stream, child completion stream, or blocked heartbeat write can starve it. Deadline readiness is terminal for that generation; only a sequence-valid acknowledgement processed before readiness may reset it.
+
+### Fix-round verification
+
+```text
+cargo fmt --all -- --check
+cargo test -p rustgoc --no-fail-fast
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --no-fail-fast
+git diff --check
+```
+
+All commands exited 0. Rustgoc passed 21 tests, including three deterministic control-session unit tests and nine real/scripted TLS control tests. The workspace passed 143 tests total with all doc tests passing; workspace/all-target Clippy emitted no warnings with warnings denied.
+
+### Residual concerns
+
+- Exact-expiry semantics are deliberately fail-closed: an acknowledgement delivered at the same poll in which the deadline is ready loses to expiry. This avoids scheduler/traffic-dependent resurrection of a dead generation.
+- TCP/UDP payload forwarding remains Task 8/9 work; this fix changes only control scheduling and child lifecycle supervision. P2P remains excluded.

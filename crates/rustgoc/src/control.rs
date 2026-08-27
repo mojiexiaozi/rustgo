@@ -254,6 +254,19 @@ pub struct RegisteredTunnel {
 }
 
 impl RegisteredTunnel {
+    #[cfg(test)]
+    pub(crate) fn accepted_for_test(tunnel_id: u32) -> Self {
+        Self {
+            tunnel_id,
+            name: format!("test-{tunnel_id}"),
+            protocol: ConfigTunnelProtocol::Tcp,
+            local_addr: "127.0.0.1:1".to_owned(),
+            remote_port: 1,
+            accepted: true,
+            error: None,
+        }
+    }
+
     pub const fn tunnel_id(&self) -> u32 {
         self.tunnel_id
     }
