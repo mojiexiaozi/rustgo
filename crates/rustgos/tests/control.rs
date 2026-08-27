@@ -524,7 +524,7 @@ async fn handshake_timeout_releases_the_bounded_unauthenticated_permit()
     let key = DeviceKeypair::from_secret_bytes([13; 32]);
     let runtime_limits = ServerRuntimeLimits {
         handshake_timeout: Duration::from_millis(120),
-        max_unauthenticated_connections: 1,
+        max_unauthenticated_connections: 2,
         max_unauthenticated_connections_per_peer: 1,
         ..ServerRuntimeLimits::default()
     };

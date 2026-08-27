@@ -22,3 +22,4 @@ tracing.workspace = true
 assert_cmd = "2.0.17"
 rcgen = "0.14.9"
 tempfile = "3.27.0"
+tokio = { workspace = true, features = ["test-util"] }

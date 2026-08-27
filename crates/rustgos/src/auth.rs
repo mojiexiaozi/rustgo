@@ -231,6 +231,7 @@ struct FailedAuthState {
     evictable_idle_failures: BTreeSet<(tokio::time::Instant, PeerBucket)>,
     protected_idle_failures: BTreeSet<(tokio::time::Instant, PeerBucket)>,
     attempt_budget: Vec<AttemptBudgetShard>,
+    overflow_pending_by_peer: HashMap<PeerBucket, usize>,
     total_failure_records: usize,
     total_pending: usize,
     total_overflow_pending: usize,
@@ -247,7 +248,6 @@ struct AttemptBudgetShard {
     window_started: Option<tokio::time::Instant>,
     used: usize,
     capacity: usize,
-    overflow_pending: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -398,7 +398,7 @@ impl FailedAuthLimiter {
         }
         let now = tokio::time::Instant::now();
         let mut bucket = state.buckets.remove(&peer);
-        let denied_by_peer_limit = if let Some(existing) = bucket.as_mut() {
+        if let Some(existing) = bucket.as_mut() {
             state.visit_bucket();
             if existing.pending == 0
                 && let Some(last_failure) = existing.failures.back()
@@ -409,16 +409,16 @@ impl FailedAuthLimiter {
             }
             let removed = trim_expired(&mut existing.failures, now, self.window);
             state.total_failure_records -= removed;
-            existing.failures.len().saturating_add(existing.pending) >= self.max_attempts
-        } else {
-            false
-        };
-        if denied_by_peer_limit {
-            state.insert_bucket(
-                peer,
-                bucket.expect("existing peer bucket"),
-                self.max_attempts,
-            );
+        }
+        let tracked_peer_records = bucket.as_ref().map_or(0, |existing| {
+            existing.failures.len().saturating_add(existing.pending)
+        });
+        if tracked_peer_records.saturating_add(state.overflow_pending_for(peer))
+            >= self.max_attempts
+        {
+            if let Some(bucket) = bucket {
+                state.insert_bucket(peer, bucket, self.max_attempts);
+            }
             return None;
         }
         if state
@@ -452,10 +452,7 @@ impl FailedAuthLimiter {
             {
                 continue;
             }
-            let overflow_headroom = bucket.as_ref().map_or(self.max_attempts, |bucket| {
-                self.max_attempts
-                    .saturating_sub(bucket.failures.len().saturating_add(bucket.pending))
-            });
+            let overflow_headroom = self.max_attempts.saturating_sub(tracked_peer_records);
             if state.total_failure_records == 0
                 || state
                     .total_pending
@@ -472,7 +469,6 @@ impl FailedAuthLimiter {
             if let Some(bucket) = bucket {
                 state.insert_bucket(peer, bucket, self.max_attempts);
             }
-            state.total_overflow_pending += 1;
             return Some(AuthAttemptReservation {
                 limiter: self.clone(),
                 peer,
@@ -499,9 +495,8 @@ impl FailedAuthLimiter {
     fn resolve(&self, peer: PeerBucket, tracked: bool, outcome: ReservationOutcome) {
         if !tracked {
             if let Ok(mut state) = self.state.lock() {
-                state.total_overflow_pending = state.total_overflow_pending.saturating_sub(1);
-                state.release_overflow(peer);
-                if matches!(outcome, ReservationOutcome::Succeeded) {
+                let released = state.release_overflow(peer);
+                if released && matches!(outcome, ReservationOutcome::Succeeded) {
                     state.clear_peer_failures(peer);
                 }
             }
@@ -591,7 +586,6 @@ impl FailedAuthState {
                 window_started: None,
                 used: 0,
                 capacity: base_capacity + usize::from(shard < extra_capacity),
-                overflow_pending: 0,
             })
             .collect();
         Self {
@@ -599,6 +593,7 @@ impl FailedAuthState {
             evictable_idle_failures: BTreeSet::new(),
             protected_idle_failures: BTreeSet::new(),
             attempt_budget,
+            overflow_pending_by_peer: HashMap::new(),
             total_failure_records: 0,
             total_pending: 0,
             total_overflow_pending: 0,
@@ -634,17 +629,35 @@ impl FailedAuthState {
     }
 
     fn try_reserve_overflow(&mut self, peer: PeerBucket, peer_headroom: usize) -> bool {
-        let shard = &mut self.attempt_budget[peer.attempt_shard()];
-        if shard.overflow_pending >= peer_headroom {
+        let pending = self.overflow_pending_by_peer.entry(peer).or_default();
+        if *pending >= peer_headroom {
             return false;
         }
-        shard.overflow_pending += 1;
+        *pending += 1;
+        self.total_overflow_pending += 1;
         true
     }
 
-    fn release_overflow(&mut self, peer: PeerBucket) {
-        let shard = &mut self.attempt_budget[peer.attempt_shard()];
-        shard.overflow_pending = shard.overflow_pending.saturating_sub(1);
+    fn overflow_pending_for(&self, peer: PeerBucket) -> usize {
+        self.overflow_pending_by_peer
+            .get(&peer)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn release_overflow(&mut self, peer: PeerBucket) -> bool {
+        let Some(pending) = self.overflow_pending_by_peer.get_mut(&peer) else {
+            return false;
+        };
+        if *pending == 0 {
+            return false;
+        }
+        *pending -= 1;
+        self.total_overflow_pending -= 1;
+        if *pending == 0 {
+            self.overflow_pending_by_peer.remove(&peer);
+        }
+        true
     }
 
     fn clear_peer_failures(&mut self, peer: PeerBucket) {
@@ -666,6 +679,9 @@ impl FailedAuthState {
     }
 
     fn insert_bucket(&mut self, peer: PeerBucket, bucket: PeerAttempts, max_attempts: usize) {
+        if bucket.pending == 0 && bucket.failures.is_empty() {
+            return;
+        }
         if bucket.pending == 0
             && let Some(last_failure) = bucket.failures.back()
         {
@@ -936,6 +952,93 @@ mod tests {
         assert!(limiter.reserve(recovering_peer).is_none());
         drop(first_overflow);
         assert!(limiter.reserve(recovering_peer).is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_cap_rejection_does_not_reinsert_an_expired_empty_bucket() {
+        let window = Duration::from_secs(60);
+        let limiter = FailedAuthLimiter::new(1, window, 1, 1);
+        let protected_peer = IpAddr::from([192, 0, 2, 100]);
+        let overflow_peer = IpAddr::from([192, 0, 2, 101]);
+        let unseen_peer = IpAddr::from([192, 0, 2, 102]);
+        limiter.reserve(protected_peer).unwrap().fail();
+        let overflow = limiter.reserve(overflow_peer).unwrap();
+
+        tokio::time::advance(window).await;
+        assert!(limiter.reserve(protected_peer).is_none());
+        drop(overflow);
+
+        assert!(
+            limiter.reserve(unseen_peer).is_some(),
+            "an expired empty target must not occupy the only tracked-peer slot"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shard_budget_rejection_does_not_reinsert_an_expired_empty_bucket() {
+        let window = Duration::from_secs(60);
+        let limiter = FailedAuthLimiter::new_with_attempt_budget(1, window, 1, 2, 32);
+        let protected_peer = IpAddr::from([198, 51, 100, 1]);
+        let protected_shard = limiter.attempt_shard_for_test(protected_peer);
+        let mut same_shard = Vec::new();
+        let mut other_shard = None;
+        for suffix in 2..=254 {
+            let candidate = IpAddr::from([198, 51, 100, suffix]);
+            if limiter.attempt_shard_for_test(candidate) == protected_shard {
+                same_shard.push(candidate);
+            } else {
+                other_shard.get_or_insert(candidate);
+            }
+            if same_shard.len() == 3 && other_shard.is_some() {
+                break;
+            }
+        }
+        let [bootstrap, first_burn, second_burn]: [IpAddr; 3] = same_shard
+            .try_into()
+            .expect("three IPv4 peers colliding with the protected shard");
+        let unseen_peer = other_shard.expect("an IPv4 peer in another shard");
+
+        drop(limiter.reserve(bootstrap).unwrap());
+        tokio::time::advance(Duration::from_secs(10)).await;
+        limiter.reserve(protected_peer).unwrap().fail();
+        tokio::time::advance(Duration::from_secs(50)).await;
+        drop(limiter.reserve(first_burn).unwrap());
+        drop(limiter.reserve(second_burn).unwrap());
+        tokio::time::advance(Duration::from_secs(10)).await;
+
+        assert!(limiter.reserve(protected_peer).is_none());
+        assert!(
+            limiter.reserve(unseen_peer).is_some(),
+            "a shard-budget denial must delete its expired empty target bucket"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn overflow_and_tracked_reservations_share_the_per_peer_limit() {
+        let window = Duration::from_secs(60);
+        let limiter = FailedAuthLimiter::new_with_attempt_budget(2, window, 1, 4, 1024);
+        let protected_peer = IpAddr::from([192, 0, 2, 103]);
+        let converting_peer = IpAddr::from([192, 0, 2, 104]);
+        limiter.reserve(protected_peer).unwrap().fail();
+        limiter.reserve(protected_peer).unwrap().fail();
+        let first_overflow = limiter.reserve(converting_peer).unwrap();
+        let second_overflow = limiter.reserve(converting_peer).unwrap();
+
+        tokio::time::advance(window).await;
+        assert!(
+            limiter.reserve(converting_peer).is_none(),
+            "two held overflow reservations must exhaust the peer limit after capacity recovery"
+        );
+
+        drop(first_overflow);
+        let tracked = limiter
+            .reserve(converting_peer)
+            .expect("releasing one overflow reservation restores exactly one peer slot");
+        assert!(limiter.reserve(converting_peer).is_none());
+
+        drop(tracked);
+        drop(second_overflow);
+        assert!(limiter.reserve(converting_peer).is_some());
     }
 
     #[test]

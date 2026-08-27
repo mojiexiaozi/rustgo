@@ -55,7 +55,7 @@ impl Default for ServerRuntimeLimits {
 impl ServerRuntimeLimits {
     fn validate(&self) -> Result<(), ServerError> {
         if self.handshake_timeout.is_zero()
-            || self.max_unauthenticated_connections == 0
+            || self.max_unauthenticated_connections < 2
             || self.max_unauthenticated_connections_per_peer == 0
             || self.max_failed_auth_attempts_per_peer == 0
             || self.failed_auth_window.is_zero()
@@ -338,6 +338,13 @@ mod tests {
             ..ServerRuntimeLimits::default()
         };
         assert_invalid(peer_tls_leaves_no_global_fairness_slot);
+
+        let one_global_slot_cannot_be_reserved_for_another_peer = ServerRuntimeLimits {
+            max_unauthenticated_connections: 1,
+            max_unauthenticated_connections_per_peer: 1,
+            ..ServerRuntimeLimits::default()
+        };
+        assert_invalid(one_global_slot_cannot_be_reserved_for_another_peer);
 
         let too_few_global_attempts_for_fair_shards = ServerRuntimeLimits {
             max_auth_attempts_per_window: 15,
