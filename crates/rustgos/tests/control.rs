@@ -169,6 +169,18 @@ impl FramedClient {
             }
         }
     }
+
+    async fn abort_after_send(
+        mut self,
+        version: ProtocolVersion,
+        message: Message,
+    ) -> Result<(), Box<dyn Error>> {
+        self.send(version, message).await?;
+        self.stream.flush().await?;
+        self.stream.get_ref().0.set_zero_linger()?;
+        drop(self);
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -568,6 +580,50 @@ async fn failed_authentication_is_rate_limited_per_peer_and_recovers_after_windo
     );
 
     drop(recovered);
+    shutdown.cancel();
+    server_task.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn aborting_before_auth_rejection_is_written_still_consumes_the_peer_budget()
+-> Result<(), Box<dyn Error>> {
+    let pki = TestPki::generate()?;
+    let authorized_key = DeviceKeypair::from_secret_bytes([20; 32]);
+    let unknown_key = DeviceKeypair::from_secret_bytes([21; 32]);
+    let runtime_limits = ServerRuntimeLimits {
+        max_failed_auth_attempts_per_peer: 1,
+        failed_auth_window: Duration::from_secs(5),
+        ..ServerRuntimeLimits::default()
+    };
+    let app = ServerApp::bind_with_runtime_limits(
+        server_config(&pki, vec![authorized("home-pc", &authorized_key, true)]),
+        runtime_limits,
+    )
+    .await?;
+    let address = app.local_addr()?;
+    let shutdown = CancellationToken::new();
+    let server_task = tokio::spawn(app.run_until(shutdown.clone()));
+
+    let mut failed = FramedClient::connect(&pki, address).await?;
+    let challenge = begin_authentication(&mut failed, VERSION, "unknown-pc", &unknown_key).await?;
+    failed
+        .abort_after_send(
+            VERSION,
+            authentication_message(
+                &challenge,
+                &unknown_key,
+                &unknown_key,
+                VERSION,
+                "unknown-pc",
+            ),
+        )
+        .await?;
+    sleep(Duration::from_millis(100)).await;
+
+    let tls = TlsClient::from_ca_file(&pki.ca_file, SERVER_NAME)?;
+    assert!(tls.connect(address).await.is_err());
+
     shutdown.cancel();
     server_task.await??;
     Ok(())

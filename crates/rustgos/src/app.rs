@@ -12,7 +12,11 @@ use crate::{
     registry::{ClientRegistry, RegistryError},
 };
 
-const MAX_RUNTIME_COUNT: usize = 1_000_000;
+const MAX_UNAUTHENTICATED_CONNECTIONS: usize = 1024;
+const MAX_FAILED_AUTH_ATTEMPTS_PER_PEER: usize = 64;
+const MAX_TRACKED_AUTH_PEERS: usize = 16_384;
+const MAX_AUTH_ATTEMPT_RECORDS: usize = 65_536;
+const MAX_PENDING_DATA_CHANNEL_TOKENS_PER_CLIENT: usize = 65_536;
 
 #[derive(Debug, Clone)]
 pub struct ServerRuntimeLimits {
@@ -21,6 +25,7 @@ pub struct ServerRuntimeLimits {
     pub max_failed_auth_attempts_per_peer: usize,
     pub failed_auth_window: Duration,
     pub max_tracked_auth_peers: usize,
+    pub max_auth_attempt_records: usize,
     pub max_pending_data_channel_tokens_per_client: usize,
     pub binding_token_ttl: Duration,
 }
@@ -33,6 +38,7 @@ impl Default for ServerRuntimeLimits {
             max_failed_auth_attempts_per_peer: 8,
             failed_auth_window: Duration::from_secs(60),
             max_tracked_auth_peers: 1024,
+            max_auth_attempt_records: 8192,
             max_pending_data_channel_tokens_per_client: 4096,
             binding_token_ttl: Duration::from_secs(30),
         }
@@ -46,12 +52,17 @@ impl ServerRuntimeLimits {
             || self.max_failed_auth_attempts_per_peer == 0
             || self.failed_auth_window.is_zero()
             || self.max_tracked_auth_peers == 0
+            || self.max_auth_attempt_records == 0
             || self.max_pending_data_channel_tokens_per_client == 0
             || self.binding_token_ttl.is_zero()
-            || self.max_unauthenticated_connections > MAX_RUNTIME_COUNT
-            || self.max_failed_auth_attempts_per_peer > MAX_RUNTIME_COUNT
-            || self.max_tracked_auth_peers > MAX_RUNTIME_COUNT
-            || self.max_pending_data_channel_tokens_per_client > MAX_RUNTIME_COUNT
+            || self.max_unauthenticated_connections > MAX_UNAUTHENTICATED_CONNECTIONS
+            || self.max_failed_auth_attempts_per_peer > MAX_FAILED_AUTH_ATTEMPTS_PER_PEER
+            || self.max_tracked_auth_peers > MAX_TRACKED_AUTH_PEERS
+            || self.max_auth_attempt_records > MAX_AUTH_ATTEMPT_RECORDS
+            || self.max_pending_data_channel_tokens_per_client
+                > MAX_PENDING_DATA_CHANNEL_TOKENS_PER_CLIENT
+            || self.max_failed_auth_attempts_per_peer > self.max_auth_attempt_records
+            || self.max_tracked_auth_peers > self.max_auth_attempt_records
             || tokio::time::Instant::now()
                 .checked_add(self.handshake_timeout)
                 .is_none()
@@ -133,6 +144,7 @@ impl ServerApp {
             runtime_limits.max_failed_auth_attempts_per_peer,
             runtime_limits.failed_auth_window,
             runtime_limits.max_tracked_auth_peers,
+            runtime_limits.max_auth_attempt_records,
         );
         let unauthenticated = Arc::new(Semaphore::new(
             runtime_limits.max_unauthenticated_connections,
@@ -233,4 +245,63 @@ pub enum ServerError {
     Registry(#[from] RegistryError),
     #[error("invalid server runtime limits")]
     InvalidRuntimeLimits,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ServerError, ServerRuntimeLimits};
+
+    fn assert_invalid(limits: ServerRuntimeLimits) {
+        assert!(matches!(
+            limits.validate(),
+            Err(ServerError::InvalidRuntimeLimits)
+        ));
+    }
+
+    #[test]
+    fn runtime_count_limits_accept_documented_hard_boundaries() {
+        let limits = ServerRuntimeLimits {
+            max_unauthenticated_connections: 1024,
+            max_failed_auth_attempts_per_peer: 64,
+            max_tracked_auth_peers: 16_384,
+            max_auth_attempt_records: 65_536,
+            max_pending_data_channel_tokens_per_client: 65_536,
+            ..ServerRuntimeLimits::default()
+        };
+
+        assert!(limits.validate().is_ok());
+    }
+
+    #[test]
+    fn runtime_count_limits_reject_values_above_each_hard_boundary() {
+        let cases: [fn(&mut ServerRuntimeLimits); 5] = [
+            |limits| limits.max_unauthenticated_connections = 1025,
+            |limits| limits.max_failed_auth_attempts_per_peer = 65,
+            |limits| limits.max_tracked_auth_peers = 16_385,
+            |limits| limits.max_auth_attempt_records = 65_537,
+            |limits| limits.max_pending_data_channel_tokens_per_client = 65_537,
+        ];
+
+        for change in cases {
+            let mut limits = ServerRuntimeLimits::default();
+            change(&mut limits);
+            assert_invalid(limits);
+        }
+    }
+
+    #[test]
+    fn runtime_limits_reject_incoherent_auth_record_budgets() {
+        let too_few_for_one_peer = ServerRuntimeLimits {
+            max_auth_attempt_records: 7,
+            ..ServerRuntimeLimits::default()
+        };
+        assert_invalid(too_few_for_one_peer);
+
+        let too_few_for_tracked_peers = ServerRuntimeLimits {
+            max_tracked_auth_peers: 8192,
+            max_auth_attempt_records: 4096,
+            ..ServerRuntimeLimits::default()
+        };
+        assert_invalid(too_few_for_tracked_peers);
+    }
 }

@@ -54,9 +54,9 @@ pub(crate) async fn serve_connection(
     peer: SocketAddr,
     unauthenticated_permit: OwnedSemaphorePermit,
 ) -> Result<(), ControlError> {
-    if !context.limiter.allows(peer.ip()) {
+    let Some(mut auth_attempt) = context.limiter.reserve(peer.ip()) else {
         return Ok(());
-    }
+    };
     let handshake_deadline = tokio::time::Instant::now()
         .checked_add(context.handshake_timeout)
         .ok_or(ControlError::HandshakeTimeout)?;
@@ -70,6 +70,7 @@ pub(crate) async fn serve_connection(
         let negotiated = match SERVER_VERSION.negotiate(hello_frame.version) {
             Ok(version) => version,
             Err(code) => {
+                auth_attempt.fail();
                 framed.send(SERVER_VERSION, protocol_error(code)).await?;
                 return Ok(None);
             }
@@ -100,12 +101,15 @@ pub(crate) async fn serve_connection(
             error: (!accepted).then_some(ProtocolErrorCode::AUTHENTICATION_FAILED),
         });
         state = state.transition(&result)?;
+        if accepted {
+            auth_attempt.succeed();
+        } else {
+            auth_attempt.fail();
+        }
         framed.send(negotiated, result).await?;
         if accepted {
-            context.limiter.record_success(peer.ip());
             Ok(Some((guard.expect("accepted guard"), state, negotiated)))
         } else {
-            context.limiter.record_failure(peer.ip());
             Ok(None)
         }
     })
