@@ -147,6 +147,7 @@ pub struct ProcessFixture {
     control_port: PortReservation,
     public_ports: Vec<RemoteEndpoint>,
     server_environment: Vec<(String, String)>,
+    client_environment: Vec<(String, String)>,
 }
 
 struct RemoteEndpoint {
@@ -283,6 +284,7 @@ impl ProcessFixture {
             control_port,
             public_ports,
             server_environment: Vec::new(),
+            client_environment: Vec::new(),
         })
     }
 
@@ -373,12 +375,22 @@ impl ProcessFixture {
             control_port,
             public_ports,
             server_environment: Vec::new(),
+            client_environment: Vec::new(),
         })
     }
 
     pub fn with_server_env(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.server_environment.push((name.into(), value.into()));
         self
+    }
+
+    pub fn with_client_env(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.client_environment.push((name.into(), value.into()));
+        self
+    }
+
+    pub fn client_config_path(&self) -> &Path {
+        &self.client_config
     }
 
     pub fn public_address(&self) -> SocketAddr {
@@ -411,7 +423,12 @@ impl ProcessFixture {
             }
         }
         let binaries = ensure_binaries()?;
-        ManagedChild::spawn("rustgoc", &binaries.client, &self.client_config, &[])
+        ManagedChild::spawn(
+            "rustgoc",
+            &binaries.client,
+            &self.client_config,
+            &self.client_environment,
+        )
     }
 }
 

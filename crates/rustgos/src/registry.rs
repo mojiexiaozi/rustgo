@@ -185,6 +185,7 @@ impl ClientRegistry {
             self.binding_ttl,
         )?;
         let runtime = Arc::new(SessionRuntime {
+            client: identity.name().to_owned(),
             bindings: Mutex::new(SessionBindings {
                 store: binding_store,
                 pending_tcp: HashMap::new(),
@@ -320,6 +321,7 @@ struct SessionBindings {
 }
 
 pub(crate) struct SessionRuntime {
+    client: String,
     bindings: Mutex<SessionBindings>,
     outbound: mpsc::Sender<Message>,
     cancellation: CancellationToken,
@@ -327,6 +329,10 @@ pub(crate) struct SessionRuntime {
 }
 
 impl SessionRuntime {
+    pub(crate) fn client(&self) -> &str {
+        &self.client
+    }
+
     pub(crate) fn cancellation(&self) -> CancellationToken {
         self.cancellation.clone()
     }

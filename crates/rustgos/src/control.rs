@@ -1,16 +1,22 @@
-use std::{io, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    io,
+    net::SocketAddr,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 use bytes::BytesMut;
 use rustgo_protocol::{
     AuthResult, BoundedString, ClientHandshakeState, ErrorMessage, Frame, FrameCodec, FrameError,
     MAX_ERROR_DETAIL_BYTES, Message, ProtocolErrorCode, ProtocolVersion,
 };
-use rustgo_transport::TlsServer;
+use rustgo_transport::{EventRateLimit, TlsServer, short_fingerprint};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{OwnedSemaphorePermit, mpsc};
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 use crate::{
     auth::{AuthAttemptReservation, Authenticator, FailedAuthLimiter, TlsHandshakePermit},
@@ -21,6 +27,8 @@ use crate::{
 pub(crate) const SERVER_VERSION: ProtocolVersion = ProtocolVersion::new(1, 0);
 const MAX_CONTROL_PAYLOAD: usize = 70 * 1024;
 const CONTROL_COMMAND_CAPACITY: usize = 1024;
+const AUTH_FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(5);
+static AUTH_FAILURE_LOG: OnceLock<EventRateLimit> = OnceLock::new();
 
 pub(crate) struct ControlContext {
     tls_server: Arc<TlsServer>,
@@ -107,6 +115,11 @@ pub(crate) async fn serve_connection(
     let Message::ClientHello(hello) = first_frame.message else {
         return Err(ControlError::InvalidState);
     };
+    let claimed_client = hello.client_name.as_str().to_owned();
+    let claimed_fingerprint = std::str::from_utf8(hello.fingerprint.as_slice())
+        .ok()
+        .map(|value| short_fingerprint(&format!("sha256:{value}")))
+        .unwrap_or_else(|| "invalid".to_owned());
     let Some(mut auth_attempt) = context.limiter.reserve(peer.ip()) else {
         return Ok(());
     };
@@ -159,6 +172,24 @@ pub(crate) async fn serve_connection(
                     .ok()
             });
             let accepted = guard.is_some();
+            if let Some(guard) = guard.as_ref() {
+                tracing::info!(
+                    client = %guard.identity().name(),
+                    fingerprint = %short_fingerprint(guard.identity().fingerprint()),
+                    event = %"auth_ok",
+                    "client authenticated"
+                );
+            } else if AUTH_FAILURE_LOG
+                .get_or_init(|| EventRateLimit::new(AUTH_FAILURE_LOG_INTERVAL))
+                .allow()
+            {
+                tracing::warn!(
+                    client = %claimed_client,
+                    fingerprint = %claimed_fingerprint,
+                    event = %"auth_failed",
+                    "client authentication rejected"
+                );
+            }
             let result = Message::AuthResult(AuthResult {
                 accepted,
                 error: (!accepted).then_some(ProtocolErrorCode::AUTHENTICATION_FAILED),
@@ -203,20 +234,30 @@ async fn run_owned_control_session<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let result = tokio::select! {
-        biased;
-        () = shutdown.cancelled() => Ok(()),
-        result = run_control_session(
-            &mut framed,
-            &mut guard,
-            &mut state,
-            negotiated,
-            heartbeat_timeout,
-            &mut outbound_rx,
-        ) => result,
-    };
-    guard.shutdown().await;
-    result
+    let span = tracing::info_span!(
+        "control_session",
+        client = %guard.identity().name(),
+        fingerprint = %short_fingerprint(guard.identity().fingerprint()),
+        event = %"control_session"
+    );
+    async move {
+        let result = tokio::select! {
+            biased;
+            () = shutdown.cancelled() => Ok(()),
+            result = run_control_session(
+                &mut framed,
+                &mut guard,
+                &mut state,
+                negotiated,
+                heartbeat_timeout,
+                &mut outbound_rx,
+            ) => result,
+        };
+        guard.shutdown().await;
+        result
+    }
+    .instrument(span)
+    .await
 }
 
 async fn run_control_session<S>(

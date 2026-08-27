@@ -11,6 +11,7 @@ use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore},
     task::{JoinHandle, JoinSet},
 };
+use tracing::Instrument;
 
 use crate::{
     control::{ControlError, FramedControl, SERVER_VERSION},
@@ -36,13 +37,16 @@ impl TcpListenerTask {
         let address = listener
             .local_addr()
             .expect("a bound TCP listener has a local address");
-        let handle = tokio::spawn(run_listener(
-            listener,
-            tunnel_id,
-            tunnel_name,
-            runtime,
-            max_connections,
-        ));
+        let span = tracing::info_span!(
+            "tcp_tunnel",
+            client = %runtime.client(),
+            tunnel = %tunnel_name,
+            event = %"tcp_tunnel"
+        );
+        let handle = tokio::spawn(
+            run_listener(listener, tunnel_id, tunnel_name, runtime, max_connections)
+                .instrument(span),
+        );
         Self {
             address,
             handle: Some(handle),
@@ -165,7 +169,14 @@ async fn relay_public_connection(
         return;
     };
 
-    tracing::debug!(tunnel = %tunnel_name, connection_id, peer = %peer, "TCP relay connected");
+    let connection = tracing::info_span!(
+        "tcp_connection",
+        client = %runtime.client(),
+        tunnel = %tunnel_name,
+        conn = connection_id,
+        event = %"tcp_open"
+    );
+    tracing::debug!(parent: &connection, peer = %peer, "TCP relay connected");
     if let Err(error) = copy_bidirectional_bounded(
         &mut public,
         &mut data_channel,
@@ -174,7 +185,7 @@ async fn relay_public_connection(
     )
     .await
     {
-        tracing::debug!(tunnel = %tunnel_name, connection_id, peer = %peer, %error, "TCP relay ended");
+        tracing::debug!(parent: &connection, peer = %peer, %error, "TCP relay ended");
     }
 }
 

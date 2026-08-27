@@ -26,6 +26,7 @@ use tokio::{
 };
 use tokio_rustls::server::TlsStream;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 use crate::{
     control::{ControlError, FramedControl, SERVER_VERSION},
@@ -115,16 +116,25 @@ impl UdpListenerTask {
         let address = listener
             .local_addr()
             .expect("a bound UDP listener has a local address");
-        let handle = tokio::spawn(run_listener(
-            listener,
-            pending,
-            tunnel_id,
-            tunnel_name,
-            runtime,
-            max_sessions,
-            max_payload,
-            limits,
-        ));
+        let span = tracing::info_span!(
+            "udp_tunnel",
+            client = %runtime.client(),
+            tunnel = %tunnel_name,
+            event = %"udp_tunnel"
+        );
+        let handle = tokio::spawn(
+            run_listener(
+                listener,
+                pending,
+                tunnel_id,
+                tunnel_name,
+                runtime,
+                max_sessions,
+                max_payload,
+                limits,
+            )
+            .instrument(span),
+        );
         Self {
             address,
             handle: Some(handle),
@@ -614,6 +624,12 @@ async fn relay_datagrams(
                     EnqueueResult::Queued => {
                         if inserted {
                             metrics.set_sessions(flows.len());
+                            let session = tracing::info_span!(
+                                "udp_session",
+                                conn = session_id,
+                                event = %"udp_session_open"
+                            );
+                            tracing::debug!(parent: &session, "UDP relay session opened");
                         }
                     }
                     EnqueueResult::Full => {

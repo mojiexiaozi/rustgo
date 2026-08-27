@@ -146,8 +146,10 @@ impl ClientApp {
                         }),
                     });
                     tracing::info!(
+                        client = %self.control.config().client.name,
                         generation = generation.get(),
-                        "event=registration_ready client tunnel registration ready"
+                        event = %"registration_ready",
+                        "client tunnel registration ready"
                     );
                     let status = self.status.clone();
                     let supervisor = self.supervisor.clone();
@@ -162,12 +164,23 @@ impl ClientApp {
                         return Ok(());
                     }
                     if let Err(error) = result {
-                        tracing::warn!(%error, generation = generation.get(), "client control generation ended");
+                        tracing::warn!(
+                            client = %self.control.config().client.name,
+                            %error,
+                            generation = generation.get(),
+                            event = %"control_ended",
+                            "client control generation ended"
+                        );
                     }
                 }
                 Err(error) => {
                     self.status.send_replace(ClientStatus::default());
-                    tracing::warn!(%error, "client control connection failed");
+                    tracing::warn!(
+                        client = %self.control.config().client.name,
+                        %error,
+                        event = %"control_connect_failed",
+                        "client control connection failed"
+                    );
                 }
             }
 

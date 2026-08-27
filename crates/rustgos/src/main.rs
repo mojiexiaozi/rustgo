@@ -2,6 +2,7 @@ use std::{path::PathBuf, process::ExitCode};
 
 use clap::{Parser, Subcommand};
 use rustgo_config::{ConfigError, check_server_references, load_server};
+use rustgo_transport::init_logging;
 use rustgos::{ServerApp, ServerError};
 use thiserror::Error;
 
@@ -39,15 +40,6 @@ async fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
-}
-
-fn init_logging() {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_ansi(false)
-        .try_init();
 }
 
 async fn execute(cli: Cli) -> Result<(), CommandError> {

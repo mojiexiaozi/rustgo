@@ -3,6 +3,7 @@ use std::{path::PathBuf, process::ExitCode};
 use clap::{Parser, Subcommand};
 use rustgo_config::{ClientConfig, check_client_references, load_client};
 use rustgo_crypto::generate_key_file;
+use rustgo_transport::init_logging;
 use rustgoc::ClientApp;
 
 /// Rustgo private-network client.
@@ -74,15 +75,6 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
-}
-
-fn init_logging() {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_ansi(false)
-        .try_init();
 }
 
 fn execute<H: CommandHandler>(cli: Cli, handler: &H) -> Result<(), String> {
