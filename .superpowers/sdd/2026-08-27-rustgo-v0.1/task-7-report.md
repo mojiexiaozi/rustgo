@@ -119,3 +119,104 @@ Observed result: every command exited 0. Rustgoc passed 15 tests, including 7 co
 - Client liveness uses two missed heartbeat intervals; server admission independently guarantees its configured timeout is strictly greater than the announced interval. Either side closing the control socket still invalidates the generation immediately.
 - Task 11 must add `certificate_authority_file` to published examples/operator documentation as already ruled.
 - TCP/UDP payload forwarding is intentionally absent until Tasks 8/9. P2P remains V0.2-only.
+
+---
+
+## Review fix round 1 (2026-08-28)
+
+### Status and commits
+
+- Status: all four open review findings are resolved and covered by regression tests.
+- Base implementation: `be358bd feat: add client control and reconnect lifecycle`.
+- Follow-up: `fix: harden client liveness and reconnect boundaries` (the follow-up commit containing this appendix).
+
+### Finding-to-fix mapping
+
+| Finding | Fix and evidence |
+| --- | --- |
+| Business traffic masked heartbeat loss | `last_heartbeat_acknowledgement` advances only after a Heartbeat frame passes negotiated-version and monotonic sequence checks. `OpenTcpStream` and `OpenUdpChannel` no longer count as liveness. A paused-time real-TLS test delivers business frames every 500 ms without acknowledging heartbeats and observes generation 1 become inactive and all spawned children receive cancellation at the two-interval deadline. |
+| Backpressured active write blocked shutdown | Active heartbeat writes run inside a biased shutdown select and a one-heartbeat-interval timeout. On every control-loop exit, the framed control stream is dropped before status invalidation and child cancellation/join. A capacity-one duplex control peer deterministically blocks `write_all`; cancellation completes the generation within the bounded assertion and the peer observes EOF. |
+| Child drain incorrectly contributed to stability | `Backoff::mark_disconnected` freezes stability at control loss. `ClientApp` calls it in the same synchronous inactive callback that clears current-generation status, before child cancellation/join. A real-TLS paused-time regression primes backoff to its cap, holds a child for ten seconds after a short generation disconnects, and proves reconnect still waits 200 ms rather than resetting to 120 ms. A transport unit test independently advances its injected clock by 100 seconds after disconnect and proves that time cannot reset attempts. |
+| Wire projection failed only after networking | Shared `ClientConfig::validate` now uses protocol-owned `MAX_CLIENT_NAME_BYTES`, `MAX_TUNNEL_NAME_BYTES`, and `MAX_TUNNELS`; client and tunnel names are measured in UTF-8 bytes, heartbeat and ports retain their bounded checks, and tunnel count is rejected above 64. The same name bound is applied to server authorized-client entries. A CLI test gives both `check` and default run a 65-tunnel config, requires the configuration error, and proves a reserved listener accepted no socket. |
+
+### RED / GREEN evidence
+
+#### 1. Heartbeat acknowledgement authority
+
+RED:
+
+```text
+cargo test -p rustgoc --test control business_frames_cannot_mask_missing_heartbeat_acknowledgements -- --exact --nocapture
+```
+
+The new test failed at `status.borrow().active().is_none()`: three valid `OpenTcpStream` frames kept the old generation active without any Heartbeat acknowledgement. GREEN moved the liveness timestamp update into the validated Heartbeat arm only. The new test plus the existing heartbeat-loss and real-server heartbeat tests all pass.
+
+#### 2. Shutdown-safe bounded active writes
+
+RED:
+
+```text
+cargo test -p rustgoc --lib shutdown_interrupts_a_backpressured_active_control_write -- --nocapture
+```
+
+The capacity-one peer caused the old heartbeat `write_all` to remain pending; the 100 ms shutdown assertion expired. GREEN introduced an internal boxed async control-I/O boundary for deterministic testing, supervises active writes with shutdown plus timeout, and drops that stream before child teardown. The regression passes and observes partial output followed by EOF.
+
+#### 3. Frozen generation duration
+
+RED:
+
+```text
+cargo test -p rustgo-transport --test backoff time_after_disconnect_cannot_make_a_short_connection_stable -- --exact --nocapture
+cargo test -p rustgoc --test control slow_child_drain_does_not_turn_a_short_generation_into_a_stable_one -- --exact --nocapture
+```
+
+The transport test first failed to compile because `mark_disconnected` did not exist. After adding the clock-freeze primitive but before wiring it into `ClientApp`, the real-TLS lifecycle test reconnected at 120 ms: ten seconds of blocked child drain had reset the old backoff. GREEN invokes the freeze in the inactive callback before join; the test now observes no reconnect at 120 ms and the capped reconnect at 200 ms.
+
+#### 4. Pre-network wire bounds
+
+RED:
+
+```text
+cargo test -p rustgo-config --test config client_and_tunnel_name_limits_count_utf8_bytes -- --exact --nocapture
+cargo test -p rustgo-config --test config client_rejects_more_tunnels_than_the_wire_can_encode -- --exact --nocapture
+cargo test -p rustgoc --test cli_config wire_overflow_is_rejected_by_check_and_run_before_opening_a_socket -- --exact --nocapture
+```
+
+The configuration tests accepted both a 129-byte/43-character multibyte name and 65 tunnels; CLI `check` also exited successfully. GREEN centralizes the protocol constants in shared validation. Both CLI modes now report `invalid configuration`, and the nonblocking reserved listener reports `WouldBlock` after both invocations.
+
+### Updated generation, cancellation, and reconnect invariants
+
+1. Only an in-range, strictly newer Heartbeat acknowledgement for a sequence already sent by this generation advances client liveness. Business control messages have no liveness authority.
+2. Every active control write is bounded by both the generation shutdown token and a finite timeout. Cancellation is biased when simultaneously ready.
+3. A terminal control loop relinquishes its control stream before any child drain can wait; no defunct generation retains that transport while its children converge.
+4. The inactive callback freezes backoff duration and clears `ClientStatus.active` synchronously before child cancellation. Child cancellation/join latency is excluded from connection stability.
+5. All children remain generation-owned and are still fully joined before backoff sleep or the next socket attempt; no fix weakened generation isolation.
+6. Client identity/tunnel projection is guaranteed wire-encodable during shared config load. `check` and run therefore fail before file parsing or socket creation for these bounds.
+7. Registration order and per-tunnel result correlation are unchanged; every reconnect still performs TLS -> hello -> challenge/signature -> auth -> full register.
+8. Ctrl+C cancels connect, active read/write, or backoff sleep and then uses the same stream-drop plus child cancel/join convergence path.
+
+### Verification after the fixes
+
+Commands executed from `C:\Users\kimi\Desktop\projects\rustgo\.worktrees\v0.1`:
+
+```text
+cargo fmt --all -- --check
+cargo test -p rustgoc --no-fail-fast
+cargo test -p rustgo-config --no-fail-fast
+cargo test -p rustgo-protocol --no-fail-fast
+cargo test -p rustgo-transport --test backoff --no-fail-fast
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --no-fail-fast
+git diff --check
+```
+
+All commands exited 0. Rustgoc passed 19 tests: one control-session unit test, five CLI-config tests, one CLI smoke test, nine real/scripted TLS control tests, and three key-generation tests. Rustgo-config passed 16 tests, rustgo-protocol passed 28, and the focused transport backoff suite passed 6. The workspace passed 141 tests total with all doc tests passing. Workspace/all-target Clippy emitted no warnings with warnings denied.
+
+### Fix-round self-review and residual concerns
+
+- Reviewed every active terminal branch: shutdown during receive, shutdown during backpressured write, write timeout, heartbeat timeout, EOF/protocol failure, and child join failure all pass through stream drop, inactive callback, child cancellation, and full join.
+- Verified that an accepted Heartbeat updates liveness only after both version and sequence validation; malformed, replayed, future, and non-Heartbeat frames cannot extend the deadline.
+- Verified the backoff clock is frozen before any await in child teardown. Existing callers that omit `mark_disconnected` retain prior `next_delay` behavior; `ClientApp` always marks both boundaries.
+- The active write timeout is intentionally the configured heartbeat interval, providing a finite bound without adding a new V0.1 configuration field. Handshake writes remain covered by the existing ten-second whole-handshake timeout.
+- The internal boxed I/O seam is private and exists to exercise blocking stream semantics; it does not expose or add a payload transport and does not alter TLS use in production.
+- Concrete TCP/UDP payload children remain Task 8/9 work. P2P remains excluded.

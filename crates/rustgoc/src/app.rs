@@ -19,6 +19,7 @@ const STABLE_CONNECTION_RESET_AFTER: Duration = Duration::from_secs(30);
 
 pub trait ReconnectBackoff: Send + 'static {
     fn mark_connected(&mut self);
+    fn mark_disconnected(&mut self) {}
     fn next_delay(&mut self) -> Duration;
 }
 
@@ -29,6 +30,10 @@ where
 {
     fn mark_connected(&mut self) {
         Backoff::mark_connected(self);
+    }
+
+    fn mark_disconnected(&mut self) {
+        Backoff::mark_disconnected(self);
     }
 
     fn next_delay(&mut self) -> Duration {
@@ -144,15 +149,13 @@ impl ClientApp {
                         }),
                     });
                     let status = self.status.clone();
+                    let supervisor = self.supervisor.clone();
+                    let backoff = &mut self.backoff;
                     let result = session
-                        .run_generation(
-                            generation,
-                            shutdown.clone(),
-                            self.supervisor.clone(),
-                            move || {
-                                status.send_replace(ClientStatus::default());
-                            },
-                        )
+                        .run_generation(generation, shutdown.clone(), supervisor, move || {
+                            backoff.mark_disconnected();
+                            status.send_replace(ClientStatus::default());
+                        })
                         .await;
                     if shutdown.is_cancelled() {
                         return Ok(());

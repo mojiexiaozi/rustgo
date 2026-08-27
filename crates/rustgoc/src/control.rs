@@ -11,9 +11,7 @@ use rustgo_protocol::{
 };
 use rustgo_transport::{TlsClient, TlsError};
 use thiserror::Error;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio_rustls::client::TlsStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const CLIENT_VERSION: ProtocolVersion = ProtocolVersion::new(1, 0);
 const MAX_CONTROL_PAYLOAD: usize = 70 * 1024;
@@ -294,7 +292,7 @@ pub struct ControlSession {
 }
 
 impl ControlSession {
-    fn new(
+    pub(crate) fn new(
         framed: FramedControl,
         version: ProtocolVersion,
         session_id: Vec<u8>,
@@ -331,16 +329,23 @@ impl std::fmt::Debug for ControlSession {
     }
 }
 
+trait ControlIo: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl<T> ControlIo for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
+
 pub(crate) struct FramedControl {
-    stream: TlsStream<TcpStream>,
+    stream: Box<dyn ControlIo>,
     read_buffer: BytesMut,
     codec: FrameCodec,
 }
 
 impl FramedControl {
-    fn new(stream: TlsStream<TcpStream>) -> Self {
+    pub(crate) fn new<S>(stream: S) -> Self
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         Self {
-            stream,
+            stream: Box::new(stream),
             read_buffer: BytesMut::new(),
             codec: FrameCodec::new(MAX_CONTROL_PAYLOAD),
         }
@@ -409,4 +414,6 @@ pub enum ClientError {
     HeartbeatTimeout,
     #[error("control connection handshake timed out")]
     HandshakeTimeout,
+    #[error("active control write timed out")]
+    ControlWriteTimeout,
 }

@@ -1,6 +1,7 @@
 use std::{collections::HashSet, net::SocketAddr};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use rustgo_protocol::{MAX_CLIENT_NAME_BYTES, MAX_TUNNEL_NAME_BYTES, MAX_TUNNELS};
 use thiserror::Error;
 
 use crate::{ClientConfig, ServerConfig};
@@ -33,7 +34,7 @@ pub(crate) fn validate_server(config: &ServerConfig) -> Result<(), ValidationErr
     let mut names = HashSet::new();
     let mut public_keys = HashSet::new();
     for client in &config.clients {
-        require_non_empty("clients.name", &client.name)?;
+        validate_wire_string("clients.name", &client.name, MAX_CLIENT_NAME_BYTES)?;
         if !names.insert(&client.name) {
             return Err(ValidationError::new(format!(
                 "duplicate client name `{}`",
@@ -49,7 +50,7 @@ pub(crate) fn validate_server(config: &ServerConfig) -> Result<(), ValidationErr
 }
 
 pub(crate) fn validate_client(config: &ClientConfig) -> Result<(), ValidationError> {
-    require_non_empty("client.name", &config.client.name)?;
+    validate_wire_string("client.name", &config.client.name, MAX_CLIENT_NAME_BYTES)?;
     validate_host_address("client.server_addr", &config.client.server_addr)?;
     require_non_empty("client.server_name", &config.client.server_name)?;
     require_nonzero(
@@ -62,11 +63,16 @@ pub(crate) fn validate_client(config: &ClientConfig) -> Result<(), ValidationErr
             u32::MAX
         )));
     }
+    if config.tunnels.len() > MAX_TUNNELS {
+        return Err(ValidationError::new(format!(
+            "tunnels must contain at most {MAX_TUNNELS} entries"
+        )));
+    }
 
     let mut names = HashSet::new();
     let mut remote_ports = HashSet::new();
     for tunnel in &config.tunnels {
-        require_non_empty("tunnels.name", &tunnel.name)?;
+        validate_wire_string("tunnels.name", &tunnel.name, MAX_TUNNEL_NAME_BYTES)?;
         validate_host_address("tunnels.local_addr", &tunnel.local_addr)?;
         if !(1..=u16::MAX as u32).contains(&tunnel.remote_port) {
             return Err(ValidationError::new(format!(
@@ -123,6 +129,20 @@ fn validate_limits(limits: &crate::Limits) -> Result<(), ValidationError> {
 fn require_non_empty(field: &str, value: &str) -> Result<(), ValidationError> {
     if value.trim().is_empty() {
         return Err(ValidationError::new(format!("{field} must not be empty")));
+    }
+    Ok(())
+}
+
+fn validate_wire_string(
+    field: &str,
+    value: &str,
+    maximum_bytes: usize,
+) -> Result<(), ValidationError> {
+    require_non_empty(field, value)?;
+    if value.len() > maximum_bytes {
+        return Err(ValidationError::new(format!(
+            "{field} must be at most {maximum_bytes} UTF-8 bytes"
+        )));
     }
     Ok(())
 }

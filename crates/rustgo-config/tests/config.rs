@@ -246,6 +246,35 @@ fn client_heartbeat_interval_must_fit_the_bounded_wire_field() {
 }
 
 #[test]
+fn client_and_tunnel_name_limits_count_utf8_bytes() {
+    let dir = TempDir::new();
+    let too_long = "界".repeat(43);
+    assert_eq!(too_long.chars().count(), 43);
+    assert_eq!(too_long.len(), 129);
+    let invalid_client =
+        valid_client().replace("name = \"home-pc\"", &format!("name = \"{too_long}\""));
+    let invalid_tunnel =
+        valid_client().replace("name = \"ssh\"", &format!("name = \"{too_long}\""));
+
+    assert!(load_client_text(&dir, &invalid_client).is_err());
+    assert!(load_client_text(&dir, &invalid_tunnel).is_err());
+}
+
+#[test]
+fn client_rejects_more_tunnels_than_the_wire_can_encode() {
+    let dir = TempDir::new();
+    let mut invalid = valid_client();
+    for index in 0..64 {
+        invalid.push_str(&format!(
+            "\n[[tunnels]]\nname = \"extra-{index}\"\nprotocol = \"tcp\"\nlocal_addr = \"127.0.0.1:22\"\nremote_port = {}\n",
+            10_000 + index
+        ));
+    }
+
+    assert!(load_client_text(&dir, &invalid).is_err());
+}
+
+#[test]
 fn invalid_ports_in_server_and_local_addresses_are_rejected() {
     let dir = TempDir::new();
     let invalid_server = valid_server().replace("0.0.0.0:7000", "0.0.0.0:0");

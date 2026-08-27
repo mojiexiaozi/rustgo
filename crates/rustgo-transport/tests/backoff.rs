@@ -109,6 +109,22 @@ fn only_a_stable_active_connection_resets_attempts() -> Result<(), Box<dyn Error
 }
 
 #[test]
+fn time_after_disconnect_cannot_make_a_short_connection_stable() -> Result<(), Box<dyn Error>> {
+    let clock = ManualClock::default();
+    let mut backoff = Backoff::with_sources(config(Duration::ZERO), MinimumJitter, clock.clone())?;
+
+    assert_eq!(backoff.next_delay(), Duration::from_millis(100));
+    assert_eq!(backoff.next_delay(), Duration::from_millis(200));
+    backoff.mark_connected();
+    clock.advance(Duration::from_secs(9));
+    backoff.mark_disconnected();
+    clock.advance(Duration::from_secs(100));
+
+    assert_eq!(backoff.next_delay(), Duration::from_millis(400));
+    Ok(())
+}
+
+#[test]
 fn repeated_attempts_cannot_overflow_duration_or_counter() -> Result<(), Box<dyn Error>> {
     let huge = BackoffConfig {
         initial_delay: Duration::MAX / 3,

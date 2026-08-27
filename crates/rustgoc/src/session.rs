@@ -105,6 +105,8 @@ impl ControlSession {
             )
             .await;
 
+        // No child teardown may retain a dead or backpressured generation's control socket.
+        drop(self.framed);
         // The current view must lose its generation before child teardown can block.
         on_inactive();
         child_shutdown.cancel();
@@ -138,7 +140,7 @@ impl ControlSession {
             .ok_or(ClientError::InvalidConfiguration)?;
         let mut heartbeat = tokio::time::interval_at(first_tick, self.heartbeat_interval);
         heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        let mut last_server_activity = tokio::time::Instant::now();
+        let mut last_heartbeat_acknowledgement = tokio::time::Instant::now();
         let mut last_sent_sequence = 0_u64;
         let mut last_acknowledged_sequence = 0_u64;
 
@@ -164,6 +166,7 @@ impl ControlSession {
                                 return Err(ClientError::InvalidState);
                             }
                             last_acknowledged_sequence = acknowledgement.sequence;
+                            last_heartbeat_acknowledgement = tokio::time::Instant::now();
                         }
                         Message::OpenTcpStream(request) => {
                             self.ensure_accepted_tunnel(request.tunnel_id)?;
@@ -184,24 +187,29 @@ impl ControlSession {
                         Message::Error(error) => return Err(ClientError::Protocol(error.code)),
                         _ => return Err(ClientError::InvalidState),
                     }
-                    last_server_activity = tokio::time::Instant::now();
                 }
                 _ = heartbeat.tick() => {
                     let now = tokio::time::Instant::now();
-                    if now.saturating_duration_since(last_server_activity) >= heartbeat_timeout {
+                    if now.saturating_duration_since(last_heartbeat_acknowledgement)
+                        >= heartbeat_timeout
+                    {
                         return Err(ClientError::HeartbeatTimeout);
                     }
                     last_sent_sequence = last_sent_sequence
                         .checked_add(1)
                         .ok_or(ClientError::SequenceExhausted)?;
-                    self.framed
-                        .send(
-                            self.version,
-                            Message::Heartbeat(Heartbeat {
-                                sequence: last_sent_sequence,
-                            }),
-                        )
-                        .await?;
+                    let write = self.framed.send(
+                        self.version,
+                        Message::Heartbeat(Heartbeat {
+                            sequence: last_sent_sequence,
+                        }),
+                    );
+                    let result = tokio::select! {
+                        biased;
+                        () = shutdown.cancelled() => return Ok(()),
+                        result = tokio::time::timeout(self.heartbeat_interval, write) => result,
+                    };
+                    result.map_err(|_| ClientError::ControlWriteTimeout)??;
                 }
             }
         }
@@ -217,5 +225,61 @@ impl ControlSession {
         } else {
             Err(ClientError::InvalidState)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{sync::Arc, time::Duration};
+
+    use tokio::io::{AsyncReadExt, duplex};
+    use tokio_util::sync::CancellationToken;
+
+    use super::{NoopChildSessionSupervisor, SessionGeneration};
+    use crate::{CLIENT_VERSION, ControlSession, RegisteredTunnel, control::FramedControl};
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_interrupts_a_backpressured_active_control_write() {
+        let (client_stream, mut server_stream) = duplex(1);
+        let session = ControlSession::new(
+            FramedControl::new(client_stream),
+            CLIENT_VERSION,
+            vec![0x51; 32],
+            Duration::from_millis(10),
+            Arc::<[RegisteredTunnel]>::from([]),
+        );
+        let shutdown = CancellationToken::new();
+        let runtime_shutdown = shutdown.clone();
+        let task = tokio::spawn(async move {
+            session
+                .run_generation(
+                    SessionGeneration(1),
+                    runtime_shutdown,
+                    Arc::new(NoopChildSessionSupervisor),
+                    || {},
+                )
+                .await
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(10)).await;
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        shutdown.cancel();
+        let result = tokio::time::timeout(Duration::from_millis(100), task)
+            .await
+            .expect("shutdown must interrupt a blocked active control write")
+            .unwrap();
+        assert!(result.is_ok());
+
+        let mut written = Vec::new();
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            server_stream.read_to_end(&mut written),
+        )
+        .await
+        .expect("the terminated generation must drop its control stream")
+        .unwrap();
+        assert!(!written.is_empty());
     }
 }

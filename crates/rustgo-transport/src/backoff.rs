@@ -57,6 +57,7 @@ pub struct Backoff<J = RandomJitter, C = SystemBackoffClock> {
     clock: C,
     next_exponential_delay: Duration,
     connected_since: Option<Duration>,
+    completed_connection_was_stable: bool,
 }
 
 impl Backoff<RandomJitter, SystemBackoffClock> {
@@ -83,12 +84,23 @@ impl<J: JitterSource, C: BackoffClock> Backoff<J, C> {
             clock,
             next_exponential_delay: config.initial_delay,
             connected_since: None,
+            completed_connection_was_stable: false,
         })
     }
 
     /// Records the start of an active authenticated connection.
     pub fn mark_connected(&mut self) {
         self.connected_since = Some(self.clock.now());
+        self.completed_connection_was_stable = false;
+    }
+
+    /// Freezes the duration of the current active connection at control loss.
+    /// Time spent draining connection-owned work must not contribute to stability.
+    pub fn mark_disconnected(&mut self) {
+        if let Some(connected_since) = self.connected_since.take() {
+            self.completed_connection_was_stable = self.clock.now().saturating_sub(connected_since)
+                >= self.config.stable_connection_reset_after;
+        }
     }
 
     /// Returns the next capped exponential delay with bounded jitter.
@@ -96,10 +108,12 @@ impl<J: JitterSource, C: BackoffClock> Backoff<J, C> {
     /// If the most recent active connection met the configured stability
     /// threshold, this call first resets the exponential attempt state.
     pub fn next_delay(&mut self) -> Duration {
-        if let Some(connected_since) = self.connected_since.take()
-            && self.clock.now().saturating_sub(connected_since)
-                >= self.config.stable_connection_reset_after
-        {
+        let active_connection_was_stable = self.connected_since.take().is_some_and(|since| {
+            self.clock.now().saturating_sub(since) >= self.config.stable_connection_reset_after
+        });
+        let completed_connection_was_stable = self.completed_connection_was_stable;
+        self.completed_connection_was_stable = false;
+        if active_connection_was_stable || completed_connection_was_stable {
             self.reset_attempts();
         }
 
@@ -118,6 +132,7 @@ impl<J: JitterSource, C: BackoffClock> Backoff<J, C> {
     pub fn reset_attempts(&mut self) {
         self.next_exponential_delay = self.config.initial_delay;
         self.connected_since = None;
+        self.completed_connection_was_stable = false;
     }
 }
 

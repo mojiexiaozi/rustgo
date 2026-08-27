@@ -656,6 +656,7 @@ async fn stable_generation_resets_backoff_and_reconnect_reregisters_every_tunnel
         event_tx.send(("active-2", names)).unwrap();
         loop {
             tokio::select! {
+                biased;
                 () = server_stop.cancelled() => break,
                 frame = second.receive() => {
                     let frame = frame?;
@@ -711,6 +712,95 @@ async fn stable_generation_resets_backoff_and_reconnect_reregisters_every_tunnel
             .is_some_and(|active| active.generation().get() == 2)
     })
     .await;
+
+    stop_server.cancel();
+    tokio::task::yield_now().await;
+    shutdown.cancel();
+    assert!(app_task.await?.is_ok());
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn slow_child_drain_does_not_turn_a_short_generation_into_a_stable_one()
+-> Result<(), AnyError> {
+    let mut time_guard = keep_paused_time_manual();
+    let pki = TestPki::generate()?;
+    let tls_server =
+        TlsServer::bind("127.0.0.1:0", &pki.certificate_file, &pki.private_key_file).await?;
+    let fixture = client_fixture(&pki, tls_server.local_addr()?.to_string())?;
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let (drop_tx, drop_rx) = oneshot::channel();
+    let stop_server = CancellationToken::new();
+    let server_stop = stop_server.clone();
+    let server = tokio::spawn(async move {
+        accept_and_drop_after_hello(&tls_server).await?;
+        event_tx.send("failed-1").unwrap();
+        accept_and_drop_after_hello(&tls_server).await?;
+        event_tx.send("failed-2").unwrap();
+
+        let (mut active, _) = accept_registered_session(&tls_server, 0xb1).await?;
+        active
+            .send(Message::OpenTcpStream(OpenTcpStream {
+                tunnel_id: 1,
+                connection_id: 51,
+                peer: SocketAddress::V4 {
+                    octets: [203, 0, 113, 51],
+                    port: 443,
+                },
+                binding_token: bytes(&[0xb2; MAX_BINDING_TOKEN_BYTES]),
+            }))
+            .await?;
+        event_tx.send("active").unwrap();
+        let _ = drop_rx.await;
+        drop(active);
+
+        let (socket, _) = tls_server.accept_tcp().await?;
+        event_tx.send("reconnect").unwrap();
+        server_stop.cancelled().await;
+        drop(socket);
+        Ok::<_, AnyError>(())
+    });
+
+    let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+    let (cancelled_tx, mut cancelled_rx) = mpsc::unbounded_channel();
+    let release = Arc::new(Semaphore::new(0));
+    let supervisor = TrackingSupervisor {
+        started: started_tx,
+        cancelled: cancelled_tx,
+        release: release.clone(),
+    };
+    let control = ControlClient::from_config(fixture.config)?;
+    let app = ClientApp::with_runtime(control, test_backoff(), Arc::new(supervisor));
+    let mut status = app.subscribe();
+    let shutdown = CancellationToken::new();
+    let app_task = tokio::spawn(app.run_until(shutdown.clone()));
+
+    assert_eq!(event_rx.recv().await, Some("failed-1"));
+    time_guard.advance(Duration::from_millis(120)).await;
+    assert_eq!(event_rx.recv().await, Some("failed-2"));
+    time_guard.advance(Duration::from_millis(200)).await;
+    assert_eq!(event_rx.recv().await, Some("active"));
+    wait_for_status(&mut status, |status| status.active().is_some()).await;
+    assert_eq!(started_rx.recv().await.unwrap().0.get(), 1);
+
+    drop_tx.send(()).unwrap();
+    wait_for_status(&mut status, |status| status.active().is_none()).await;
+    assert_eq!(cancelled_rx.recv().await.unwrap().get(), 1);
+    time_guard.advance(Duration::from_secs(10)).await;
+    assert!(event_rx.try_recv().is_err());
+
+    release.add_permits(1);
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    time_guard.advance(Duration::from_millis(120)).await;
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert!(event_rx.try_recv().is_err());
+    time_guard.advance(Duration::from_millis(80)).await;
+    assert_eq!(event_rx.recv().await, Some("reconnect"));
 
     shutdown.cancel();
     stop_server.cancel();
@@ -771,7 +861,7 @@ async fn heartbeat_loss_clears_active_then_cancels_and_joins_all_children_before
             tokio::select! {
                 () = server_stop.cancelled() => break,
                 frame = second.receive() => {
-                    let frame = frame?;
+                    let Ok(frame) = frame else { break };
                     let Message::Heartbeat(heartbeat) = frame.message else {
                         return Err("active client sent a non-heartbeat message".into());
                     };
@@ -839,6 +929,84 @@ async fn heartbeat_loss_clears_active_then_cancels_and_joins_all_children_before
     tokio::task::yield_now().await;
     assert!(!app_task.is_finished());
     release.add_permits(1);
+    stop_server.cancel();
+    assert!(app_task.await?.is_ok());
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn business_frames_cannot_mask_missing_heartbeat_acknowledgements() -> Result<(), AnyError> {
+    let mut time_guard = keep_paused_time_manual();
+    let pki = TestPki::generate()?;
+    let tls_server =
+        TlsServer::bind("127.0.0.1:0", &pki.certificate_file, &pki.private_key_file).await?;
+    let fixture = client_fixture(&pki, tls_server.local_addr()?.to_string())?;
+    let (registered_tx, mut registered_rx) = mpsc::unbounded_channel();
+    let (business_tx, mut business_rx) = mpsc::unbounded_channel();
+    let stop_server = CancellationToken::new();
+    let server_stop = stop_server.clone();
+    let server = tokio::spawn(async move {
+        let (mut control, _) = accept_registered_session(&tls_server, 0xa1).await?;
+        registered_tx.send(()).unwrap();
+        let mut connection_id = 40_u64;
+        loop {
+            tokio::select! {
+                biased;
+                () = server_stop.cancelled() => break,
+                command = business_rx.recv() => {
+                    let Some(()) = command else { break };
+                    connection_id += 1;
+                    control
+                        .send(Message::OpenTcpStream(OpenTcpStream {
+                            tunnel_id: 1,
+                            connection_id,
+                            peer: SocketAddress::V4 {
+                                octets: [203, 0, 113, 41],
+                                port: 443,
+                            },
+                            binding_token: bytes(&[0xa2; MAX_BINDING_TOKEN_BYTES]),
+                        }))
+                        .await?;
+                }
+            }
+        }
+        Ok::<_, AnyError>(())
+    });
+
+    let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+    let (cancelled_tx, mut cancelled_rx) = mpsc::unbounded_channel();
+    let release = Arc::new(Semaphore::new(0));
+    let supervisor = TrackingSupervisor {
+        started: started_tx,
+        cancelled: cancelled_tx,
+        release: release.clone(),
+    };
+    let control = ControlClient::from_config(fixture.config)?;
+    let app = ClientApp::with_runtime(control, test_backoff(), Arc::new(supervisor));
+    let mut status = app.subscribe();
+    let shutdown = CancellationToken::new();
+    let app_task = tokio::spawn(app.run_until(shutdown.clone()));
+
+    registered_rx.recv().await.unwrap();
+    wait_for_status(&mut status, |status| status.active().is_some()).await;
+    for _ in 0..3 {
+        time_guard.advance(Duration::from_millis(500)).await;
+        business_tx.send(()).unwrap();
+        assert_eq!(started_rx.recv().await.unwrap().0.get(), 1);
+    }
+
+    time_guard.advance(Duration::from_millis(500)).await;
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert!(status.borrow().active().is_none());
+    for _ in 0..3 {
+        assert_eq!(cancelled_rx.recv().await.unwrap().get(), 1);
+    }
+
+    shutdown.cancel();
+    release.add_permits(3);
     stop_server.cancel();
     assert!(app_task.await?.is_ok());
     server.await??;

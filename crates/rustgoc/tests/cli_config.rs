@@ -113,3 +113,41 @@ fn default_run_enters_client_runtime_and_rejects_invalid_identity_material() {
         .assert()
         .failure();
 }
+
+#[test]
+fn wire_overflow_is_rejected_by_check_and_run_before_opening_a_socket() {
+    let dir = TempDir::new();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let mut contents = valid_config().replace("127.0.0.1:7000", &address.to_string());
+    for index in 0..64 {
+        contents.push_str(&format!(
+            "\n[[tunnels]]\nname = \"extra-{index}\"\nprotocol = \"tcp\"\nlocal_addr = \"127.0.0.1:22\"\nremote_port = {}\n",
+            10_000 + index
+        ));
+    }
+    let config = dir.write("overflow.toml", &contents);
+    dir.write("ca.pem", "not needed when configuration is invalid");
+    dir.write("device.key", "not needed when configuration is invalid");
+
+    let check = command()
+        .current_dir(&dir.path)
+        .args(["check", "-c", config.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!check.status.success());
+    assert!(String::from_utf8_lossy(&check.stderr).contains("invalid configuration"));
+
+    let run = command()
+        .current_dir(&dir.path)
+        .args(["-c", config.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!run.status.success());
+    assert!(String::from_utf8_lossy(&run.stderr).contains("invalid configuration"));
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
