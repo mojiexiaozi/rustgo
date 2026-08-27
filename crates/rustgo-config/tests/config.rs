@@ -1,10 +1,14 @@
+#![forbid(unsafe_code)]
+
 use std::{
     fs,
     path::{Path, PathBuf},
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use rustgo_config::{ClientConfig, ServerConfig, TunnelProtocol, load_client, load_server};
+use rustgo_config::{
+    ClientConfig, ServerConfig, TunnelProtocol, load_client, load_client_with_lookup, load_server,
+};
 
 static NEXT_TEMP_DIR: AtomicUsize = AtomicUsize::new(0);
 
@@ -116,23 +120,23 @@ fn client_rejects_unknown_fields() {
 #[test]
 fn environment_variable_expands_before_parsing() {
     let dir = TempDir::new();
-    unsafe { std::env::set_var("RUSTGO_TEST_SERVER_NAME", "expanded.example.test") };
     let config = valid_client().replace("tunnel.example.com", "${RUSTGO_TEST_SERVER_NAME}");
 
-    let loaded = load_client_text(&dir, &config).unwrap();
+    let loaded = load_client_with_lookup(&dir.write("client.toml", &config), |name| {
+        (name == "RUSTGO_TEST_SERVER_NAME").then(|| "expanded.example.test".to_owned())
+    })
+    .unwrap();
 
     assert_eq!(loaded.client.server_addr, "expanded.example.test:7000");
     assert_eq!(loaded.client.server_name, "expanded.example.test");
-    unsafe { std::env::remove_var("RUSTGO_TEST_SERVER_NAME") };
 }
 
 #[test]
 fn missing_environment_variable_is_an_error() {
     let dir = TempDir::new();
-    unsafe { std::env::remove_var("RUSTGO_TEST_MISSING") };
     let config = valid_client().replace("tunnel.example.com", "${RUSTGO_TEST_MISSING}");
 
-    let error = load_client_text(&dir, &config).unwrap_err();
+    let error = load_client_with_lookup(&dir.write("client.toml", &config), |_| None).unwrap_err();
 
     assert!(error.to_string().contains("RUSTGO_TEST_MISSING"));
 }

@@ -32,7 +32,14 @@ pub enum ConfigError {
 }
 
 pub fn load_server(path: &Path) -> Result<ServerConfig, ConfigError> {
-    let mut config: ServerConfig = load(path)?;
+    load_server_with_lookup(path, |variable| env::var(variable).ok())
+}
+
+pub fn load_server_with_lookup<F>(path: &Path, environment: F) -> Result<ServerConfig, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let mut config: ServerConfig = load(path, &environment)?;
     resolve_path(path, &mut config.server.certificate_file);
     resolve_path(path, &mut config.server.private_key_file);
     config.validate().map_err(|error| ConfigError::Validation {
@@ -43,7 +50,14 @@ pub fn load_server(path: &Path) -> Result<ServerConfig, ConfigError> {
 }
 
 pub fn load_client(path: &Path) -> Result<ClientConfig, ConfigError> {
-    let mut config: ClientConfig = load(path)?;
+    load_client_with_lookup(path, |variable| env::var(variable).ok())
+}
+
+pub fn load_client_with_lookup<F>(path: &Path, environment: F) -> Result<ClientConfig, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let mut config: ClientConfig = load(path, &environment)?;
     resolve_path(path, &mut config.client.private_key_file);
     config.validate().map_err(|error| ConfigError::Validation {
         path: path.to_path_buf(),
@@ -67,15 +81,16 @@ pub fn check_client_references(
     check_reference(config_path, "private key", &config.client.private_key_file)
 }
 
-fn load<T>(path: &Path) -> Result<T, ConfigError>
+fn load<T, F>(path: &Path, environment: &F) -> Result<T, ConfigError>
 where
     T: serde::de::DeserializeOwned,
+    F: Fn(&str) -> Option<String>,
 {
     let contents = fs::read_to_string(path).map_err(|error| ConfigError::Read {
         path: path.to_path_buf(),
         kind: error.kind(),
     })?;
-    let expanded = interpolate(path, &contents)?;
+    let expanded = interpolate(path, &contents, environment)?;
     toml::from_str(&expanded).map_err(|_| ConfigError::TomlParse {
         path: path.to_path_buf(),
     })
@@ -104,7 +119,10 @@ fn check_reference(
     }
 }
 
-fn interpolate(path: &Path, source: &str) -> Result<String, ConfigError> {
+fn interpolate<F>(path: &Path, source: &str, environment: &F) -> Result<String, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
     let mut expanded = String::with_capacity(source.len());
     let mut remaining = source;
     while let Some(start) = remaining.find("${") {
@@ -117,7 +135,7 @@ fn interpolate(path: &Path, source: &str) -> Result<String, ConfigError> {
         if !is_environment_variable_name(variable) {
             return Err(interpolation_error(path, "invalid placeholder"));
         }
-        let value = env::var(variable).map_err(|_| interpolation_error(path, variable))?;
+        let value = environment(variable).ok_or_else(|| interpolation_error(path, variable))?;
         expanded.push_str(&value);
         remaining = &after_open[end + 1..];
     }
