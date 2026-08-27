@@ -43,6 +43,7 @@ fn valid_config() -> &'static str {
 name = "home-pc"
 server_addr = "127.0.0.1:7000"
 server_name = "localhost"
+certificate_authority_file = "ca.pem"
 private_key_file = "device.key"
 heartbeat_interval_secs = 20
 
@@ -73,6 +74,7 @@ fn default_run_reports_missing_conventional_config_and_override_flag() {
 fn check_validates_locally_without_contacting_the_configured_server() {
     let dir = TempDir::new();
     let config = dir.write("valid.toml", valid_config());
+    dir.write("ca.pem", "test CA");
     dir.write("device.key", "test private key");
     let _reserved_port = TcpListener::bind("127.0.0.1:7000").unwrap();
 
@@ -87,6 +89,7 @@ fn check_validates_locally_without_contacting_the_configured_server() {
 fn explicit_config_does_not_consult_conventional_filename() {
     let dir = TempDir::new();
     let config = dir.write("custom.toml", valid_config());
+    dir.write("ca.pem", "test CA");
     dir.write("device.key", "test private key");
     dir.write("client.toml", "not valid toml = [");
 
@@ -95,4 +98,18 @@ fn explicit_config_does_not_consult_conventional_filename() {
         .args(["check", "-c", config.to_str().unwrap()])
         .assert()
         .success();
+}
+
+#[test]
+fn default_run_enters_client_runtime_and_rejects_invalid_identity_material() {
+    let dir = TempDir::new();
+    let config = dir.write("run.toml", valid_config());
+    dir.write("ca.pem", "not a certificate");
+    dir.write("device.key", "not a Rustgo private key");
+
+    command()
+        .current_dir(&dir.path)
+        .args(["-c", config.to_str().unwrap()])
+        .assert()
+        .failure();
 }

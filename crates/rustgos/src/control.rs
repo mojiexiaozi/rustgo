@@ -79,6 +79,18 @@ pub(crate) async fn serve_connection(
         let Message::ClientHello(hello) = hello_frame.message else {
             return Err(ControlError::InvalidState);
         };
+        if hello.heartbeat_interval_secs == 0
+            || u64::from(hello.heartbeat_interval_secs) >= context.heartbeat_timeout.as_secs()
+        {
+            auth_attempt.fail();
+            framed
+                .send(
+                    negotiated,
+                    protocol_error(ProtocolErrorCode::INCOMPATIBLE_HEARTBEAT),
+                )
+                .await?;
+            return Ok(None);
+        }
         state = state.transition(&Message::ClientHello(hello.clone()))?;
         let pending = context.authenticator.begin(hello, negotiated)?;
         let challenge = Message::ServerChallenge(pending.challenge()?);
@@ -142,7 +154,14 @@ pub(crate) async fn serve_connection(
         }
         match frame.message {
             Message::Heartbeat(heartbeat) => {
-                state = state.transition(&Message::Heartbeat(heartbeat))?;
+                let acknowledgement = Message::Heartbeat(heartbeat);
+                state = state.transition(&acknowledgement)?;
+                tokio::time::timeout(
+                    context.heartbeat_timeout,
+                    framed.send(negotiated, acknowledgement),
+                )
+                .await
+                .map_err(|_| ControlError::HeartbeatTimeout)??;
             }
             _ => return Err(ControlError::InvalidState),
         }

@@ -29,6 +29,7 @@ fn messages() -> Vec<Message> {
         Message::ClientHello(ClientHello {
             client_name: text("home-pc"),
             fingerprint: bytes(&[0x11; 32]),
+            heartbeat_interval_secs: 20,
         }),
         Message::ServerChallenge(ServerChallenge {
             challenge: bytes(&[0x22; 32]),

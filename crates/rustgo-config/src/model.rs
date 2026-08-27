@@ -54,6 +54,7 @@ pub struct ClientSection {
     pub name: String,
     pub server_addr: String,
     pub server_name: String,
+    pub certificate_authority_file: PathBuf,
     pub private_key_file: PathBuf,
     pub heartbeat_interval_secs: u64,
 }

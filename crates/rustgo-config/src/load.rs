@@ -58,6 +58,7 @@ where
     F: Fn(&str) -> Option<String>,
 {
     let mut config: ClientConfig = load(path, &environment)?;
+    resolve_path(path, &mut config.client.certificate_authority_file);
     resolve_path(path, &mut config.client.private_key_file);
     config.validate().map_err(|error| ConfigError::Validation {
         path: path.to_path_buf(),
@@ -78,6 +79,11 @@ pub fn check_client_references(
     config_path: &Path,
     config: &ClientConfig,
 ) -> Result<(), ConfigError> {
+    check_reference(
+        config_path,
+        "certificate authority",
+        &config.client.certificate_authority_file,
+    )?;
     check_reference(config_path, "private key", &config.client.private_key_file)
 }
 

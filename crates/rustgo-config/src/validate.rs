@@ -56,6 +56,12 @@ pub(crate) fn validate_client(config: &ClientConfig) -> Result<(), ValidationErr
         "client.heartbeat_interval_secs",
         config.client.heartbeat_interval_secs,
     )?;
+    if config.client.heartbeat_interval_secs > u64::from(u32::MAX) {
+        return Err(ValidationError::new(format!(
+            "client.heartbeat_interval_secs must be at most {}",
+            u32::MAX
+        )));
+    }
 
     let mut names = HashSet::new();
     let mut remote_ports = HashSet::new();

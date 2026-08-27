@@ -321,6 +321,7 @@ impl ProtocolErrorCode {
     pub const AUTHENTICATION_FAILED: Self = Self(6);
     pub const UNKNOWN_SESSION: Self = Self(7);
     pub const TUNNEL_REJECTED: Self = Self(8);
+    pub const INCOMPATIBLE_HEARTBEAT: Self = Self(9);
     pub const INTERNAL: Self = Self(255);
 
     pub const fn as_u16(self) -> u16 {
@@ -344,7 +345,7 @@ impl<'de> Deserialize<'de> for ProtocolErrorCode {
     {
         let value = u16::deserialize(deserializer)?;
         match value {
-            1..=8 | 255 => Ok(Self(value)),
+            1..=9 | 255 => Ok(Self(value)),
             _ => Err(de::Error::custom("unknown protocol error code")),
         }
     }
@@ -394,6 +395,7 @@ pub enum SocketAddress {
 pub struct ClientHello {
     pub client_name: BoundedString<MAX_CLIENT_NAME_BYTES>,
     pub fingerprint: BoundedBytes<MAX_FINGERPRINT_BYTES>,
+    pub heartbeat_interval_secs: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

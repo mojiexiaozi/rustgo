@@ -7,7 +7,8 @@ use std::{
 };
 
 use rustgo_config::{
-    ClientConfig, ServerConfig, TunnelProtocol, load_client, load_client_with_lookup, load_server,
+    ClientConfig, ServerConfig, TunnelProtocol, check_client_references, load_client,
+    load_client_with_lookup, load_server,
 };
 
 static NEXT_TEMP_DIR: AtomicUsize = AtomicUsize::new(0);
@@ -69,6 +70,7 @@ fn valid_client() -> String {
 name = "home-pc"
 server_addr = "tunnel.example.com:7000"
 server_name = "tunnel.example.com"
+certificate_authority_file = "certs/ca.crt"
 private_key_file = "keys/device.key"
 heartbeat_interval_secs = 20
 
@@ -155,6 +157,32 @@ fn relative_file_paths_resolve_from_config_directory() {
         loaded.server.private_key_file,
         dir.path.join("certs/server.key")
     );
+
+    let client_path = dir.write("client.toml", &valid_client());
+    let client = load_client(&client_path).unwrap();
+    assert_eq!(
+        client.client.certificate_authority_file,
+        dir.path.join("certs/ca.crt")
+    );
+    assert_eq!(
+        client.client.private_key_file,
+        dir.path.join("keys/device.key")
+    );
+}
+
+#[test]
+fn client_reference_check_requires_the_explicit_ca_and_private_key() {
+    let dir = TempDir::new();
+    let config_path = dir.write("client.toml", &valid_client());
+    let config = load_client(&config_path).unwrap();
+
+    let missing_ca = check_client_references(&config_path, &config).unwrap_err();
+    assert!(missing_ca.to_string().contains("certificate authority"));
+
+    fs::create_dir_all(dir.path.join("certs")).unwrap();
+    fs::write(dir.path.join("certs/ca.crt"), "test CA").unwrap();
+    let missing_key = check_client_references(&config_path, &config).unwrap_err();
+    assert!(missing_key.to_string().contains("private key"));
 }
 
 #[test]
@@ -204,6 +232,17 @@ fn invalid_ports_and_zero_timeouts_are_rejected() {
 
     assert!(load_server_text(&dir, &invalid_server).is_err());
     assert!(load_client_text(&dir, &invalid_client).is_err());
+}
+
+#[test]
+fn client_heartbeat_interval_must_fit_the_bounded_wire_field() {
+    let dir = TempDir::new();
+    let invalid = valid_client().replace(
+        "heartbeat_interval_secs = 20",
+        "heartbeat_interval_secs = 4294967296",
+    );
+
+    assert!(load_client_text(&dir, &invalid).is_err());
 }
 
 #[test]

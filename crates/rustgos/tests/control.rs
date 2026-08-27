@@ -221,6 +221,7 @@ async fn begin_authentication(
             Message::ClientHello(ClientHello {
                 client_name: text(name),
                 fingerprint: bytes(&wire_fingerprint(fingerprint_key)),
+                heartbeat_interval_secs: 1,
             }),
         )
         .await?;
@@ -500,6 +501,7 @@ async fn protocol_major_mismatch_is_rejected_before_authentication() -> Result<(
             Message::ClientHello(ClientHello {
                 client_name: text("home-pc"),
                 fingerprint: bytes(&wire_fingerprint(&key)),
+                heartbeat_interval_secs: 1,
             }),
         )
         .await?;
@@ -511,6 +513,45 @@ async fn protocol_major_mismatch_is_rejected_before_authentication() -> Result<(
         return Err("server did not send a protocol error".into());
     };
     assert_eq!(error.code, ProtocolErrorCode::UNSUPPORTED_VERSION);
+
+    shutdown.cancel();
+    server_task.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn heartbeat_interval_must_be_strictly_below_server_timeout_before_challenge()
+-> Result<(), Box<dyn Error>> {
+    let pki = TestPki::generate()?;
+    let key = DeviceKeypair::from_secret_bytes([24; 32]);
+    let mut config = server_config(&pki, vec![authorized("home-pc", &key, true)]);
+    config.server.heartbeat_timeout_secs = 20;
+    let app = ServerApp::bind(config).await?;
+    let address = app.local_addr()?;
+    let shutdown = CancellationToken::new();
+    let server_task = tokio::spawn(app.run_until(shutdown.clone()));
+
+    for interval in [0, 20, 21] {
+        let mut client = FramedClient::connect(&pki, address).await?;
+        client
+            .send(
+                VERSION,
+                Message::ClientHello(ClientHello {
+                    client_name: text("home-pc"),
+                    fingerprint: bytes(&wire_fingerprint(&key)),
+                    heartbeat_interval_secs: interval,
+                }),
+            )
+            .await?;
+        let Frame {
+            message: Message::Error(error),
+            ..
+        } = client.receive().await?
+        else {
+            return Err("server did not return a heartbeat compatibility error".into());
+        };
+        assert_eq!(error.code, ProtocolErrorCode::INCOMPATIBLE_HEARTBEAT);
+    }
 
     shutdown.cancel();
     server_task.await??;
@@ -799,7 +840,7 @@ async fn heartbeat_timeout_drops_the_control_owner_and_its_listener() -> Result<
     let key = DeviceKeypair::from_secret_bytes([17; 32]);
     let port = unused_tcp_port()?;
     let mut config = server_config(&pki, vec![authorized("home-pc", &key, true)]);
-    config.server.heartbeat_timeout_secs = 1;
+    config.server.heartbeat_timeout_secs = 2;
     let app = ServerApp::bind(config).await?;
     let address = app.local_addr()?;
     let registry = app.registry();

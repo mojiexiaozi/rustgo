@@ -1122,9 +1122,20 @@ name = "rustgoc"
 version = "0.1.0"
 dependencies = [
  "assert_cmd",
+ "bytes",
  "clap",
+ "rcgen",
  "rustgo-config",
  "rustgo-crypto",
+ "rustgo-protocol",
+ "rustgo-transport",
+ "rustgos",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]

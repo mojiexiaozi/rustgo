@@ -17,6 +17,7 @@ fn hello() -> Message {
     Message::ClientHello(ClientHello {
         client_name: text("home-pc"),
         fingerprint: bytes(&[1; 32]),
+        heartbeat_interval_secs: 20,
     })
 }
 
@@ -172,6 +173,7 @@ fn protocol_error_codes_are_explicit_and_stable() {
     assert_eq!(ProtocolErrorCode::AUTHENTICATION_FAILED.as_u16(), 6);
     assert_eq!(ProtocolErrorCode::UNKNOWN_SESSION.as_u16(), 7);
     assert_eq!(ProtocolErrorCode::TUNNEL_REJECTED.as_u16(), 8);
+    assert_eq!(ProtocolErrorCode::INCOMPATIBLE_HEARTBEAT.as_u16(), 9);
     assert_eq!(ProtocolErrorCode::INTERNAL.as_u16(), 255);
 }
 

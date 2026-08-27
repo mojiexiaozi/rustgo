@@ -1,0 +1,412 @@
+use std::{collections::HashMap, io, sync::Arc, time::Duration};
+
+use bytes::BytesMut;
+use rustgo_config::{ClientConfig, TunnelProtocol as ConfigTunnelProtocol};
+use rustgo_crypto::{AuthTranscript, CryptoError, DeviceKeypair, sign_auth};
+use rustgo_protocol::{
+    BoundedBytes, BoundedString, BoundedVec, ClientAuthenticate, ClientHandshakeState, ClientHello,
+    Frame, FrameCodec, FrameError, MAX_CLIENT_NAME_BYTES, MAX_FINGERPRINT_BYTES,
+    MAX_PUBLIC_KEY_BYTES, MAX_SIGNATURE_BYTES, MAX_TUNNEL_NAME_BYTES, Message, ProtocolErrorCode,
+    ProtocolVersion, RegisterTunnels, TunnelProtocol, TunnelRegistration,
+};
+use rustgo_transport::{TlsClient, TlsError};
+use thiserror::Error;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio_rustls::client::TlsStream;
+
+pub const CLIENT_VERSION: ProtocolVersion = ProtocolVersion::new(1, 0);
+const MAX_CONTROL_PAYLOAD: usize = 70 * 1024;
+const CONTROL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Clone)]
+pub struct ControlClient {
+    config: Arc<ClientConfig>,
+    keypair: Arc<DeviceKeypair>,
+    tls_client: TlsClient,
+    heartbeat_interval: Duration,
+}
+
+impl ControlClient {
+    /// Builds every local security dependency before any network socket is opened.
+    pub fn from_config(config: ClientConfig) -> Result<Self, ClientError> {
+        config
+            .validate()
+            .map_err(|_| ClientError::InvalidConfiguration)?;
+        let heartbeat_interval_secs = u32::try_from(config.client.heartbeat_interval_secs)
+            .map_err(|_| ClientError::InvalidConfiguration)?;
+        if heartbeat_interval_secs == 0 {
+            return Err(ClientError::InvalidConfiguration);
+        }
+        let keypair = DeviceKeypair::load_private_file(&config.client.private_key_file)?;
+        let tls_client = TlsClient::from_ca_file(
+            &config.client.certificate_authority_file,
+            &config.client.server_name,
+        )?;
+        Ok(Self {
+            config: Arc::new(config),
+            keypair: Arc::new(keypair),
+            tls_client,
+            heartbeat_interval: Duration::from_secs(u64::from(heartbeat_interval_secs)),
+        })
+    }
+
+    pub fn config(&self) -> &ClientConfig {
+        &self.config
+    }
+
+    pub async fn connect(&self) -> Result<ControlSession, ClientError> {
+        tokio::time::timeout(CONTROL_HANDSHAKE_TIMEOUT, self.connect_inner())
+            .await
+            .map_err(|_| ClientError::HandshakeTimeout)?
+    }
+
+    async fn connect_inner(&self) -> Result<ControlSession, ClientError> {
+        let stream = self
+            .tls_client
+            .connect(&self.config.client.server_addr)
+            .await?;
+        let mut framed = FramedControl::new(stream);
+        let mut state = ClientHandshakeState::new();
+
+        let public_key = self.keypair.public_key();
+        let fingerprint = public_key.fingerprint().to_string();
+        let fingerprint = fingerprint
+            .strip_prefix("sha256:")
+            .ok_or(ClientError::InvalidIdentity)?;
+        let hello = Message::ClientHello(ClientHello {
+            client_name: BoundedString::<MAX_CLIENT_NAME_BYTES>::try_from(
+                self.config.client.name.as_str(),
+            )
+            .map_err(|_| ClientError::InvalidConfiguration)?,
+            fingerprint: BoundedBytes::<MAX_FINGERPRINT_BYTES>::try_from(fingerprint.as_bytes())
+                .map_err(|_| ClientError::InvalidIdentity)?,
+            heartbeat_interval_secs: u32::try_from(self.config.client.heartbeat_interval_secs)
+                .map_err(|_| ClientError::InvalidConfiguration)?,
+        });
+        state = state.transition(&hello)?;
+        framed.send(CLIENT_VERSION, hello).await?;
+
+        let challenge_frame = framed.receive().await?;
+        let negotiated = negotiated_version(challenge_frame.version)?;
+        let challenge = match challenge_frame.message {
+            Message::ServerChallenge(challenge) => challenge,
+            Message::Error(error) => return Err(ClientError::Protocol(error.code)),
+            _ => return Err(ClientError::InvalidState),
+        };
+        state = state.transition(&Message::ServerChallenge(challenge.clone()))?;
+
+        let transcript = AuthTranscript::new(
+            challenge.challenge.as_slice().to_vec(),
+            challenge.session_id.as_slice().to_vec(),
+            transcript_version(negotiated)?,
+            self.config.client.name.clone(),
+        );
+        let authentication = Message::ClientAuthenticate(ClientAuthenticate {
+            public_key: BoundedBytes::<MAX_PUBLIC_KEY_BYTES>::try_from(
+                public_key.to_string().as_bytes(),
+            )
+            .map_err(|_| ClientError::InvalidIdentity)?,
+            signature: BoundedBytes::<MAX_SIGNATURE_BYTES>::try_from(
+                sign_auth(&self.keypair, &transcript).as_slice(),
+            )
+            .map_err(|_| ClientError::InvalidIdentity)?,
+        });
+        state = state.transition(&authentication)?;
+        framed.send(negotiated, authentication).await?;
+
+        let auth_frame = framed.receive().await?;
+        require_version(auth_frame.version, negotiated)?;
+        let result = match auth_frame.message {
+            Message::AuthResult(result) => result,
+            Message::Error(error) => return Err(ClientError::Protocol(error.code)),
+            _ => return Err(ClientError::InvalidState),
+        };
+        state = state.transition(&Message::AuthResult(result.clone()))?;
+        if !result.accepted {
+            return Err(ClientError::AuthenticationRejected);
+        }
+
+        let registration = registration_message(&self.config)?;
+        state = state.transition(&registration)?;
+        if !state.is_active() {
+            return Err(ClientError::InvalidState);
+        }
+        framed.send(negotiated, registration).await?;
+
+        let results_frame = framed.receive().await?;
+        require_version(results_frame.version, negotiated)?;
+        let results = match results_frame.message {
+            Message::TunnelResults(results) => results,
+            Message::Error(error) => return Err(ClientError::Protocol(error.code)),
+            _ => return Err(ClientError::InvalidState),
+        };
+        let registered_tunnels = correlate_results(&self.config, results.results.into_vec())?;
+
+        Ok(ControlSession::new(
+            framed,
+            negotiated,
+            challenge.session_id.into_vec(),
+            self.heartbeat_interval,
+            registered_tunnels,
+        ))
+    }
+}
+
+fn negotiated_version(server_version: ProtocolVersion) -> Result<ProtocolVersion, ClientError> {
+    let negotiated = CLIENT_VERSION
+        .negotiate(server_version)
+        .map_err(ClientError::Protocol)?;
+    if negotiated != server_version {
+        return Err(ClientError::InvalidState);
+    }
+    Ok(negotiated)
+}
+
+fn require_version(
+    actual: ProtocolVersion,
+    negotiated: ProtocolVersion,
+) -> Result<(), ClientError> {
+    if actual == negotiated {
+        Ok(())
+    } else {
+        Err(ClientError::InvalidState)
+    }
+}
+
+fn transcript_version(version: ProtocolVersion) -> Result<u16, ClientError> {
+    if version.major > u16::from(u8::MAX) || version.minor > u16::from(u8::MAX) {
+        return Err(ClientError::InvalidState);
+    }
+    Ok((version.major << 8) | version.minor)
+}
+
+fn registration_message(config: &ClientConfig) -> Result<Message, ClientError> {
+    let mut tunnels = Vec::with_capacity(config.tunnels.len());
+    for (index, tunnel) in config.tunnels.iter().enumerate() {
+        let tunnel_id = u32::try_from(index)
+            .ok()
+            .and_then(|value| value.checked_add(1))
+            .ok_or(ClientError::InvalidConfiguration)?;
+        tunnels.push(TunnelRegistration {
+            tunnel_id,
+            name: BoundedString::<MAX_TUNNEL_NAME_BYTES>::try_from(tunnel.name.as_str())
+                .map_err(|_| ClientError::InvalidConfiguration)?,
+            protocol: match tunnel.protocol {
+                ConfigTunnelProtocol::Tcp => TunnelProtocol::TCP,
+                ConfigTunnelProtocol::Udp => TunnelProtocol::UDP,
+            },
+            remote_port: u16::try_from(tunnel.remote_port)
+                .map_err(|_| ClientError::InvalidConfiguration)?,
+        });
+    }
+    Ok(Message::RegisterTunnels(RegisterTunnels {
+        tunnels: BoundedVec::try_from(tunnels).map_err(|_| ClientError::InvalidConfiguration)?,
+    }))
+}
+
+fn correlate_results(
+    config: &ClientConfig,
+    results: Vec<rustgo_protocol::TunnelResult>,
+) -> Result<Arc<[RegisteredTunnel]>, ClientError> {
+    if results.len() != config.tunnels.len() {
+        return Err(ClientError::InvalidTunnelResults);
+    }
+    let mut by_id = HashMap::with_capacity(results.len());
+    for result in results {
+        if result.tunnel_id == 0 || by_id.insert(result.tunnel_id, result).is_some() {
+            return Err(ClientError::InvalidTunnelResults);
+        }
+    }
+    let mut registered = Vec::with_capacity(config.tunnels.len());
+    for (index, tunnel) in config.tunnels.iter().enumerate() {
+        let tunnel_id = u32::try_from(index)
+            .ok()
+            .and_then(|value| value.checked_add(1))
+            .ok_or(ClientError::InvalidTunnelResults)?;
+        let result = by_id
+            .remove(&tunnel_id)
+            .ok_or(ClientError::InvalidTunnelResults)?;
+        registered.push(RegisteredTunnel {
+            tunnel_id,
+            name: tunnel.name.clone(),
+            protocol: tunnel.protocol,
+            local_addr: tunnel.local_addr.clone(),
+            remote_port: u16::try_from(tunnel.remote_port)
+                .map_err(|_| ClientError::InvalidTunnelResults)?,
+            accepted: result.accepted,
+            error: result.error,
+        });
+    }
+    if !by_id.is_empty() {
+        return Err(ClientError::InvalidTunnelResults);
+    }
+    Ok(registered.into())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisteredTunnel {
+    tunnel_id: u32,
+    name: String,
+    protocol: ConfigTunnelProtocol,
+    local_addr: String,
+    remote_port: u16,
+    accepted: bool,
+    error: Option<ProtocolErrorCode>,
+}
+
+impl RegisteredTunnel {
+    pub const fn tunnel_id(&self) -> u32 {
+        self.tunnel_id
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub const fn protocol(&self) -> ConfigTunnelProtocol {
+        self.protocol
+    }
+
+    pub fn local_addr(&self) -> &str {
+        &self.local_addr
+    }
+
+    pub const fn remote_port(&self) -> u16 {
+        self.remote_port
+    }
+
+    pub const fn accepted(&self) -> bool {
+        self.accepted
+    }
+
+    pub const fn error(&self) -> Option<ProtocolErrorCode> {
+        self.error
+    }
+}
+
+pub struct ControlSession {
+    pub(crate) framed: FramedControl,
+    pub(crate) version: ProtocolVersion,
+    pub(crate) session_id: Vec<u8>,
+    pub(crate) heartbeat_interval: Duration,
+    registered_tunnels: Arc<[RegisteredTunnel]>,
+}
+
+impl ControlSession {
+    fn new(
+        framed: FramedControl,
+        version: ProtocolVersion,
+        session_id: Vec<u8>,
+        heartbeat_interval: Duration,
+        registered_tunnels: Arc<[RegisteredTunnel]>,
+    ) -> Self {
+        Self {
+            framed,
+            version,
+            session_id,
+            heartbeat_interval,
+            registered_tunnels,
+        }
+    }
+
+    pub fn registered_tunnels(&self) -> &[RegisteredTunnel] {
+        &self.registered_tunnels
+    }
+
+    pub(crate) fn registered_tunnels_shared(&self) -> Arc<[RegisteredTunnel]> {
+        self.registered_tunnels.clone()
+    }
+}
+
+impl std::fmt::Debug for ControlSession {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ControlSession")
+            .field("version", &self.version)
+            .field("session_id", &"[REDACTED]")
+            .field("heartbeat_interval", &self.heartbeat_interval)
+            .field("registered_tunnels", &self.registered_tunnels)
+            .finish_non_exhaustive()
+    }
+}
+
+pub(crate) struct FramedControl {
+    stream: TlsStream<TcpStream>,
+    read_buffer: BytesMut,
+    codec: FrameCodec,
+}
+
+impl FramedControl {
+    fn new(stream: TlsStream<TcpStream>) -> Self {
+        Self {
+            stream,
+            read_buffer: BytesMut::new(),
+            codec: FrameCodec::new(MAX_CONTROL_PAYLOAD),
+        }
+    }
+
+    pub(crate) async fn receive(&mut self) -> Result<Frame, ClientError> {
+        loop {
+            if let Some(frame) = self.codec.decode(&mut self.read_buffer)? {
+                return Ok(frame);
+            }
+            if self.read_buffer.len() >= MAX_CONTROL_PAYLOAD + rustgo_protocol::HEADER_LEN {
+                return Err(ClientError::FrameTooLarge);
+            }
+            if self.stream.read_buf(&mut self.read_buffer).await? == 0 {
+                return Err(ClientError::Closed);
+            }
+        }
+    }
+
+    pub(crate) async fn send(
+        &mut self,
+        version: ProtocolVersion,
+        message: Message,
+    ) -> Result<(), ClientError> {
+        let encoded = self.codec.encode(version, 0, &message)?;
+        self.stream.write_all(&encoded).await?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum ClientError {
+    #[error("invalid client configuration")]
+    InvalidConfiguration,
+    #[error("invalid client identity")]
+    InvalidIdentity,
+    #[error("TLS transport failed: {0}")]
+    Tls(#[from] TlsError),
+    #[error("device identity failed: {0}")]
+    Crypto(#[from] CryptoError),
+    #[error("control frame failed: {0}")]
+    Frame(#[from] FrameError),
+    #[error("control protocol state failed: {0}")]
+    State(#[from] rustgo_protocol::StateError),
+    #[error("control I/O failed: {0}")]
+    Io(#[from] io::Error),
+    #[error("server rejected authentication")]
+    AuthenticationRejected,
+    #[error("server rejected control protocol operation with code {0:?}")]
+    Protocol(ProtocolErrorCode),
+    #[error("server returned an invalid control protocol state")]
+    InvalidState,
+    #[error("server returned invalid tunnel registration results")]
+    InvalidTunnelResults,
+    #[error("control connection closed")]
+    Closed,
+    #[error("control frame exceeded the configured maximum")]
+    FrameTooLarge,
+    #[error("client task failed to join")]
+    TaskJoin,
+    #[error("client session generation exhausted")]
+    GenerationExhausted,
+    #[error("client heartbeat sequence exhausted")]
+    SequenceExhausted,
+    #[error("server heartbeat response timed out")]
+    HeartbeatTimeout,
+    #[error("control connection handshake timed out")]
+    HandshakeTimeout,
+}
