@@ -1,9 +1,10 @@
 use std::{fmt, io, path::PathBuf, str::FromStr};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use zeroize::Zeroize;
 
 use crate::AuthTranscript;
 
@@ -33,10 +34,10 @@ pub struct DeviceKeypair {
 
 impl DeviceKeypair {
     #[must_use]
-    pub fn from_secret_bytes(secret: [u8; 32]) -> Self {
-        Self {
-            signing_key: SigningKey::from_bytes(&secret),
-        }
+    pub fn from_secret_bytes(mut secret: [u8; 32]) -> Self {
+        let keypair = Self::from_secret_bytes_ref(&secret);
+        secret.zeroize();
+        keypair
     }
 
     #[must_use]
@@ -44,8 +45,14 @@ impl DeviceKeypair {
         DevicePublicKey(self.signing_key.verifying_key())
     }
 
-    pub(crate) fn secret_bytes(&self) -> [u8; 32] {
-        self.signing_key.to_bytes()
+    pub(crate) fn from_secret_bytes_ref(secret: &[u8; 32]) -> Self {
+        Self {
+            signing_key: SigningKey::from_bytes(secret),
+        }
+    }
+
+    pub(crate) fn secret_bytes(&self) -> &[u8; 32] {
+        self.signing_key.as_bytes()
     }
 }
 
@@ -98,6 +105,9 @@ impl FromStr for DevicePublicKey {
             .try_into()
             .map_err(|_| CryptoError::InvalidPublicKey)?;
         let key = VerifyingKey::from_bytes(&bytes).map_err(|_| CryptoError::InvalidPublicKey)?;
+        if key.is_weak() {
+            return Err(CryptoError::InvalidPublicKey);
+        }
         Ok(Self(key))
     }
 }
@@ -141,6 +151,6 @@ pub fn verify_auth(
         Signature::from_slice(signature).map_err(|_| CryptoError::AuthenticationFailed)?;
     public_key
         .0
-        .verify(transcript.as_bytes(), &signature)
+        .verify_strict(transcript.as_bytes(), &signature)
         .map_err(|_| CryptoError::AuthenticationFailed)
 }

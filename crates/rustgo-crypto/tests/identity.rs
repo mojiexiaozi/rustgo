@@ -1,7 +1,8 @@
 use std::str::FromStr;
 
 use rustgo_crypto::{
-    AuthTranscript, DeviceKeypair, DevicePublicKey, Fingerprint, sign_auth, verify_auth,
+    AuthTranscript, CryptoError, DeviceKeypair, DevicePublicKey, Fingerprint, sign_auth,
+    verify_auth,
 };
 
 const RFC_8032_SECRET: [u8; 32] = [
@@ -88,6 +89,32 @@ fn malformed_and_invalid_signatures_share_a_non_secret_error() {
 
     assert_eq!(malformed, invalid);
     assert_eq!(invalid.to_string(), "authentication verification failed");
+}
+
+#[test]
+fn weak_public_key_and_universal_forgery_are_rejected_for_every_transcript() {
+    // The compressed Edwards25519 identity is a small-order public key. With
+    // the identity as R and s=0, ordinary Ed25519 verification accepts the
+    // same signature for arbitrary messages.
+    let encoded_identity = "ed25519:AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    let mut universal_forgery = [0_u8; 64];
+    universal_forgery[0] = 1;
+    let transcripts = [
+        AuthTranscript::new(vec![1], vec![2], 1, "client-a".into()),
+        AuthTranscript::new(vec![9, 8, 7], vec![6, 5], 2, "client-b".into()),
+    ];
+
+    match DevicePublicKey::from_str(encoded_identity) {
+        Ok(weak_key) => {
+            for transcript in &transcripts {
+                assert_eq!(
+                    verify_auth(&weak_key, transcript, &universal_forgery),
+                    Err(CryptoError::AuthenticationFailed)
+                );
+            }
+        }
+        Err(error) => assert_eq!(error, CryptoError::InvalidPublicKey),
+    }
 }
 
 #[test]

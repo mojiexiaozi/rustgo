@@ -54,11 +54,15 @@ impl CommandHandler for LocalCommandHandler {
 }
 
 fn main() -> ExitCode {
-    match execute(Cli::parse(), &LocalCommandHandler) {
+    let cli = Cli::parse();
+    let show_config_hint = !matches!(&cli.command, Some(Command::Keygen { .. }));
+    match execute(cli, &LocalCommandHandler) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("rustgoc: {error}");
-            eprintln!("Use -c <path> to select a client configuration file.");
+            if show_config_hint {
+                eprintln!("Use -c <path> to select a client configuration file.");
+            }
             ExitCode::FAILURE
         }
     }

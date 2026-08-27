@@ -1,13 +1,14 @@
 use std::{
     fs,
     io::{self, Write},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
+use atomicwrites::move_atomic;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use rand::{TryRngCore, rngs::OsRng};
-use tempfile::{Builder, NamedTempFile};
-use zeroize::{Zeroize, Zeroizing};
+use tempfile::Builder;
+use zeroize::Zeroizing;
 
 use crate::{CryptoError, DeviceKeypair, DevicePublicKey};
 
@@ -24,16 +25,15 @@ pub fn generate_key_file(directory: &Path) -> Result<DevicePublicKey, CryptoErro
     ensure_absent(&private_path)?;
     ensure_absent(&public_path)?;
 
-    let mut secret = [0_u8; 32];
+    let mut secret = Zeroizing::new([0_u8; 32]);
     OsRng
-        .try_fill_bytes(&mut secret)
+        .try_fill_bytes(secret.as_mut())
         .map_err(|error| CryptoError::KeyFileIo {
             operation: "obtain operating-system randomness for",
             path: private_path.clone(),
             kind: io::Error::other(error).kind(),
         })?;
-    let keypair = DeviceKeypair::from_secret_bytes(secret);
-    secret.zeroize();
+    let keypair = DeviceKeypair::from_secret_bytes_ref(&secret);
     let public_key = keypair.public_key();
 
     let mut private_temp = new_temp(directory, PRIVATE_FILE_NAME, &private_path)?;
@@ -48,7 +48,6 @@ pub fn generate_key_file(directory: &Path) -> Result<DevicePublicKey, CryptoErro
     )?;
     persist_without_overwrite(public_temp, &public_path)?;
 
-    sync_directory(directory)?;
     Ok(public_key)
 }
 
@@ -67,11 +66,12 @@ impl DeviceKeypair {
                 .decode(payload)
                 .map_err(|_| CryptoError::InvalidPrivateKey)?,
         );
-        let secret: [u8; 32] = secret
-            .as_slice()
-            .try_into()
-            .map_err(|_| CryptoError::InvalidPrivateKey)?;
-        Ok(Self::from_secret_bytes(secret))
+        if secret.len() != 32 {
+            return Err(CryptoError::InvalidPrivateKey);
+        }
+        let mut secret_bytes = Zeroizing::new([0_u8; 32]);
+        secret_bytes.copy_from_slice(&secret);
+        Ok(Self::from_secret_bytes_ref(&secret_bytes))
     }
 }
 
@@ -85,74 +85,70 @@ fn ensure_absent(path: &Path) -> Result<(), CryptoError> {
     }
 }
 
-fn new_temp(
-    directory: &Path,
-    name: &str,
-    destination: &Path,
-) -> Result<NamedTempFile, CryptoError> {
-    Builder::new()
+fn new_temp(directory: &Path, name: &str, destination: &Path) -> Result<KeyTempFile, CryptoError> {
+    let temporary = Builder::new()
         .prefix(&format!(".{name}."))
         .suffix(".tmp")
         .tempfile_in(directory)
-        .map_err(|error| io_error("create temporary", destination, error))
+        .map_err(|error| io_error("create temporary", destination, error))?;
+    let (file, path) = temporary
+        .keep()
+        .map_err(|error| io_error("prepare temporary", destination, error.error))?;
+    Ok(KeyTempFile { file, path })
 }
 
 fn write_private_key(
-    file: &mut NamedTempFile,
+    file: &mut KeyTempFile,
     keypair: &DeviceKeypair,
     destination: &Path,
 ) -> Result<(), CryptoError> {
-    let secret = Zeroizing::new(keypair.secret_bytes());
     let mut encoded = Zeroizing::new([0_u8; 44]);
     let encoded_length = STANDARD
-        .encode_slice(secret.as_slice(), encoded.as_mut_slice())
+        .encode_slice(keypair.secret_bytes(), encoded.as_mut_slice())
         .map_err(|_| CryptoError::InvalidPrivateKey)?;
 
-    file.write_all(PRIVATE_KEY_PREFIX.as_bytes())
-        .and_then(|()| file.write_all(&encoded[..encoded_length]))
-        .and_then(|()| file.write_all(b"\n"))
-        .and_then(|()| file.flush())
-        .and_then(|()| file.as_file().sync_all())
+    file.file
+        .write_all(PRIVATE_KEY_PREFIX.as_bytes())
+        .and_then(|()| file.file.write_all(&encoded[..encoded_length]))
+        .and_then(|()| file.file.write_all(b"\n"))
+        .and_then(|()| file.file.flush())
+        .and_then(|()| file.file.sync_all())
         .map_err(|error| io_error("write", destination, error))
 }
 
 fn write_and_sync(
-    file: &mut NamedTempFile,
+    file: &mut KeyTempFile,
     contents: &[u8],
     destination: &Path,
 ) -> Result<(), CryptoError> {
-    file.write_all(contents)
-        .and_then(|()| file.flush())
-        .and_then(|()| file.as_file().sync_all())
+    file.file
+        .write_all(contents)
+        .and_then(|()| file.file.flush())
+        .and_then(|()| file.file.sync_all())
         .map_err(|error| io_error("write", destination, error))
 }
 
-fn persist_without_overwrite(file: NamedTempFile, destination: &Path) -> Result<(), CryptoError> {
-    file.persist_noclobber(destination)
-        .map(|_| ())
-        .map_err(|error| {
-            if error.error.kind() == io::ErrorKind::AlreadyExists {
-                CryptoError::KeyDestinationExists {
-                    path: destination.to_path_buf(),
-                }
-            } else {
-                io_error("persist", destination, error.error)
+fn persist_without_overwrite(file: KeyTempFile, destination: &Path) -> Result<(), CryptoError> {
+    move_atomic(&file.path, destination).map_err(|error| {
+        if error.kind() == io::ErrorKind::AlreadyExists {
+            CryptoError::KeyDestinationExists {
+                path: destination.to_path_buf(),
             }
-        })
+        } else {
+            io_error("persist and synchronize", destination, error)
+        }
+    })
 }
 
-#[cfg(unix)]
-fn sync_directory(directory: &Path) -> Result<(), CryptoError> {
-    fs::File::open(directory)
-        .and_then(|file| file.sync_all())
-        .map_err(|error| io_error("sync directory containing", directory, error))
+struct KeyTempFile {
+    file: fs::File,
+    path: PathBuf,
 }
 
-#[cfg(not(unix))]
-fn sync_directory(_directory: &Path) -> Result<(), CryptoError> {
-    // Windows applies inherited ACLs; NamedTempFile still uses create-new and
-    // persist-noclobber so no Unix permission mode is claimed or emulated.
-    Ok(())
+impl Drop for KeyTempFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
 }
 
 fn io_error(operation: &'static str, path: &Path, error: io::Error) -> CryptoError {

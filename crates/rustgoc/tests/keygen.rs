@@ -95,6 +95,7 @@ fn keygen_refuses_to_overwrite_either_destination() {
         let output = run_keygen(&output_dir);
 
         assert!(!output.status.success());
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("Use -c"));
         assert_eq!(fs::read(&existing_path).unwrap(), b"owned-by-user");
         let other_name = if existing_name == "device.key" {
             "device.pub"
