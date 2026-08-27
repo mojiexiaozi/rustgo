@@ -1,0 +1,87 @@
+use std::path::PathBuf;
+
+use serde::Deserialize;
+
+use crate::ValidationError;
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ServerConfig {
+    pub server: ServerSection,
+    pub limits: Limits,
+    #[serde(default)]
+    pub clients: Vec<AuthorizedClient>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ServerSection {
+    pub bind_addr: String,
+    pub certificate_file: PathBuf,
+    pub private_key_file: PathBuf,
+    pub heartbeat_timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Limits {
+    pub max_clients: u32,
+    pub max_tunnels_per_client: u32,
+    pub max_tcp_connections_per_tunnel: u32,
+    pub max_udp_sessions_per_tunnel: u32,
+    pub max_udp_payload_bytes: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AuthorizedClient {
+    pub name: String,
+    pub public_key: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClientConfig {
+    pub client: ClientSection,
+    #[serde(default)]
+    pub tunnels: Vec<TunnelConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClientSection {
+    pub name: String,
+    pub server_addr: String,
+    pub server_name: String,
+    pub private_key_file: PathBuf,
+    pub heartbeat_interval_secs: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TunnelConfig {
+    pub name: String,
+    pub protocol: TunnelProtocol,
+    pub local_addr: String,
+    pub remote_port: u32,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum TunnelProtocol {
+    Tcp,
+    Udp,
+}
+
+impl ServerConfig {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        crate::validate::validate_server(self)
+    }
+}
+
+impl ClientConfig {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        crate::validate::validate_client(self)
+    }
+}

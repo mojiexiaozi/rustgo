@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 clap.workspace = true
+rustgo-config = { path = "../rustgo-config" }
 
 [dev-dependencies]
 assert_cmd = "2.0.17"
