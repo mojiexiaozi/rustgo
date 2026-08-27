@@ -2,6 +2,7 @@ use std::{path::PathBuf, process::ExitCode};
 
 use clap::{Parser, Subcommand};
 use rustgo_config::{ClientConfig, ConfigError, check_client_references, load_client};
+use rustgo_crypto::generate_key_file;
 
 /// Rustgo private-network client.
 #[derive(Debug, Parser)]
@@ -45,8 +46,10 @@ impl CommandHandler for LocalCommandHandler {
         Ok(())
     }
 
-    fn keygen(&self, _output: PathBuf) -> Result<(), String> {
-        Err("key generation is not available until device identity support is installed".to_owned())
+    fn keygen(&self, output: PathBuf) -> Result<(), String> {
+        generate_key_file(&output)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
 }
 

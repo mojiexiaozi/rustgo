@@ -3,3 +3,12 @@ name = "rustgo-crypto"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[dependencies]
+base64.workspace = true
+ed25519-dalek.workspace = true
+rand.workspace = true
+sha2.workspace = true
+tempfile = "3.27.0"
+thiserror.workspace = true
+zeroize = "1.8.1"
