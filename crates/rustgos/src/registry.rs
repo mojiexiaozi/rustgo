@@ -140,8 +140,10 @@ impl ClientRegistry {
             self.binding_ttl,
         )?;
         let runtime = Arc::new(SessionRuntime {
-            binding_store: Mutex::new(binding_store),
-            pending_tcp: Mutex::new(HashMap::new()),
+            bindings: Mutex::new(SessionBindings {
+                store: binding_store,
+                pending_tcp: HashMap::new(),
+            }),
             outbound,
             cancellation: CancellationToken::new(),
             binding_ttl: self.binding_ttl,
@@ -177,6 +179,7 @@ impl ClientRegistry {
             tunnel_ids: HashMap::new(),
             tunnel_names: HashSet::new(),
             data_channels: Vec::new(),
+            released: false,
         })
     }
 
@@ -231,12 +234,17 @@ pub(crate) struct PendingTcpOpen {
 
 struct PendingTcp {
     channel_kind: ChannelKind,
+    binding_token: BoundedBytes<MAX_BINDING_TOKEN_BYTES>,
     destination: oneshot::Sender<ServerDataStream>,
 }
 
+struct SessionBindings {
+    store: ChannelBindingStore,
+    pending_tcp: HashMap<u64, PendingTcp>,
+}
+
 pub(crate) struct SessionRuntime {
-    binding_store: Mutex<ChannelBindingStore>,
-    pending_tcp: Mutex<HashMap<u64, PendingTcp>>,
+    bindings: Mutex<SessionBindings>,
     outbound: mpsc::Sender<Message>,
     cancellation: CancellationToken,
     binding_ttl: Duration,
@@ -268,34 +276,19 @@ impl SessionRuntime {
                 connection_id,
             };
             let (destination, data_channel) = oneshot::channel();
-            {
-                let mut pending = self
-                    .pending_tcp
-                    .lock()
-                    .map_err(|_| RegistryError::Internal)?;
-                if pending.contains_key(&connection_id) {
-                    continue;
-                }
-                pending.insert(
-                    connection_id,
-                    PendingTcp {
-                        channel_kind,
-                        destination,
-                    },
-                );
+            let mut bindings = self.bindings.lock().map_err(|_| RegistryError::Internal)?;
+            if bindings.pending_tcp.contains_key(&connection_id) {
+                continue;
             }
-            let binding_token = match self
-                .binding_store
-                .lock()
-                .map_err(|_| RegistryError::Internal)?
-                .issue(channel_kind)
-            {
-                Ok(token) => token,
-                Err(error) => {
-                    self.cancel_pending(connection_id);
-                    return Err(error.into());
-                }
-            };
+            let binding_token = bindings.store.issue(channel_kind)?;
+            bindings.pending_tcp.insert(
+                connection_id,
+                PendingTcp {
+                    channel_kind,
+                    binding_token: binding_token.clone(),
+                    destination,
+                },
+            );
             return Ok(PendingTcpOpen {
                 connection_id,
                 binding_token,
@@ -306,9 +299,15 @@ impl SessionRuntime {
     }
 
     pub(crate) fn cancel_pending(&self, connection_id: u64) {
-        if let Ok(mut pending) = self.pending_tcp.lock() {
-            pending.remove(&connection_id);
-        }
+        let Ok(mut bindings) = self.bindings.lock() else {
+            return;
+        };
+        let Some(pending) = bindings.pending_tcp.remove(&connection_id) else {
+            return;
+        };
+        bindings
+            .store
+            .revoke(pending.channel_kind, pending.binding_token.as_slice());
     }
 
     fn redeem_if_present(
@@ -326,14 +325,14 @@ impl SessionRuntime {
                 channel_id: request.target_id,
             }
         };
-        let mut store = match self.binding_store.lock() {
-            Ok(store) => store,
+        let mut bindings = match self.bindings.lock() {
+            Ok(bindings) => bindings,
             Err(_) => return Some(Err(RegistryError::Internal)),
         };
-        if !store.recognizes(request.binding_token.as_slice()) {
+        if !bindings.store.recognizes(request.binding_token.as_slice()) {
             return None;
         }
-        let binding = match store.redeem(
+        let binding = match bindings.store.redeem(
             request.client_name.as_str(),
             request.session_id.as_slice(),
             channel_kind,
@@ -342,11 +341,7 @@ impl SessionRuntime {
             Ok(binding) => binding,
             Err(error) => return Some(Err(error.into())),
         };
-        drop(store);
-        let pending = match self.pending_tcp.lock() {
-            Ok(mut pending) => pending.remove(&request.target_id),
-            Err(_) => return Some(Err(RegistryError::Internal)),
-        };
+        let pending = bindings.pending_tcp.remove(&request.target_id);
         let Some(pending) = pending else {
             return Some(Err(RegistryError::Binding(BindingError::Rejected)));
         };
@@ -360,9 +355,10 @@ impl SessionRuntime {
         &self,
         channel_kind: ChannelKind,
     ) -> Result<BoundedBytes<MAX_BINDING_TOKEN_BYTES>, RegistryError> {
-        self.binding_store
+        self.bindings
             .lock()
             .map_err(|_| RegistryError::Internal)?
+            .store
             .issue(channel_kind)
             .map_err(RegistryError::Binding)
     }
@@ -374,17 +370,23 @@ impl SessionRuntime {
         channel_kind: ChannelKind,
         token: &[u8],
     ) -> Result<ChannelBinding, RegistryError> {
-        self.binding_store
+        self.bindings
             .lock()
             .map_err(|_| RegistryError::Internal)?
+            .store
             .redeem(presented_client, presented_session_id, channel_kind, token)
             .map_err(RegistryError::Binding)
     }
 
     fn cancel(&self) {
         self.cancellation.cancel();
-        if let Ok(mut pending) = self.pending_tcp.lock() {
-            pending.clear();
+        if let Ok(mut bindings) = self.bindings.lock() {
+            let pending = std::mem::take(&mut bindings.pending_tcp);
+            for pending in pending.into_values() {
+                bindings
+                    .store
+                    .revoke(pending.channel_kind, pending.binding_token.as_slice());
+            }
         }
     }
 }
@@ -397,6 +399,7 @@ pub struct ControlSessionGuard {
     tunnel_ids: HashMap<u32, TunnelProtocol>,
     tunnel_names: HashSet<String>,
     data_channels: Vec<AuthenticatedDataChannel>,
+    released: bool,
 }
 
 impl std::fmt::Debug for ControlSessionGuard {
@@ -501,11 +504,17 @@ impl ControlSessionGuard {
     }
 
     pub async fn shutdown(&mut self) {
+        if self.released {
+            return;
+        }
         self.runtime.cancel();
         for listener in &mut self.listeners {
             listener.shutdown().await;
         }
+        self.listeners.clear();
         self.data_channels.clear();
+        self.registry.release(&self.identity);
+        self.released = true;
     }
 
     async fn bind_listener(
@@ -533,10 +542,14 @@ impl ControlSessionGuard {
 
 impl Drop for ControlSessionGuard {
     fn drop(&mut self) {
+        if self.released {
+            return;
+        }
         self.runtime.cancel();
         self.data_channels.clear();
         self.listeners.clear();
         self.registry.release(&self.identity);
+        self.released = true;
     }
 }
 

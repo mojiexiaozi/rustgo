@@ -8,4 +8,5 @@ publish = false
 [dependencies]
 rcgen = "0.14.9"
 rustgo-crypto = { path = "../../crates/rustgo-crypto" }
+socket2 = "0.6.5"
 tempfile = "3.27.0"

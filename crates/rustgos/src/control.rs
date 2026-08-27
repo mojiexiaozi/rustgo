@@ -10,6 +10,7 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{OwnedSemaphorePermit, mpsc};
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     auth::{AuthAttemptReservation, Authenticator, FailedAuthLimiter, TlsHandshakePermit},
@@ -56,23 +57,39 @@ pub(crate) async fn serve_connection(
     peer: SocketAddr,
     unauthenticated_permit: OwnedSemaphorePermit,
     tls_peer_permit: TlsHandshakePermit,
+    shutdown: CancellationToken,
 ) -> Result<(), ControlError> {
     let handshake_deadline = tokio::time::Instant::now()
         .checked_add(context.handshake_timeout)
         .ok_or(ControlError::HandshakeTimeout)?;
-    let stream = tokio::time::timeout_at(handshake_deadline, context.tls_server.handshake(socket))
-        .await
-        .map_err(|_| ControlError::HandshakeTimeout)??;
+    let stream = tokio::select! {
+        biased;
+        () = shutdown.cancelled() => return Ok(()),
+        result = tokio::time::timeout_at(handshake_deadline, context.tls_server.handshake(socket)) => {
+            result.map_err(|_| ControlError::HandshakeTimeout)??
+        }
+    };
     let mut framed = FramedControl::new(stream);
-    let first_frame = tokio::time::timeout_at(handshake_deadline, framed.receive())
-        .await
-        .map_err(|_| ControlError::HandshakeTimeout)??;
+    let first_frame = tokio::select! {
+        biased;
+        () = shutdown.cancelled() => return Ok(()),
+        result = tokio::time::timeout_at(handshake_deadline, framed.receive()) => {
+            result.map_err(|_| ControlError::HandshakeTimeout)??
+        }
+    };
     if let Message::DataChannelBind(request) = first_frame.message {
         drop(unauthenticated_permit);
         drop(tls_peer_permit);
-        return tcp::serve_data_connection(context.registry, framed, first_frame.version, request)
-            .await
-            .map_err(Into::into);
+        return tokio::select! {
+            biased;
+            () = shutdown.cancelled() => Ok(()),
+            result = tcp::serve_data_connection(
+                context.registry,
+                framed,
+                first_frame.version,
+                request,
+            ) => result.map_err(Into::into),
+        };
     }
     let Message::ClientHello(hello) = first_frame.message else {
         return Err(ControlError::InvalidState);
@@ -80,74 +97,127 @@ pub(crate) async fn serve_connection(
     let Some(mut auth_attempt) = context.limiter.reserve(peer.ip()) else {
         return Ok(());
     };
-    let (outbound, mut outbound_rx) = mpsc::channel(CONTROL_COMMAND_CAPACITY);
-    let authenticated = tokio::time::timeout_at(handshake_deadline, async {
-        let mut state = ClientHandshakeState::new();
-        let negotiated = match SERVER_VERSION.negotiate(first_frame.version) {
-            Ok(version) => version,
-            Err(code) => {
+    let (outbound, outbound_rx) = mpsc::channel(CONTROL_COMMAND_CAPACITY);
+    let authenticated = tokio::select! {
+        biased;
+        () = shutdown.cancelled() => return Ok(()),
+        result = tokio::time::timeout_at(handshake_deadline, async {
+            let mut state = ClientHandshakeState::new();
+            let negotiated = match SERVER_VERSION.negotiate(first_frame.version) {
+                Ok(version) => version,
+                Err(code) => {
+                    auth_attempt.fail();
+                    framed.send(SERVER_VERSION, protocol_error(code)).await?;
+                    return Ok(None);
+                }
+            };
+            if hello.heartbeat_interval_secs == 0
+                || u64::from(hello.heartbeat_interval_secs) >= context.heartbeat_timeout.as_secs()
+            {
                 auth_attempt.fail();
-                framed.send(SERVER_VERSION, protocol_error(code)).await?;
+                framed
+                    .send(
+                        negotiated,
+                        protocol_error(ProtocolErrorCode::INCOMPATIBLE_HEARTBEAT),
+                    )
+                    .await?;
                 return Ok(None);
             }
-        };
-        if hello.heartbeat_interval_secs == 0
-            || u64::from(hello.heartbeat_interval_secs) >= context.heartbeat_timeout.as_secs()
-        {
-            auth_attempt.fail();
-            framed
-                .send(
-                    negotiated,
-                    protocol_error(ProtocolErrorCode::INCOMPATIBLE_HEARTBEAT),
-                )
-                .await?;
-            return Ok(None);
-        }
-        state = state.transition(&Message::ClientHello(hello.clone()))?;
-        let pending = context.authenticator.begin(hello, negotiated)?;
-        let challenge = Message::ServerChallenge(pending.challenge()?);
-        state = state.transition(&challenge)?;
-        framed.send(negotiated, challenge).await?;
+            state = state.transition(&Message::ClientHello(hello.clone()))?;
+            let pending = context.authenticator.begin(hello, negotiated)?;
+            let challenge = Message::ServerChallenge(pending.challenge()?);
+            state = state.transition(&challenge)?;
+            framed.send(negotiated, challenge).await?;
 
-        let authentication_frame = framed.receive().await?;
-        let Message::ClientAuthenticate(authentication) = authentication_frame.message else {
-            return Err(ControlError::InvalidState);
-        };
-        state = state.transition(&Message::ClientAuthenticate(authentication.clone()))?;
-        let identity = if authentication_frame.version == negotiated {
-            context.authenticator.finish(pending, authentication).ok()
-        } else {
-            None
-        };
-        let guard = identity.and_then(|identity| {
-            context
-                .registry
-                .claim_with_outbound(identity, outbound.clone())
-                .ok()
-        });
-        let accepted = guard.is_some();
-        let result = Message::AuthResult(AuthResult {
-            accepted,
-            error: (!accepted).then_some(ProtocolErrorCode::AUTHENTICATION_FAILED),
-        });
-        state = state.transition(&result)?;
-        send_auth_result(&mut framed, &mut auth_attempt, negotiated, result, accepted).await?;
-        if accepted {
-            Ok(Some((guard.expect("accepted guard"), state, negotiated)))
-        } else {
-            Ok(None)
-        }
-    })
-    .await
-    .map_err(|_| ControlError::HandshakeTimeout)??;
+            let authentication_frame = framed.receive().await?;
+            let Message::ClientAuthenticate(authentication) = authentication_frame.message else {
+                return Err(ControlError::InvalidState);
+            };
+            state = state.transition(&Message::ClientAuthenticate(authentication.clone()))?;
+            let identity = if authentication_frame.version == negotiated {
+                context.authenticator.finish(pending, authentication).ok()
+            } else {
+                None
+            };
+            let guard = identity.and_then(|identity| {
+                context
+                    .registry
+                    .claim_with_outbound(identity, outbound.clone())
+                    .ok()
+            });
+            let accepted = guard.is_some();
+            let result = Message::AuthResult(AuthResult {
+                accepted,
+                error: (!accepted).then_some(ProtocolErrorCode::AUTHENTICATION_FAILED),
+            });
+            state = state.transition(&result)?;
+            send_auth_result(&mut framed, &mut auth_attempt, negotiated, result, accepted).await?;
+            if accepted {
+                Ok(Some((guard.expect("accepted guard"), state, negotiated)))
+            } else {
+                Ok(None)
+            }
+        }) => result.map_err(|_| ControlError::HandshakeTimeout)??,
+    };
 
     drop(unauthenticated_permit);
     drop(tls_peer_permit);
-    let Some((mut guard, mut state, negotiated)) = authenticated else {
+    let Some((guard, state, negotiated)) = authenticated else {
         return Ok(());
     };
 
-    let registration_frame = tokio::time::timeout(context.heartbeat_timeout, framed.receive())
+    run_owned_control_session(
+        framed,
+        guard,
+        state,
+        negotiated,
+        context.heartbeat_timeout,
+        outbound_rx,
+        shutdown,
+    )
+    .await
+}
+
+async fn run_owned_control_session<S>(
+    mut framed: FramedControl<S>,
+    mut guard: ControlSessionGuard,
+    mut state: ClientHandshakeState,
+    negotiated: ProtocolVersion,
+    heartbeat_timeout: Duration,
+    mut outbound_rx: mpsc::Receiver<Message>,
+    shutdown: CancellationToken,
+) -> Result<(), ControlError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let result = tokio::select! {
+        biased;
+        () = shutdown.cancelled() => Ok(()),
+        result = run_control_session(
+            &mut framed,
+            &mut guard,
+            &mut state,
+            negotiated,
+            heartbeat_timeout,
+            &mut outbound_rx,
+        ) => result,
+    };
+    guard.shutdown().await;
+    result
+}
+
+async fn run_control_session<S>(
+    framed: &mut FramedControl<S>,
+    guard: &mut ControlSessionGuard,
+    state: &mut ClientHandshakeState,
+    negotiated: ProtocolVersion,
+    heartbeat_timeout: Duration,
+    outbound_rx: &mut mpsc::Receiver<Message>,
+) -> Result<(), ControlError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let registration_frame = tokio::time::timeout(heartbeat_timeout, framed.receive())
         .await
         .map_err(|_| ControlError::HeartbeatTimeout)??;
     if registration_frame.version != negotiated {
@@ -156,24 +226,22 @@ pub(crate) async fn serve_connection(
     let Message::RegisterTunnels(registration) = registration_frame.message else {
         return Err(ControlError::InvalidState);
     };
-    state = state.transition(&Message::RegisterTunnels(registration.clone()))?;
+    *state = state.transition(&Message::RegisterTunnels(registration.clone()))?;
     let results = guard.register_tunnels(registration).await;
     framed
         .send(negotiated, Message::TunnelResults(results))
         .await?;
 
     tracing::info!(client = %guard.identity().name(), listeners = guard.listener_count(), "event=registration_ready server tunnel registration ready");
-    let result = run_active_control(
-        &mut framed,
-        &mut guard,
-        &mut state,
+    run_active_control(
+        framed,
+        guard,
+        state,
         negotiated,
-        context.heartbeat_timeout,
-        &mut outbound_rx,
+        heartbeat_timeout,
+        outbound_rx,
     )
-    .await;
-    guard.shutdown().await;
-    result
+    .await
 }
 
 async fn run_active_control<S>(
@@ -344,12 +412,68 @@ pub(crate) enum ControlError {
 
 #[cfg(test)]
 mod tests {
-    use std::{net::IpAddr, time::Duration};
+    use std::{
+        io,
+        net::{IpAddr, Ipv4Addr},
+        pin::Pin,
+        task::{Context, Poll},
+        time::Duration,
+    };
 
-    use rustgo_protocol::{AuthResult, Message, ProtocolErrorCode};
+    use rustgo_protocol::{
+        AuthResult, BoundedString, BoundedVec, ClientHandshakeState, FrameCodec, Message,
+        ProtocolErrorCode, RegisterTunnels, TunnelProtocol, TunnelRegistration,
+    };
+    use tokio::{
+        io::{AsyncRead, AsyncWrite, ReadBuf},
+        sync::mpsc,
+    };
+    use tokio_util::sync::CancellationToken;
 
-    use super::{FramedControl, SERVER_VERSION, send_auth_result};
-    use crate::auth::FailedAuthLimiter;
+    use super::{FramedControl, SERVER_VERSION, run_owned_control_session, send_auth_result};
+    use crate::{AuthenticatedClient, auth::FailedAuthLimiter, registry::ClientRegistry};
+
+    struct RegistrationThenWriteFailure {
+        input: std::io::Cursor<Vec<u8>>,
+    }
+
+    impl AsyncRead for RegistrationThenWriteFailure {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            buffer: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let available = self.input.get_ref().len() - self.input.position() as usize;
+            let read = available.min(buffer.remaining());
+            if read != 0 {
+                let start = self.input.position() as usize;
+                buffer.put_slice(&self.input.get_ref()[start..start + read]);
+                self.input.set_position((start + read) as u64);
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for RegistrationThenWriteFailure {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            _buffer: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "scripted registration reply failure",
+            )))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
 
     #[tokio::test]
     async fn rejected_auth_is_charged_before_a_failed_result_write() {
@@ -372,5 +496,64 @@ mod tests {
         drop(attempt);
 
         assert!(limiter.reserve(peer).is_none());
+    }
+
+    #[tokio::test]
+    async fn tunnel_results_write_failure_joins_listener_before_releasing_identity() {
+        let port = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let registry = ClientRegistry::new(
+            1,
+            1,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            1,
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let session_id = vec![0x51; 32];
+        let identity = AuthenticatedClient::verified(
+            "home-pc".to_owned(),
+            "sha256:test".to_owned(),
+            session_id.clone(),
+        );
+        let (outbound, outbound_rx) = mpsc::channel(1);
+        let guard = registry.claim_with_outbound(identity, outbound).unwrap();
+        let registration = Message::RegisterTunnels(RegisterTunnels {
+            tunnels: BoundedVec::try_from(vec![TunnelRegistration {
+                tunnel_id: 1,
+                name: BoundedString::try_from("ssh").unwrap(),
+                protocol: TunnelProtocol::TCP,
+                remote_port: port,
+            }])
+            .unwrap(),
+        });
+        let encoded = FrameCodec::new(70 * 1024)
+            .encode(SERVER_VERSION, 0, &registration)
+            .unwrap();
+        let framed = FramedControl::new(RegistrationThenWriteFailure {
+            input: std::io::Cursor::new(encoded.to_vec()),
+        });
+        let state = ClientHandshakeState::AwaitingTunnelRegistration {
+            session_id: rustgo_protocol::BoundedBytes::try_from(session_id.as_slice()).unwrap(),
+        };
+
+        let result = run_owned_control_session(
+            framed,
+            guard,
+            state,
+            SERVER_VERSION,
+            Duration::from_secs(2),
+            outbound_rx,
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert!(matches!(result, Err(super::ControlError::Io(_))));
+        assert_eq!(registry.active_count(), 0);
+        let rebound = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
+        drop(rebound);
     }
 }

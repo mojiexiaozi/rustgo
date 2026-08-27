@@ -834,6 +834,44 @@ async fn later_duplicate_login_cannot_evict_owner_and_disconnect_releases_listen
 }
 
 #[tokio::test]
+async fn failed_tunnel_results_write_joins_listener_before_identity_release_and_rebind()
+-> Result<(), Box<dyn Error>> {
+    let pki = TestPki::generate()?;
+    let key = DeviceKeypair::from_secret_bytes([26; 32]);
+    let port = unused_tcp_port()?;
+    let app = ServerApp::bind(server_config(&pki, vec![authorized("home-pc", &key, true)])).await?;
+    let address = app.local_addr()?;
+    let registry = app.registry();
+    let shutdown = CancellationToken::new();
+    let server_task = tokio::spawn(app.run_until(shutdown.clone()));
+
+    let mut first = FramedClient::connect(&pki, address).await?;
+    assert!(authenticate(&mut first, "home-pc", &key).await?.accepted);
+    first
+        .send(
+            VERSION,
+            Message::RegisterTunnels(RegisterTunnels {
+                tunnels: BoundedVec::try_from(vec![tcp_tunnel(1, "ssh", port)]).unwrap(),
+            }),
+        )
+        .await?;
+    first.stream.get_ref().0.set_zero_linger()?;
+    drop(first);
+
+    wait_for_active_count(&registry, 0).await?;
+    let mut second = FramedClient::connect(&pki, address).await?;
+    assert!(authenticate(&mut second, "home-pc", &key).await?.accepted);
+    let results = register_tunnels(&mut second, vec![tcp_tunnel(1, "ssh", port)]).await?;
+    assert!(results.results.as_slice()[0].accepted);
+
+    drop(second);
+    wait_for_active_count(&registry, 0).await?;
+    shutdown.cancel();
+    server_task.await??;
+    Ok(())
+}
+
+#[tokio::test]
 async fn heartbeat_timeout_drops_the_control_owner_and_its_listener() -> Result<(), Box<dyn Error>>
 {
     let pki = TestPki::generate()?;

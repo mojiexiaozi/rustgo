@@ -198,11 +198,14 @@ impl ServerApp {
     pub async fn run_until(self, shutdown: CancellationToken) -> Result<(), ServerError> {
         let session_shutdown = CancellationToken::new();
         let mut sessions = JoinSet::new();
-        loop {
+        let result = loop {
             tokio::select! {
-                () = shutdown.cancelled() => break,
+                () = shutdown.cancelled() => break Ok(()),
                 accepted = self.tls_server.accept_tcp() => {
-                    let (socket, peer) = accepted?;
+                    let (socket, peer) = match accepted {
+                        Ok(accepted) => accepted,
+                        Err(error) => break Err(error.into()),
+                    };
                     let Some(peer_permit) = self.tls_handshakes.try_acquire(peer.ip()) else {
                         continue;
                     };
@@ -225,28 +228,26 @@ impl ServerApp {
                     );
                     let child_shutdown = session_shutdown.child_token();
                     sessions.spawn(async move {
-                        tokio::select! {
-                            () = child_shutdown.cancelled() => {}
-                            result = control::serve_connection(
-                                context,
-                                socket,
-                                peer,
-                                permit,
-                                peer_permit,
-                            ) => {
-                                if let Err(error) = result {
-                                    tracing::debug!(peer = %peer, %error, "control session ended");
-                                }
-                            }
+                        if let Err(error) = control::serve_connection(
+                            context,
+                            socket,
+                            peer,
+                            permit,
+                            peer_permit,
+                            child_shutdown,
+                        )
+                        .await
+                        {
+                            tracing::debug!(peer = %peer, %error, "control session ended");
                         }
                     });
                 }
             }
             while sessions.try_join_next().is_some() {}
-        }
+        };
         session_shutdown.cancel();
         while sessions.join_next().await.is_some() {}
-        Ok(())
+        result
     }
 }
 

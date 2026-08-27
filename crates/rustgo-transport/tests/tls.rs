@@ -340,6 +340,53 @@ fn binding_token_rejects_wrong_identity_session_kind_and_target() -> Result<(), 
     Ok(())
 }
 
+#[test]
+fn binding_revocation_requires_the_owning_store_exact_kind_and_token() -> Result<(), Box<dyn Error>>
+{
+    let session_a = session_id(21);
+    let session_b = session_id(22);
+    let tcp = ChannelKind::Tcp {
+        tunnel_id: 3,
+        connection_id: 44,
+    };
+    let wrong_kind = ChannelKind::Tcp {
+        tunnel_id: 3,
+        connection_id: 45,
+    };
+    let mut store_a = ChannelBindingStore::new(
+        "client-a",
+        &session_a,
+        2,
+        std::time::Duration::from_secs(30),
+    )?;
+    let mut store_b = ChannelBindingStore::new(
+        "client-b",
+        &session_b,
+        2,
+        std::time::Duration::from_secs(30),
+    )?;
+    let token_a = store_a.issue(tcp)?;
+    let token_b = store_b.issue(tcp)?;
+
+    assert!(!store_b.revoke(tcp, token_a.as_slice()));
+    assert!(!store_a.revoke(wrong_kind, token_a.as_slice()));
+    assert!(store_a.revoke(tcp, token_a.as_slice()));
+    assert!(!store_a.revoke(tcp, token_a.as_slice()));
+    assert_eq!(
+        store_a.redeem("client-a", &session_a, tcp, token_a.as_slice()),
+        Err(BindingError::Rejected)
+    );
+    assert_eq!(
+        store_b.redeem("client-b", &session_b, tcp, token_b.as_slice()),
+        Ok(ChannelBinding {
+            client_id: "client-b".to_owned(),
+            session_id: session_b,
+            channel_kind: tcp,
+        })
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn expired_token_is_rejected() -> Result<(), Box<dyn Error>> {
     let session = session_id(11);

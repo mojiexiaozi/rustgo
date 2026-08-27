@@ -18,8 +18,11 @@ use tokio_util::sync::CancellationToken;
 use crate::{ChildSessionContext, ChildSessionRequest, ChildSessionSupervisor, ControlClient};
 
 const MAX_CLIENT_TCP_CONNECTIONS: usize = 4096;
+const MAX_CLIENT_CONCURRENT_LOCAL_CONNECTS: usize = 64;
 const MAX_CLIENT_CONCURRENT_TLS_HANDSHAKES: usize = 4;
 const TCP_SETUP_TIMEOUT: Duration = Duration::from_secs(10);
+const LOCAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const DATA_CHANNEL_SETUP_TIMEOUT: Duration = Duration::from_secs(8);
 const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const DATA_FRAME_MAX: usize = 1024;
 
@@ -29,6 +32,7 @@ pub(crate) struct TcpSessionSupervisor {
     tls_client: TlsClient,
     local_targets: Arc<HashMap<u32, String>>,
     permits: Arc<Semaphore>,
+    local_connect_permits: Arc<Semaphore>,
     handshake_permits: Arc<Semaphore>,
 }
 
@@ -52,6 +56,7 @@ impl TcpSessionSupervisor {
             tls_client: control.tls_client(),
             local_targets: Arc::new(local_targets),
             permits: Arc::new(Semaphore::new(MAX_CLIENT_TCP_CONNECTIONS)),
+            local_connect_permits: Arc::new(Semaphore::new(MAX_CLIENT_CONCURRENT_LOCAL_CONNECTS)),
             handshake_permits: Arc::new(Semaphore::new(MAX_CLIENT_CONCURRENT_TLS_HANDSHAKES)),
         }
     }
@@ -69,6 +74,7 @@ impl ChildSessionSupervisor for TcpSessionSupervisor {
         let tls_client = self.tls_client.clone();
         let local_targets = self.local_targets.clone();
         let permits = self.permits.clone();
+        let local_connect_permits = self.local_connect_permits.clone();
         let handshake_permits = self.handshake_permits.clone();
         Box::pin(async move {
             match request {
@@ -79,6 +85,7 @@ impl ChildSessionSupervisor for TcpSessionSupervisor {
                         tls_client,
                         local_targets,
                         permits,
+                        local_connect_permits,
                         handshake_permits,
                         context,
                         request,
@@ -99,6 +106,7 @@ async fn run_tcp(
     tls_client: TlsClient,
     local_targets: Arc<HashMap<u32, String>>,
     permits: Arc<Semaphore>,
+    local_connect_permits: Arc<Semaphore>,
     handshake_permits: Arc<Semaphore>,
     context: ChildSessionContext,
     request: rustgo_protocol::OpenTcpStream,
@@ -115,23 +123,20 @@ async fn run_tcp(
         report_failure(&context, request.connection_id, &shutdown).await;
         return;
     };
-    let setup = async {
-        let handshake_permit = handshake_permits
-            .acquire_owned()
-            .await
-            .map_err(|_| TcpClientError::HandshakeAdmissionClosed)?;
-        let result = setup_tcp(
-            &client_name,
-            &server_addr,
-            &tls_client,
-            &local_address,
-            context.session_id(),
-            &request,
-        )
-        .await;
-        drop(handshake_permit);
-        result
-    };
+    let setup = setup_with_admission(
+        local_connect_permits,
+        handshake_permits,
+        async { TcpStream::connect(&local_address).await.map_err(Into::into) },
+        || {
+            setup_data_channel(
+                &client_name,
+                &server_addr,
+                &tls_client,
+                context.session_id(),
+                &request,
+            )
+        },
+    );
     let setup = tokio::select! {
         biased;
         () = shutdown.cancelled() => return,
@@ -164,15 +169,44 @@ async fn run_tcp(
     .await;
 }
 
-async fn setup_tcp(
+async fn setup_with_admission<T, U, LocalFuture, DataFactory, DataFuture>(
+    local_connect_permits: Arc<Semaphore>,
+    handshake_permits: Arc<Semaphore>,
+    local_connect: LocalFuture,
+    data_setup: DataFactory,
+) -> Result<(T, U), TcpClientError>
+where
+    LocalFuture: Future<Output = Result<T, TcpClientError>>,
+    DataFactory: FnOnce() -> DataFuture,
+    DataFuture: Future<Output = Result<U, TcpClientError>>,
+{
+    let local_permit = local_connect_permits
+        .acquire_owned()
+        .await
+        .map_err(|_| TcpClientError::LocalAdmissionClosed)?;
+    let local = tokio::time::timeout(LOCAL_CONNECT_TIMEOUT, local_connect)
+        .await
+        .map_err(|_| TcpClientError::LocalConnectTimeout)??;
+    drop(local_permit);
+
+    let handshake_permit = handshake_permits
+        .acquire_owned()
+        .await
+        .map_err(|_| TcpClientError::HandshakeAdmissionClosed)?;
+    let data = tokio::time::timeout(DATA_CHANNEL_SETUP_TIMEOUT, data_setup())
+        .await
+        .map_err(|_| TcpClientError::DataSetupTimeout)??;
+    drop(handshake_permit);
+    Ok((local, data))
+}
+
+async fn setup_data_channel(
     client_name: &str,
     server_addr: &str,
     tls_client: &TlsClient,
-    local_address: &str,
     session_id: &[u8],
     request: &rustgo_protocol::OpenTcpStream,
-) -> Result<(TcpStream, TlsStream<TcpStream>), TcpClientError> {
-    let local = TcpStream::connect(local_address).await?;
+) -> Result<TlsStream<TcpStream>, TcpClientError> {
     let mut data = tls_client.connect(server_addr).await?;
     let bind = Message::DataChannelBind(DataChannelBind {
         client_name: BoundedString::<MAX_CLIENT_NAME_BYTES>::try_from(client_name)
@@ -198,7 +232,7 @@ async fn setup_tcp(
     if ready.connection_id != request.connection_id || !ready.accepted || ready.error.is_some() {
         return Err(TcpClientError::InvalidAcknowledgement);
     }
-    Ok((local, data))
+    Ok(data)
 }
 
 async fn read_frame_exact<R>(stream: &mut R, codec: FrameCodec) -> Result<Frame, TcpClientError>
@@ -261,6 +295,56 @@ enum TcpClientError {
     InvalidBinding,
     #[error("invalid data-channel acknowledgement")]
     InvalidAcknowledgement,
+    #[error("local TCP connection admission closed")]
+    LocalAdmissionClosed,
+    #[error("local TCP connection timed out")]
+    LocalConnectTimeout,
     #[error("data-channel TLS handshake admission closed")]
     HandshakeAdmissionClosed,
+    #[error("data-channel setup timed out")]
+    DataSetupTimeout,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{future::pending, sync::Arc, time::Duration};
+
+    use tokio::sync::Semaphore;
+
+    use super::{TcpClientError, setup_with_admission};
+
+    #[tokio::test]
+    async fn four_slow_local_connects_do_not_block_one_healthy_tls_setup() {
+        let local_permits = Arc::new(Semaphore::new(64));
+        let handshake_permits = Arc::new(Semaphore::new(4));
+        let mut slow = Vec::new();
+        for _ in 0..4 {
+            let local_permits = local_permits.clone();
+            let handshake_permits = handshake_permits.clone();
+            slow.push(tokio::spawn(async move {
+                setup_with_admission(
+                    local_permits,
+                    handshake_permits,
+                    pending::<Result<(), TcpClientError>>(),
+                    || async { Ok::<_, TcpClientError>(()) },
+                )
+                .await
+            }));
+        }
+        tokio::task::yield_now().await;
+
+        let healthy = setup_with_admission(
+            local_permits,
+            handshake_permits,
+            async { Ok::<_, TcpClientError>(()) },
+            || async { Ok::<_, TcpClientError>(()) },
+        );
+        let result = tokio::time::timeout(Duration::from_millis(100), healthy).await;
+
+        assert!(matches!(result, Ok(Ok(((), ())))));
+        for task in slow {
+            task.abort();
+            let _ = task.await;
+        }
+    }
 }

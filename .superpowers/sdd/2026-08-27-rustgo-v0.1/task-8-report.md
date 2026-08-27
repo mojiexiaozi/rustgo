@@ -210,3 +210,166 @@ Windows LF-to-CRLF checkout notices).
   but can temporarily consume that bounded capacity.
 - UDP relay/data dispatch and all P2P behavior remain intentionally absent and
   are not inferred from the generalized `DataChannelKind` wire field.
+
+---
+
+## Review fix round 1 (2026-08-28)
+
+### Status and commit
+
+- Status: all four review findings are addressed with regression evidence.
+- Base implementation: `e5d5105 feat: relay fixed-port TCP tunnels`.
+- Follow-up: `fix: harden TCP relay ownership and backpressure` (the follow-up
+  commit containing this appendix).
+
+### Finding-to-fix mapping
+
+| Finding | Fix and evidence |
+| --- | --- |
+| Unredeemed opens exhausted the shared binding store | The session now protects the binding store and pending TCP map with one mutex. Every `PendingTcp` retains its exact channel kind and token. Control-send failure, client rejection, pending timeout, control cancellation, and listener shutdown remove the rendezvous and revoke that exact unredeemed token in one critical section; a token already redeemed is a no-op. Revocation requires the owning store, exact token, and exact channel kind. |
+| Slow local dials occupied all TLS setup slots | Rustgoc now has an independent 64-entry local-connect admission pool and five-second local-connect timeout. Only after local connect succeeds does it acquire one of four TLS setup permits. That permit covers server TCP/TLS connect, encrypted binding first frame, and exact readiness acknowledgement. The existing ten-second outer setup timeout and generation cancellation still cap permit waits plus both stages together. |
+| Tunnel-results write failure skipped ordered guard shutdown | After authentication, one owned control wrapper handles registration, result write, active control, external cancellation, and every returned error. It always cancels the runtime, joins TCP listener/relay tasks, drops all listener leases and guarded data streams, then releases registry identity exactly once. Server accept failure and ordinary shutdown also converge through session cancellation and full `JoinSet` drain. |
+| Large-stream/backpressure E2E assertions were too weak | The 16 MiB producer now writes one chunk and waits behind a gate; the consumer must receive that chunk before the producer may send the remainder or half-close. The slow-consumer test uses 32 MiB, constrains both public receive and local echo socket buffers, holds a reader gate closed, and requires the producer completion channel to remain empty until that gate opens; it then verifies every byte and both thread completions. |
+
+### RED / GREEN evidence
+
+#### 1. Exact token revocation and shared-capacity recovery
+
+RED:
+
+```text
+cargo test -p rustgo-transport --test tls binding_revocation_requires_the_owning_store_exact_kind_and_token -- --exact --nocapture
+cargo test -p rustgo-e2e --test tcp local_refusal_closes_only_that_connection -- --exact --nocapture
+```
+
+The transport test failed to compile because `ChannelBindingStore::revoke` did
+not exist. The real-process test configured two tunnels with a ten-token shared
+capacity, drove twelve fast local refusals, then tried the healthy tunnel. The
+old runtime reset the healthy connection after the leaked refusal tokens filled
+the store.
+
+GREEN adds exact conditional revocation and stores each issued token beside its
+pending destination. The E2E sequence now exceeds the configured capacity and
+the unrelated healthy tunnel still echoes exactly. A second binding store and a
+wrong channel kind cannot revoke the owner's token; correct redemption remains
+possible until the owner revokes it, and repeated/already-redeemed revocation is
+a no-op.
+
+#### 2. Independent local-connect and TLS admission
+
+RED:
+
+```text
+cargo test -p rustgoc four_slow_local_connects_do_not_block_one_healthy_tls_setup -- --nocapture
+```
+
+The regression first failed to compile because no ordered two-stage admission
+function existed. It launches four never-completing local-connect futures with a
+four-entry TLS pool, then runs one healthy local+data setup under a 100 ms bound.
+If a TLS permit is acquired before local completion, the four slow futures own
+all permits and the healthy setup times out.
+
+GREEN runs the same production `setup_with_admission` path used by TCP children.
+All four slow local attempts consume only entries in the separate 64-entry local
+pool; the healthy setup acquires a TLS permit and completes. Aborting the slow
+tasks drops their RAII permits. The outer child select still gives generation
+cancellation priority and caps the complete setup at ten seconds.
+
+#### 3. Registration-reply failure cleanup ordering
+
+RED:
+
+```text
+cargo test -p rustgos tunnel_results_write_failure_joins_listener_before_releasing_identity -- --nocapture
+```
+
+The deterministic unit regression first failed to compile because there was no
+owned post-authentication lifecycle wrapper. Its scripted stream supplies a
+valid registration frame, fails every results write with `BrokenPipe`, and then
+requires both registry count zero and immediate rebinding of the created port.
+
+A companion real TLS test sends registration, closes with zero linger to make
+the reply fail, waits for identity release, immediately reconnects with the
+same identity, and registers the same fixed port. The old runtime could pass
+this real race when Tokio happened to process the listener abort quickly, which
+is why the deterministic ownership regression is the ordering authority.
+
+GREEN moves registration receive/bind/result send and the active loop under one
+owned wrapper. It selects external cancellation without dropping the guard,
+then always awaits the idempotent guard shutdown. `shutdown` cancels pending and
+active work, joins TCP listeners, drops TCP/UDP leases and guarded streams, and
+only then removes the exact registry identity. A `released` bit prevents the
+destructor from repeating cleanup.
+
+#### 4. Observable streaming and backpressure
+
+The new 16 MiB early-progress gate passed: one echoed chunk arrives while the
+producer is deliberately blocked before the remainder and before EOF. A relay
+that accumulates the whole request would deadlock until the socket timeout.
+
+The first strengthened 32 MiB backpressure run failed its evidence assertion:
+Windows localhost auto-tuned buffers allowed the producer to complete while the
+reader gate was closed. GREEN explicitly constrains the public receive buffer
+and both local echo socket buffers to 16 KiB. With the same 32 MiB fixed-chunk
+stream, the completion channel remains empty for the closed-gate interval, then
+the producer and consumer both complete after opening the gate with no changed
+or missing byte.
+
+### Updated security, ownership, and limit invariants
+
+1. Token issue, pending publication, correct redemption, pending removal, and
+   exact revocation serialize under one per-control-session mutex.
+2. `cancel_pending(connection_id)` can reach only the authenticated control
+   session's own map and revokes only the token recorded for that exact channel;
+   attacker-supplied identity fields cannot select another session for revoke.
+3. Every known-token presentation remains consume-before-validate. Later timeout
+   or cancellation sees the token already absent and performs a harmless no-op.
+4. Local connect, TLS data setup, and active relay have separate RAII bounds:
+   64 local attempts, four TLS setups, and 4096 total TCP child tasks. Individual
+   local/data timeouts sit inside the ten-second whole-setup and generation
+   cancellation boundary.
+5. Once a guard can own a listener, no ordinary result, protocol error, control
+   EOF, heartbeat timeout, reply-write error, app shutdown, or accept-loop error
+   releases its identity through a bare destructor path. Cleanup completes
+   before release; the destructor remains only a panic/runtime-destruction
+   fail-safe that cancels and aborts.
+6. The E2E fixture retains no whole-transfer buffers. Its only 32 MiB state is a
+   byte count; producer and consumer each reuse one 16 KiB chunk.
+
+### Fix-round verification
+
+Commands to be run on the final follow-up tree:
+
+```text
+cargo test -p rustgo-e2e --test tcp -- --nocapture
+cargo test -p rustgos -p rustgoc --no-fail-fast
+cargo test -p rustgo-transport --test tls --no-fail-fast
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --no-fail-fast
+git diff --check
+```
+
+Final observed result on the follow-up tree:
+
+- TCP E2E: 10 passed, including the shared-capacity refusal recovery, early
+  16 MiB progress, gated 32 MiB backpressure, half-close, concurrency, local
+  isolation, port conflict, cleanup, and restart scenarios.
+- `rustgos` + `rustgoc`: 73 passed.
+- Transport TLS suite: 14 passed.
+- Full workspace: 162 passed, 0 failed.
+- Format check, workspace/all-target Clippy with warnings denied, and
+  `git diff --check`: passed.
+
+### Residual concerns
+
+- The original bounded linear scan for data-token owner discovery remains; an
+  opaque-token owner index is still the appropriate future high-scale change.
+- Local/TLS/whole-setup/idle limits remain V0.1 hard runtime constants rather
+  than strict-schema TOML fields.
+- The E2E port allocator still minimizes, but cannot eliminate, Windows'
+  cross-process release/bind race.
+- Panic or wholesale Tokio-runtime destruction cannot asynchronously join from
+  `Drop`; the fallback cancels and aborts. All normal server lifecycle and error
+  paths now retain the future and use ordered async shutdown.
+- UDP relay and P2P remain outside Task 8.

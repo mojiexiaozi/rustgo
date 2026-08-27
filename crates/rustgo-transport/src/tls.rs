@@ -135,6 +135,22 @@ impl ChannelBindingStore {
         self.pending.contains_key(&token)
     }
 
+    /// Removes an unredeemed token only when its complete channel identity matches.
+    pub fn revoke(&mut self, channel_kind: ChannelKind, token: &[u8]) -> bool {
+        let Ok(token) = <[u8; BINDING_TOKEN_BYTES]>::try_from(token) else {
+            return false;
+        };
+        match self.pending.entry(token) {
+            std::collections::hash_map::Entry::Occupied(entry)
+                if entry.get().channel_kind == channel_kind =>
+            {
+                entry.remove();
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Consumes a token and authenticates its complete control-session binding.
     pub fn redeem(
         &mut self,

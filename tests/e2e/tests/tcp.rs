@@ -3,6 +3,7 @@
 use std::{
     io::{Read, Write},
     net::{Shutdown, TcpListener, TcpStream},
+    sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
@@ -167,23 +168,45 @@ fn streams_sixteen_mib_without_a_whole_transfer_buffer() -> TestResult {
     stream.set_read_timeout(Some(Duration::from_secs(20)))?;
     stream.set_write_timeout(Some(Duration::from_secs(20)))?;
     let mut writer = stream.try_clone()?;
-    let writer_task = thread::spawn(move || -> TestResult {
-        for index in 0..CHUNKS {
-            let chunk = vec![(index % 251) as u8; CHUNK];
-            writer.write_all(&chunk)?;
-        }
-        writer.shutdown(Shutdown::Write)?;
-        Ok(())
+    let (first_chunk_written, wait_for_first_chunk) = mpsc::channel();
+    let (allow_remainder, remainder_gate) = mpsc::channel();
+    let (producer_complete, producer_result) = mpsc::channel();
+    let writer_task = thread::spawn(move || {
+        let result = (|| -> TestResult {
+            let first = vec![0_u8; CHUNK];
+            writer.write_all(&first)?;
+            first_chunk_written.send(())?;
+            remainder_gate.recv()?;
+            for index in 1..CHUNKS {
+                let chunk = vec![(index % 251) as u8; CHUNK];
+                writer.write_all(&chunk)?;
+            }
+            writer.shutdown(Shutdown::Write)?;
+            Ok(())
+        })();
+        let _ = producer_complete.send(result);
     });
     let mut reader = stream;
     let mut chunk = vec![0_u8; CHUNK];
-    for index in 0..CHUNKS {
+    wait_for_first_chunk.recv_timeout(Duration::from_secs(2))?;
+    let early_read = reader.read_exact(&mut chunk);
+    let producer_before_gate = producer_result.try_recv();
+    allow_remainder.send(())?;
+    early_read?;
+    if chunk.iter().any(|byte| *byte != 0) {
+        return Err("16 MiB stream changed the first chunk".into());
+    }
+    if !matches!(producer_before_gate, Err(mpsc::TryRecvError::Empty)) {
+        return Err("16 MiB producer reached EOF before the early-progress gate opened".into());
+    }
+    for index in 1..CHUNKS {
         reader.read_exact(&mut chunk)?;
         if chunk.iter().any(|byte| *byte != (index % 251) as u8) {
             return Err(format!("16 MiB stream changed chunk {index}").into());
         }
     }
-    writer_task.join().map_err(|_| "16 MiB writer panicked")??;
+    producer_result.recv_timeout(Duration::from_secs(5))??;
+    writer_task.join().map_err(|_| "16 MiB writer panicked")?;
 
     client.terminate()?;
     server.terminate()?;
@@ -192,37 +215,74 @@ fn streams_sixteen_mib_without_a_whole_transfer_buffer() -> TestResult {
 
 #[test]
 fn slow_reader_applies_backpressure_without_losing_bytes() -> TestResult {
-    const TOTAL: usize = 512 * 1024;
-    const CHUNK: usize = 1024;
-    let echo = EchoServer::start_with_delay(Duration::from_millis(1), CHUNK)?;
+    const TOTAL: usize = 32 * 1024 * 1024;
+    const CHUNK: usize = 16 * 1024;
+    let echo = EchoServer::start()?;
     let (fixture, mut server, mut client) = launch(ProcessFixture::single_tcp(echo.address())?)?;
     let stream = connect(fixture.public_address())?;
-    stream.set_read_timeout(Some(Duration::from_secs(15)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(15)))?;
+    socket2::SockRef::from(&stream).set_recv_buffer_size(CHUNK)?;
+    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
     let mut writer = stream.try_clone()?;
-    let writer_task = thread::spawn(move || -> TestResult {
+    let (producer_complete, producer_result) = mpsc::channel();
+    let writer_task = thread::spawn(move || {
         let chunk = vec![0x5a; CHUNK];
-        for _ in 0..(TOTAL / CHUNK) {
-            writer.write_all(&chunk)?;
-        }
-        writer.shutdown(Shutdown::Write)?;
-        Ok(())
+        let result = (|| -> TestResult {
+            for _ in 0..(TOTAL / CHUNK) {
+                writer.write_all(&chunk)?;
+            }
+            writer.shutdown(Shutdown::Write)?;
+            Ok(())
+        })();
+        let _ = producer_complete.send(result);
     });
-    let mut reader = stream;
-    let mut received = 0;
-    let mut chunk = [0_u8; 512];
-    while received < TOTAL {
-        let read = reader.read(&mut chunk)?;
-        if read == 0 {
-            return Err(format!("slow reader received only {received} of {TOTAL} bytes").into());
+    let (open_read_gate, read_gate) = mpsc::channel();
+    let (consumer_complete, consumer_result) = mpsc::channel();
+    let reader_task = thread::spawn(move || {
+        let result = (|| -> TestResult {
+            read_gate.recv()?;
+            let mut reader = stream;
+            let mut received = 0;
+            let mut chunk = [0_u8; CHUNK];
+            while received < TOTAL {
+                let read = reader.read(&mut chunk)?;
+                if read == 0 {
+                    return Err(
+                        format!("slow reader received only {received} of {TOTAL} bytes").into(),
+                    );
+                }
+                if chunk[..read].iter().any(|byte| *byte != 0x5a) {
+                    return Err("slow reader observed changed payload bytes".into());
+                }
+                received += read;
+            }
+            Ok(())
+        })();
+        let _ = consumer_complete.send(result);
+    });
+
+    thread::sleep(Duration::from_millis(500));
+    let producer_before_gate = producer_result.try_recv();
+    let producer_was_blocked = matches!(&producer_before_gate, Err(mpsc::TryRecvError::Empty));
+    open_read_gate.send(())?;
+    let producer_after_gate = match producer_before_gate {
+        Err(mpsc::TryRecvError::Empty) => producer_result.recv_timeout(Duration::from_secs(30))?,
+        Ok(result) => result,
+        Err(mpsc::TryRecvError::Disconnected) => {
+            return Err("backpressure producer exited without a completion result".into());
         }
-        if chunk[..read].iter().any(|byte| *byte != 0x5a) {
-            return Err("slow reader observed changed payload bytes".into());
-        }
-        received += read;
-        thread::sleep(Duration::from_millis(1));
+    };
+    producer_after_gate?;
+    consumer_result.recv_timeout(Duration::from_secs(30))??;
+    writer_task
+        .join()
+        .map_err(|_| "backpressure writer panicked")?;
+    reader_task
+        .join()
+        .map_err(|_| "backpressure reader panicked")?;
+    if !producer_was_blocked {
+        return Err("32 MiB producer completed while the reader gate was closed".into());
     }
-    writer_task.join().map_err(|_| "slow writer panicked")??;
 
     client.terminate()?;
     server.terminate()?;
@@ -261,9 +321,12 @@ fn local_refusal_closes_only_that_connection() -> TestResult {
     let (fixture, mut server, mut client) = launch(fixture)?;
     refused.release();
 
-    let mut failed = connect(fixture.public_address_at(0))?;
-    let _ = failed.write_all(b"cannot arrive");
-    assert_stream_closes(failed, Duration::from_secs(3))?;
+    for attempt in 0..12 {
+        let mut failed = connect(fixture.public_address_at(0))?;
+        let _ = failed.write_all(b"cannot arrive");
+        assert_stream_closes(failed, Duration::from_secs(3))
+            .map_err(|error| format!("refused connection {attempt} did not close: {error}"))?;
+    }
     assert_echo(fixture.public_address_at(1), b"healthy after refusal")?;
 
     client.terminate()?;

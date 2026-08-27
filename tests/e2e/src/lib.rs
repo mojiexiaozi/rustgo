@@ -192,10 +192,11 @@ impl ProcessFixture {
         fs::write(
             &server_config,
             format!(
-                "[server]\nbind_addr = \"{}\"\ncertificate_file = {}\nprivate_key_file = {}\nheartbeat_timeout_secs = 5\n\n[limits]\nmax_clients = 8\nmax_tunnels_per_client = 8\nmax_tcp_connections_per_tunnel = {max_tcp_connections_per_tunnel}\nmax_udp_sessions_per_tunnel = 8\nmax_udp_payload_bytes = 65507\n\n[[clients]]\nname = \"home-pc\"\npublic_key = \"{}\"\nenabled = true\n",
+                "[server]\nbind_addr = \"{}\"\ncertificate_file = {}\nprivate_key_file = {}\nheartbeat_timeout_secs = 5\n\n[limits]\nmax_clients = 8\nmax_tunnels_per_client = {}\nmax_tcp_connections_per_tunnel = {max_tcp_connections_per_tunnel}\nmax_udp_sessions_per_tunnel = 1\nmax_udp_payload_bytes = 65507\n\n[[clients]]\nname = \"home-pc\"\npublic_key = \"{}\"\nenabled = true\n",
                 control_port.address,
                 toml_path(&certificate_file)?,
                 toml_path(&private_key_file)?,
+                tunnels.len(),
                 device_key.public_key(),
             ),
         )?;
@@ -463,6 +464,12 @@ impl EchoServer {
                 match listener.accept() {
                     Ok((mut stream, _)) => connections.push(thread::spawn(move || {
                         if stream.set_nonblocking(false).is_err() {
+                            return;
+                        }
+                        let socket = socket2::SockRef::from(&stream);
+                        if socket.set_recv_buffer_size(chunk_size).is_err()
+                            || socket.set_send_buffer_size(chunk_size).is_err()
+                        {
                             return;
                         }
                         let mut buffer = vec![0_u8; chunk_size];
