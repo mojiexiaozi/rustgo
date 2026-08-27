@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     auth::{AuthAttemptReservation, Authenticator, FailedAuthLimiter, TlsHandshakePermit},
     registry::{ClientRegistry, ControlSessionGuard},
-    tcp,
+    tcp, udp,
 };
 
 pub(crate) const SERVER_VERSION: ProtocolVersion = ProtocolVersion::new(1, 0);
@@ -80,15 +80,28 @@ pub(crate) async fn serve_connection(
     if let Message::DataChannelBind(request) = first_frame.message {
         drop(unauthenticated_permit);
         drop(tls_peer_permit);
-        return tokio::select! {
-            biased;
-            () = shutdown.cancelled() => Ok(()),
-            result = tcp::serve_data_connection(
-                context.registry,
-                framed,
-                first_frame.version,
-                request,
-            ) => result.map_err(Into::into),
+        return if request.kind == rustgo_protocol::DataChannelKind::UDP {
+            tokio::select! {
+                biased;
+                () = shutdown.cancelled() => Ok(()),
+                result = udp::serve_data_connection(
+                    context.registry,
+                    framed,
+                    first_frame.version,
+                    request,
+                ) => result.map_err(Into::into),
+            }
+        } else {
+            tokio::select! {
+                biased;
+                () = shutdown.cancelled() => Ok(()),
+                result = tcp::serve_data_connection(
+                    context.registry,
+                    framed,
+                    first_frame.version,
+                    request,
+                ) => result.map_err(Into::into),
+            }
         };
     }
     let Message::ClientHello(hello) = first_frame.message else {

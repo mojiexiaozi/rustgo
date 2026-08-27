@@ -10,6 +10,7 @@ use crate::{
     auth::{Authenticator, FailedAuthLimiter, TlsHandshakeLimiter},
     control,
     registry::{ClientRegistry, RegistryError},
+    udp::UdpRuntimeLimits,
 };
 
 const MAX_UNAUTHENTICATED_CONNECTIONS: usize = 1024;
@@ -20,6 +21,8 @@ const MAX_AUTH_ATTEMPT_RECORDS: usize = 65_536;
 const MIN_AUTH_ATTEMPTS_PER_WINDOW: usize = 16;
 const MAX_AUTH_ATTEMPTS_PER_WINDOW: usize = 65_536;
 const MAX_PENDING_DATA_CHANNEL_TOKENS_PER_CLIENT: usize = 65_536;
+const MAX_UDP_QUEUE_CAPACITY: usize = 65_536;
+const MAX_UDP_SWEEP_BATCH: usize = 65_536;
 
 #[derive(Debug, Clone)]
 pub struct ServerRuntimeLimits {
@@ -33,6 +36,11 @@ pub struct ServerRuntimeLimits {
     pub max_auth_attempts_per_window: usize,
     pub max_pending_data_channel_tokens_per_client: usize,
     pub binding_token_ttl: Duration,
+    pub udp_queue_capacity: usize,
+    pub udp_idle_timeout: Duration,
+    pub udp_sweep_interval: Duration,
+    pub udp_sweep_batch: usize,
+    pub udp_writer_delay: Duration,
 }
 
 impl Default for ServerRuntimeLimits {
@@ -48,6 +56,11 @@ impl Default for ServerRuntimeLimits {
             max_auth_attempts_per_window: 8192,
             max_pending_data_channel_tokens_per_client: 4096,
             binding_token_ttl: Duration::from_secs(30),
+            udp_queue_capacity: 1024,
+            udp_idle_timeout: Duration::from_secs(60),
+            udp_sweep_interval: Duration::from_secs(1),
+            udp_sweep_batch: 64,
+            udp_writer_delay: Duration::ZERO,
         }
     }
 }
@@ -64,6 +77,10 @@ impl ServerRuntimeLimits {
             || self.max_auth_attempts_per_window < MIN_AUTH_ATTEMPTS_PER_WINDOW
             || self.max_pending_data_channel_tokens_per_client == 0
             || self.binding_token_ttl.is_zero()
+            || self.udp_queue_capacity == 0
+            || self.udp_idle_timeout.is_zero()
+            || self.udp_sweep_interval.is_zero()
+            || self.udp_sweep_batch == 0
             || self.max_unauthenticated_connections > MAX_UNAUTHENTICATED_CONNECTIONS
             || self.max_unauthenticated_connections_per_peer
                 > MAX_UNAUTHENTICATED_CONNECTIONS_PER_PEER
@@ -76,6 +93,9 @@ impl ServerRuntimeLimits {
             || self.max_auth_attempts_per_window > MAX_AUTH_ATTEMPTS_PER_WINDOW
             || self.max_pending_data_channel_tokens_per_client
                 > MAX_PENDING_DATA_CHANNEL_TOKENS_PER_CLIENT
+            || self.udp_queue_capacity > MAX_UDP_QUEUE_CAPACITY
+            || self.udp_sweep_batch > MAX_UDP_SWEEP_BATCH
+            || self.udp_writer_delay > Duration::from_secs(60)
             || self.max_failed_auth_attempts_per_peer > self.max_auth_attempt_records
             || self.max_tracked_auth_peers > self.max_auth_attempt_records
             || tokio::time::Instant::now()
@@ -86,6 +106,15 @@ impl ServerRuntimeLimits {
                 .is_none()
             || tokio::time::Instant::now()
                 .checked_add(self.binding_token_ttl)
+                .is_none()
+            || tokio::time::Instant::now()
+                .checked_add(self.udp_idle_timeout)
+                .is_none()
+            || tokio::time::Instant::now()
+                .checked_add(self.udp_sweep_interval)
+                .is_none()
+            || tokio::time::Instant::now()
+                .checked_add(self.udp_writer_delay)
                 .is_none()
         {
             return Err(ServerError::InvalidRuntimeLimits);
@@ -107,7 +136,9 @@ pub struct ServerApp {
 
 impl ServerApp {
     pub async fn bind(config: ServerConfig) -> Result<Self, ServerError> {
-        Self::bind_with_runtime_limits(config, ServerRuntimeLimits::default()).await
+        let mut runtime_limits = ServerRuntimeLimits::default();
+        runtime_limits.apply_internal_test_overrides()?;
+        Self::bind_with_runtime_limits(config, runtime_limits).await
     }
 
     pub async fn bind_with_runtime_limits(
@@ -151,13 +182,26 @@ impl ServerApp {
         .map_err(|_| ServerError::InvalidRuntimeLimits)?;
         let max_tcp_connections = usize::try_from(config.limits.max_tcp_connections_per_tunnel)
             .map_err(|_| ServerError::InvalidRuntimeLimits)?;
-        let registry = ClientRegistry::new_with_tcp_limit(
+        let max_udp_sessions = usize::try_from(config.limits.max_udp_sessions_per_tunnel)
+            .map_err(|_| ServerError::InvalidRuntimeLimits)?;
+        let max_udp_payload = usize::try_from(config.limits.max_udp_payload_bytes)
+            .map_err(|_| ServerError::InvalidRuntimeLimits)?;
+        let registry = ClientRegistry::new_with_relay_limits(
             max_clients,
             max_tunnels,
             max_tcp_connections,
+            max_udp_sessions,
+            max_udp_payload,
             listener_ip,
             binding_capacity,
             runtime_limits.binding_token_ttl,
+            UdpRuntimeLimits {
+                queue_capacity: runtime_limits.udp_queue_capacity,
+                idle_timeout: runtime_limits.udp_idle_timeout,
+                sweep_interval: runtime_limits.udp_sweep_interval,
+                sweep_batch: runtime_limits.udp_sweep_batch,
+                writer_delay: runtime_limits.udp_writer_delay,
+            },
         )?;
         let limiter = FailedAuthLimiter::new_with_attempt_budget(
             runtime_limits.max_failed_auth_attempts_per_peer,
@@ -251,6 +295,44 @@ impl ServerApp {
     }
 }
 
+impl ServerRuntimeLimits {
+    fn apply_internal_test_overrides(&mut self) -> Result<(), ServerError> {
+        if std::env::var("RUSTGO_INTERNAL_TESTING").as_deref() != Ok("1") {
+            return Ok(());
+        }
+
+        fn parse(name: &str) -> Result<Option<u64>, ServerError> {
+            std::env::var(name)
+                .ok()
+                .map(|value| {
+                    value
+                        .parse::<u64>()
+                        .map_err(|_| ServerError::InvalidRuntimeLimits)
+                })
+                .transpose()
+        }
+
+        if let Some(value) = parse("RUSTGO_TEST_UDP_QUEUE_CAPACITY")? {
+            self.udp_queue_capacity =
+                usize::try_from(value).map_err(|_| ServerError::InvalidRuntimeLimits)?;
+        }
+        if let Some(value) = parse("RUSTGO_TEST_UDP_IDLE_TIMEOUT_MS")? {
+            self.udp_idle_timeout = Duration::from_millis(value);
+        }
+        if let Some(value) = parse("RUSTGO_TEST_UDP_SWEEP_INTERVAL_MS")? {
+            self.udp_sweep_interval = Duration::from_millis(value);
+        }
+        if let Some(value) = parse("RUSTGO_TEST_UDP_SWEEP_BATCH")? {
+            self.udp_sweep_batch =
+                usize::try_from(value).map_err(|_| ServerError::InvalidRuntimeLimits)?;
+        }
+        if let Some(value) = parse("RUSTGO_TEST_UDP_WRITE_DELAY_MS")? {
+            self.udp_writer_delay = Duration::from_millis(value);
+        }
+        Ok(())
+    }
+}
+
 impl std::fmt::Debug for ServerApp {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -304,7 +386,7 @@ mod tests {
 
     #[test]
     fn runtime_count_limits_reject_values_above_each_hard_boundary() {
-        let cases: [fn(&mut ServerRuntimeLimits); 7] = [
+        let cases: [fn(&mut ServerRuntimeLimits); 9] = [
             |limits| limits.max_unauthenticated_connections = 1025,
             |limits| limits.max_unauthenticated_connections_per_peer = 65,
             |limits| limits.max_failed_auth_attempts_per_peer = 65,
@@ -312,6 +394,8 @@ mod tests {
             |limits| limits.max_auth_attempt_records = 65_537,
             |limits| limits.max_auth_attempts_per_window = 65_537,
             |limits| limits.max_pending_data_channel_tokens_per_client = 65_537,
+            |limits| limits.udp_queue_capacity = 65_537,
+            |limits| limits.udp_sweep_batch = 65_537,
         ];
 
         for change in cases {

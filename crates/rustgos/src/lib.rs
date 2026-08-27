@@ -7,6 +7,7 @@ mod auth;
 mod control;
 mod registry;
 mod tcp;
+mod udp;
 
 pub use app::{ServerApp, ServerError, ServerRuntimeLimits};
 pub use auth::AuthenticatedClient;

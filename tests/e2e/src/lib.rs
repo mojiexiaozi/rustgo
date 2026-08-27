@@ -4,7 +4,7 @@ use std::{
     error::Error,
     fs,
     io::{BufRead, BufReader, Read, Write},
-    net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream},
+    net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
@@ -91,6 +91,40 @@ struct PortReservation {
     address: SocketAddr,
 }
 
+struct UdpPortReservation {
+    socket: Option<UdpSocket>,
+    address: SocketAddr,
+}
+
+impl UdpPortReservation {
+    fn acquire() -> TestResult<Self> {
+        let socket = UdpSocket::bind(SocketAddr::new(LOOPBACK, 0))?;
+        let address = socket.local_addr()?;
+        Ok(Self {
+            socket: Some(socket),
+            address,
+        })
+    }
+
+    fn release(&mut self) {
+        self.socket.take();
+    }
+}
+
+enum EndpointReservation {
+    Tcp(PortReservation),
+    Udp(UdpPortReservation),
+}
+
+impl EndpointReservation {
+    fn release(&mut self) {
+        match self {
+            Self::Tcp(reservation) => reservation.release(),
+            Self::Udp(reservation) => reservation.release(),
+        }
+    }
+}
+
 impl PortReservation {
     fn acquire() -> TestResult<Self> {
         let listener = TcpListener::bind(SocketAddr::new(LOOPBACK, 0))?;
@@ -112,11 +146,37 @@ pub struct ProcessFixture {
     client_config: PathBuf,
     control_port: PortReservation,
     public_ports: Vec<RemoteEndpoint>,
+    server_environment: Vec<(String, String)>,
 }
 
 struct RemoteEndpoint {
     address: SocketAddr,
-    reservation: Option<PortReservation>,
+    reservation: Option<EndpointReservation>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UdpTunnelSpec {
+    name: String,
+    local_address: SocketAddr,
+    remote_port: Option<u16>,
+}
+
+impl UdpTunnelSpec {
+    pub fn available(name: impl Into<String>, local_address: SocketAddr) -> Self {
+        Self {
+            name: name.into(),
+            local_address,
+            remote_port: None,
+        }
+    }
+
+    pub fn on_port(name: impl Into<String>, local_address: SocketAddr, remote_port: u16) -> Self {
+        Self {
+            name: name.into(),
+            local_address,
+            remote_port: Some(remote_port),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -183,7 +243,7 @@ impl ProcessFixture {
                 let reservation = PortReservation::acquire()?;
                 public_ports.push(RemoteEndpoint {
                     address: reservation.address,
-                    reservation: Some(reservation),
+                    reservation: Some(EndpointReservation::Tcp(reservation)),
                 });
             }
         }
@@ -222,7 +282,103 @@ impl ProcessFixture {
             client_config,
             control_port,
             public_ports,
+            server_environment: Vec::new(),
         })
+    }
+
+    pub fn single_udp(
+        local_address: SocketAddr,
+        max_udp_sessions_per_tunnel: u32,
+        max_udp_payload_bytes: u32,
+    ) -> TestResult<Self> {
+        Self::udp_tunnels(
+            vec![UdpTunnelSpec::available("echo", local_address)],
+            max_udp_sessions_per_tunnel,
+            max_udp_payload_bytes,
+        )
+    }
+
+    pub fn udp_tunnels(
+        tunnels: Vec<UdpTunnelSpec>,
+        max_udp_sessions_per_tunnel: u32,
+        max_udp_payload_bytes: u32,
+    ) -> TestResult<Self> {
+        if tunnels.is_empty() {
+            return Err("process fixture requires at least one UDP tunnel".into());
+        }
+        let directory = tempfile::tempdir()?;
+        let ca_file = directory.path().join("ca.pem");
+        let certificate_file = directory.path().join("server.pem");
+        let private_key_file = directory.path().join("server.key");
+        let (ca_pem, issuer) = certificate_authority()?;
+        let (server_pem, server_key_pem) = server_certificate(&issuer)?;
+        fs::write(&ca_file, ca_pem)?;
+        fs::write(&certificate_file, server_pem)?;
+        fs::write(&private_key_file, server_key_pem)?;
+
+        let key_directory = directory.path().join("device");
+        generate_key_file(&key_directory)?;
+        let device_key_file = key_directory.join("device.key");
+        let device_key = DeviceKeypair::load_private_file(&device_key_file)?;
+
+        let control_port = PortReservation::acquire()?;
+        let mut public_ports = Vec::with_capacity(tunnels.len());
+        for tunnel in &tunnels {
+            if let Some(port) = tunnel.remote_port {
+                public_ports.push(RemoteEndpoint {
+                    address: SocketAddr::new(LOOPBACK, port),
+                    reservation: None,
+                });
+            } else {
+                let reservation = UdpPortReservation::acquire()?;
+                public_ports.push(RemoteEndpoint {
+                    address: reservation.address,
+                    reservation: Some(EndpointReservation::Udp(reservation)),
+                });
+            }
+        }
+        let server_config = directory.path().join("server.toml");
+        let client_config = directory.path().join("client.toml");
+        fs::write(
+            &server_config,
+            format!(
+                "[server]\nbind_addr = \"{}\"\ncertificate_file = {}\nprivate_key_file = {}\nheartbeat_timeout_secs = 5\n\n[limits]\nmax_clients = 8\nmax_tunnels_per_client = {}\nmax_tcp_connections_per_tunnel = 1\nmax_udp_sessions_per_tunnel = {max_udp_sessions_per_tunnel}\nmax_udp_payload_bytes = {max_udp_payload_bytes}\n\n[[clients]]\nname = \"home-pc\"\npublic_key = \"{}\"\nenabled = true\n",
+                control_port.address,
+                toml_path(&certificate_file)?,
+                toml_path(&private_key_file)?,
+                tunnels.len(),
+                device_key.public_key(),
+            ),
+        )?;
+        let mut client_toml = format!(
+            "[client]\nname = \"home-pc\"\nserver_addr = \"{}\"\nserver_name = \"{SERVER_NAME}\"\ncertificate_authority_file = {}\nprivate_key_file = {}\nheartbeat_interval_secs = 1\n",
+            control_port.address,
+            toml_path(&ca_file)?,
+            toml_path(&device_key_file)?,
+        );
+        for (tunnel, public) in tunnels.iter().zip(&public_ports) {
+            client_toml.push_str(&format!(
+                "\n[[tunnels]]\nname = \"{}\"\nprotocol = \"udp\"\nlocal_addr = \"{}\"\nremote_port = {}\n",
+                tunnel.name,
+                tunnel.local_address,
+                public.address.port(),
+            ));
+        }
+        fs::write(&client_config, client_toml)?;
+
+        Ok(Self {
+            _directory: directory,
+            server_config,
+            client_config,
+            control_port,
+            public_ports,
+            server_environment: Vec::new(),
+        })
+    }
+
+    pub fn with_server_env(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.server_environment.push((name.into(), value.into()));
+        self
     }
 
     pub fn public_address(&self) -> SocketAddr {
@@ -240,7 +396,12 @@ impl ProcessFixture {
     pub fn start_server(&mut self) -> TestResult<ManagedChild> {
         self.control_port.release();
         let binaries = ensure_binaries()?;
-        ManagedChild::spawn("rustgos", &binaries.server, &self.server_config)
+        ManagedChild::spawn(
+            "rustgos",
+            &binaries.server,
+            &self.server_config,
+            &self.server_environment,
+        )
     }
 
     pub fn start_client(&mut self) -> TestResult<ManagedChild> {
@@ -250,7 +411,7 @@ impl ProcessFixture {
             }
         }
         let binaries = ensure_binaries()?;
-        ManagedChild::spawn("rustgoc", &binaries.client, &self.client_config)
+        ManagedChild::spawn("rustgoc", &binaries.client, &self.client_config, &[])
     }
 }
 
@@ -324,11 +485,17 @@ pub struct ManagedChild {
 }
 
 impl ManagedChild {
-    fn spawn(name: &'static str, binary: &Path, config: &Path) -> TestResult<Self> {
+    fn spawn(
+        name: &'static str,
+        binary: &Path,
+        config: &Path,
+        environment: &[(String, String)],
+    ) -> TestResult<Self> {
         let mut child = Command::new(binary)
             .arg("-c")
             .arg(config)
             .env("RUST_LOG", "rustgos=debug,rustgoc=debug")
+            .envs(environment.iter().map(|(name, value)| (name, value)))
             .current_dir(config.parent().expect("config has a parent"))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -442,6 +609,58 @@ pub struct EchoServer {
     address: SocketAddr,
     shutdown: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
+}
+
+pub struct UdpEchoServer {
+    address: SocketAddr,
+    shutdown: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl UdpEchoServer {
+    pub fn start() -> TestResult<Self> {
+        let socket = UdpSocket::bind(SocketAddr::new(LOOPBACK, 0))?;
+        socket.set_nonblocking(true)?;
+        let address = socket.local_addr()?;
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_shutdown = shutdown.clone();
+        let thread = thread::spawn(move || {
+            let mut buffer = vec![0_u8; u16::MAX as usize];
+            while !thread_shutdown.load(Ordering::Acquire) {
+                match socket.recv_from(&mut buffer) {
+                    Ok((received, peer)) => {
+                        let _ = socket.send_to(&buffer[..received], peer);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+        });
+        Ok(Self {
+            address,
+            shutdown,
+            thread: Some(thread),
+        })
+    }
+
+    pub fn address(&self) -> SocketAddr {
+        self.address
+    }
+}
+
+impl Drop for UdpEchoServer {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        if let Ok(wakeup) = UdpSocket::bind(SocketAddr::new(LOOPBACK, 0)) {
+            let _ = wakeup.send_to(&[], self.address);
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 impl EchoServer {

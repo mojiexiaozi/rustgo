@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     ChildSessionSupervisor, ClientError, ControlClient, RegisteredTunnel, SessionGeneration,
-    tcp::TcpSessionSupervisor,
+    udp::RelaySessionSupervisor,
 };
 
 const INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(1);
@@ -86,7 +86,7 @@ impl ClientApp {
             stable_connection_reset_after: STABLE_CONNECTION_RESET_AFTER,
         })
         .map_err(|_| ClientError::InvalidConfiguration)?;
-        let supervisor = Arc::new(TcpSessionSupervisor::new(&control));
+        let supervisor = Arc::new(RelaySessionSupervisor::new(&control));
         Ok(Self::with_runtime(control, backoff, supervisor))
     }
 

@@ -20,7 +20,11 @@ use tokio::{
 use tokio_rustls::server::TlsStream;
 use tokio_util::sync::CancellationToken;
 
-use crate::{AuthenticatedClient, tcp::TcpListenerTask};
+use crate::{
+    AuthenticatedClient,
+    tcp::TcpListenerTask,
+    udp::{UdpListenerTask, UdpRuntimeLimits},
+};
 
 const MAX_CONNECTION_ID_ATTEMPTS: usize = 16;
 type ServerDataStream = TlsStream<TcpStream>;
@@ -31,9 +35,12 @@ pub struct ClientRegistry {
     max_clients: usize,
     max_tunnels_per_client: usize,
     max_tcp_connections_per_tunnel: usize,
+    max_udp_sessions_per_tunnel: usize,
+    max_udp_payload_bytes: usize,
     listener_ip: IpAddr,
     binding_capacity: usize,
     binding_ttl: Duration,
+    udp_runtime_limits: UdpRuntimeLimits,
 }
 
 #[derive(Default)]
@@ -57,6 +64,11 @@ impl std::fmt::Debug for ClientRegistry {
                 "max_tcp_connections_per_tunnel",
                 &self.max_tcp_connections_per_tunnel,
             )
+            .field(
+                "max_udp_sessions_per_tunnel",
+                &self.max_udp_sessions_per_tunnel,
+            )
+            .field("max_udp_payload_bytes", &self.max_udp_payload_bytes)
             .field("listener_ip", &self.listener_ip)
             .finish_non_exhaustive()
     }
@@ -81,6 +93,7 @@ impl ClientRegistry {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn new_with_tcp_limit(
         max_clients: usize,
         max_tunnels_per_client: usize,
@@ -89,11 +102,40 @@ impl ClientRegistry {
         binding_capacity: usize,
         binding_ttl: Duration,
     ) -> Result<Self, RegistryError> {
+        Self::new_with_relay_limits(
+            max_clients,
+            max_tunnels_per_client,
+            max_tcp_connections_per_tunnel,
+            1,
+            rustgo_protocol::MAX_UDP_PAYLOAD_BYTES,
+            listener_ip,
+            binding_capacity,
+            binding_ttl,
+            UdpRuntimeLimits::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_relay_limits(
+        max_clients: usize,
+        max_tunnels_per_client: usize,
+        max_tcp_connections_per_tunnel: usize,
+        max_udp_sessions_per_tunnel: usize,
+        max_udp_payload_bytes: usize,
+        listener_ip: IpAddr,
+        binding_capacity: usize,
+        binding_ttl: Duration,
+        udp_runtime_limits: UdpRuntimeLimits,
+    ) -> Result<Self, RegistryError> {
         if max_clients == 0
             || max_tunnels_per_client == 0
             || max_tcp_connections_per_tunnel == 0
+            || max_udp_sessions_per_tunnel == 0
+            || max_udp_payload_bytes == 0
+            || max_udp_payload_bytes > rustgo_protocol::MAX_UDP_PAYLOAD_BYTES
             || binding_capacity == 0
             || binding_ttl.is_zero()
+            || !udp_runtime_limits.is_valid()
         {
             return Err(RegistryError::InvalidConfiguration);
         }
@@ -102,9 +144,12 @@ impl ClientRegistry {
             max_clients,
             max_tunnels_per_client,
             max_tcp_connections_per_tunnel,
+            max_udp_sessions_per_tunnel,
+            max_udp_payload_bytes,
             listener_ip,
             binding_capacity,
             binding_ttl,
+            udp_runtime_limits,
         })
     }
 
@@ -143,6 +188,7 @@ impl ClientRegistry {
             bindings: Mutex::new(SessionBindings {
                 store: binding_store,
                 pending_tcp: HashMap::new(),
+                pending_udp: HashMap::new(),
             }),
             outbound,
             cancellation: CancellationToken::new(),
@@ -232,7 +278,19 @@ pub(crate) struct PendingTcpOpen {
     pub(crate) data_channel: oneshot::Receiver<ServerDataStream>,
 }
 
+pub(crate) struct PendingUdpOpen {
+    pub(crate) channel_id: u64,
+    pub(crate) binding_token: BoundedBytes<MAX_BINDING_TOKEN_BYTES>,
+    pub(crate) data_channel: oneshot::Receiver<ServerDataStream>,
+}
+
 struct PendingTcp {
+    channel_kind: ChannelKind,
+    binding_token: BoundedBytes<MAX_BINDING_TOKEN_BYTES>,
+    destination: oneshot::Sender<ServerDataStream>,
+}
+
+struct PendingUdp {
     channel_kind: ChannelKind,
     binding_token: BoundedBytes<MAX_BINDING_TOKEN_BYTES>,
     destination: oneshot::Sender<ServerDataStream>,
@@ -241,6 +299,7 @@ struct PendingTcp {
 struct SessionBindings {
     store: ChannelBindingStore,
     pending_tcp: HashMap<u64, PendingTcp>,
+    pending_udp: HashMap<u64, PendingUdp>,
 }
 
 pub(crate) struct SessionRuntime {
@@ -298,11 +357,58 @@ impl SessionRuntime {
         Err(RegistryError::EntropyUnavailable)
     }
 
+    pub(crate) fn prepare_udp(&self, tunnel_id: u32) -> Result<PendingUdpOpen, RegistryError> {
+        for _ in 0..MAX_CONNECTION_ID_ATTEMPTS {
+            let channel_id = OsRng
+                .try_next_u64()
+                .map_err(|_| RegistryError::EntropyUnavailable)?;
+            if channel_id == 0 {
+                continue;
+            }
+            let channel_kind = ChannelKind::Udp {
+                tunnel_id,
+                channel_id,
+            };
+            let (destination, data_channel) = oneshot::channel();
+            let mut bindings = self.bindings.lock().map_err(|_| RegistryError::Internal)?;
+            if bindings.pending_udp.contains_key(&channel_id) {
+                continue;
+            }
+            let binding_token = bindings.store.issue(channel_kind)?;
+            bindings.pending_udp.insert(
+                channel_id,
+                PendingUdp {
+                    channel_kind,
+                    binding_token: binding_token.clone(),
+                    destination,
+                },
+            );
+            return Ok(PendingUdpOpen {
+                channel_id,
+                binding_token,
+                data_channel,
+            });
+        }
+        Err(RegistryError::EntropyUnavailable)
+    }
+
     pub(crate) fn cancel_pending(&self, connection_id: u64) {
         let Ok(mut bindings) = self.bindings.lock() else {
             return;
         };
         let Some(pending) = bindings.pending_tcp.remove(&connection_id) else {
+            return;
+        };
+        bindings
+            .store
+            .revoke(pending.channel_kind, pending.binding_token.as_slice());
+    }
+
+    pub(crate) fn cancel_pending_udp(&self, channel_id: u64) {
+        let Ok(mut bindings) = self.bindings.lock() else {
+            return;
+        };
+        let Some(pending) = bindings.pending_udp.remove(&channel_id) else {
             return;
         };
         bindings
@@ -341,14 +447,24 @@ impl SessionRuntime {
             Ok(binding) => binding,
             Err(error) => return Some(Err(error.into())),
         };
-        let pending = bindings.pending_tcp.remove(&request.target_id);
-        let Some(pending) = pending else {
-            return Some(Err(RegistryError::Binding(BindingError::Rejected)));
+        let destination = if request.kind == DataChannelKind::TCP {
+            let Some(pending) = bindings.pending_tcp.remove(&request.target_id) else {
+                return Some(Err(RegistryError::Binding(BindingError::Rejected)));
+            };
+            if pending.channel_kind != channel_kind {
+                return Some(Err(RegistryError::Binding(BindingError::Rejected)));
+            }
+            pending.destination
+        } else {
+            let Some(pending) = bindings.pending_udp.remove(&request.target_id) else {
+                return Some(Err(RegistryError::Binding(BindingError::Rejected)));
+            };
+            if pending.channel_kind != channel_kind {
+                return Some(Err(RegistryError::Binding(BindingError::Rejected)));
+            }
+            pending.destination
         };
-        if pending.channel_kind != channel_kind {
-            return Some(Err(RegistryError::Binding(BindingError::Rejected)));
-        }
-        Some(Ok((binding, pending.destination)))
+        Some(Ok((binding, destination)))
     }
 
     fn issue(
@@ -382,6 +498,12 @@ impl SessionRuntime {
         self.cancellation.cancel();
         if let Ok(mut bindings) = self.bindings.lock() {
             let pending = std::mem::take(&mut bindings.pending_tcp);
+            for pending in pending.into_values() {
+                bindings
+                    .store
+                    .revoke(pending.channel_kind, pending.binding_token.as_slice());
+            }
+            let pending = std::mem::take(&mut bindings.pending_udp);
             for pending in pending.into_values() {
                 bindings
                     .store
@@ -535,7 +657,16 @@ impl ControlSessionGuard {
                 self.registry.max_tcp_connections_per_tunnel,
             )))
         } else {
-            UdpSocket::bind(address).await.map(ListenerLease::Udp)
+            let socket = UdpSocket::bind(address).await?;
+            Ok(ListenerLease::Udp(UdpListenerTask::spawn(
+                socket,
+                tunnel_id,
+                tunnel_name.to_owned(),
+                self.runtime.clone(),
+                self.registry.max_udp_sessions_per_tunnel,
+                self.registry.max_udp_payload_bytes,
+                self.registry.udp_runtime_limits,
+            )))
         }
     }
 }
@@ -555,13 +686,14 @@ impl Drop for ControlSessionGuard {
 
 enum ListenerLease {
     Tcp(TcpListenerTask),
-    Udp(UdpSocket),
+    Udp(UdpListenerTask),
 }
 
 impl ListenerLease {
     async fn shutdown(&mut self) {
-        if let Self::Tcp(listener) = self {
-            listener.shutdown().await;
+        match self {
+            Self::Tcp(listener) => listener.shutdown().await,
+            Self::Udp(listener) => listener.shutdown().await,
         }
     }
 }
@@ -570,10 +702,7 @@ impl std::fmt::Debug for ListenerLease {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Tcp(listener) => formatter.debug_tuple("Tcp").field(listener).finish(),
-            Self::Udp(socket) => formatter
-                .debug_tuple("Udp")
-                .field(&socket.local_addr().ok())
-                .finish(),
+            Self::Udp(listener) => formatter.debug_tuple("Udp").field(listener).finish(),
         }
     }
 }
