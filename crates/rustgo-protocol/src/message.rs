@@ -10,9 +10,11 @@ pub const MAX_CHALLENGE_BYTES: usize = 64;
 pub const MAX_SESSION_ID_BYTES: usize = 32;
 pub const MAX_PUBLIC_KEY_BYTES: usize = 64;
 pub const MAX_SIGNATURE_BYTES: usize = 128;
+pub const MAX_BINDING_TOKEN_BYTES: usize = 64;
 pub const MAX_TUNNELS: usize = 64;
 pub const MAX_TUNNEL_NAME_BYTES: usize = 128;
 pub const MAX_UDP_PAYLOAD_BYTES: usize = 65_507;
+pub const UDP_METADATA_LEN: usize = 31;
 pub const MAX_ERROR_DETAIL_BYTES: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -271,6 +273,7 @@ impl MessageId {
     pub const UDP_DATAGRAM: Self = Self(9);
     pub const HEARTBEAT: Self = Self(10);
     pub const ERROR: Self = Self(11);
+    pub const OPEN_UDP_CHANNEL: Self = Self(12);
 
     pub const fn as_u16(self) -> u16 {
         self.0
@@ -284,11 +287,12 @@ impl MessageId {
             4 => 16,
             5 => 32 * 1024,
             6 => 8 * 1024,
-            7 => 64,
+            7 => 160,
             8 => 32,
-            9 => 65_600,
+            9 => UDP_METADATA_LEN + MAX_UDP_PAYLOAD_BYTES,
             10 => 16,
             11 => 1024,
+            12 => 96,
             _ => 0,
         }
     }
@@ -299,7 +303,7 @@ impl TryFrom<u16> for MessageId {
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
         match value {
-            1..=11 => Ok(Self(value)),
+            1..=12 => Ok(Self(value)),
             _ => Err(value),
         }
     }
@@ -440,6 +444,14 @@ pub struct OpenTcpStream {
     pub tunnel_id: u32,
     pub connection_id: u64,
     pub peer: SocketAddress,
+    pub binding_token: BoundedBytes<MAX_BINDING_TOKEN_BYTES>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenUdpChannel {
+    pub tunnel_id: u32,
+    pub channel_id: u64,
+    pub binding_token: BoundedBytes<MAX_BINDING_TOKEN_BYTES>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -481,6 +493,7 @@ pub enum Message {
     UdpDatagram(UdpDatagram),
     Heartbeat(Heartbeat),
     Error(ErrorMessage),
+    OpenUdpChannel(OpenUdpChannel),
 }
 
 impl Message {
@@ -497,6 +510,7 @@ impl Message {
             Self::UdpDatagram(_) => MessageId::UDP_DATAGRAM,
             Self::Heartbeat(_) => MessageId::HEARTBEAT,
             Self::Error(_) => MessageId::ERROR,
+            Self::OpenUdpChannel(_) => MessageId::OPEN_UDP_CHANNEL,
         }
     }
 }

@@ -5,12 +5,14 @@ use thiserror::Error;
 
 use crate::ProtocolVersion;
 use crate::message::{
-    AuthResult, ClientAuthenticate, ClientHello, ErrorMessage, Heartbeat, Message, MessageId,
-    OpenTcpStream, RegisterTunnels, ServerChallenge, TcpStreamReady, TunnelResults, UdpDatagram,
+    AuthResult, BoundedBytes, ClientAuthenticate, ClientHello, ErrorMessage, Heartbeat,
+    MAX_UDP_PAYLOAD_BYTES, Message, MessageId, OpenTcpStream, OpenUdpChannel, RegisterTunnels,
+    ServerChallenge, SocketAddress, TcpStreamReady, TunnelResults, UDP_METADATA_LEN, UdpDatagram,
 };
 
 pub const MAGIC: [u8; 4] = *b"RSGO";
 pub const HEADER_LEN: usize = 16;
+pub const SUPPORTED_FLAGS: u16 = 0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
@@ -25,6 +27,8 @@ pub enum FrameError {
     InvalidMagic,
     #[error("unknown message ID {0}")]
     UnknownMessage(u16),
+    #[error("unsupported frame flags {0:#06x}")]
+    UnsupportedFlags(u16),
     #[error("payload length {declared} exceeds frame maximum {max}")]
     PayloadTooLarge { declared: usize, max: usize },
     #[error("payload length {declared} exceeds {message:?} maximum {max}")]
@@ -59,6 +63,7 @@ impl FrameCodec {
         flags: u16,
         message: &Message,
     ) -> Result<Bytes, FrameError> {
+        validate_flags(flags)?;
         let message_id = message.id();
         let payload = encode_payload(message)?;
         self.validate_payload_length(message_id, payload.len())?;
@@ -83,9 +88,8 @@ impl FrameCodec {
         if input.len() < frame_len {
             return Ok(None);
         }
-        let mut frame_bytes = input.split_to(frame_len);
-        frame_bytes.advance(HEADER_LEN);
-        let message = decode_payload(header.message_id, &frame_bytes)?;
+        let message = decode_payload(header.message_id, &input[HEADER_LEN..frame_len])?;
+        input.advance(frame_len);
         Ok(Some(Frame {
             version: header.version,
             flags: header.flags,
@@ -133,6 +137,7 @@ impl FrameCodec {
         let raw_message_id = u16::from_be_bytes([input[8], input[9]]);
         let message_id = MessageId::try_from(raw_message_id).map_err(FrameError::UnknownMessage)?;
         let flags = u16::from_be_bytes([input[10], input[11]]);
+        validate_flags(flags)?;
         let declared = u32::from_be_bytes([input[12], input[13], input[14], input[15]]);
         let payload_len = usize::try_from(declared).map_err(|_| FrameError::LengthOverflow)?;
         self.validate_payload_length(message_id, payload_len)?;
@@ -167,6 +172,14 @@ impl FrameCodec {
     }
 }
 
+fn validate_flags(flags: u16) -> Result<(), FrameError> {
+    let unsupported = flags & !SUPPORTED_FLAGS;
+    if unsupported != 0 {
+        return Err(FrameError::UnsupportedFlags(unsupported));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Header {
     version: ProtocolVersion,
@@ -189,14 +202,20 @@ fn encode_payload(message: &Message) -> Result<Vec<u8>, FrameError> {
         Message::TunnelResults(value) => serialize(value),
         Message::OpenTcpStream(value) => serialize(value),
         Message::TcpStreamReady(value) => serialize(value),
-        Message::UdpDatagram(value) => serialize(value),
+        Message::UdpDatagram(value) => encode_udp(value),
         Message::Heartbeat(value) => serialize(value),
         Message::Error(value) => serialize(value),
+        Message::OpenUdpChannel(value) => serialize(value),
     }
 }
 
 fn deserialize<T: DeserializeOwned>(message: MessageId, payload: &[u8]) -> Result<T, FrameError> {
-    postcard::from_bytes(payload).map_err(|_| FrameError::MalformedPayload { message })
+    let (value, remainder) =
+        postcard::take_from_bytes(payload).map_err(|_| FrameError::MalformedPayload { message })?;
+    if !remainder.is_empty() {
+        return Err(FrameError::MalformedPayload { message });
+    }
+    Ok(value)
 }
 
 fn decode_payload(message: MessageId, payload: &[u8]) -> Result<Message, FrameError> {
@@ -225,11 +244,74 @@ fn decode_payload(message: MessageId, payload: &[u8]) -> Result<Message, FrameEr
         MessageId::TCP_STREAM_READY => {
             deserialize::<TcpStreamReady>(message, payload).map(Message::TcpStreamReady)
         }
-        MessageId::UDP_DATAGRAM => {
-            deserialize::<UdpDatagram>(message, payload).map(Message::UdpDatagram)
-        }
+        MessageId::UDP_DATAGRAM => decode_udp(message, payload).map(Message::UdpDatagram),
         MessageId::HEARTBEAT => deserialize::<Heartbeat>(message, payload).map(Message::Heartbeat),
         MessageId::ERROR => deserialize::<ErrorMessage>(message, payload).map(Message::Error),
+        MessageId::OPEN_UDP_CHANNEL => {
+            deserialize::<OpenUdpChannel>(message, payload).map(Message::OpenUdpChannel)
+        }
         _ => unreachable!("all valid message IDs are handled"),
     }
+}
+
+fn encode_udp(datagram: &UdpDatagram) -> Result<Vec<u8>, FrameError> {
+    let mut payload = Vec::with_capacity(UDP_METADATA_LEN + datagram.payload.as_slice().len());
+    payload.put_u32(datagram.tunnel_id);
+    payload.put_u64(datagram.session_id);
+    match datagram.source {
+        SocketAddress::V4 { octets, port } => {
+            payload.put_u8(4);
+            payload.extend_from_slice(&octets);
+            payload.extend_from_slice(&[0; 12]);
+            payload.put_u16(port);
+        }
+        SocketAddress::V6 { octets, port } => {
+            payload.put_u8(6);
+            payload.extend_from_slice(&octets);
+            payload.put_u16(port);
+        }
+    }
+    payload.extend_from_slice(datagram.payload.as_slice());
+    Ok(payload)
+}
+
+fn decode_udp(message: MessageId, payload: &[u8]) -> Result<UdpDatagram, FrameError> {
+    if payload.len() < UDP_METADATA_LEN {
+        return Err(FrameError::MalformedPayload { message });
+    }
+    let raw = &payload[UDP_METADATA_LEN..];
+    if raw.len() > MAX_UDP_PAYLOAD_BYTES {
+        return Err(FrameError::MessagePayloadTooLarge {
+            message,
+            declared: payload.len(),
+            max: UDP_METADATA_LEN + MAX_UDP_PAYLOAD_BYTES,
+        });
+    }
+
+    let tunnel_id = u32::from_be_bytes(payload[0..4].try_into().expect("fixed metadata width"));
+    let session_id = u64::from_be_bytes(payload[4..12].try_into().expect("fixed metadata width"));
+    let address: [u8; 16] = payload[13..29].try_into().expect("fixed metadata width");
+    let port = u16::from_be_bytes(payload[29..31].try_into().expect("fixed metadata width"));
+    let source = match payload[12] {
+        4 if address[4..] == [0; 12] => SocketAddress::V4 {
+            octets: address[0..4].try_into().expect("IPv4 width"),
+            port,
+        },
+        6 => SocketAddress::V6 {
+            octets: address,
+            port,
+        },
+        _ => return Err(FrameError::MalformedPayload { message }),
+    };
+    let payload = BoundedBytes::try_from(raw).map_err(|_| FrameError::MessagePayloadTooLarge {
+        message,
+        declared: payload.len(),
+        max: UDP_METADATA_LEN + MAX_UDP_PAYLOAD_BYTES,
+    })?;
+    Ok(UdpDatagram {
+        tunnel_id,
+        session_id,
+        source,
+        payload,
+    })
 }

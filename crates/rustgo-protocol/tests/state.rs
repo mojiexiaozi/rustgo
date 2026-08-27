@@ -1,7 +1,8 @@
 use rustgo_protocol::{
     AuthResult, BoundedBytes, BoundedString, BoundedVec, ClientAuthenticate, ClientHandshakeState,
-    ClientHello, Heartbeat, Message, ProtocolErrorCode, ProtocolVersion, RegisterTunnels,
-    ServerChallenge, StateError, TunnelProtocol, TunnelRegistration,
+    ClientHello, Heartbeat, MAX_BINDING_TOKEN_BYTES, Message, OpenTcpStream, OpenUdpChannel,
+    ProtocolErrorCode, ProtocolVersion, RegisterTunnels, ServerChallenge, SocketAddress,
+    StateError, TunnelProtocol, TunnelRegistration,
 };
 
 fn text<const MAX: usize>(value: &str) -> BoundedString<MAX> {
@@ -172,4 +173,41 @@ fn protocol_error_codes_are_explicit_and_stable() {
     assert_eq!(ProtocolErrorCode::UNKNOWN_SESSION.as_u16(), 7);
     assert_eq!(ProtocolErrorCode::TUNNEL_REJECTED.as_u16(), 8);
     assert_eq!(ProtocolErrorCode::INTERNAL.as_u16(), 255);
+}
+
+#[test]
+fn active_state_accepts_data_channel_control_notifications() {
+    let state = ClientHandshakeState::new()
+        .transition(&hello())
+        .unwrap()
+        .transition(&challenge())
+        .unwrap()
+        .transition(&authenticate())
+        .unwrap()
+        .transition(&auth_result(true))
+        .unwrap()
+        .transition(&registration())
+        .unwrap();
+    let token = bytes(&[9; MAX_BINDING_TOKEN_BYTES]);
+    let tcp = Message::OpenTcpStream(OpenTcpStream {
+        tunnel_id: 1,
+        connection_id: 2,
+        peer: SocketAddress::V4 {
+            octets: [203, 0, 113, 1],
+            port: 443,
+        },
+        binding_token: token.clone(),
+    });
+    let udp = Message::OpenUdpChannel(OpenUdpChannel {
+        tunnel_id: 1,
+        channel_id: 3,
+        binding_token: token,
+    });
+
+    assert_eq!(state.transition(&tcp), Ok(state.clone()));
+    assert_eq!(state.transition(&udp), Ok(state));
+    assert_eq!(
+        ClientHandshakeState::new().transition(&tcp),
+        Err(StateError::invalid_state())
+    );
 }

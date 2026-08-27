@@ -61,6 +61,9 @@ impl ClientHandshakeState {
                 })
             }
             (Self::Active { .. }, Message::Heartbeat(_)) => Ok(self.clone()),
+            (Self::Active { .. }, Message::OpenTcpStream(_) | Message::OpenUdpChannel(_)) => {
+                Ok(self.clone())
+            }
             _ => Err(StateError::invalid_state()),
         }
     }
