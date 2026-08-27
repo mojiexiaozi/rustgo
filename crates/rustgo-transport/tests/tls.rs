@@ -215,6 +215,25 @@ async fn malformed_tls_material_fails_before_socket_binding_without_leaking_key_
     Ok(())
 }
 
+#[tokio::test]
+async fn malformed_trailing_chain_certificate_is_rejected_before_binding()
+-> Result<(), Box<dyn Error>> {
+    let pki = TestPki::generate()?;
+    let occupied = TcpListener::bind("127.0.0.1:0").await?;
+    let address = occupied.local_addr()?;
+    let certificate_file = pki._directory.path().join("malformed-chain.pem");
+    let leaf = fs::read_to_string(&pki.certificate_file)?;
+    let malformed_trailing = "-----BEGIN CERTIFICATE-----\nAA==\n-----END CERTIFICATE-----\n";
+    fs::write(&certificate_file, format!("{leaf}{malformed_trailing}"))?;
+
+    let error = TlsServer::bind(address, &certificate_file, &pki.private_key_file)
+        .await
+        .expect_err("every certificate must be parsed before binding");
+
+    assert!(matches!(error, TlsError::InvalidCertificateFile { .. }));
+    Ok(())
+}
+
 fn root_store(path: &Path) -> Result<RootCertStore, Box<dyn Error>> {
     let bytes = fs::read(path)?;
     let certificates = rustls_pemfile::certs(&mut bytes.as_slice())
@@ -322,8 +341,7 @@ fn binding_token_rejects_wrong_identity_session_kind_and_target() -> Result<(), 
 }
 
 #[tokio::test]
-async fn expired_tokens_fail_and_expired_entries_release_bounded_capacity()
--> Result<(), Box<dyn Error>> {
+async fn expired_token_is_rejected() -> Result<(), Box<dyn Error>> {
     let session = session_id(11);
     let kind = ChannelKind::Udp {
         tunnel_id: 8,
@@ -332,11 +350,10 @@ async fn expired_tokens_fail_and_expired_entries_release_bounded_capacity()
     let mut bindings = ChannelBindingStore::new(
         "client-a",
         &session,
-        1,
+        2,
         std::time::Duration::from_millis(10),
     )?;
     let expired = bindings.issue(kind)?;
-    assert_eq!(bindings.issue(kind), Err(BindingError::CapacityReached));
 
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
 
@@ -344,6 +361,28 @@ async fn expired_tokens_fail_and_expired_entries_release_bounded_capacity()
         bindings.redeem("client-a", &session, kind, expired.as_slice()),
         Err(BindingError::Rejected)
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn issuing_after_ttl_reclaims_expired_capacity_without_redemption()
+-> Result<(), Box<dyn Error>> {
+    let session = session_id(12);
+    let kind = ChannelKind::Udp {
+        tunnel_id: 8,
+        channel_id: 14,
+    };
+    let mut bindings = ChannelBindingStore::new(
+        "client-a",
+        &session,
+        1,
+        std::time::Duration::from_millis(10),
+    )?;
+    let _expired = bindings.issue(kind)?;
+    assert_eq!(bindings.issue(kind), Err(BindingError::CapacityReached));
+
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
     assert!(bindings.issue(kind).is_ok());
     Ok(())
 }
@@ -367,4 +406,29 @@ fn binding_store_rejects_unbounded_or_empty_owner_values() {
         ),
         Err(BindingError::InvalidConfiguration)
     ));
+}
+
+#[test]
+fn channel_binding_store_debug_redacts_owner_and_token_material() -> Result<(), Box<dyn Error>> {
+    const CLIENT_SENTINEL: &str = "DEBUG-SECRET-CLIENT";
+    let session_sentinel = vec![0xc7; 32];
+    let mut bindings = ChannelBindingStore::new(
+        CLIENT_SENTINEL,
+        &session_sentinel,
+        4,
+        std::time::Duration::from_secs(30),
+    )?;
+    let token_sentinel = bindings.issue(ChannelKind::Tcp {
+        tunnel_id: 3,
+        connection_id: 41,
+    })?;
+
+    let debug = format!("{bindings:?}");
+
+    assert!(!debug.contains(CLIENT_SENTINEL));
+    assert!(!debug.contains(&format!("{:?}", session_sentinel.as_slice())));
+    assert!(!debug.contains(&format!("{:?}", token_sentinel.as_slice())));
+    assert!(debug.contains("pending_count: 1"));
+    assert!(debug.contains("capacity: 4"));
+    Ok(())
 }

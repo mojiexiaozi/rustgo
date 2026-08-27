@@ -46,13 +46,23 @@ struct PendingBinding {
 /// Call [`Self::redeem`] only after a data socket has successfully completed
 /// [`TlsServer::handshake`]. Removing a known token before validating the
 /// presentation makes every known token single-use, including failed attempts.
-#[derive(Debug)]
 pub struct ChannelBindingStore {
     client_id: String,
     session_id: Vec<u8>,
     capacity: usize,
     time_to_live: Duration,
     pending: HashMap<[u8; BINDING_TOKEN_BYTES], PendingBinding>,
+}
+
+impl std::fmt::Debug for ChannelBindingStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ChannelBindingStore")
+            .field("capacity", &self.capacity)
+            .field("time_to_live", &self.time_to_live)
+            .field("pending_count", &self.pending.len())
+            .finish()
+    }
 }
 
 impl ChannelBindingStore {
@@ -328,6 +338,16 @@ fn load_certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>, TlsErr
         return Err(TlsError::InvalidCertificateFile {
             path: path.to_owned(),
         });
+    }
+    for certificate in &certificates {
+        match x509_parser::parse_x509_certificate(certificate.as_ref()) {
+            Ok(([], _)) => {}
+            _ => {
+                return Err(TlsError::InvalidCertificateFile {
+                    path: path.to_owned(),
+                });
+            }
+        }
     }
     Ok(certificates)
 }

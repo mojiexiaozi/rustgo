@@ -43,7 +43,8 @@ where
 {
     let (first_reader, first_writer) = tokio::io::split(first);
     let (second_reader, second_writer) = tokio::io::split(second);
-    let (activity_sender, mut activity_receiver) = watch::channel(0_u64);
+    let started_at = tokio::time::Instant::now();
+    let (activity_sender, mut activity_receiver) = watch::channel(started_at);
 
     let first_to_second = copy_one_direction(first_reader, second_writer, activity_sender.clone());
     let second_to_first = copy_one_direction(second_reader, first_writer, activity_sender);
@@ -57,20 +58,30 @@ where
     };
     tokio::pin!(copy);
 
-    let idle = tokio::time::sleep(idle_timeout);
+    let idle = tokio::time::sleep_until(started_at + idle_timeout);
     tokio::pin!(idle);
 
     loop {
         tokio::select! {
-            result = &mut copy => return result,
+            biased;
             _ = cancellation.cancelled() => return Err(CopyError::Cancelled),
+            result = &mut copy => return result,
             activity = activity_receiver.changed() => {
                 if activity.is_err() {
                     return copy.await;
                 }
-                idle.as_mut().reset(tokio::time::Instant::now() + idle_timeout);
+                let last_progress = *activity_receiver.borrow_and_update();
+                idle.as_mut().reset(last_progress + idle_timeout);
             }
-            _ = &mut idle => return Err(CopyError::IdleTimeout),
+            _ = &mut idle => {
+                let last_progress = *activity_receiver.borrow_and_update();
+                let deadline = last_progress + idle_timeout;
+                if deadline > tokio::time::Instant::now() {
+                    idle.as_mut().reset(deadline);
+                } else {
+                    return Err(CopyError::IdleTimeout);
+                }
+            }
         }
     }
 }
@@ -78,7 +89,7 @@ where
 async fn copy_one_direction<R, W>(
     mut reader: R,
     mut writer: W,
-    activity: watch::Sender<u64>,
+    activity: watch::Sender<tokio::time::Instant>,
 ) -> Result<u64, CopyError>
 where
     R: AsyncRead + Unpin,
@@ -92,10 +103,17 @@ where
             writer.shutdown().await?;
             return Ok(copied);
         }
-        writer.write_all(&buffer[..read]).await?;
-        copied = copied
-            .checked_add(read as u64)
-            .ok_or(CopyError::ByteCountOverflow)?;
-        activity.send_modify(|version| *version = version.wrapping_add(1));
+        let mut written = 0;
+        while written < read {
+            let progress = writer.write(&buffer[written..read]).await?;
+            if progress == 0 {
+                return Err(CopyError::Io(io::Error::from(io::ErrorKind::WriteZero)));
+            }
+            written += progress;
+            copied = copied
+                .checked_add(progress as u64)
+                .ok_or(CopyError::ByteCountOverflow)?;
+            activity.send_replace(tokio::time::Instant::now());
+        }
     }
 }

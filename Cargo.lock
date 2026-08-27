@@ -1114,6 +1114,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-util",
+ "x509-parser",
 ]
 
 [[package]]
