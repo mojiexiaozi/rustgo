@@ -12,7 +12,7 @@ use tokio::net::TcpStream;
 use tokio::sync::OwnedSemaphorePermit;
 
 use crate::{
-    auth::{Authenticator, FailedAuthLimiter},
+    auth::{AuthAttemptReservation, Authenticator, FailedAuthLimiter},
     registry::ClientRegistry,
 };
 
@@ -54,15 +54,15 @@ pub(crate) async fn serve_connection(
     peer: SocketAddr,
     unauthenticated_permit: OwnedSemaphorePermit,
 ) -> Result<(), ControlError> {
-    let Some(mut auth_attempt) = context.limiter.reserve(peer.ip()) else {
-        return Ok(());
-    };
     let handshake_deadline = tokio::time::Instant::now()
         .checked_add(context.handshake_timeout)
         .ok_or(ControlError::HandshakeTimeout)?;
     let stream = tokio::time::timeout_at(handshake_deadline, context.tls_server.handshake(socket))
         .await
         .map_err(|_| ControlError::HandshakeTimeout)??;
+    let Some(mut auth_attempt) = context.limiter.reserve(peer.ip()) else {
+        return Ok(());
+    };
     let mut framed = FramedControl::new(stream);
     let authenticated = tokio::time::timeout_at(handshake_deadline, async {
         let mut state = ClientHandshakeState::new();
@@ -101,12 +101,7 @@ pub(crate) async fn serve_connection(
             error: (!accepted).then_some(ProtocolErrorCode::AUTHENTICATION_FAILED),
         });
         state = state.transition(&result)?;
-        if accepted {
-            auth_attempt.succeed();
-        } else {
-            auth_attempt.fail();
-        }
-        framed.send(negotiated, result).await?;
+        send_auth_result(&mut framed, &mut auth_attempt, negotiated, result, accepted).await?;
         if accepted {
             Ok(Some((guard.expect("accepted guard"), state, negotiated)))
         } else {
@@ -158,6 +153,24 @@ fn protocol_error(code: ProtocolErrorCode) -> Message {
         detail: BoundedString::<MAX_ERROR_DETAIL_BYTES>::try_from("protocol rejected")
             .expect("static detail is bounded"),
     })
+}
+
+async fn send_auth_result<S>(
+    framed: &mut FramedControl<S>,
+    attempt: &mut AuthAttemptReservation,
+    version: ProtocolVersion,
+    result: Message,
+    accepted: bool,
+) -> Result<(), ControlError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    if accepted {
+        attempt.succeed();
+    } else {
+        attempt.fail();
+    }
+    framed.send(version, result).await
 }
 
 struct FramedControl<S> {
@@ -225,4 +238,37 @@ pub(crate) enum ControlError {
     FrameTooLarge,
     #[error("invalid control protocol state")]
     InvalidState,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{net::IpAddr, time::Duration};
+
+    use rustgo_protocol::{AuthResult, Message, ProtocolErrorCode};
+
+    use super::{FramedControl, SERVER_VERSION, send_auth_result};
+    use crate::auth::FailedAuthLimiter;
+
+    #[tokio::test]
+    async fn rejected_auth_is_charged_before_a_failed_result_write() {
+        let limiter = FailedAuthLimiter::new(1, Duration::from_secs(60), 4, 4);
+        let peer = IpAddr::from([192, 0, 2, 70]);
+        let mut attempt = limiter.reserve(peer).unwrap();
+        let (stream, closed_peer) = tokio::io::duplex(1024);
+        drop(closed_peer);
+        let mut framed = FramedControl::new(stream);
+        let result = Message::AuthResult(AuthResult {
+            accepted: false,
+            error: Some(ProtocolErrorCode::AUTHENTICATION_FAILED),
+        });
+
+        assert!(
+            send_auth_result(&mut framed, &mut attempt, SERVER_VERSION, result, false)
+                .await
+                .is_err()
+        );
+        drop(attempt);
+
+        assert!(limiter.reserve(peer).is_none());
+    }
 }

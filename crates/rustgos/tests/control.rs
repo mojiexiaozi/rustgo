@@ -170,13 +170,16 @@ impl FramedClient {
         }
     }
 
-    async fn abort_after_send(
+    async fn abort_after_response(
         mut self,
         version: ProtocolVersion,
         message: Message,
     ) -> Result<(), Box<dyn Error>> {
         self.send(version, message).await?;
-        self.stream.flush().await?;
+        let response = self.receive().await?;
+        if response.message != Message::AuthResult(rejected_authentication()) {
+            return Err("server did not reject authentication before abort".into());
+        }
         self.stream.get_ref().0.set_zero_linger()?;
         drop(self);
         Ok(())
@@ -540,6 +543,52 @@ async fn handshake_timeout_releases_the_bounded_unauthenticated_permit()
 }
 
 #[tokio::test]
+async fn tls_aborts_malformed_inputs_and_timeout_do_not_consume_auth_failures()
+-> Result<(), Box<dyn Error>> {
+    let pki = TestPki::generate()?;
+    let key = DeviceKeypair::from_secret_bytes([22; 32]);
+    let runtime_limits = ServerRuntimeLimits {
+        handshake_timeout: Duration::from_millis(80),
+        max_failed_auth_attempts_per_peer: 1,
+        ..ServerRuntimeLimits::default()
+    };
+    let app = ServerApp::bind_with_runtime_limits(
+        server_config(&pki, vec![authorized("home-pc", &key, true)]),
+        runtime_limits,
+    )
+    .await?;
+    let address = app.local_addr()?;
+    let shutdown = CancellationToken::new();
+    let server_task = tokio::spawn(app.run_until(shutdown.clone()));
+
+    for _ in 0..4 {
+        drop(TcpStream::connect(address).await?);
+    }
+    for _ in 0..3 {
+        let mut malformed = TcpStream::connect(address).await?;
+        malformed.write_all(b"GET / HTTP/1.0\r\n\r\n").await?;
+        drop(malformed);
+    }
+    let stalled = TcpStream::connect(address).await?;
+    sleep(Duration::from_millis(120)).await;
+    drop(stalled);
+
+    let mut client = FramedClient::connect(&pki, address).await?;
+    assert_eq!(
+        authenticate(&mut client, "home-pc", &key).await?,
+        AuthResult {
+            accepted: true,
+            error: None,
+        }
+    );
+
+    drop(client);
+    shutdown.cancel();
+    server_task.await??;
+    Ok(())
+}
+
+#[tokio::test]
 async fn failed_authentication_is_rate_limited_per_peer_and_recovers_after_window()
 -> Result<(), Box<dyn Error>> {
     let pki = TestPki::generate()?;
@@ -566,8 +615,12 @@ async fn failed_authentication_is_rate_limited_per_peer_and_recovers_after_windo
     );
     drop(failed);
 
-    let tls = TlsClient::from_ca_file(&pki.ca_file, SERVER_NAME)?;
-    assert!(tls.connect(address).await.is_err());
+    let mut limited = FramedClient::connect(&pki, address).await?;
+    assert!(
+        begin_authentication(&mut limited, VERSION, "home-pc", &key)
+            .await
+            .is_err()
+    );
 
     sleep(Duration::from_millis(150)).await;
     let mut recovered = FramedClient::connect(&pki, address).await?;
@@ -586,8 +639,8 @@ async fn failed_authentication_is_rate_limited_per_peer_and_recovers_after_windo
 }
 
 #[tokio::test]
-async fn aborting_before_auth_rejection_is_written_still_consumes_the_peer_budget()
--> Result<(), Box<dyn Error>> {
+async fn fully_sent_auth_failure_remains_charged_after_abortive_close() -> Result<(), Box<dyn Error>>
+{
     let pki = TestPki::generate()?;
     let authorized_key = DeviceKeypair::from_secret_bytes([20; 32]);
     let unknown_key = DeviceKeypair::from_secret_bytes([21; 32]);
@@ -608,7 +661,7 @@ async fn aborting_before_auth_rejection_is_written_still_consumes_the_peer_budge
     let mut failed = FramedClient::connect(&pki, address).await?;
     let challenge = begin_authentication(&mut failed, VERSION, "unknown-pc", &unknown_key).await?;
     failed
-        .abort_after_send(
+        .abort_after_response(
             VERSION,
             authentication_message(
                 &challenge,
@@ -621,8 +674,12 @@ async fn aborting_before_auth_rejection_is_written_still_consumes_the_peer_budge
         .await?;
     sleep(Duration::from_millis(100)).await;
 
-    let tls = TlsClient::from_ca_file(&pki.ca_file, SERVER_NAME)?;
-    assert!(tls.connect(address).await.is_err());
+    let mut limited = FramedClient::connect(&pki, address).await?;
+    assert!(
+        begin_authentication(&mut limited, VERSION, "home-pc", &authorized_key)
+            .await
+            .is_err()
+    );
 
     shutdown.cancel();
     server_task.await??;
