@@ -9,15 +9,17 @@ use rustgo_transport::TlsServer;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::{OwnedSemaphorePermit, mpsc};
 
 use crate::{
     auth::{AuthAttemptReservation, Authenticator, FailedAuthLimiter, TlsHandshakePermit},
-    registry::ClientRegistry,
+    registry::{ClientRegistry, ControlSessionGuard},
+    tcp,
 };
 
 pub(crate) const SERVER_VERSION: ProtocolVersion = ProtocolVersion::new(1, 0);
 const MAX_CONTROL_PAYLOAD: usize = 70 * 1024;
+const CONTROL_COMMAND_CAPACITY: usize = 1024;
 
 pub(crate) struct ControlContext {
     tls_server: Arc<TlsServer>,
@@ -61,23 +63,33 @@ pub(crate) async fn serve_connection(
     let stream = tokio::time::timeout_at(handshake_deadline, context.tls_server.handshake(socket))
         .await
         .map_err(|_| ControlError::HandshakeTimeout)??;
+    let mut framed = FramedControl::new(stream);
+    let first_frame = tokio::time::timeout_at(handshake_deadline, framed.receive())
+        .await
+        .map_err(|_| ControlError::HandshakeTimeout)??;
+    if let Message::DataChannelBind(request) = first_frame.message {
+        drop(unauthenticated_permit);
+        drop(tls_peer_permit);
+        return tcp::serve_data_connection(context.registry, framed, first_frame.version, request)
+            .await
+            .map_err(Into::into);
+    }
+    let Message::ClientHello(hello) = first_frame.message else {
+        return Err(ControlError::InvalidState);
+    };
     let Some(mut auth_attempt) = context.limiter.reserve(peer.ip()) else {
         return Ok(());
     };
-    let mut framed = FramedControl::new(stream);
+    let (outbound, mut outbound_rx) = mpsc::channel(CONTROL_COMMAND_CAPACITY);
     let authenticated = tokio::time::timeout_at(handshake_deadline, async {
         let mut state = ClientHandshakeState::new();
-        let hello_frame = framed.receive().await?;
-        let negotiated = match SERVER_VERSION.negotiate(hello_frame.version) {
+        let negotiated = match SERVER_VERSION.negotiate(first_frame.version) {
             Ok(version) => version,
             Err(code) => {
                 auth_attempt.fail();
                 framed.send(SERVER_VERSION, protocol_error(code)).await?;
                 return Ok(None);
             }
-        };
-        let Message::ClientHello(hello) = hello_frame.message else {
-            return Err(ControlError::InvalidState);
         };
         if hello.heartbeat_interval_secs == 0
             || u64::from(hello.heartbeat_interval_secs) >= context.heartbeat_timeout.as_secs()
@@ -107,7 +119,12 @@ pub(crate) async fn serve_connection(
         } else {
             None
         };
-        let guard = identity.and_then(|identity| context.registry.claim(identity).ok());
+        let guard = identity.and_then(|identity| {
+            context
+                .registry
+                .claim_with_outbound(identity, outbound.clone())
+                .ok()
+        });
         let accepted = guard.is_some();
         let result = Message::AuthResult(AuthResult {
             accepted,
@@ -145,25 +162,77 @@ pub(crate) async fn serve_connection(
         .send(negotiated, Message::TunnelResults(results))
         .await?;
 
+    tracing::info!(client = %guard.identity().name(), listeners = guard.listener_count(), "event=registration_ready server tunnel registration ready");
+    let result = run_active_control(
+        &mut framed,
+        &mut guard,
+        &mut state,
+        negotiated,
+        context.heartbeat_timeout,
+        &mut outbound_rx,
+    )
+    .await;
+    guard.shutdown().await;
+    result
+}
+
+async fn run_active_control<S>(
+    framed: &mut FramedControl<S>,
+    guard: &mut ControlSessionGuard,
+    state: &mut ClientHandshakeState,
+    negotiated: ProtocolVersion,
+    heartbeat_timeout: Duration,
+    outbound: &mut mpsc::Receiver<Message>,
+) -> Result<(), ControlError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let heartbeat_deadline = tokio::time::sleep(heartbeat_timeout);
+    tokio::pin!(heartbeat_deadline);
     loop {
-        let frame = tokio::time::timeout(context.heartbeat_timeout, framed.receive())
-            .await
-            .map_err(|_| ControlError::HeartbeatTimeout)??;
-        if frame.version != negotiated {
-            return Err(ControlError::InvalidState);
-        }
-        match frame.message {
-            Message::Heartbeat(heartbeat) => {
-                let acknowledgement = Message::Heartbeat(heartbeat);
-                state = state.transition(&acknowledgement)?;
-                tokio::time::timeout(
-                    context.heartbeat_timeout,
-                    framed.send(negotiated, acknowledgement),
-                )
-                .await
-                .map_err(|_| ControlError::HeartbeatTimeout)??;
+        tokio::select! {
+            biased;
+            () = &mut heartbeat_deadline => return Err(ControlError::HeartbeatTimeout),
+            outbound_message = outbound.recv() => {
+                let Some(message) = outbound_message else {
+                    return Err(ControlError::Closed);
+                };
+                *state = state.transition(&message)?;
+                let write = framed.send(negotiated, message);
+                tokio::select! {
+                    biased;
+                    () = &mut heartbeat_deadline => return Err(ControlError::HeartbeatTimeout),
+                    result = write => result?,
+                }
             }
-            _ => return Err(ControlError::InvalidState),
+            frame = framed.receive() => {
+                let frame = frame?;
+                if frame.version != negotiated {
+                    return Err(ControlError::InvalidState);
+                }
+                match frame.message {
+                    Message::Heartbeat(heartbeat) => {
+                        let acknowledgement = Message::Heartbeat(heartbeat);
+                        *state = state.transition(&acknowledgement)?;
+                        let write = framed.send(negotiated, acknowledgement);
+                        tokio::select! {
+                            biased;
+                            () = &mut heartbeat_deadline => return Err(ControlError::HeartbeatTimeout),
+                            result = write => result?,
+                        }
+                        heartbeat_deadline.as_mut().reset(
+                            tokio::time::Instant::now()
+                                .checked_add(heartbeat_timeout)
+                                .ok_or(ControlError::HeartbeatTimeout)?,
+                        );
+                    }
+                    Message::TcpStreamReady(ready) if !ready.accepted => {
+                        *state = state.transition(&Message::TcpStreamReady(ready.clone()))?;
+                        guard.reject_tcp(ready.connection_id);
+                    }
+                    _ => return Err(ControlError::InvalidState),
+                }
+            }
         }
     }
 }
@@ -194,7 +263,7 @@ where
     framed.send(version, result).await
 }
 
-struct FramedControl<S> {
+pub(crate) struct FramedControl<S> {
     stream: S,
     read_buffer: BytesMut,
     codec: FrameCodec,
@@ -204,7 +273,7 @@ impl<S> FramedControl<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    fn new(stream: S) -> Self {
+    pub(crate) fn new(stream: S) -> Self {
         Self {
             stream,
             read_buffer: BytesMut::new(),
@@ -212,7 +281,7 @@ where
         }
     }
 
-    async fn receive(&mut self) -> Result<Frame, ControlError> {
+    pub(crate) async fn receive(&mut self) -> Result<Frame, ControlError> {
         loop {
             if let Some(frame) = self.codec.decode(&mut self.read_buffer)? {
                 return Ok(frame);
@@ -226,7 +295,7 @@ where
         }
     }
 
-    async fn send(
+    pub(crate) async fn send(
         &mut self,
         version: ProtocolVersion,
         message: Message,
@@ -234,6 +303,18 @@ where
         let frame = self.codec.encode(version, 0, &message)?;
         self.stream.write_all(&frame).await?;
         Ok(())
+    }
+
+    pub(crate) fn is_buffer_empty(&self) -> bool {
+        self.read_buffer.is_empty()
+    }
+
+    pub(crate) fn into_stream(self) -> Result<S, ControlError> {
+        if self.read_buffer.is_empty() {
+            Ok(self.stream)
+        } else {
+            Err(ControlError::InvalidState)
+        }
     }
 }
 

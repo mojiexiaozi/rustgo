@@ -8,8 +8,8 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    ChildSessionSupervisor, ClientError, ControlClient, NoopChildSessionSupervisor,
-    RegisteredTunnel, SessionGeneration,
+    ChildSessionSupervisor, ClientError, ControlClient, RegisteredTunnel, SessionGeneration,
+    tcp::TcpSessionSupervisor,
 };
 
 const INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(1);
@@ -86,11 +86,8 @@ impl ClientApp {
             stable_connection_reset_after: STABLE_CONNECTION_RESET_AFTER,
         })
         .map_err(|_| ClientError::InvalidConfiguration)?;
-        Ok(Self::with_runtime(
-            control,
-            backoff,
-            Arc::new(NoopChildSessionSupervisor),
-        ))
+        let supervisor = Arc::new(TcpSessionSupervisor::new(&control));
+        Ok(Self::with_runtime(control, backoff, supervisor))
     }
 
     pub fn with_runtime<B>(
@@ -148,6 +145,10 @@ impl ClientApp {
                             registered_tunnels: session.registered_tunnels_shared(),
                         }),
                     });
+                    tracing::info!(
+                        generation = generation.get(),
+                        "event=registration_ready client tunnel registration ready"
+                    );
                     let status = self.status.clone();
                     let supervisor = self.supervisor.clone();
                     let backoff = &mut self.backoff;

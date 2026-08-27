@@ -2,10 +2,11 @@ use bytes::BytesMut;
 use proptest::prelude::*;
 use rustgo_protocol::{
     AuthResult, BoundedBytes, BoundedString, BoundedVec, ClientAuthenticate, ClientHello,
-    ErrorMessage, FrameCodec, FrameError, HEADER_LEN, Heartbeat, MAGIC, MAX_BINDING_TOKEN_BYTES,
-    MAX_UDP_PAYLOAD_BYTES, Message, MessageId, OpenTcpStream, OpenUdpChannel, ProtocolErrorCode,
-    ProtocolVersion, RegisterTunnels, ServerChallenge, SocketAddress, TcpStreamReady,
-    TunnelProtocol, TunnelRegistration, TunnelResult, TunnelResults, UDP_METADATA_LEN, UdpDatagram,
+    DataChannelBind, DataChannelKind, ErrorMessage, FrameCodec, FrameError, HEADER_LEN, Heartbeat,
+    MAGIC, MAX_BINDING_TOKEN_BYTES, MAX_UDP_PAYLOAD_BYTES, Message, MessageId, OpenTcpStream,
+    OpenUdpChannel, ProtocolErrorCode, ProtocolVersion, RegisterTunnels, ServerChallenge,
+    SocketAddress, TcpStreamReady, TunnelProtocol, TunnelRegistration, TunnelResult, TunnelResults,
+    UDP_METADATA_LEN, UdpDatagram,
 };
 
 const VERSION: ProtocolVersion = ProtocolVersion::new(1, 7);
@@ -87,6 +88,14 @@ fn messages() -> Vec<Message> {
             channel_id: 9002,
             binding_token: bytes(&[0x77; MAX_BINDING_TOKEN_BYTES]),
         }),
+        Message::DataChannelBind(DataChannelBind {
+            client_name: text("home-pc"),
+            session_id: bytes(&[0x88; 32]),
+            kind: DataChannelKind::TCP,
+            tunnel_id: 41,
+            target_id: 9001,
+            binding_token: bytes(&[0x99; MAX_BINDING_TOKEN_BYTES]),
+        }),
     ]
 }
 
@@ -136,6 +145,37 @@ fn message_ids_are_explicit_and_stable() {
     assert_eq!(MessageId::HEARTBEAT.as_u16(), 10);
     assert_eq!(MessageId::ERROR.as_u16(), 11);
     assert_eq!(MessageId::OPEN_UDP_CHANNEL.as_u16(), 12);
+    assert_eq!(MessageId::DATA_CHANNEL_BIND.as_u16(), 13);
+}
+
+#[test]
+fn tls_data_channel_has_an_explicit_first_frame_message_id() {
+    assert_eq!(MessageId::try_from(13).map(MessageId::as_u16), Ok(13));
+}
+
+#[test]
+fn data_channel_bind_first_frame_decodes_from_its_stable_wire_shape() {
+    let payload = [1, b'a', 1, 2, 1, 1, 1, 1, 3];
+    let mut encoded = Vec::from(MAGIC);
+    encoded.extend_from_slice(&1_u16.to_be_bytes());
+    encoded.extend_from_slice(&0_u16.to_be_bytes());
+    encoded.extend_from_slice(&13_u16.to_be_bytes());
+    encoded.extend_from_slice(&0_u16.to_be_bytes());
+    encoded.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    encoded.extend_from_slice(&payload);
+
+    let decoded = FrameCodec::new(4096).decode_exact(&encoded).unwrap();
+    assert_eq!(
+        decoded.message,
+        Message::DataChannelBind(DataChannelBind {
+            client_name: text("a"),
+            session_id: bytes(&[2]),
+            kind: DataChannelKind::TCP,
+            tunnel_id: 1,
+            target_id: 1,
+            binding_token: bytes(&[3]),
+        })
+    );
 }
 
 #[test]

@@ -124,6 +124,17 @@ impl ChannelBindingStore {
         Err(BindingError::EntropyUnavailable)
     }
 
+    /// Reports whether this session owns the presented token without changing it.
+    ///
+    /// Callers that multiplex many authenticated sessions use this only while
+    /// holding their session lock, immediately followed by [`Self::redeem`].
+    pub fn recognizes(&self, token: &[u8]) -> bool {
+        let Ok(token) = <[u8; BINDING_TOKEN_BYTES]>::try_from(token) else {
+            return false;
+        };
+        self.pending.contains_key(&token)
+    }
+
     /// Consumes a token and authenticates its complete control-session binding.
     pub fn redeem(
         &mut self,

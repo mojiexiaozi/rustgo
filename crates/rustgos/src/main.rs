@@ -30,6 +30,7 @@ enum Action {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    init_logging();
     match execute(Cli::parse()).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -38,6 +39,15 @@ async fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn init_logging() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_ansi(false)
+        .try_init();
 }
 
 async fn execute(cli: Cli) -> Result<(), CommandError> {

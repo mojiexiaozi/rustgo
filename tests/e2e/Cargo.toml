@@ -1,0 +1,11 @@
+[package]
+name = "rustgo-e2e"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+rcgen = "0.14.9"
+rustgo-crypto = { path = "../../crates/rustgo-crypto" }
+tempfile = "3.27.0"

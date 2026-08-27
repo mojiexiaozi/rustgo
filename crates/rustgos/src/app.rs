@@ -149,9 +149,12 @@ impl ServerApp {
             ),
         )
         .map_err(|_| ServerError::InvalidRuntimeLimits)?;
-        let registry = ClientRegistry::new(
+        let max_tcp_connections = usize::try_from(config.limits.max_tcp_connections_per_tunnel)
+            .map_err(|_| ServerError::InvalidRuntimeLimits)?;
+        let registry = ClientRegistry::new_with_tcp_limit(
             max_clients,
             max_tunnels,
+            max_tcp_connections,
             listener_ip,
             binding_capacity,
             runtime_limits.binding_token_ttl,

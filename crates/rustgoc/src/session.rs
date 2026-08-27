@@ -1,10 +1,13 @@
 use std::{future::Future, pin::Pin, sync::Arc};
 
+use rustgo_config::TunnelProtocol as ConfigTunnelProtocol;
 use rustgo_protocol::{Heartbeat, Message, OpenTcpStream, OpenUdpChannel};
-use tokio::{task::JoinSet, time::MissedTickBehavior};
+use tokio::{sync::mpsc, task::JoinSet, time::MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 
 use crate::{ClientError, ControlSession};
+
+const CHILD_CONTROL_CAPACITY: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SessionGeneration(u64);
@@ -32,6 +35,7 @@ pub enum ChildSessionRequest {
 pub struct ChildSessionContext {
     generation: SessionGeneration,
     session_id: Arc<[u8]>,
+    control_outbound: mpsc::Sender<Message>,
 }
 
 impl ChildSessionContext {
@@ -41,6 +45,14 @@ impl ChildSessionContext {
 
     pub fn session_id(&self) -> &[u8] {
         &self.session_id
+    }
+
+    pub(crate) async fn send_control(&self, message: Message, shutdown: &CancellationToken) {
+        tokio::select! {
+            biased;
+            () = shutdown.cancelled() => {}
+            _ = self.control_outbound.send(message) => {}
+        }
     }
 }
 
@@ -91,9 +103,11 @@ impl ControlSession {
     {
         let child_shutdown = CancellationToken::new();
         let mut children = JoinSet::new();
+        let (control_outbound, mut child_control) = mpsc::channel(CHILD_CONTROL_CAPACITY);
         let child_context = ChildSessionContext {
             generation,
             session_id: Arc::from(self.session_id.clone()),
+            control_outbound,
         };
         let result = self
             .run_control_loop(
@@ -102,6 +116,7 @@ impl ControlSession {
                 &child_shutdown,
                 &supervisor,
                 &mut children,
+                &mut child_control,
             )
             .await;
 
@@ -130,6 +145,7 @@ impl ControlSession {
         child_shutdown: &CancellationToken,
         supervisor: &Arc<dyn ChildSessionSupervisor>,
         children: &mut JoinSet<()>,
+        child_control: &mut mpsc::Receiver<Message>,
     ) -> Result<(), ClientError> {
         let heartbeat_timeout = self
             .heartbeat_interval
@@ -181,6 +197,24 @@ impl ControlSession {
                         return Err(ClientError::TaskJoin);
                     }
                 }
+                child_message = child_control.recv() => {
+                    let Some(message) = child_message else {
+                        return Err(ClientError::InvalidState);
+                    };
+                    if !matches!(message, Message::TcpStreamReady(_)) {
+                        return Err(ClientError::InvalidState);
+                    }
+                    let write = self.framed.send(self.version, message);
+                    let result = tokio::select! {
+                        biased;
+                        () = shutdown.cancelled() => return Ok(()),
+                        () = &mut heartbeat_deadline => {
+                            return Err(ClientError::HeartbeatTimeout);
+                        }
+                        result = tokio::time::timeout(self.heartbeat_interval, write) => result,
+                    };
+                    result.map_err(|_| ClientError::ControlWriteTimeout)??;
+                }
                 frame = self.framed.receive() => {
                     let frame = frame?;
                     if frame.version != self.version {
@@ -200,7 +234,10 @@ impl ControlSession {
                             heartbeat_deadline.as_mut().reset(next_deadline);
                         }
                         Message::OpenTcpStream(request) => {
-                            self.ensure_accepted_tunnel(request.tunnel_id)?;
+                            self.ensure_accepted_tunnel(
+                                request.tunnel_id,
+                                ConfigTunnelProtocol::Tcp,
+                            )?;
                             children.spawn(supervisor.run_child(
                                 child_context.clone(),
                                 ChildSessionRequest::Tcp(request),
@@ -208,7 +245,10 @@ impl ControlSession {
                             ));
                         }
                         Message::OpenUdpChannel(request) => {
-                            self.ensure_accepted_tunnel(request.tunnel_id)?;
+                            self.ensure_accepted_tunnel(
+                                request.tunnel_id,
+                                ConfigTunnelProtocol::Udp,
+                            )?;
                             children.spawn(supervisor.run_child(
                                 child_context.clone(),
                                 ChildSessionRequest::Udp(request),
@@ -223,12 +263,14 @@ impl ControlSession {
         }
     }
 
-    fn ensure_accepted_tunnel(&self, tunnel_id: u32) -> Result<(), ClientError> {
-        if self
-            .registered_tunnels()
-            .iter()
-            .any(|tunnel| tunnel.tunnel_id() == tunnel_id && tunnel.accepted())
-        {
+    fn ensure_accepted_tunnel(
+        &self,
+        tunnel_id: u32,
+        protocol: ConfigTunnelProtocol,
+    ) -> Result<(), ClientError> {
+        if self.registered_tunnels().iter().any(|tunnel| {
+            tunnel.tunnel_id() == tunnel_id && tunnel.protocol() == protocol && tunnel.accepted()
+        }) {
             Ok(())
         } else {
             Err(ClientError::InvalidState)
@@ -293,6 +335,42 @@ mod tests {
 
     fn token(marker: u8) -> BoundedBytes<MAX_BINDING_TOKEN_BYTES> {
         BoundedBytes::try_from([marker; MAX_BINDING_TOKEN_BYTES].as_slice()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn wrong_child_kind_is_rejected_before_supervisor_admission() {
+        let (client_stream, server_stream) = duplex(16 * 1024);
+        let mut peer = FramedControl::new(server_stream);
+        let session = ControlSession::new(
+            FramedControl::new(client_stream),
+            CLIENT_VERSION,
+            vec![0x41; 32],
+            Duration::from_secs(1),
+            Arc::from([RegisteredTunnel::accepted_for_test(1)]),
+        );
+        let supervisor = CountingSupervisor::default();
+        let requested = supervisor.requested.clone();
+        let runtime = tokio::spawn(session.run_generation(
+            SessionGeneration(1),
+            CancellationToken::new(),
+            Arc::new(supervisor),
+            || {},
+        ));
+
+        peer.send(
+            CLIENT_VERSION,
+            Message::OpenUdpChannel(OpenUdpChannel {
+                tunnel_id: 1,
+                channel_id: 7,
+                binding_token: token(0x42),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let result = tokio::time::timeout(Duration::from_millis(100), runtime).await;
+        assert!(matches!(result, Ok(Ok(Err(ClientError::InvalidState)))));
+        assert_eq!(requested.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test(start_paused = true)]

@@ -5,21 +5,32 @@ use std::{
     time::Duration,
 };
 
+use rand::{TryRngCore, rngs::OsRng};
 use rustgo_protocol::{
-    BoundedBytes, BoundedVec, MAX_BINDING_TOKEN_BYTES, MAX_TUNNELS, ProtocolErrorCode,
-    RegisterTunnels, TunnelProtocol, TunnelResult, TunnelResults,
+    BoundedBytes, BoundedVec, DataChannelBind, DataChannelKind, MAX_BINDING_TOKEN_BYTES,
+    MAX_TUNNELS, Message, ProtocolErrorCode, RegisterTunnels, TunnelProtocol, TunnelResult,
+    TunnelResults,
 };
 use rustgo_transport::{BindingError, ChannelBinding, ChannelBindingStore, ChannelKind};
 use thiserror::Error;
-use tokio::net::{TcpListener, UdpSocket};
+use tokio::{
+    net::{TcpListener, TcpStream, UdpSocket},
+    sync::{mpsc, oneshot},
+};
+use tokio_rustls::server::TlsStream;
+use tokio_util::sync::CancellationToken;
 
-use crate::AuthenticatedClient;
+use crate::{AuthenticatedClient, tcp::TcpListenerTask};
+
+const MAX_CONNECTION_ID_ATTEMPTS: usize = 16;
+type ServerDataStream = TlsStream<TcpStream>;
 
 #[derive(Clone)]
 pub struct ClientRegistry {
     inner: Arc<Mutex<RegistryState>>,
     max_clients: usize,
     max_tunnels_per_client: usize,
+    max_tcp_connections_per_tunnel: usize,
     listener_ip: IpAddr,
     binding_capacity: usize,
     binding_ttl: Duration,
@@ -33,6 +44,7 @@ struct RegistryState {
 struct ActiveSession {
     name: String,
     session_id: Vec<u8>,
+    runtime: Arc<SessionRuntime>,
 }
 
 impl std::fmt::Debug for ClientRegistry {
@@ -41,12 +53,17 @@ impl std::fmt::Debug for ClientRegistry {
             .debug_struct("ClientRegistry")
             .field("max_clients", &self.max_clients)
             .field("max_tunnels_per_client", &self.max_tunnels_per_client)
+            .field(
+                "max_tcp_connections_per_tunnel",
+                &self.max_tcp_connections_per_tunnel,
+            )
             .field("listener_ip", &self.listener_ip)
             .finish_non_exhaustive()
     }
 }
 
 impl ClientRegistry {
+    #[cfg(test)]
     pub(crate) fn new(
         max_clients: usize,
         max_tunnels_per_client: usize,
@@ -54,8 +71,27 @@ impl ClientRegistry {
         binding_capacity: usize,
         binding_ttl: Duration,
     ) -> Result<Self, RegistryError> {
+        Self::new_with_tcp_limit(
+            max_clients,
+            max_tunnels_per_client,
+            1,
+            listener_ip,
+            binding_capacity,
+            binding_ttl,
+        )
+    }
+
+    pub(crate) fn new_with_tcp_limit(
+        max_clients: usize,
+        max_tunnels_per_client: usize,
+        max_tcp_connections_per_tunnel: usize,
+        listener_ip: IpAddr,
+        binding_capacity: usize,
+        binding_ttl: Duration,
+    ) -> Result<Self, RegistryError> {
         if max_clients == 0
             || max_tunnels_per_client == 0
+            || max_tcp_connections_per_tunnel == 0
             || binding_capacity == 0
             || binding_ttl.is_zero()
         {
@@ -65,6 +101,7 @@ impl ClientRegistry {
             inner: Arc::new(Mutex::new(RegistryState::default())),
             max_clients,
             max_tunnels_per_client,
+            max_tcp_connections_per_tunnel,
             listener_ip,
             binding_capacity,
             binding_ttl,
@@ -81,10 +118,34 @@ impl ClientRegistry {
             .is_ok_and(|state| state.active.contains_key(fingerprint))
     }
 
+    #[cfg(test)]
     pub(crate) fn claim(
         &self,
         identity: AuthenticatedClient,
     ) -> Result<ControlSessionGuard, RegistryError> {
+        let (outbound, receiver) = mpsc::channel(1);
+        drop(receiver);
+        self.claim_with_outbound(identity, outbound)
+    }
+
+    pub(crate) fn claim_with_outbound(
+        &self,
+        identity: AuthenticatedClient,
+        outbound: mpsc::Sender<Message>,
+    ) -> Result<ControlSessionGuard, RegistryError> {
+        let binding_store = ChannelBindingStore::new(
+            identity.name(),
+            identity.session_id(),
+            self.binding_capacity,
+            self.binding_ttl,
+        )?;
+        let runtime = Arc::new(SessionRuntime {
+            binding_store: Mutex::new(binding_store),
+            pending_tcp: Mutex::new(HashMap::new()),
+            outbound,
+            cancellation: CancellationToken::new(),
+            binding_ttl: self.binding_ttl,
+        });
         {
             let mut state = self.inner.lock().map_err(|_| RegistryError::Internal)?;
             if state.active.contains_key(identity.fingerprint())
@@ -103,31 +164,47 @@ impl ClientRegistry {
                 ActiveSession {
                     name: identity.name().to_owned(),
                     session_id: identity.session_id().to_vec(),
+                    runtime: runtime.clone(),
                 },
             );
         }
 
-        let binding_store = match ChannelBindingStore::new(
-            identity.name(),
-            identity.session_id(),
-            self.binding_capacity,
-            self.binding_ttl,
-        ) {
-            Ok(store) => store,
-            Err(error) => {
-                self.release(&identity);
-                return Err(RegistryError::Binding(error));
-            }
-        };
         Ok(ControlSessionGuard {
             registry: self.clone(),
             identity,
+            runtime,
             listeners: Vec::new(),
             tunnel_ids: HashMap::new(),
             tunnel_names: HashSet::new(),
-            binding_store: Some(binding_store),
             data_channels: Vec::new(),
         })
+    }
+
+    pub(crate) fn authenticate_data_channel(
+        &self,
+        stream: ServerDataStream,
+        request: &DataChannelBind,
+    ) -> Result<AuthenticatedDataChannel, RegistryError> {
+        let runtimes = self
+            .inner
+            .lock()
+            .map_err(|_| RegistryError::Internal)?
+            .active
+            .values()
+            .map(|active| active.runtime.clone())
+            .collect::<Vec<_>>();
+        for runtime in runtimes {
+            if let Some(result) = runtime.redeem_if_present(request) {
+                let (binding, destination) = result?;
+                return Ok(AuthenticatedDataChannel {
+                    stream: Some(stream),
+                    binding,
+                    destination: Some(destination),
+                    cancellation: runtime.cancellation(),
+                });
+            }
+        }
+        Err(RegistryError::Binding(BindingError::Rejected))
     }
 
     fn release(&self, identity: &AuthenticatedClient) {
@@ -146,13 +223,179 @@ impl ClientRegistry {
     }
 }
 
+pub(crate) struct PendingTcpOpen {
+    pub(crate) connection_id: u64,
+    pub(crate) binding_token: BoundedBytes<MAX_BINDING_TOKEN_BYTES>,
+    pub(crate) data_channel: oneshot::Receiver<ServerDataStream>,
+}
+
+struct PendingTcp {
+    channel_kind: ChannelKind,
+    destination: oneshot::Sender<ServerDataStream>,
+}
+
+pub(crate) struct SessionRuntime {
+    binding_store: Mutex<ChannelBindingStore>,
+    pending_tcp: Mutex<HashMap<u64, PendingTcp>>,
+    outbound: mpsc::Sender<Message>,
+    cancellation: CancellationToken,
+    binding_ttl: Duration,
+}
+
+impl SessionRuntime {
+    pub(crate) fn cancellation(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+
+    pub(crate) const fn binding_ttl(&self) -> Duration {
+        self.binding_ttl
+    }
+
+    pub(crate) fn outbound(&self) -> mpsc::Sender<Message> {
+        self.outbound.clone()
+    }
+
+    pub(crate) fn prepare_tcp(&self, tunnel_id: u32) -> Result<PendingTcpOpen, RegistryError> {
+        for _ in 0..MAX_CONNECTION_ID_ATTEMPTS {
+            let connection_id = OsRng
+                .try_next_u64()
+                .map_err(|_| RegistryError::EntropyUnavailable)?;
+            if connection_id == 0 {
+                continue;
+            }
+            let channel_kind = ChannelKind::Tcp {
+                tunnel_id,
+                connection_id,
+            };
+            let (destination, data_channel) = oneshot::channel();
+            {
+                let mut pending = self
+                    .pending_tcp
+                    .lock()
+                    .map_err(|_| RegistryError::Internal)?;
+                if pending.contains_key(&connection_id) {
+                    continue;
+                }
+                pending.insert(
+                    connection_id,
+                    PendingTcp {
+                        channel_kind,
+                        destination,
+                    },
+                );
+            }
+            let binding_token = match self
+                .binding_store
+                .lock()
+                .map_err(|_| RegistryError::Internal)?
+                .issue(channel_kind)
+            {
+                Ok(token) => token,
+                Err(error) => {
+                    self.cancel_pending(connection_id);
+                    return Err(error.into());
+                }
+            };
+            return Ok(PendingTcpOpen {
+                connection_id,
+                binding_token,
+                data_channel,
+            });
+        }
+        Err(RegistryError::EntropyUnavailable)
+    }
+
+    pub(crate) fn cancel_pending(&self, connection_id: u64) {
+        if let Ok(mut pending) = self.pending_tcp.lock() {
+            pending.remove(&connection_id);
+        }
+    }
+
+    fn redeem_if_present(
+        &self,
+        request: &DataChannelBind,
+    ) -> Option<Result<(ChannelBinding, oneshot::Sender<ServerDataStream>), RegistryError>> {
+        let channel_kind = if request.kind == DataChannelKind::TCP {
+            ChannelKind::Tcp {
+                tunnel_id: request.tunnel_id,
+                connection_id: request.target_id,
+            }
+        } else {
+            ChannelKind::Udp {
+                tunnel_id: request.tunnel_id,
+                channel_id: request.target_id,
+            }
+        };
+        let mut store = match self.binding_store.lock() {
+            Ok(store) => store,
+            Err(_) => return Some(Err(RegistryError::Internal)),
+        };
+        if !store.recognizes(request.binding_token.as_slice()) {
+            return None;
+        }
+        let binding = match store.redeem(
+            request.client_name.as_str(),
+            request.session_id.as_slice(),
+            channel_kind,
+            request.binding_token.as_slice(),
+        ) {
+            Ok(binding) => binding,
+            Err(error) => return Some(Err(error.into())),
+        };
+        drop(store);
+        let pending = match self.pending_tcp.lock() {
+            Ok(mut pending) => pending.remove(&request.target_id),
+            Err(_) => return Some(Err(RegistryError::Internal)),
+        };
+        let Some(pending) = pending else {
+            return Some(Err(RegistryError::Binding(BindingError::Rejected)));
+        };
+        if pending.channel_kind != channel_kind {
+            return Some(Err(RegistryError::Binding(BindingError::Rejected)));
+        }
+        Some(Ok((binding, pending.destination)))
+    }
+
+    fn issue(
+        &self,
+        channel_kind: ChannelKind,
+    ) -> Result<BoundedBytes<MAX_BINDING_TOKEN_BYTES>, RegistryError> {
+        self.binding_store
+            .lock()
+            .map_err(|_| RegistryError::Internal)?
+            .issue(channel_kind)
+            .map_err(RegistryError::Binding)
+    }
+
+    fn redeem(
+        &self,
+        presented_client: &str,
+        presented_session_id: &[u8],
+        channel_kind: ChannelKind,
+        token: &[u8],
+    ) -> Result<ChannelBinding, RegistryError> {
+        self.binding_store
+            .lock()
+            .map_err(|_| RegistryError::Internal)?
+            .redeem(presented_client, presented_session_id, channel_kind, token)
+            .map_err(RegistryError::Binding)
+    }
+
+    fn cancel(&self) {
+        self.cancellation.cancel();
+        if let Ok(mut pending) = self.pending_tcp.lock() {
+            pending.clear();
+        }
+    }
+}
+
 pub struct ControlSessionGuard {
     registry: ClientRegistry,
     identity: AuthenticatedClient,
+    runtime: Arc<SessionRuntime>,
     listeners: Vec<ListenerLease>,
     tunnel_ids: HashMap<u32, TunnelProtocol>,
     tunnel_names: HashSet<String>,
-    binding_store: Option<ChannelBindingStore>,
     data_channels: Vec<AuthenticatedDataChannel>,
 }
 
@@ -186,14 +429,19 @@ impl ControlSessionGuard {
             {
                 false
             } else {
-                self.bind_listener(tunnel.protocol, tunnel.remote_port)
-                    .await
-                    .is_ok_and(|lease| {
-                        self.tunnel_ids.insert(tunnel.tunnel_id, tunnel.protocol);
-                        self.tunnel_names.insert(tunnel.name.as_str().to_owned());
-                        self.listeners.push(lease);
-                        true
-                    })
+                self.bind_listener(
+                    tunnel.tunnel_id,
+                    tunnel.name.as_str(),
+                    tunnel.protocol,
+                    tunnel.remote_port,
+                )
+                .await
+                .is_ok_and(|lease| {
+                    self.tunnel_ids.insert(tunnel.tunnel_id, tunnel.protocol);
+                    self.tunnel_names.insert(tunnel.name.as_str().to_owned());
+                    self.listeners.push(lease);
+                    true
+                })
             };
             results.push(TunnelResult {
                 tunnel_id: tunnel.tunnel_id,
@@ -205,6 +453,10 @@ impl ControlSessionGuard {
             results: BoundedVec::<TunnelResult, MAX_TUNNELS>::try_from(results)
                 .expect("wire request already enforces the tunnel count bound"),
         }
+    }
+
+    pub fn reject_tcp(&self, connection_id: u64) {
+        self.runtime.cancel_pending(connection_id);
     }
 
     pub fn issue_data_channel_binding(
@@ -221,34 +473,26 @@ impl ControlSessionGuard {
         if self.tunnel_ids.get(&tunnel_id) != Some(&required) {
             return Err(RegistryError::UnknownTunnel);
         }
-        self.binding_store
-            .as_mut()
-            .ok_or(RegistryError::Internal)?
-            .issue(channel_kind)
-            .map_err(RegistryError::Binding)
+        self.runtime.issue(channel_kind)
     }
 
     /// Redeems a one-time binding only while consuming an established TLS data stream.
-    ///
-    /// There is intentionally no Rustgos API that redeems a token from a plaintext socket or
-    /// from token bytes alone. Payload relay is supplied by Tasks 8 and 9.
     pub fn authenticate_data_channel(
         &mut self,
-        stream: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+        stream: ServerDataStream,
         presented_client: &str,
         presented_session_id: &[u8],
         channel_kind: ChannelKind,
         token: &[u8],
     ) -> Result<&AuthenticatedDataChannel, RegistryError> {
-        let binding = self
-            .binding_store
-            .as_mut()
-            .ok_or(RegistryError::Internal)?
-            .redeem(presented_client, presented_session_id, channel_kind, token)
-            .map_err(RegistryError::Binding)?;
+        let binding =
+            self.runtime
+                .redeem(presented_client, presented_session_id, channel_kind, token)?;
         self.data_channels.push(AuthenticatedDataChannel {
-            _stream: stream,
+            stream: Some(stream),
             binding,
+            destination: None,
+            cancellation: self.runtime.cancellation(),
         });
         Ok(self
             .data_channels
@@ -256,14 +500,31 @@ impl ControlSessionGuard {
             .expect("a data channel was just inserted"))
     }
 
+    pub async fn shutdown(&mut self) {
+        self.runtime.cancel();
+        for listener in &mut self.listeners {
+            listener.shutdown().await;
+        }
+        self.data_channels.clear();
+    }
+
     async fn bind_listener(
         &self,
+        tunnel_id: u32,
+        tunnel_name: &str,
         protocol: TunnelProtocol,
         port: u16,
     ) -> Result<ListenerLease, std::io::Error> {
         let address = SocketAddr::new(self.registry.listener_ip, port);
         if protocol == TunnelProtocol::TCP {
-            TcpListener::bind(address).await.map(ListenerLease::Tcp)
+            let listener = TcpListener::bind(address).await?;
+            Ok(ListenerLease::Tcp(TcpListenerTask::spawn(
+                listener,
+                tunnel_id,
+                tunnel_name.to_owned(),
+                self.runtime.clone(),
+                self.registry.max_tcp_connections_per_tunnel,
+            )))
         } else {
             UdpSocket::bind(address).await.map(ListenerLease::Udp)
         }
@@ -272,25 +533,30 @@ impl ControlSessionGuard {
 
 impl Drop for ControlSessionGuard {
     fn drop(&mut self) {
+        self.runtime.cancel();
         self.data_channels.clear();
         self.listeners.clear();
-        self.binding_store.take();
         self.registry.release(&self.identity);
     }
 }
 
 enum ListenerLease {
-    Tcp(TcpListener),
+    Tcp(TcpListenerTask),
     Udp(UdpSocket),
+}
+
+impl ListenerLease {
+    async fn shutdown(&mut self) {
+        if let Self::Tcp(listener) = self {
+            listener.shutdown().await;
+        }
+    }
 }
 
 impl std::fmt::Debug for ListenerLease {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Tcp(listener) => formatter
-                .debug_tuple("Tcp")
-                .field(&listener.local_addr().ok())
-                .finish(),
+            Self::Tcp(listener) => formatter.debug_tuple("Tcp").field(listener).finish(),
             Self::Udp(socket) => formatter
                 .debug_tuple("Udp")
                 .field(&socket.local_addr().ok())
@@ -300,13 +566,32 @@ impl std::fmt::Debug for ListenerLease {
 }
 
 pub struct AuthenticatedDataChannel {
-    _stream: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+    stream: Option<ServerDataStream>,
     binding: ChannelBinding,
+    destination: Option<oneshot::Sender<ServerDataStream>>,
+    cancellation: CancellationToken,
 }
 
 impl AuthenticatedDataChannel {
     pub fn binding(&self) -> &ChannelBinding {
         &self.binding
+    }
+
+    pub(crate) fn stream_mut(&mut self) -> Result<&mut ServerDataStream, RegistryError> {
+        self.stream.as_mut().ok_or(RegistryError::Internal)
+    }
+
+    pub(crate) fn cancellation(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+
+    pub(crate) fn deliver(mut self) -> Result<(), RegistryError> {
+        let stream = self.stream.take().ok_or(RegistryError::Internal)?;
+        self.destination
+            .take()
+            .ok_or(RegistryError::Internal)?
+            .send(stream)
+            .map_err(|_| RegistryError::Binding(BindingError::Rejected))
     }
 }
 
@@ -322,6 +607,8 @@ pub enum RegistryError {
     UnknownTunnel,
     #[error("channel binding failed: {0}")]
     Binding(#[from] BindingError),
+    #[error("secure connection ID entropy is unavailable")]
+    EntropyUnavailable,
     #[error("internal registry failure")]
     Internal,
 }
@@ -334,7 +621,10 @@ mod tests {
         BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
         KeyUsagePurpose,
     };
-    use rustgo_protocol::TunnelProtocol;
+    use rustgo_protocol::{
+        BoundedBytes, BoundedString, DataChannelBind, DataChannelKind, MAX_BINDING_TOKEN_BYTES,
+        MAX_CLIENT_NAME_BYTES, MAX_SESSION_ID_BYTES, TunnelProtocol,
+    };
     use rustgo_transport::{ChannelKind, TlsClient, TlsServer};
     use tempfile::TempDir;
     use tokio::io::AsyncReadExt;
@@ -343,6 +633,24 @@ mod tests {
     use crate::AuthenticatedClient;
 
     const SERVER_NAME: &str = "data.example.test";
+
+    fn bind_request(
+        client: &str,
+        session_id: &[u8],
+        kind: DataChannelKind,
+        tunnel_id: u32,
+        target_id: u64,
+        token: &[u8],
+    ) -> DataChannelBind {
+        DataChannelBind {
+            client_name: BoundedString::<MAX_CLIENT_NAME_BYTES>::try_from(client).unwrap(),
+            session_id: BoundedBytes::<MAX_SESSION_ID_BYTES>::try_from(session_id).unwrap(),
+            kind,
+            tunnel_id,
+            target_id,
+            binding_token: BoundedBytes::<MAX_BINDING_TOKEN_BYTES>::try_from(token).unwrap(),
+        }
+    }
 
     struct TestPki {
         _directory: TempDir,
@@ -447,5 +755,145 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(1), client_stream.read(&mut byte)).await;
         assert!(matches!(read, Ok(Ok(0)) | Ok(Err(_))));
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn dispatcher_consumes_known_tokens_on_wrong_binding_fields_and_reuse()
+    -> Result<(), Box<dyn Error>> {
+        let pki = TestPki::generate()?;
+        let session_id = vec![3; 32];
+        let identity = AuthenticatedClient::verified(
+            "home-pc".to_owned(),
+            "sha256:test".to_owned(),
+            session_id.clone(),
+        );
+        let registry = ClientRegistry::new(
+            1,
+            1,
+            IpAddr::from([127, 0, 0, 1]),
+            16,
+            Duration::from_secs(30),
+        )?;
+        let mut guard = registry.claim(identity)?;
+        guard.tunnel_ids.insert(1, TunnelProtocol::TCP);
+        let tls_server =
+            TlsServer::bind("127.0.0.1:0", &pki.certificate_file, &pki.private_key_file).await?;
+        let address = tls_server.local_addr()?;
+        let tls_client = TlsClient::from_ca_file(&pki.ca_file, SERVER_NAME)?;
+
+        for case in 0..4 {
+            let pending = guard.runtime.prepare_tcp(1)?;
+            let correct = bind_request(
+                "home-pc",
+                &session_id,
+                DataChannelKind::TCP,
+                1,
+                pending.connection_id,
+                pending.binding_token.as_slice(),
+            );
+            let invalid = match case {
+                0 => bind_request(
+                    "other-client",
+                    &session_id,
+                    DataChannelKind::TCP,
+                    1,
+                    pending.connection_id,
+                    pending.binding_token.as_slice(),
+                ),
+                1 => bind_request(
+                    "home-pc",
+                    &[4; 32],
+                    DataChannelKind::TCP,
+                    1,
+                    pending.connection_id,
+                    pending.binding_token.as_slice(),
+                ),
+                2 => bind_request(
+                    "home-pc",
+                    &session_id,
+                    DataChannelKind::UDP,
+                    1,
+                    pending.connection_id,
+                    pending.binding_token.as_slice(),
+                ),
+                _ => bind_request(
+                    "home-pc",
+                    &session_id,
+                    DataChannelKind::TCP,
+                    1,
+                    pending.connection_id.wrapping_add(1),
+                    pending.binding_token.as_slice(),
+                ),
+            };
+            let (invalid_server, _invalid_client) =
+                tls_pair(&tls_server, &tls_client, address).await?;
+            assert!(
+                registry
+                    .authenticate_data_channel(invalid_server, &invalid)
+                    .is_err()
+            );
+            let (retry_server, _retry_client) = tls_pair(&tls_server, &tls_client, address).await?;
+            assert!(
+                registry
+                    .authenticate_data_channel(retry_server, &correct)
+                    .is_err()
+            );
+            guard.runtime.cancel_pending(pending.connection_id);
+        }
+
+        let pending = guard.runtime.prepare_tcp(1)?;
+        let correct = bind_request(
+            "home-pc",
+            &session_id,
+            DataChannelKind::TCP,
+            1,
+            pending.connection_id,
+            pending.binding_token.as_slice(),
+        );
+        let (first_server, _first_client) = tls_pair(&tls_server, &tls_client, address).await?;
+        let authenticated = registry.authenticate_data_channel(first_server, &correct)?;
+        drop(authenticated);
+        let (reused_server, _reused_client) = tls_pair(&tls_server, &tls_client, address).await?;
+        assert!(
+            registry
+                .authenticate_data_channel(reused_server, &correct)
+                .is_err()
+        );
+
+        let unknown = bind_request(
+            "home-pc",
+            &session_id,
+            DataChannelKind::TCP,
+            1,
+            99,
+            &[0x55; MAX_BINDING_TOKEN_BYTES],
+        );
+        let (unknown_server, _unknown_client) = tls_pair(&tls_server, &tls_client, address).await?;
+        assert!(
+            registry
+                .authenticate_data_channel(unknown_server, &unknown)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    async fn tls_pair(
+        server: &TlsServer,
+        client: &TlsClient,
+        address: std::net::SocketAddr,
+    ) -> Result<
+        (
+            tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+            tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
+        ),
+        Box<dyn Error>,
+    > {
+        let server_side = async {
+            let (socket, _) = server.accept_tcp().await?;
+            server.handshake(socket).await
+        };
+        let (server_stream, client_stream) =
+            tokio::try_join!(server_side, client.connect(address))?;
+        Ok((server_stream, client_stream))
     }
 }

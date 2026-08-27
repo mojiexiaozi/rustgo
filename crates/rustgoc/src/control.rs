@@ -53,6 +53,10 @@ impl ControlClient {
         &self.config
     }
 
+    pub(crate) fn tls_client(&self) -> TlsClient {
+        self.tls_client.clone()
+    }
+
     pub async fn connect(&self) -> Result<ControlSession, ClientError> {
         tokio::time::timeout(CONTROL_HANDSHAKE_TIMEOUT, self.connect_inner())
             .await

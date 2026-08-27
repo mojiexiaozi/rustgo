@@ -274,6 +274,7 @@ impl MessageId {
     pub const HEARTBEAT: Self = Self(10);
     pub const ERROR: Self = Self(11);
     pub const OPEN_UDP_CHANNEL: Self = Self(12);
+    pub const DATA_CHANNEL_BIND: Self = Self(13);
 
     pub const fn as_u16(self) -> u16 {
         self.0
@@ -293,6 +294,7 @@ impl MessageId {
             10 => 16,
             11 => 1024,
             12 => 96,
+            13 => 384,
             _ => 0,
         }
     }
@@ -303,7 +305,7 @@ impl TryFrom<u16> for MessageId {
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
         match value {
-            1..=12 => Ok(Self(value)),
+            1..=13 => Ok(Self(value)),
             _ => Err(value),
         }
     }
@@ -385,6 +387,40 @@ impl<'de> Deserialize<'de> for TunnelProtocol {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DataChannelKind(u8);
+
+impl DataChannelKind {
+    pub const TCP: Self = Self(1);
+    pub const UDP: Self = Self(2);
+
+    pub const fn as_u8(self) -> u8 {
+        self.0
+    }
+}
+
+impl Serialize for DataChannelKind {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_u8(self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for DataChannelKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match u8::deserialize(deserializer)? {
+            1 => Ok(Self::TCP),
+            2 => Ok(Self::UDP),
+            _ => Err(de::Error::custom("unknown data channel kind")),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SocketAddress {
     V4 { octets: [u8; 4], port: u16 },
@@ -457,6 +493,16 @@ pub struct OpenUdpChannel {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DataChannelBind {
+    pub client_name: BoundedString<MAX_CLIENT_NAME_BYTES>,
+    pub session_id: BoundedBytes<MAX_SESSION_ID_BYTES>,
+    pub kind: DataChannelKind,
+    pub tunnel_id: u32,
+    pub target_id: u64,
+    pub binding_token: BoundedBytes<MAX_BINDING_TOKEN_BYTES>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TcpStreamReady {
     pub connection_id: u64,
     pub accepted: bool,
@@ -496,6 +542,7 @@ pub enum Message {
     Heartbeat(Heartbeat),
     Error(ErrorMessage),
     OpenUdpChannel(OpenUdpChannel),
+    DataChannelBind(DataChannelBind),
 }
 
 impl Message {
@@ -513,6 +560,7 @@ impl Message {
             Self::Heartbeat(_) => MessageId::HEARTBEAT,
             Self::Error(_) => MessageId::ERROR,
             Self::OpenUdpChannel(_) => MessageId::OPEN_UDP_CHANNEL,
+            Self::DataChannelBind(_) => MessageId::DATA_CHANNEL_BIND,
         }
     }
 }

@@ -61,6 +61,7 @@ impl CommandHandler for LocalCommandHandler {
 }
 
 fn main() -> ExitCode {
+    init_logging();
     let cli = Cli::parse();
     let show_config_hint = !matches!(&cli.command, Some(Command::Keygen { .. }));
     match execute(cli, &LocalCommandHandler) {
@@ -73,6 +74,15 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn init_logging() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_ansi(false)
+        .try_init();
 }
 
 fn execute<H: CommandHandler>(cli: Cli, handler: &H) -> Result<(), String> {
