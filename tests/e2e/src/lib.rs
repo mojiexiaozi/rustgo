@@ -466,12 +466,6 @@ impl EchoServer {
                         if stream.set_nonblocking(false).is_err() {
                             return;
                         }
-                        let socket = socket2::SockRef::from(&stream);
-                        if socket.set_recv_buffer_size(chunk_size).is_err()
-                            || socket.set_send_buffer_size(chunk_size).is_err()
-                        {
-                            return;
-                        }
                         let mut buffer = vec![0_u8; chunk_size];
                         loop {
                             match stream.read(&mut buffer) {

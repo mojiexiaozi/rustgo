@@ -1128,7 +1128,6 @@ version = "0.1.0"
 dependencies = [
  "rcgen",
  "rustgo-crypto",
- "socket2",
  "tempfile",
 ]
 

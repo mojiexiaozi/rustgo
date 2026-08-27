@@ -373,3 +373,108 @@ Final observed result on the follow-up tree:
   `Drop`; the fallback cancels and aborts. All normal server lifecycle and error
   paths now retain the future and use ordered async shutdown.
 - UDP relay and P2P remain outside Task 8.
+
+## Review fix round 2 (2026-08-28)
+
+Status: causal backpressure evidence replaces the round-1 timed/buffer-sized
+proxy. This section supersedes the round-1 backpressure paragraph and its
+32 MiB wording; no runtime behavior changed.
+
+### Evidence gap and causal test protocol
+
+The old regression held the public reader for 500 ms and checked only that the
+producer completion channel was empty. A slow machine could satisfy that check
+without socket backpressure, while successful `SO_RCVBUF`/`SO_SNDBUF` calls did
+not prove the effective end-to-end capacity. Those socket-size overrides and
+the direct `socket2` test dependency are now removed.
+
+The replacement retains real `rustgos` and `rustgoc` processes and uses one
+single-threaded gated local echo target:
+
+1. The public peer sends a distinct handshake through the relay and receives a
+   distinct local-target acknowledgement. The target then reports that its
+   application read gate is closed.
+2. A nonblocking public producer reports thread start and at least one 16 KiB
+   chunk of progress. It writes without a predetermined transfer size until a
+   real socket write returns `WouldBlock`, recording the exact byte offset as a
+   saturation barrier.
+3. While the target remains in its gate-command loop, a non-consuming socket
+   `peek` must observe queued payload at the local endpoint. Thus the full
+   public-to-relay-to-local path has data waiting, while target application
+   reads have not started. The public consumer remains active throughout, so
+   reverse-direction reader starvation cannot create the forward blockage.
+4. The test explicitly permits the producer to retry. Its next terminal event
+   must be a second actual `WouldBlock`, not completion. A second gated `peek`
+   confirms the only local read gate is still closed.
+5. Still before opening the local gate, the producer arms a finite completion
+   target 8 MiB beyond its second saturation offset and resumes independently.
+   Its next event must be another real `WouldBlock`, not completion, and the
+   target must still observe queued payload without reading it. At this point
+   the local read gate is the only remaining release condition.
+6. The test opens that gate without sending any further producer command. The
+   producer finishes, half-closes, and the consumer validates every echoed byte
+   and the exact producer/consumer totals.
+
+Fixed sleeps remain only as one-millisecond nonblocking retry backoff; they are
+not assertions. Deadlines bound failure duration but do not establish the
+backpressure condition.
+
+### RED / GREEN evidence
+
+RED 1 used the final target/control protocol with a deliberate one-byte read in
+the supposedly closed gate. The real-process test failed in 0.53 seconds with:
+
+```text
+Error: "local target consumed payload while its read gate was closed"
+```
+
+RED 2 changed the closed-gate assertion to require an observable queued byte
+before the non-consuming `peek` implementation existed. It failed in 0.50
+seconds with:
+
+```text
+Error: "no payload was queued at the closed local read gate"
+```
+
+GREEN removed the deliberate read and implemented the non-consuming local
+socket observation. The targeted real-process regression passed in 0.56
+seconds. The complete TCP E2E suite then passed 10/10 in 25.40 seconds.
+
+RED 3 armed the producer's finite completion target while the local gate was
+still closed but, before the new drain-blocked barrier existed, the test timed
+out after eight seconds and the compiler reported that
+`BlockedWhileDraining` was never constructed. GREEN emits that barrier only
+from an actual nonblocking `WouldBlock` branch. The targeted regression then
+passed in 0.54 seconds; no producer command is sent after the local gate opens.
+
+### Fix-round-2 verification
+
+Commands on the final follow-up tree:
+
+```text
+cargo test -p rustgo-e2e --test tcp slow_reader_applies_backpressure_without_losing_bytes -- --exact --nocapture
+cargo test -p rustgo-e2e --test tcp -- --nocapture
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --no-fail-fast
+git diff --check
+```
+
+Final observed result:
+
+- Targeted causal backpressure regression: 1 passed in 0.55 seconds after the
+  final single-gate tightening and Clippy-equivalent refactor.
+- Complete real-process TCP E2E: 10 passed in 25.23 seconds; the workspace
+  rerun also passed all 10 in 25.59 seconds.
+- Full workspace: 162 passed, 0 failed.
+- Format check, workspace/all-target Clippy with warnings denied, and
+  `git diff --check`: passed.
+
+### Round-2 residual concerns
+
+- Nonblocking retry loops use one-millisecond backoff to avoid busy-spinning;
+  correctness is derived from socket results and channel ordering, not elapsed
+  sleep duration.
+- The dynamic producer has a 512 MiB no-saturation safety ceiling. Reaching it
+  fails the test instead of accepting an unproven platform socket path.
+- The earlier runtime and Windows port-allocation concerns remain unchanged.
