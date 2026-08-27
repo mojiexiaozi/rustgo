@@ -98,3 +98,21 @@ fn explicit_config_does_not_consult_conventional_filename() {
         .assert()
         .success();
 }
+
+#[test]
+fn default_run_enters_server_runtime_and_rejects_invalid_tls_material() {
+    let dir = TempDir::new();
+    let config = dir.write("valid.toml", valid_config());
+    dir.write("server.crt", "test certificate");
+    dir.write("server.key", "test private key");
+
+    let output = command()
+        .current_dir(&dir.path)
+        .args(["-c", config.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success());
+    assert!(stderr.contains("TLS"));
+}

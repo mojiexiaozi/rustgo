@@ -1,7 +1,9 @@
 use std::{path::PathBuf, process::ExitCode};
 
 use clap::{Parser, Subcommand};
-use rustgo_config::{ConfigError, ServerConfig, check_server_references, load_server};
+use rustgo_config::{ConfigError, check_server_references, load_server};
+use rustgos::{ServerApp, ServerError};
+use thiserror::Error;
 
 /// Rustgo public relay server.
 #[derive(Debug, Parser)]
@@ -26,22 +28,9 @@ enum Action {
     Check,
 }
 
-trait CommandHandler {
-    fn run(&self, config: ServerConfig) -> Result<(), ConfigError>;
-}
-
-struct LocalCommandHandler;
-
-impl CommandHandler for LocalCommandHandler {
-    fn run(&self, _config: ServerConfig) -> Result<(), ConfigError> {
-        // Runtime startup is supplied by the server application task. Keeping it behind
-        // this handler preserves this parser and validation contract for that task.
-        Ok(())
-    }
-}
-
-fn main() -> ExitCode {
-    match execute(Cli::parse(), &LocalCommandHandler) {
+#[tokio::main]
+async fn main() -> ExitCode {
+    match execute(Cli::parse()).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("rustgos: {error}");
@@ -51,7 +40,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn execute<H: CommandHandler>(cli: Cli, handler: &H) -> Result<(), ConfigError> {
+async fn execute(cli: Cli) -> Result<(), CommandError> {
     let action = match cli.command {
         None => Action::Run,
         Some(Command::Check) => Action::Check,
@@ -60,7 +49,19 @@ fn execute<H: CommandHandler>(cli: Cli, handler: &H) -> Result<(), ConfigError> 
     check_server_references(&cli.config, &config)?;
 
     match action {
-        Action::Run => handler.run(config),
+        Action::Run => ServerApp::bind(config)
+            .await?
+            .run()
+            .await
+            .map_err(Into::into),
         Action::Check => Ok(()),
     }
+}
+
+#[derive(Debug, Error)]
+enum CommandError {
+    #[error(transparent)]
+    Config(#[from] ConfigError),
+    #[error(transparent)]
+    Server(#[from] ServerError),
 }
