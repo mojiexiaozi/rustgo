@@ -1,5 +1,12 @@
 #![forbid(unsafe_code)]
 
+mod protocol;
+
+pub use protocol::{
+    AuthenticationChallenge, ScriptedProtocolClient, ScriptedProtocolError, authenticate,
+    authentication_message, begin_authentication, finish_authentication, wire_fingerprint,
+};
+
 use std::{
     error::Error,
     fs,
@@ -86,6 +93,14 @@ fn ensure_binaries() -> TestResult<Binaries> {
         .map_err(|message| message.clone().into())
 }
 
+pub fn server_binary_path() -> TestResult<PathBuf> {
+    Ok(ensure_binaries()?.server)
+}
+
+pub fn client_binary_path() -> TestResult<PathBuf> {
+    Ok(ensure_binaries()?.client)
+}
+
 struct PortReservation {
     listener: Option<TcpListener>,
     address: SocketAddr,
@@ -144,6 +159,7 @@ pub struct ProcessFixture {
     _directory: TempDir,
     server_config: PathBuf,
     client_config: PathBuf,
+    ca_file: PathBuf,
     control_port: PortReservation,
     public_ports: Vec<RemoteEndpoint>,
     server_environment: Vec<(String, String)>,
@@ -281,6 +297,7 @@ impl ProcessFixture {
             _directory: directory,
             server_config,
             client_config,
+            ca_file,
             control_port,
             public_ports,
             server_environment: Vec::new(),
@@ -372,6 +389,7 @@ impl ProcessFixture {
             _directory: directory,
             server_config,
             client_config,
+            ca_file,
             control_port,
             public_ports,
             server_environment: Vec::new(),
@@ -391,6 +409,14 @@ impl ProcessFixture {
 
     pub fn client_config_path(&self) -> &Path {
         &self.client_config
+    }
+
+    pub fn server_config_path(&self) -> &Path {
+        &self.server_config
+    }
+
+    pub fn certificate_authority_path(&self) -> &Path {
+        &self.ca_file
     }
 
     pub fn public_address(&self) -> SocketAddr {
@@ -498,6 +524,8 @@ pub struct ManagedChild {
     child: Child,
     lines: mpsc::Receiver<String>,
     captured: Arc<Mutex<Vec<String>>>,
+    stdout: Arc<Mutex<Vec<String>>>,
+    stderr: Arc<Mutex<Vec<String>>>,
     readers: Vec<thread::JoinHandle<()>>,
 }
 
@@ -522,15 +550,24 @@ impl ManagedChild {
         let stderr = child.stderr.take().ok_or("child stderr was not piped")?;
         let (sender, lines) = mpsc::channel();
         let captured = Arc::new(Mutex::new(Vec::new()));
+        let stdout_captured = Arc::new(Mutex::new(Vec::new()));
+        let stderr_captured = Arc::new(Mutex::new(Vec::new()));
         let readers = vec![
-            spawn_log_reader(stdout, sender.clone(), captured.clone()),
-            spawn_log_reader(stderr, sender, captured.clone()),
+            spawn_log_reader(
+                stdout,
+                sender.clone(),
+                captured.clone(),
+                stdout_captured.clone(),
+            ),
+            spawn_log_reader(stderr, sender, captured.clone(), stderr_captured.clone()),
         ];
         Ok(Self {
             name,
             child,
             lines,
             captured,
+            stdout: stdout_captured,
+            stderr: stderr_captured,
             readers,
         })
     }
@@ -574,10 +611,46 @@ impl ManagedChild {
     }
 
     pub fn output(&self) -> String {
-        self.captured
-            .lock()
-            .map(|lines| lines.join("\n"))
-            .unwrap_or_else(|_| "<poisoned log capture>".to_owned())
+        captured_output(&self.captured)
+    }
+
+    pub fn stdout_output(&self) -> String {
+        captured_output(&self.stdout)
+    }
+
+    pub fn stderr_output(&self) -> String {
+        captured_output(&self.stderr)
+    }
+
+    pub fn wait_for_stderr_line(&mut self, needle: &str, timeout: Duration) -> TestResult<String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(line) = self
+                .stderr
+                .lock()
+                .ok()
+                .and_then(|lines| lines.iter().find(|line| line.contains(needle)).cloned())
+            {
+                return Ok(line);
+            }
+            if let Some(status) = self.child.try_wait()? {
+                return Err(format!(
+                    "{} exited with {status} before stderr contained `{needle}`; stderr:\n{}",
+                    self.name,
+                    self.stderr_output()
+                )
+                .into());
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "timed out waiting for `{needle}` on {} stderr; stderr:\n{}",
+                    self.name,
+                    self.stderr_output()
+                )
+                .into());
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     pub fn terminate(&mut self) -> TestResult {
@@ -608,6 +681,7 @@ fn spawn_log_reader<R>(
     stream: R,
     sender: mpsc::Sender<String>,
     captured: Arc<Mutex<Vec<String>>>,
+    stream_captured: Arc<Mutex<Vec<String>>>,
 ) -> thread::JoinHandle<()>
 where
     R: Read + Send + 'static,
@@ -617,9 +691,19 @@ where
             if let Ok(mut output) = captured.lock() {
                 output.push(line.clone());
             }
+            if let Ok(mut output) = stream_captured.lock() {
+                output.push(line.clone());
+            }
             let _ = sender.send(line);
         }
     })
+}
+
+fn captured_output(captured: &Arc<Mutex<Vec<String>>>) -> String {
+    captured
+        .lock()
+        .map(|lines| lines.join("\n"))
+        .unwrap_or_else(|_| "<poisoned log capture>".to_owned())
 }
 
 pub struct EchoServer {

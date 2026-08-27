@@ -1,29 +1,36 @@
-use std::{error::Error, fs, path::PathBuf, time::Duration};
+use std::{
+    error::Error,
+    fs,
+    ops::{Deref, DerefMut},
+    path::PathBuf,
+    time::Duration,
+};
 
-use bytes::BytesMut;
 use rcgen::{
     BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
     KeyUsagePurpose,
 };
 use rustgo_config::{AuthorizedClient, Limits, ServerConfig, ServerSection};
-use rustgo_crypto::{AuthTranscript, DeviceKeypair, sign_auth};
-use rustgo_protocol::{
-    AuthResult, BoundedBytes, BoundedString, BoundedVec, ClientAuthenticate, ClientHello, Frame,
-    FrameCodec, Heartbeat, Message, ProtocolErrorCode, ProtocolVersion, RegisterTunnels,
-    ServerChallenge, TunnelProtocol, TunnelRegistration, TunnelResults,
+use rustgo_crypto::DeviceKeypair;
+use rustgo_e2e::{
+    ScriptedProtocolClient, ScriptedProtocolError, authenticate, authentication_message,
+    begin_authentication, finish_authentication, wire_fingerprint,
 };
-use rustgo_transport::{TlsClient, TlsError};
+use rustgo_protocol::{
+    AuthResult, BoundedBytes, BoundedString, BoundedVec, ClientHello, Frame, Heartbeat, Message,
+    ProtocolErrorCode, ProtocolVersion, RegisterTunnels, TunnelProtocol, TunnelRegistration,
+    TunnelResults,
+};
+use rustgo_transport::TlsClient;
 use rustgos::{ServerApp, ServerRuntimeLimits};
 use tempfile::TempDir;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpSocket, TcpStream};
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
-use tokio_rustls::client::TlsStream;
 use tokio_util::sync::CancellationToken;
 
 const SERVER_NAME: &str = "tunnel.example.test";
 const VERSION: ProtocolVersion = ProtocolVersion::new(1, 0);
-const FRAME_MAX: usize = 70 * 1024;
 
 struct TestPki {
     _directory: TempDir,
@@ -117,178 +124,49 @@ fn bytes<const MAX: usize>(value: &[u8]) -> BoundedBytes<MAX> {
     BoundedBytes::try_from(value).unwrap()
 }
 
-fn wire_fingerprint(key: &DeviceKeypair) -> Vec<u8> {
-    key.public_key()
-        .fingerprint()
-        .to_string()
-        .strip_prefix("sha256:")
-        .unwrap()
-        .as_bytes()
-        .to_vec()
-}
-
-fn transcript_version(version: ProtocolVersion) -> u16 {
-    assert!(version.major <= u8::MAX.into() && version.minor <= u8::MAX.into());
-    (version.major << 8) | version.minor
-}
-
-struct FramedClient {
-    stream: TlsStream<TcpStream>,
-    read_buffer: BytesMut,
-    codec: FrameCodec,
-}
+struct FramedClient(ScriptedProtocolClient);
 
 impl FramedClient {
-    async fn connect(pki: &TestPki, address: std::net::SocketAddr) -> Result<Self, TlsError> {
-        let tls = TlsClient::from_ca_file(&pki.ca_file, SERVER_NAME)?;
-        let stream = tls.connect(address).await?;
-        Ok(Self {
-            stream,
-            read_buffer: BytesMut::new(),
-            codec: FrameCodec::new(FRAME_MAX),
-        })
+    async fn connect(
+        pki: &TestPki,
+        address: std::net::SocketAddr,
+    ) -> Result<Self, ScriptedProtocolError> {
+        ScriptedProtocolClient::connect(&pki.ca_file, SERVER_NAME, address)
+            .await
+            .map(Self)
     }
 
     async fn connect_from(
         pki: &TestPki,
         address: std::net::SocketAddr,
         source: std::net::Ipv4Addr,
-    ) -> Result<Self, Box<dyn Error>> {
-        let socket = TcpSocket::new_v4()?;
-        socket.bind((source, 0).into())?;
-        let socket = socket.connect(address).await?;
-        let tls = TlsClient::from_ca_file(&pki.ca_file, SERVER_NAME)?;
-        let stream = tls.handshake(socket).await?;
-        Ok(Self {
-            stream,
-            read_buffer: BytesMut::new(),
-            codec: FrameCodec::new(FRAME_MAX),
-        })
-    }
-
-    async fn send(
-        &mut self,
-        version: ProtocolVersion,
-        message: Message,
-    ) -> Result<(), Box<dyn Error>> {
-        let encoded = self.codec.encode(version, 0, &message)?;
-        self.stream.write_all(&encoded).await?;
-        Ok(())
-    }
-
-    async fn receive(&mut self) -> Result<Frame, Box<dyn Error>> {
-        loop {
-            if let Some(frame) = self.codec.decode(&mut self.read_buffer)? {
-                return Ok(frame);
-            }
-            if self.stream.read_buf(&mut self.read_buffer).await? == 0 {
-                return Err("control connection closed".into());
-            }
-        }
+    ) -> Result<Self, ScriptedProtocolError> {
+        ScriptedProtocolClient::connect_from(&pki.ca_file, SERVER_NAME, address, source)
+            .await
+            .map(Self)
     }
 
     async fn abort_after_response(
-        mut self,
+        self,
         version: ProtocolVersion,
         message: Message,
-    ) -> Result<(), Box<dyn Error>> {
-        self.send(version, message).await?;
-        let response = self.receive().await?;
-        if response.message != Message::AuthResult(rejected_authentication()) {
-            return Err("server did not reject authentication before abort".into());
-        }
-        self.stream.get_ref().0.set_zero_linger()?;
-        drop(self);
-        Ok(())
+    ) -> Result<(), ScriptedProtocolError> {
+        self.0.abort_after_response(version, message).await
     }
 }
 
-#[derive(Clone)]
-struct AuthenticationChallenge {
-    challenge: Vec<u8>,
-    session_id: Vec<u8>,
+impl Deref for FramedClient {
+    type Target = ScriptedProtocolClient;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
-async fn begin_authentication(
-    client: &mut FramedClient,
-    version: ProtocolVersion,
-    name: &str,
-    fingerprint_key: &DeviceKeypair,
-) -> Result<AuthenticationChallenge, Box<dyn Error>> {
-    client
-        .send(
-            version,
-            Message::ClientHello(ClientHello {
-                client_name: text(name),
-                fingerprint: bytes(&wire_fingerprint(fingerprint_key)),
-                heartbeat_interval_secs: 1,
-            }),
-        )
-        .await?;
-    let Frame {
-        message:
-            Message::ServerChallenge(ServerChallenge {
-                challenge,
-                session_id,
-            }),
-        ..
-    } = client.receive().await?
-    else {
-        return Err("server did not send a challenge".into());
-    };
-    Ok(AuthenticationChallenge {
-        challenge: challenge.into_vec(),
-        session_id: session_id.into_vec(),
-    })
-}
-
-fn authentication_message(
-    challenge: &AuthenticationChallenge,
-    public_key: &DeviceKeypair,
-    signing_key: &DeviceKeypair,
-    transcript_version_value: ProtocolVersion,
-    transcript_name: &str,
-) -> Message {
-    let transcript = AuthTranscript::new(
-        challenge.challenge.clone(),
-        challenge.session_id.clone(),
-        transcript_version(transcript_version_value),
-        transcript_name.to_owned(),
-    );
-    Message::ClientAuthenticate(ClientAuthenticate {
-        public_key: bytes(public_key.public_key().to_string().as_bytes()),
-        signature: bytes(&sign_auth(signing_key, &transcript)),
-    })
-}
-
-async fn finish_authentication(
-    client: &mut FramedClient,
-    version: ProtocolVersion,
-    authentication: Message,
-) -> Result<AuthResult, Box<dyn Error>> {
-    client.send(version, authentication).await?;
-    let Frame {
-        message: Message::AuthResult(result),
-        ..
-    } = client.receive().await?
-    else {
-        return Err("server did not send an authentication result".into());
-    };
-    Ok(result)
-}
-
-async fn authenticate(
-    client: &mut FramedClient,
-    name: &str,
-    key: &DeviceKeypair,
-) -> Result<AuthResult, Box<dyn Error>> {
-    let challenge = begin_authentication(client, VERSION, name, key).await?;
-    finish_authentication(
-        client,
-        VERSION,
-        authentication_message(&challenge, key, key, VERSION, name),
-    )
-    .await
+impl DerefMut for FramedClient {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
 }
 
 fn rejected_authentication() -> AuthResult {
@@ -855,7 +733,7 @@ async fn failed_tunnel_results_write_joins_listener_before_identity_release_and_
             }),
         )
         .await?;
-    first.stream.get_ref().0.set_zero_linger()?;
+    first.set_zero_linger()?;
     drop(first);
 
     wait_for_active_count(&registry, 0).await?;

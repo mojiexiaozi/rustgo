@@ -1126,9 +1126,16 @@ dependencies = [
 name = "rustgo-e2e"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "bytes",
  "rcgen",
  "rustgo-crypto",
+ "rustgo-protocol",
+ "rustgo-transport",
  "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]
@@ -1194,6 +1201,7 @@ dependencies = [
  "rcgen",
  "rustgo-config",
  "rustgo-crypto",
+ "rustgo-e2e",
  "rustgo-protocol",
  "rustgo-transport",
  "tempfile",

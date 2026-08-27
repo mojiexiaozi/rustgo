@@ -3,7 +3,7 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use rustgo_protocol::{
     FrameCodec, Message, OpenTcpStream, ProtocolVersion, SocketAddress, TcpStreamReady,
 };
-use rustgo_transport::{copy_bidirectional_bounded, safe_context};
+use rustgo_transport::{copy_bidirectional_bounded, safe_context, short_id};
 use thiserror::Error;
 use tokio::{
     io::{AsyncWrite, AsyncWriteExt},
@@ -173,7 +173,7 @@ async fn relay_public_connection(
         "tcp_connection",
         client = %safe_context(runtime.client()),
         tunnel = %safe_context(&tunnel_name),
-        conn = connection_id,
+        conn = %short_id(connection_id),
         event = %"tcp_open"
     );
     tracing::info!(parent: &connection, peer = %peer, "TCP relay connected");

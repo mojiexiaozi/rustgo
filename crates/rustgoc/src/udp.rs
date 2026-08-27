@@ -18,7 +18,7 @@ use rustgo_protocol::{
     MAX_CLIENT_NAME_BYTES, MAX_SESSION_ID_BYTES, MAX_UDP_PAYLOAD_BYTES, Message, OpenUdpChannel,
     SocketAddress, UDP_METADATA_LEN, UdpDatagram,
 };
-use rustgo_transport::TlsClient;
+use rustgo_transport::{TlsClient, safe_context, short_id};
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -115,8 +115,14 @@ struct UdpSessionSupervisor {
     client_name: String,
     server_addr: String,
     tls_client: TlsClient,
-    local_targets: Arc<HashMap<u32, String>>,
+    local_targets: Arc<HashMap<u32, UdpTunnelTarget>>,
     permits: Arc<Semaphore>,
+}
+
+#[derive(Clone)]
+struct UdpTunnelTarget {
+    name: String,
+    local_address: String,
 }
 
 impl UdpSessionSupervisor {
@@ -131,7 +137,15 @@ impl UdpSessionSupervisor {
                 u32::try_from(index)
                     .ok()
                     .and_then(|index| index.checked_add(1))
-                    .map(|tunnel_id| (tunnel_id, tunnel.local_addr.clone()))
+                    .map(|tunnel_id| {
+                        (
+                            tunnel_id,
+                            UdpTunnelTarget {
+                                name: tunnel.name.clone(),
+                                local_address: tunnel.local_addr.clone(),
+                            },
+                        )
+                    })
             })
             .collect();
         Self {
@@ -175,7 +189,7 @@ impl ChildSessionSupervisor for UdpSessionSupervisor {
                 );
                 return;
             };
-            let Some(local_target) = local_targets.get(&request.tunnel_id).cloned() else {
+            let Some(target) = local_targets.get(&request.tunnel_id).cloned() else {
                 return;
             };
             let setup = setup_data_channel(
@@ -212,8 +226,9 @@ impl ChildSessionSupervisor for UdpSessionSupervisor {
             );
             if let Err(error) = relay_local_datagrams(
                 data,
+                &client_name,
+                target,
                 request.tunnel_id,
-                local_target,
                 context.generation().get(),
                 limits,
                 shutdown,
@@ -486,12 +501,17 @@ fn try_queue<T>(sender: &mpsc::Sender<T>, value: T, queued: &AtomicUsize) -> Que
 
 async fn relay_local_datagrams(
     data: TlsStream<TcpStream>,
+    client_name: &str,
+    target: UdpTunnelTarget,
     tunnel_id: u32,
-    local_target: String,
     generation: u64,
     limits: NegotiatedUdpLimits,
     shutdown: CancellationToken,
 ) -> Result<(), UdpClientError> {
+    let UdpTunnelTarget {
+        name: tunnel_name,
+        local_address: local_target,
+    } = target;
     let (reader, writer) = tokio::io::split(data);
     let mut reader = UdpFrameReader::new(reader);
     let (data_outbound, data_receiver) = mpsc::channel(limits.queue_capacity);
@@ -640,6 +660,13 @@ async fn relay_local_datagrams(
                         break Err(UdpClientError::InvalidRuntime);
                     }
                     metrics.sessions.store(sessions.sessions.len(), Ordering::Release);
+                    tracing::info!(
+                        client = %safe_context(client_name),
+                        tunnel = %safe_context(&tunnel_name),
+                        conn = %short_id(datagram.session_id),
+                        event = %"udp_session_open",
+                        "UDP local relay session opened"
+                    );
                 }
                 let Some(session) = sessions.sessions.get_mut(&datagram.session_id) else {
                     continue;

@@ -6,6 +6,13 @@ license.workspace = true
 publish = false
 
 [dependencies]
+base64.workspace = true
+bytes.workspace = true
 rcgen = "0.14.9"
 rustgo-crypto = { path = "../../crates/rustgo-crypto" }
+rustgo-protocol = { path = "../../crates/rustgo-protocol" }
+rustgo-transport = { path = "../../crates/rustgo-transport" }
 tempfile = "3.27.0"
+thiserror.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true

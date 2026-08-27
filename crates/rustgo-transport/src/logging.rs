@@ -33,6 +33,7 @@ pub fn try_init() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             tracing_fmt::layer()
                 .compact()
                 .with_ansi(false)
+                .with_writer(std::io::stderr)
                 .with_target(false)
                 .with_timer(OffsetTimestamp),
         )
@@ -46,6 +47,12 @@ pub fn short_fingerprint(fingerprint: &str) -> String {
     let value = fingerprint.strip_prefix("sha256:").unwrap_or(fingerprint);
     let prefix: String = value.chars().take(12).collect();
     format!("sha256:{prefix}")
+}
+
+/// Renders a connection or session identifier as compact diagnostic context.
+#[must_use]
+pub fn short_id(value: u64) -> String {
+    format!("{:04x}", value & 0xffff)
 }
 
 /// Escapes control characters before an untrusted value is used in a text log.

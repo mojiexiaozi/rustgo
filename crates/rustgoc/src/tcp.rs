@@ -5,7 +5,7 @@ use rustgo_protocol::{
     BoundedBytes, BoundedString, DataChannelBind, DataChannelKind, Frame, FrameCodec, FrameError,
     MAX_CLIENT_NAME_BYTES, MAX_SESSION_ID_BYTES, Message, ProtocolErrorCode, TcpStreamReady,
 };
-use rustgo_transport::{TlsClient, copy_bidirectional_bounded};
+use rustgo_transport::{TlsClient, copy_bidirectional_bounded, safe_context, short_id};
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
@@ -30,10 +30,16 @@ pub(crate) struct TcpSessionSupervisor {
     client_name: String,
     server_addr: String,
     tls_client: TlsClient,
-    local_targets: Arc<HashMap<u32, String>>,
+    local_targets: Arc<HashMap<u32, TcpTunnelTarget>>,
     permits: Arc<Semaphore>,
     local_connect_permits: Arc<Semaphore>,
     handshake_permits: Arc<Semaphore>,
+}
+
+#[derive(Clone)]
+struct TcpTunnelTarget {
+    name: String,
+    local_address: String,
 }
 
 impl TcpSessionSupervisor {
@@ -47,7 +53,15 @@ impl TcpSessionSupervisor {
                 u32::try_from(index)
                     .ok()
                     .and_then(|index| index.checked_add(1))
-                    .map(|tunnel_id| (tunnel_id, tunnel.local_addr.clone()))
+                    .map(|tunnel_id| {
+                        (
+                            tunnel_id,
+                            TcpTunnelTarget {
+                                name: tunnel.name.clone(),
+                                local_address: tunnel.local_addr.clone(),
+                            },
+                        )
+                    })
             })
             .collect();
         Self {
@@ -104,7 +118,7 @@ async fn run_tcp(
     client_name: String,
     server_addr: String,
     tls_client: TlsClient,
-    local_targets: Arc<HashMap<u32, String>>,
+    local_targets: Arc<HashMap<u32, TcpTunnelTarget>>,
     permits: Arc<Semaphore>,
     local_connect_permits: Arc<Semaphore>,
     handshake_permits: Arc<Semaphore>,
@@ -119,10 +133,11 @@ async fn run_tcp(
             return;
         }
     };
-    let Some(local_address) = local_targets.get(&request.tunnel_id).cloned() else {
+    let Some(target) = local_targets.get(&request.tunnel_id).cloned() else {
         report_failure(&context, request.connection_id, &shutdown).await;
         return;
     };
+    let local_address = target.local_address;
     let setup = setup_with_admission(
         local_connect_permits,
         handshake_permits,
@@ -158,6 +173,14 @@ async fn run_tcp(
             return;
         }
     };
+
+    tracing::info!(
+        client = %safe_context(&client_name),
+        tunnel = %safe_context(&target.name),
+        conn = %short_id(request.connection_id),
+        event = %"tcp_open",
+        "TCP local relay connected"
+    );
 
     relay_local_connection(
         &mut local,

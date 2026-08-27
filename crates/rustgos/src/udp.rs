@@ -16,7 +16,7 @@ use rustgo_protocol::{
     OpenUdpChannel, ProtocolVersion, SocketAddress, UDP_METADATA_LEN, UdpDatagram,
     UdpSessionRetired,
 };
-use rustgo_transport::safe_context;
+use rustgo_transport::{safe_context, short_id};
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -627,7 +627,7 @@ async fn relay_datagrams(
                             metrics.set_sessions(flows.len());
                             let session = tracing::info_span!(
                                 "udp_session",
-                                conn = session_id,
+                                conn = %short_id(session_id),
                                 event = %"udp_session_open"
                             );
                             tracing::info!(parent: &session, "UDP relay session opened");
