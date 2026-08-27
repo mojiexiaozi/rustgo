@@ -3,3 +3,17 @@ name = "rustgo-transport"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[dependencies]
+rand.workspace = true
+rustgo-protocol = { path = "../rustgo-protocol" }
+rustls.workspace = true
+rustls-pemfile.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tokio-util = { version = "0.7.19", features = ["rt"] }
+
+[dev-dependencies]
+rcgen = "0.14.9"
+tempfile = "3.27.0"
