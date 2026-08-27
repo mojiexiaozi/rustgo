@@ -3,7 +3,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
     time::Duration,
@@ -41,7 +41,9 @@ fn expect_no_datagram(socket: &UdpSocket) -> TestResult {
         Err(error)
             if matches!(
                 error.kind(),
-                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                io::ErrorKind::TimedOut
+                    | io::ErrorKind::WouldBlock
+                    | io::ErrorKind::ConnectionReset
             ) =>
         {
             Ok(())
@@ -135,6 +137,114 @@ struct PeriodicReplyUdpServer {
     address: SocketAddr,
     shutdown: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
+}
+
+struct DelayedMarkedReplyUdpServer {
+    address: SocketAddr,
+    shutdown: Arc<AtomicBool>,
+    received: Arc<AtomicUsize>,
+    delayed_sent: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl DelayedMarkedReplyUdpServer {
+    fn start(delay: Duration) -> TestResult<Self> {
+        let socket = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))?;
+        socket.set_nonblocking(true)?;
+        let address = socket.local_addr()?;
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let received = Arc::new(AtomicUsize::new(0));
+        let delayed_sent = Arc::new(AtomicBool::new(false));
+        let thread_shutdown = shutdown.clone();
+        let thread_received = received.clone();
+        let thread_delayed_sent = delayed_sent.clone();
+        let thread = thread::spawn(move || {
+            let mut replies = Vec::new();
+            let mut buffer = [0_u8; 2048];
+            while !thread_shutdown.load(Ordering::Acquire) {
+                match socket.recv_from(&mut buffer) {
+                    Ok((length, peer)) => {
+                        thread_received.fetch_add(1, Ordering::AcqRel);
+                        let payload = buffer[..length].to_vec();
+                        if payload.first() == Some(&0xD1) {
+                            let reply_socket = match socket.try_clone() {
+                                Ok(socket) => socket,
+                                Err(_) => break,
+                            };
+                            let reply_sent = thread_delayed_sent.clone();
+                            replies.push(thread::spawn(move || {
+                                thread::sleep(delay);
+                                let _ = reply_socket.send_to(&payload, peer);
+                                reply_sent.store(true, Ordering::Release);
+                            }));
+                        } else {
+                            let _ = socket.send_to(&payload, peer);
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    // Sending the delayed reply to the now-closed generation-1
+                    // socket surfaces as WSAECONNRESET on the next recv on Windows.
+                    Err(error) if error.kind() == io::ErrorKind::ConnectionReset => {}
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+            for reply in replies {
+                let _ = reply.join();
+            }
+        });
+        Ok(Self {
+            address,
+            shutdown,
+            received,
+            delayed_sent,
+            thread: Some(thread),
+        })
+    }
+
+    fn address(&self) -> SocketAddr {
+        self.address
+    }
+
+    fn wait_for_received(&self, minimum: usize, timeout: Duration) -> TestResult {
+        let deadline = std::time::Instant::now() + timeout;
+        while self.received.load(Ordering::Acquire) < minimum {
+            if std::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "local UDP service received {} datagrams, expected at least {minimum}",
+                    self.received.load(Ordering::Acquire)
+                )
+                .into());
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        Ok(())
+    }
+
+    fn wait_for_delayed_reply(&self, timeout: Duration) -> TestResult {
+        let deadline = std::time::Instant::now() + timeout;
+        while !self.delayed_sent.load(Ordering::Acquire) {
+            if std::time::Instant::now() >= deadline {
+                return Err("local UDP service never sent its delayed reply".into());
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for DelayedMarkedReplyUdpServer {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        if let Ok(wakeup) = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)) {
+            let _ = wakeup.send_to(&[], self.address);
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 impl PeriodicReplyUdpServer {
@@ -447,6 +557,55 @@ fn negotiated_limits_retire_idle_client_flow_before_capacity_reuse() -> TestResu
 }
 
 #[test]
+fn retirement_queue_full_tears_down_generation_before_a_delayed_old_reply_can_renew_it()
+-> TestResult {
+    let service = DelayedMarkedReplyUdpServer::start(Duration::from_millis(900))?;
+    let fixture = ProcessFixture::single_udp(service.address(), 3, 64)?
+        .with_server_env("RUSTGO_INTERNAL_TESTING", "1")
+        .with_server_env("RUSTGO_TEST_UDP_QUEUE_CAPACITY", "1")
+        .with_server_env("RUSTGO_TEST_UDP_IDLE_TIMEOUT_MS", "800")
+        .with_server_env("RUSTGO_TEST_UDP_SWEEP_INTERVAL_MS", "20")
+        .with_server_env("RUSTGO_TEST_UDP_WRITE_DELAY_MS", "500");
+    let (fixture, mut server, mut client) = launch(fixture)?;
+    client.wait_for_line("event=udp_channel_ready", READY_TIMEOUT)?;
+    let public = fixture.public_address();
+    let delayed = public_socket()?;
+    let blocker = public_socket()?;
+    let queued = public_socket()?;
+
+    delayed.send_to(b"\xD1late", public)?;
+    service.wait_for_received(1, Duration::from_secs(2))?;
+    blocker.send_to(b"block-writer", public)?;
+    thread::sleep(Duration::from_millis(30));
+    queued.send_to(b"fill-queue", public)?;
+
+    server.wait_for_line("reason=\"retirement_queue_full\"", Duration::from_secs(3))?;
+    let server_cleanup = server.wait_for_line("event=udp_cleanup", Duration::from_secs(3))?;
+    assert!(server_cleanup.contains("sessions=0"), "{server_cleanup}");
+    assert!(server_cleanup.contains("queue=0"), "{server_cleanup}");
+    let cleanup = client.wait_for_line("event=udp_cleanup", Duration::from_secs(5))?;
+    assert!(cleanup.contains("generation=1"), "{cleanup}");
+    assert!(cleanup.contains("sessions=0"), "{cleanup}");
+    assert!(cleanup.contains("queue=0"), "{cleanup}");
+    assert!(cleanup.contains("local_queue=0"), "{cleanup}");
+    client.wait_for_line("event=registration_ready", Duration::from_secs(12))?;
+    client.wait_for_line("event=udp_channel_ready", READY_TIMEOUT)?;
+    service.wait_for_delayed_reply(Duration::from_secs(2))?;
+    if let Err(error) = assert_datagram_echo(&delayed, public, b"generation two remains healthy") {
+        return Err(format!(
+            "restored UDP mapping did not echo: {error}\nclient output:\n{}\nserver output:\n{}",
+            client.output(),
+            server.output(),
+        )
+        .into());
+    }
+
+    client.terminate()?;
+    server.terminate()?;
+    Ok(())
+}
+
+#[test]
 fn bounded_queue_overflow_drops_without_killing_the_tunnel() -> TestResult {
     let echo = UdpEchoServer::start()?;
     let fixture = ProcessFixture::single_udp(echo.address(), 8, 1024)?
@@ -543,6 +702,48 @@ fn udp_tunnels_are_isolated() -> TestResult {
     let (length, source) = socket.recv_from(&mut response)?;
     assert_eq!(source, fixture.public_address_at(1));
     assert_eq!(&response[..length], b"\xB2two");
+
+    client.terminate()?;
+    server.terminate()?;
+    Ok(())
+}
+
+#[test]
+fn token_capacity_rejects_the_unprepared_udp_tunnel_before_registration() -> TestResult {
+    let alpha = UdpEchoServer::start()?;
+    let beta = UdpEchoServer::start()?;
+    let fixture = ProcessFixture::udp_tunnels(
+        vec![
+            UdpTunnelSpec::available("accepted", alpha.address()),
+            UdpTunnelSpec::available("rejected", beta.address()),
+        ],
+        8,
+        1024,
+    )?
+    .with_server_env("RUSTGO_INTERNAL_TESTING", "1")
+    .with_server_env("RUSTGO_TEST_MAX_PENDING_DATA_CHANNEL_TOKENS", "1");
+    let (fixture, mut server, mut client) = launch(fixture)?;
+    let registration = server.wait_for_line("event=registration_ready", READY_TIMEOUT)?;
+    assert!(registration.contains("listeners=1"), "{registration}");
+    client.wait_for_line("event=udp_channel_ready", READY_TIMEOUT)?;
+    thread::sleep(Duration::from_millis(250));
+    assert_eq!(
+        client.output().matches("event=udp_channel_ready").count(),
+        1,
+        "only the fully prepared tunnel may be active:\n{}",
+        client.output()
+    );
+    assert_eq!(
+        server.output().matches("event=udp_channel_ready").count(),
+        1,
+        "only the fully prepared listener may own a data channel:\n{}",
+        server.output()
+    );
+
+    let socket = public_socket_with_timeout(Duration::from_millis(500))?;
+    assert_datagram_echo(&socket, fixture.public_address_at(0), b"accepted")?;
+    socket.send_to(b"rejected", fixture.public_address_at(1))?;
+    expect_no_datagram(&socket)?;
 
     client.terminate()?;
     server.terminate()?;

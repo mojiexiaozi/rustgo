@@ -287,6 +287,7 @@ where
 }
 
 struct ClientSession {
+    lease: u64,
     external: SocketAddr,
     sender: mpsc::Sender<Vec<u8>>,
     cancellation: CancellationToken,
@@ -349,6 +350,17 @@ impl ClientSessionTable {
             self.sweep_tail = session.previous;
         }
         true
+    }
+
+    fn remove_if_lease(&mut self, session_id: u64, lease: u64) -> bool {
+        if !self
+            .sessions
+            .get(&session_id)
+            .is_some_and(|session| session.lease == lease)
+        {
+            return false;
+        }
+        self.remove(session_id)
     }
 
     fn rotate_sweep_head(&mut self, session_id: u64) -> bool {
@@ -494,6 +506,7 @@ async fn relay_local_datagrams(
     let mut writer_finished = false;
     let mut sessions = ClientSessionTable::new();
     let mut local_tasks = JoinSet::new();
+    let mut next_local_lease = 0_u64;
     let first_sweep = tokio::time::Instant::now()
         .checked_add(limits.sweep_interval)
         .ok_or(UdpClientError::InvalidRuntime)?;
@@ -526,8 +539,8 @@ async fn relay_local_datagrams(
                 let Some(joined) = joined else {
                     continue;
                 };
-                let (session_id, result) = joined.map_err(|_| UdpClientError::TaskJoin)?;
-                sessions.remove(session_id);
+                let (session_id, lease, result) = joined.map_err(|_| UdpClientError::TaskJoin)?;
+                sessions.remove_if_lease(session_id, lease);
                 metrics.sessions.store(sessions.sessions.len(), Ordering::Release);
                 if let Err(error) = result {
                     tracing::warn!(tunnel_id, session_id, %error, "event=udp_session_end local UDP session ended");
@@ -592,6 +605,10 @@ async fn relay_local_datagrams(
                     let task_shutdown = session_shutdown.clone();
                     let last_activity = Arc::new(Mutex::new(now));
                     let task_activity = last_activity.clone();
+                    let lease = next_local_lease
+                        .checked_add(1)
+                        .ok_or(UdpClientError::InvalidRuntime)?;
+                    next_local_lease = lease;
                     local_tasks.spawn(async move {
                         let result = run_local_session(
                             local_target,
@@ -606,11 +623,12 @@ async fn relay_local_datagrams(
                             task_shutdown,
                         )
                         .await;
-                        (session_id, result)
+                        (session_id, lease, result)
                     });
                     if !sessions.insert(
                         datagram.session_id,
                         ClientSession {
+                            lease,
                             external,
                             sender,
                             cancellation: session_shutdown,
@@ -984,6 +1002,46 @@ mod tests {
     }
 
     #[test]
+    fn old_local_task_completion_cannot_remove_a_recreated_session_id() {
+        let mut sessions = ClientSessionTable::new();
+        let old_cancellation = CancellationToken::new();
+        let (old_sender, _old_receiver) = mpsc::channel(1);
+        assert!(sessions.insert(
+            7,
+            ClientSession {
+                lease: 1,
+                external: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 10_007),
+                sender: old_sender,
+                cancellation: old_cancellation.clone(),
+                last_activity: Arc::new(Mutex::new(tokio::time::Instant::now())),
+                previous: None,
+                next: None,
+            },
+        ));
+        assert!(sessions.remove(7));
+        assert!(old_cancellation.is_cancelled());
+
+        let replacement_cancellation = CancellationToken::new();
+        let (replacement_sender, _replacement_receiver) = mpsc::channel(1);
+        assert!(sessions.insert(
+            7,
+            ClientSession {
+                lease: 2,
+                external: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 10_007),
+                sender: replacement_sender,
+                cancellation: replacement_cancellation.clone(),
+                last_activity: Arc::new(Mutex::new(tokio::time::Instant::now())),
+                previous: None,
+                next: None,
+            },
+        ));
+
+        assert!(!sessions.remove_if_lease(7, 1));
+        assert_eq!(sessions.sessions[&7].lease, 2);
+        assert!(!replacement_cancellation.is_cancelled());
+    }
+
+    #[test]
     fn removed_local_sessions_do_not_grow_the_bounded_sweep_ring() {
         let mut sessions = ClientSessionTable::new();
         for session_id in 1..=128 {
@@ -992,6 +1050,7 @@ mod tests {
             assert!(sessions.insert(
                 session_id,
                 ClientSession {
+                    lease: session_id,
                     external: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 10_000),
                     sender,
                     cancellation: CancellationToken::new(),
@@ -1030,6 +1089,7 @@ mod tests {
             assert!(sessions.insert(
                 session_id,
                 ClientSession {
+                    lease: session_id,
                     external: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 10_000),
                     sender,
                     cancellation: CancellationToken::new(),

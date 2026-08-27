@@ -339,6 +339,10 @@ impl SessionRuntime {
         self.outbound.clone()
     }
 
+    pub(crate) fn fail_generation(&self) {
+        self.cancel();
+    }
+
     pub(crate) fn prepare_tcp(&self, tunnel_id: u32) -> Result<PendingTcpOpen, RegistryError> {
         for _ in 0..MAX_CONNECTION_ID_ATTEMPTS {
             let connection_id = OsRng
@@ -560,6 +564,10 @@ impl ControlSessionGuard {
         self.listeners.len()
     }
 
+    pub(crate) fn cancellation(&self) -> CancellationToken {
+        self.runtime.cancellation()
+    }
+
     pub async fn register_tunnels(&mut self, request: RegisterTunnels) -> TunnelResults {
         let mut results = Vec::with_capacity(request.tunnels.as_slice().len());
         for tunnel in request.tunnels.into_vec() {
@@ -662,7 +670,7 @@ impl ControlSessionGuard {
         tunnel_name: &str,
         protocol: TunnelProtocol,
         port: u16,
-    ) -> Result<ListenerLease, std::io::Error> {
+    ) -> Result<ListenerLease, RegistryError> {
         let address = SocketAddr::new(self.registry.listener_ip, port);
         if protocol == TunnelProtocol::TCP {
             let listener = TcpListener::bind(address).await?;
@@ -675,8 +683,10 @@ impl ControlSessionGuard {
             )))
         } else {
             let socket = UdpSocket::bind(address).await?;
+            let pending = self.runtime.prepare_udp(tunnel_id)?;
             Ok(ListenerLease::Udp(UdpListenerTask::spawn(
                 socket,
+                pending,
                 tunnel_id,
                 tunnel_name.to_owned(),
                 self.runtime.clone(),
@@ -766,6 +776,8 @@ pub enum RegistryError {
     UnknownTunnel,
     #[error("channel binding failed: {0}")]
     Binding(#[from] BindingError),
+    #[error("listener I/O failed: {0}")]
+    Io(#[from] std::io::Error),
     #[error("secure connection ID entropy is unavailable")]
     EntropyUnavailable,
     #[error("internal registry failure")]

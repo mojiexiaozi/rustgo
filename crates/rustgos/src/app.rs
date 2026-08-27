@@ -337,6 +337,10 @@ impl ServerRuntimeLimits {
         if let Some(value) = parse("RUSTGO_TEST_UDP_DISCONNECT_AFTER_REPLIES")? {
             self.udp_test_disconnect_after_replies = Some(value);
         }
+        if let Some(value) = parse("RUSTGO_TEST_MAX_PENDING_DATA_CHANNEL_TOKENS")? {
+            self.max_pending_data_channel_tokens_per_client =
+                usize::try_from(value).map_err(|_| ServerError::InvalidRuntimeLimits)?;
+        }
         Ok(())
     }
 }

@@ -29,7 +29,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     control::{ControlError, FramedControl, SERVER_VERSION},
-    registry::{ClientRegistry, RegistryError, SessionRuntime},
+    registry::{ClientRegistry, PendingUdpOpen, RegistryError, SessionRuntime},
 };
 
 const MAX_SESSION_ID_ATTEMPTS: usize = 16;
@@ -104,6 +104,7 @@ impl UdpListenerTask {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn(
         listener: UdpSocket,
+        pending: PendingUdpOpen,
         tunnel_id: u32,
         tunnel_name: String,
         runtime: Arc<SessionRuntime>,
@@ -116,6 +117,7 @@ impl UdpListenerTask {
             .expect("a bound UDP listener has a local address");
         let handle = tokio::spawn(run_listener(
             listener,
+            pending,
             tunnel_id,
             tunnel_name,
             runtime,
@@ -156,6 +158,7 @@ impl Drop for UdpListenerTask {
 #[allow(clippy::too_many_arguments)]
 async fn run_listener(
     listener: UdpSocket,
+    pending: PendingUdpOpen,
     tunnel_id: u32,
     tunnel_name: String,
     runtime: Arc<SessionRuntime>,
@@ -163,66 +166,86 @@ async fn run_listener(
     max_payload: usize,
     limits: UdpRuntimeLimits,
 ) {
-    let pending = match runtime.prepare_udp(tunnel_id) {
-        Ok(pending) => pending,
-        Err(error) => {
-            tracing::warn!(tunnel = %tunnel_name, %error, "UDP binding allocation failed");
-            return;
-        }
-    };
-    let channel_id = pending.channel_id;
     let cancellation = runtime.cancellation();
-    let request = match limits.open_channel(
+    let result = run_listener_inner(
+        listener,
+        pending,
+        tunnel_id,
+        &tunnel_name,
+        runtime.clone(),
+        max_sessions,
+        max_payload,
+        limits,
+        cancellation.clone(),
+    )
+    .await;
+    if let Err(error) = result {
+        tracing::warn!(
+            tunnel = %tunnel_name,
+            tunnel_id,
+            %error,
+            "event=udp_generation_fatal UDP listener ended its control generation"
+        );
+        if !cancellation.is_cancelled() {
+            runtime.fail_generation();
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_listener_inner(
+    listener: UdpSocket,
+    pending: PendingUdpOpen,
+    tunnel_id: u32,
+    tunnel_name: &str,
+    runtime: Arc<SessionRuntime>,
+    max_sessions: usize,
+    max_payload: usize,
+    limits: UdpRuntimeLimits,
+    cancellation: CancellationToken,
+) -> Result<(), UdpRelayError> {
+    let channel_id = pending.channel_id;
+    let request = Message::OpenUdpChannel(limits.open_channel(
         tunnel_id,
         channel_id,
         pending.binding_token,
         max_sessions,
         max_payload,
-    ) {
-        Ok(request) => Message::OpenUdpChannel(request),
-        Err(error) => {
-            runtime.cancel_pending_udp(channel_id);
-            tracing::warn!(tunnel = %tunnel_name, %error, "invalid negotiated UDP limits");
-            return;
-        }
-    };
+    )?);
     let control_outbound = runtime.outbound();
     let sent = tokio::select! {
         biased;
-        () = cancellation.cancelled() => false,
-        result = control_outbound.send(request) => result.is_ok(),
+        () = cancellation.cancelled() => return Ok(()),
+        result = control_outbound.send(request) => result,
     };
-    if !sent {
+    if sent.is_err() {
         runtime.cancel_pending_udp(channel_id);
-        return;
+        return Err(UdpRelayError::ControlChannelClosed);
     }
     let data_channel = tokio::select! {
         biased;
-        () = cancellation.cancelled() => None,
+        () = cancellation.cancelled() => return Ok(()),
         result = tokio::time::timeout(runtime.binding_ttl(), pending.data_channel) => {
-            result.ok().and_then(Result::ok)
+            match result {
+                Ok(Ok(data_channel)) => data_channel,
+                Ok(Err(_)) => return Err(UdpRelayError::DataChannelClosed),
+                Err(_) => return Err(UdpRelayError::DataChannelSetupTimeout),
+            }
         }
-    };
-    let Some(data_channel) = data_channel else {
-        runtime.cancel_pending_udp(channel_id);
-        return;
     };
 
     tracing::info!(tunnel = %tunnel_name, tunnel_id, channel_id, "event=udp_channel_ready server UDP data channel ready");
-    if let Err(error) = relay_datagrams(
+    relay_datagrams(
         listener,
         data_channel,
         tunnel_id,
-        &tunnel_name,
+        tunnel_name,
         max_sessions,
         max_payload,
         limits,
         cancellation,
     )
     .await
-    {
-        tracing::debug!(tunnel = %tunnel_name, tunnel_id, channel_id, %error, "UDP relay ended");
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -507,7 +530,7 @@ async fn relay_datagrams(
     let mut sweep = tokio::time::interval_at(first_sweep, limits.sweep_interval);
     sweep.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
-    let result = loop {
+    let result = 'relay: loop {
         tokio::select! {
             () = cancellation.cancelled() => break Ok(()),
             joined = &mut writer_task => {
@@ -527,7 +550,6 @@ async fn relay_datagrams(
                 if !expired.is_empty() {
                     metrics.set_sessions(flows.len());
                     let expired_count = expired.len();
-                    let mut channel_closed = false;
                     for session_id in expired {
                         let retirement = Message::UdpSessionRetired(UdpSessionRetired {
                             tunnel_id,
@@ -535,18 +557,20 @@ async fn relay_datagrams(
                         });
                         match try_enqueue(&outbound, retirement, &metrics) {
                             EnqueueResult::Queued => {}
-                            EnqueueResult::Full => UdpMetrics::record_drop(
-                                &metrics.queue_drops,
-                                tunnel_name,
-                                "retirement_queue_full",
-                            ),
-                            EnqueueResult::Closed => channel_closed = true,
+                            EnqueueResult::Full => {
+                                UdpMetrics::record_drop(
+                                    &metrics.queue_drops,
+                                    tunnel_name,
+                                    "retirement_queue_full",
+                                );
+                                break 'relay Err(UdpRelayError::RetirementDeliveryFailed);
+                            }
+                            EnqueueResult::Closed => {
+                                break 'relay Err(UdpRelayError::RetirementDeliveryFailed);
+                            }
                         }
                     }
                     tracing::debug!(tunnel = %tunnel_name, expired = expired_count, sessions = flows.len(), "event=udp_idle_sweep expired UDP sessions");
-                    if channel_closed {
-                        break Err(UdpRelayError::DataChannelClosed);
-                    }
                 }
             }
             received = public.recv_from(&mut receive_buffer) => {
@@ -836,6 +860,12 @@ pub(crate) enum UdpRelayError {
     Frame(#[from] FrameError),
     #[error("UDP data channel closed")]
     DataChannelClosed,
+    #[error("UDP control command channel closed")]
+    ControlChannelClosed,
+    #[error("UDP data channel setup timed out")]
+    DataChannelSetupTimeout,
+    #[error("UDP session retirement could not enter the bounded data queue")]
+    RetirementDeliveryFailed,
     #[error("invalid UDP data frame")]
     InvalidFrame,
     #[error("UDP frame exceeded the configured maximum")]

@@ -414,3 +414,150 @@ git diff --check
 - The original report's bounded token-owner linear lookup and Windows ephemeral
   fixture bind race remain. Live IPv6 and Windows/Linux interoperability also
   remain release-matrix work; this repair was verified on Windows x86_64 GNU.
+
+---
+
+## Review fix round 2 (2026-08-28)
+
+Repair commit: `fix: close UDP retirement ownership races` (the commit
+containing this appendix).
+
+This appendix records the second controller repair pass. It supersedes round
+1's statement that best-effort retirement plus the matching idle lease was
+sufficient: once a valid delayed local reply can refresh that lease, dropping
+the retirement notification is not a safe convergence mechanism.
+
+### Findings and implemented corrections
+
+1. **Retirement delivery is now fail-closed.** The server still removes an
+   expired flow from its authoritative table before it emits
+   `UdpSessionRetired`, but a full or closed data-writer queue is now a terminal
+   UDP-listener error. The listener logs and counts
+   `reason="retirement_queue_full"`, cleans its flow table and writer, and calls
+   `SessionRuntime::fail_generation()`. The active control loop directly
+   observes the same cancellation token, drops the control stream, joins all
+   listeners, and lets the client reconnect and re-register every tunnel. An
+   undelivered retirement therefore cannot coexist indefinitely with an active
+   old client socket.
+2. **Local task completion is compare-and-remove by lease.** Every Rustgoc flow
+   task receives a nonzero monotonic local lease in addition to the wire
+   `session_id`. The table stores both values, the join result returns both, and
+   completion removes the entry only when both still match. A retired or swept
+   task completing after the same wire ID has been recreated can no longer
+   delete or cancel the replacement flow.
+3. **A UDP listener cannot be accepted before its data channel is preparable.**
+   Rustgos now binds the public socket and reserves its pending authenticated
+   UDP data token synchronously inside registration. Only after both succeed is
+   `TunnelResult::accepted` produced and the listener spawned with that owned
+   reservation. Token-capacity exhaustion rejects only that tunnel during
+   registration, drops its bound socket, and leaves prepared sibling tunnels
+   active. Later token send, acknowledgement, TLS EOF, writer, or relay failure
+   remains generation-fatal; normal generation cancellation is the only
+   nonfatal listener exit.
+
+### Repair RED / GREEN evidence
+
+- `retirement_queue_full_tears_down_generation_before_a_delayed_old_reply_can_renew_it`
+  was introduced as a real-process RED with three flows, an 800 ms negotiated
+  idle lease, queue capacity one, a 500 ms server writer delay, and a valid
+  delayed local reply at 900 ms. Before the fix Rustgos logged
+  `retirement_queue_full` but the test timed out waiting for `udp_cleanup`:
+  generation 1 remained active and the old client socket could refresh itself.
+  GREEN observes generation-1 zero-count cleanup, generation-2 registration and
+  data readiness, waits until the delayed reply is actually sent, and then
+  proves exact echo through the restored fixed public port. The first GREEN run
+  also exposed Windows `WSAECONNRESET` in the delayed fixture after it replied
+  to the intentionally closed old socket; the fixture now treats that Windows
+  connected-UDP notification as recoverable and continues serving the new
+  socket.
+- `old_local_task_completion_cannot_remove_a_recreated_session_id` initially
+  failed to compile because `ClientSession` had no lease and the table exposed
+  no compare-and-remove operation. GREEN removes the stale epoch while
+  preserving a recreated entry with the same wire ID and a newer local lease.
+- `token_capacity_rejects_the_unprepared_udp_tunnel_before_registration` used
+  the internal-only token-capacity override of one with two configured UDP
+  tunnels. RED logged `registration_ready ... listeners=2`: the second tunnel
+  had already been accepted even though its listener could never allocate a
+  token. GREEN logs exactly one accepted listener and one client/server
+  `udp_channel_ready`, relays through the prepared mapping, and observes no
+  datagram through the rejected public port. Windows reports an ICMP-unreachable
+  condition for that unbound port as `ConnectionReset`; the no-datagram helper
+  accepts that documented socket outcome without weakening the positive echo
+  assertion.
+
+### Timing and ownership invariants after round 2
+
+1. Removing server flow authority must be followed by exactly one of two
+   outcomes: its retirement frame enters the bounded writer queue, or the
+   owning generation is cancelled. Queue-full retirement is counted and then
+   fatal; it is never merely dropped.
+2. Generation cancellation is observed both by the UDP listener tree and the
+   active control loop. The old control stream and every child are shut down
+   and joined before reconnect can publish the next active generation, so a
+   delayed old reply has no authoritative TLS route to renew.
+3. A wire `session_id` is not a client task identity. Client task identity is
+   `(session_id, local_lease)`, and only an exact match may mutate the table on
+   completion. Task/socket admission still counts live-or-cancelling tasks, so
+   the negotiated session cap is never exceeded while an old epoch drains.
+4. An accepted UDP listener owns a bound public socket and a pending,
+   tunnel-specific, one-use data token. Registration failure releases both; an
+   accepted result cannot represent a listener that already failed token
+   preparation.
+5. Every non-cancellation server UDP-listener exit cancels the generation.
+   Normal cancellation completes cleanup without recursively reporting a new
+   failure. Payload, session, queue, token, sweep, and tunnel bounds from round
+   1 remain hard bounds, and datagram boundaries remain unchanged.
+
+### Drop, cleanup, and status evidence
+
+- The saturation regression observes `event=udp_drop
+  reason="retirement_queue_full"`, followed by server and client
+  `event=udp_cleanup` with zero sessions/tasks for generation 1 and a later
+  generation-2 `registration_ready` plus `udp_channel_ready`. The status cannot
+  remain falsely active after the listener loses reliable retirement delivery.
+- The token-capacity regression observes `registration_ready ... listeners=1`
+  for two requested UDP tunnels, exactly one ready data channel on each side,
+  a positive echo on that listener, and no payload on the rejected port.
+- The local-lease unit regression proves a late join result is a no-op against
+  the replacement epoch. No extra table entry, socket, task, or queue is
+  allocated to achieve that protection.
+
+### Review-round verification
+
+Observed on the final review tree:
+
+```text
+cargo test -p rustgo-e2e --test udp -- --nocapture
+cargo test -p rustgo-protocol -p rustgos -p rustgoc --no-fail-fast
+cargo test -p rustgo-e2e --test tcp -- --nocapture
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --no-fail-fast
+git diff --check
+```
+
+- UDP real-process E2E: 16 passed, 0 failed, including the retirement saturation
+  and token-capacity regressions.
+- TCP real-process regression: 10 passed, 0 failed.
+- Protocol/server/client focused run: 116 passed, 0 failed (protocol 32,
+  Rustgos 55, Rustgoc 29).
+- Full workspace: 191 passed, 0 failed; every doc test passed.
+- Format check and workspace/all-target Clippy with warnings denied exited 0.
+- `git diff --check` had no whitespace errors; Git printed only LF-to-CRLF
+  checkout notices.
+
+### Remaining concerns after round 2
+
+- Fail-closed listener/retirement failure deliberately rebuilds the whole
+  generation, briefly interrupting unrelated tunnels. This is the reliable
+  V0.1 ownership choice; same-generation recovery would require an explicit
+  listener-preserving channel handoff protocol.
+- Pending UDP tokens now start their bounded TTL during registration. The
+  30-second default comfortably covers the bounded 64-tunnel registration
+  exchange, but an unusually short test TTL or a heavily stalled peer can
+  still cause the later data bind to expire and correctly rebuild the
+  generation.
+- The controller-approved per-flow connected socket design remains strictly
+  bounded by negotiated sessions and idle retirement. The bounded linear token
+  owner lookup, Windows ephemeral fixture bind race, live IPv6, and
+  Windows/Linux interoperability remain release-matrix work.

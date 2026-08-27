@@ -270,9 +270,13 @@ where
 {
     let heartbeat_deadline = tokio::time::sleep(heartbeat_timeout);
     tokio::pin!(heartbeat_deadline);
+    let generation_cancellation = guard.cancellation();
     loop {
         tokio::select! {
             biased;
+            () = generation_cancellation.cancelled() => {
+                return Err(ControlError::ListenerGenerationTerminated);
+            }
             () = &mut heartbeat_deadline => return Err(ControlError::HeartbeatTimeout),
             outbound_message = outbound.recv() => {
                 let Some(message) = outbound_message else {
@@ -421,6 +425,8 @@ pub(crate) enum ControlError {
     FrameTooLarge,
     #[error("invalid control protocol state")]
     InvalidState,
+    #[error("a registered listener terminated its control generation")]
+    ListenerGenerationTerminated,
 }
 
 #[cfg(test)]
