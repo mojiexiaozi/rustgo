@@ -9,12 +9,15 @@ use std::{
     time::Duration,
 };
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
+};
 use rustgo_crypto::DeviceKeypair;
 use rustgo_e2e::{
-    EchoServer, ProcessFixture, ScriptedProtocolClient, TestResult, UdpEchoServer,
-    authentication_message, begin_authentication, client_binary_path, finish_authentication,
-    server_binary_path,
+    EchoServer, ProcessFixture, ScriptedProtocolClient, TcpTunnelSpec, TestResult, UdpEchoServer,
+    UdpTunnelSpec, authentication_message, begin_authentication_with_fingerprint,
+    client_binary_path, finish_authentication, server_binary_path,
 };
 use rustgo_protocol::{
     AuthResult, BoundedBytes, BoundedString, DataChannelBind, DataChannelKind,
@@ -29,6 +32,8 @@ const PRIVATE_KEY_SENTINEL: [u8; 32] = *b"RUSTGO_PRIVATE_KEY_SENTINEL_1234";
 const BINDING_TOKEN_SENTINEL: [u8; 64] =
     *b"RUSTGO_BINDING_TOKEN_SENTINEL_0123456789_ABCDEFGHIJKLMNOPQRSTUVW";
 const INJECTED_CLIENT_NAME: &str = "untrusted\r\nFORGED event=tcp_open\x1b[31m";
+const INJECTED_FINGERPRINT: &[u8] = b"fp\r\nFORGED\x1b!fingerprint-suffix";
+const INJECTED_TUNNEL_NAME: &str = "relay\r\nFORGED event=auth_ok\x1b[31m";
 
 #[test]
 fn tcp_lifecycle_is_visible_at_info_with_context_on_each_process_stderr() -> TestResult {
@@ -165,6 +170,90 @@ fn cli_and_toml_expose_no_json_or_log_format_interface() -> TestResult {
 }
 
 #[test]
+fn authenticated_tcp_tunnel_context_cannot_inject_physical_log_lines() -> TestResult {
+    let echo = EchoServer::start()?;
+    let mut fixture = ProcessFixture::tcp_tunnels(
+        vec![TcpTunnelSpec::available(
+            INJECTED_TUNNEL_NAME,
+            echo.address(),
+        )],
+        1,
+    )?
+    .with_server_env("RUST_LOG", "info")
+    .with_client_env("RUST_LOG", "info");
+    let mut server = fixture.start_server()?;
+    let mut client = fixture.start_client()?;
+    client.wait_for_stderr_line("event=registration_ready", READY_TIMEOUT)?;
+
+    let mut first = TcpStream::connect_timeout(&fixture.public_address(), READY_TIMEOUT)?;
+    first.set_read_timeout(Some(READY_TIMEOUT))?;
+    first.write_all(SENTINEL_PAYLOAD)?;
+    let mut echoed = vec![0_u8; SENTINEL_PAYLOAD.len()];
+    first.read_exact(&mut echoed)?;
+    assert_eq!(echoed, SENTINEL_PAYLOAD);
+    server.wait_for_stderr_line("event=tcp_open", READY_TIMEOUT)?;
+    client.wait_for_stderr_line("event=tcp_open", READY_TIMEOUT)?;
+
+    let _second = TcpStream::connect_timeout(&fixture.public_address(), READY_TIMEOUT)?;
+    server.wait_for_stderr_line("TCP tunnel connection limit reached", READY_TIMEOUT)?;
+
+    let server_stderr = server.stderr_bytes();
+    let client_stderr = client.stderr_bytes();
+    assert_physical_log_bytes_are_single_line(&server_stderr)?;
+    assert_physical_log_bytes_are_single_line(&client_stderr)?;
+    let server_text = std::str::from_utf8(&server_stderr)?;
+    let client_text = std::str::from_utf8(&client_stderr)?;
+    assert!(server_text.contains(r"tunnel=relay\r\nFORGED event=auth_ok\u{1b}[31m"));
+    assert!(client_text.contains(r"tunnel=relay\r\nFORGED event=auth_ok\u{1b}[31m"));
+
+    client.terminate()?;
+    server.terminate()?;
+    Ok(())
+}
+
+#[test]
+fn authenticated_udp_tunnel_context_cannot_inject_physical_log_lines() -> TestResult {
+    let echo = UdpEchoServer::start()?;
+    let mut fixture = ProcessFixture::udp_tunnels(
+        vec![UdpTunnelSpec::available(
+            INJECTED_TUNNEL_NAME,
+            echo.address(),
+        )],
+        8,
+        1024,
+    )?
+    .with_server_env("RUST_LOG", "info")
+    .with_client_env("RUST_LOG", "info");
+    let mut server = fixture.start_server()?;
+    let mut client = fixture.start_client()?;
+    client.wait_for_stderr_line("event=registration_ready", READY_TIMEOUT)?;
+    server.wait_for_stderr_line("event=udp_channel_ready", READY_TIMEOUT)?;
+
+    let socket = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))?;
+    socket.set_read_timeout(Some(READY_TIMEOUT))?;
+    socket.send_to(SENTINEL_PAYLOAD, fixture.public_address())?;
+    let mut echoed = [0_u8; 128];
+    let (received, source) = socket.recv_from(&mut echoed)?;
+    assert_eq!(source, fixture.public_address());
+    assert_eq!(&echoed[..received], SENTINEL_PAYLOAD);
+    server.wait_for_stderr_line("event=udp_session_open", READY_TIMEOUT)?;
+    client.wait_for_stderr_line("event=udp_session_open", READY_TIMEOUT)?;
+
+    let server_stderr = server.stderr_bytes();
+    let client_stderr = client.stderr_bytes();
+    assert_physical_log_bytes_are_single_line(&server_stderr)?;
+    assert_physical_log_bytes_are_single_line(&client_stderr)?;
+    let server_text = std::str::from_utf8(&server_stderr)?;
+    let client_text = std::str::from_utf8(&client_stderr)?;
+    assert!(server_text.contains(r"tunnel=relay\r\nFORGED event=auth_ok\u{1b}[31m"));
+    assert!(client_text.contains(r"tunnel=relay\r\nFORGED event=auth_ok\u{1b}[31m"));
+
+    client.terminate()?;
+    server.terminate()?;
+    Ok(())
+}
+
+#[test]
 fn scripted_tls_logs_escape_context_and_redact_auth_and_binding_material() -> TestResult {
     let echo = EchoServer::start()?;
     let mut fixture = ProcessFixture::single_tcp(echo.address())?
@@ -195,9 +284,13 @@ fn scripted_tls_logs_escape_context_and_redact_auth_and_binding_material() -> Te
             fixture.control_address(),
         )
         .await?;
-        let challenge =
-            begin_authentication(&mut control, VERSION, INJECTED_CLIENT_NAME, &scripted_key)
-                .await?;
+        let challenge = begin_authentication_with_fingerprint(
+            &mut control,
+            VERSION,
+            INJECTED_CLIENT_NAME,
+            INJECTED_FINGERPRINT,
+        )
+        .await?;
         let authentication = authentication_message(
             &challenge,
             &scripted_key,
@@ -247,26 +340,58 @@ fn scripted_tls_logs_escape_context_and_redact_auth_and_binding_material() -> Te
 
     server.wait_for_stderr_line("event=auth_failed", READY_TIMEOUT)?;
     server.wait_for_stderr_line("invalid control protocol state", READY_TIMEOUT)?;
-    let server_stderr = server.stderr_output();
-    let authorized_client_stderr = authorized_client.stderr_output();
+    let server_stderr_bytes = server.stderr_bytes();
+    let server_stdout_bytes = server.stdout_bytes();
+    let authorized_client_stderr_bytes = authorized_client.stderr_bytes();
+    let authorized_client_stdout_bytes = authorized_client.stdout_bytes();
+    let server_stderr = std::str::from_utf8(&server_stderr_bytes)?;
+    let authorized_client_stderr = std::str::from_utf8(&authorized_client_stderr_bytes)?;
     let output = format!(
         "{server_stderr}\n{}\n{authorized_client_stderr}\n{}",
-        server.stdout_output(),
-        authorized_client.stdout_output()
+        std::str::from_utf8(&server_stdout_bytes)?,
+        std::str::from_utf8(&authorized_client_stdout_bytes)?,
     );
+    let streams = [
+        ("server stderr", server_stderr_bytes.as_slice()),
+        ("server stdout", server_stdout_bytes.as_slice()),
+        (
+            "authorized client stderr",
+            authorized_client_stderr_bytes.as_slice(),
+        ),
+        (
+            "authorized client stdout",
+            authorized_client_stdout_bytes.as_slice(),
+        ),
+    ];
     let short_fingerprint = &authorized_fingerprint[.."sha256:".len() + 12];
     assert!(output.contains(&format!("fingerprint={short_fingerprint}")));
-    assert!(!output.contains(&authorized_fingerprint));
-    assert!(!output.contains(&authorized_private_key));
-    assert!(!output.contains(&scripted_fingerprint));
+    assert_bytes_absent(
+        &streams,
+        "authorized fingerprint",
+        authorized_fingerprint.as_bytes(),
+    );
+    assert_bytes_absent(
+        &streams,
+        "authorized private key",
+        authorized_private_key.as_bytes(),
+    );
+    assert_bytes_absent(
+        &streams,
+        "scripted fingerprint",
+        scripted_fingerprint.as_bytes(),
+    );
     assert!(server_stderr.contains(r"untrusted\r\nFORGED"));
     assert!(server_stderr.contains(r"\u{1b}"));
-    assert_physical_log_lines_are_single_line(&server_stderr)?;
-    assert_physical_log_lines_are_single_line(&authorized_client_stderr)?;
-    assert_secret_representations_absent(&output, "private key", &PRIVATE_KEY_SENTINEL, true);
-    assert_secret_representations_absent(&output, "challenge", &challenge.challenge, false);
-    assert_secret_representations_absent(&output, "signature", &signature, false);
-    assert_secret_representations_absent(&output, "binding token", &BINDING_TOKEN_SENTINEL, true);
+    assert!(
+        server_stderr.contains(r"fingerprint=sha256:fp\r\nFORGED\u{1b}!"),
+        "malicious claimed fingerprint was not escaped: {server_stderr}"
+    );
+    assert_physical_log_bytes_are_single_line(&server_stderr_bytes)?;
+    assert_physical_log_bytes_are_single_line(&authorized_client_stderr_bytes)?;
+    assert_secret_representations_absent(&streams, "private key", &PRIVATE_KEY_SENTINEL);
+    assert_secret_representations_absent(&streams, "challenge", &challenge.challenge);
+    assert_secret_representations_absent(&streams, "signature", &signature);
+    assert_secret_representations_absent(&streams, "binding token", &BINDING_TOKEN_SENTINEL);
 
     server.terminate()?;
     Ok(())
@@ -331,16 +456,23 @@ fn field_value<'a>(line: &'a str, field: &str) -> Option<&'a str> {
         .map(|value| value.trim_end_matches([':', '}']))
 }
 
-fn assert_physical_log_lines_are_single_line(output: &str) -> TestResult {
+fn assert_physical_log_bytes_are_single_line(output: &[u8]) -> TestResult {
     assert!(
-        !output.contains('\r'),
-        "raw carriage return in logs: {output}"
+        !output.contains(&b'\r'),
+        "raw carriage return in logs: {}",
+        String::from_utf8_lossy(output)
     );
     assert!(
-        !output.contains('\x1b'),
-        "ANSI/control escape in logs: {output}"
+        !output.contains(&b'\x1b'),
+        "ANSI/control escape in logs: {}",
+        String::from_utf8_lossy(output)
     );
-    for line in output.lines().filter(|line| !line.is_empty()) {
+    for raw_line in output
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        let line =
+            std::str::from_utf8(raw_line).map_err(|_| "process log contained non-UTF-8 bytes")?;
         assert!(
             has_offset_timestamp_and_level(line),
             "injected or malformed physical log line: {line}"
@@ -349,30 +481,45 @@ fn assert_physical_log_lines_are_single_line(output: &str) -> TestResult {
     Ok(())
 }
 
-fn assert_secret_representations_absent(
-    output: &str,
-    label: &str,
-    secret: &[u8],
-    expect_printable_raw: bool,
-) {
-    let mut representations = vec![
+fn assert_secret_representations_absent(outputs: &[(&str, &[u8])], label: &str, secret: &[u8]) {
+    assert_bytes_absent(outputs, &format!("{label} raw bytes"), secret);
+    let lowercase_hex = hex(secret);
+    let representations = [
         ("base64", STANDARD.encode(secret)),
-        ("hex", hex(secret)),
+        ("base64 without padding", STANDARD_NO_PAD.encode(secret)),
+        ("URL-safe base64", URL_SAFE.encode(secret)),
+        (
+            "URL-safe base64 without padding",
+            URL_SAFE_NO_PAD.encode(secret),
+        ),
+        ("lowercase hex", lowercase_hex.clone()),
+        ("uppercase hex", lowercase_hex.to_uppercase()),
         ("debug byte array", format!("{secret:?}")),
     ];
-    if let Ok(raw) = std::str::from_utf8(secret)
-        && raw.chars().all(|character| !character.is_control())
-    {
-        representations.push(("raw printable", raw.to_owned()));
-    } else {
-        assert!(!expect_printable_raw, "{label} sentinel must be printable");
-    }
     for (representation, value) in representations {
-        assert!(
-            !output.contains(&value),
-            "{label} leaked as {representation}: {value}\noutput:\n{output}"
+        assert_bytes_absent(
+            outputs,
+            &format!("{label} {representation}: {value}"),
+            value.as_bytes(),
         );
     }
+}
+
+fn assert_bytes_absent(outputs: &[(&str, &[u8])], label: &str, needle: &[u8]) {
+    assert!(!needle.is_empty(), "secret sentinel must not be empty");
+    for (stream, output) in outputs {
+        assert!(
+            !contains_subslice(output, needle),
+            "{label} leaked on {stream}; output:\n{}",
+            String::from_utf8_lossy(output)
+        );
+    }
+}
+
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
 
 fn hex(bytes: &[u8]) -> String {

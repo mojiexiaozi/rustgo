@@ -46,7 +46,7 @@ pub fn try_init() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 pub fn short_fingerprint(fingerprint: &str) -> String {
     let value = fingerprint.strip_prefix("sha256:").unwrap_or(fingerprint);
     let prefix: String = value.chars().take(12).collect();
-    format!("sha256:{prefix}")
+    format!("sha256:{}", safe_display(&prefix))
 }
 
 /// Renders a connection or session identifier as compact diagnostic context.
@@ -58,17 +58,60 @@ pub fn short_id(value: u64) -> String {
 /// Escapes control characters before an untrusted value is used in a text log.
 #[must_use]
 pub fn safe_context(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    for character in value.chars() {
-        if character.is_control() {
-            for byte in character.escape_default() {
-                escaped.push(byte);
-            }
-        } else {
-            escaped.push(character);
-        }
+    safe_display(value).to_string()
+}
+
+/// Wraps any displayable diagnostic value so control characters are escaped.
+///
+/// Use this at the tracing field boundary for text that can contain configured,
+/// protocol-supplied, peer-derived, or error-derived content.
+#[must_use]
+pub const fn safe_display<T>(value: T) -> SafeDisplay<T> {
+    SafeDisplay(value)
+}
+
+/// A display adapter that cannot emit literal control characters.
+#[derive(Clone, Copy)]
+pub struct SafeDisplay<T>(T);
+
+impl<T> fmt::Debug for SafeDisplay<T>
+where
+    T: fmt::Display,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
     }
-    escaped
+}
+
+impl<T> fmt::Display for SafeDisplay<T>
+where
+    T: fmt::Display,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        struct EscapingWriter<'a, 'b> {
+            formatter: &'a mut fmt::Formatter<'b>,
+        }
+
+        impl fmt::Write for EscapingWriter<'_, '_> {
+            fn write_str(&mut self, value: &str) -> fmt::Result {
+                for character in value.chars() {
+                    if character.is_control() {
+                        for escaped in character.escape_default() {
+                            fmt::Write::write_char(self.formatter, escaped)?;
+                        }
+                    } else {
+                        fmt::Write::write_char(self.formatter, character)?;
+                    }
+                }
+                Ok(())
+            }
+        }
+
+        fmt::write(
+            &mut EscapingWriter { formatter },
+            format_args!("{}", self.0),
+        )
+    }
 }
 
 /// A constant-memory limiter for repeated diagnostic events.
@@ -108,5 +151,30 @@ impl FormatTime for OffsetTimestamp {
             .format(&format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3][offset_hour sign:mandatory]:[offset_minute]"))
             .map_err(|_| fmt::Error)?;
         writer.write_str(&rendered)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{safe_display, short_fingerprint};
+
+    #[test]
+    fn safe_display_escapes_controls_from_nested_display_values() {
+        assert_eq!(
+            safe_display("name\r\n\u{1b}\u{0085}").to_string(),
+            r"name\r\n\u{1b}\u{85}"
+        );
+        assert_eq!(
+            format!("{:?}", safe_display("name\r\n\u{1b}\u{0085}")),
+            r"name\r\n\u{1b}\u{85}"
+        );
+    }
+
+    #[test]
+    fn short_fingerprint_escapes_the_untrusted_prefix() {
+        assert_eq!(
+            short_fingerprint("sha256:fp\r\nFORGED\u{1b}!suffix"),
+            r"sha256:fp\r\nFORGED\u{1b}!"
+        );
     }
 }

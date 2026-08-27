@@ -4,13 +4,14 @@ mod protocol;
 
 pub use protocol::{
     AuthenticationChallenge, ScriptedProtocolClient, ScriptedProtocolError, authenticate,
-    authentication_message, begin_authentication, finish_authentication, wire_fingerprint,
+    authentication_message, begin_authentication, begin_authentication_with_fingerprint,
+    finish_authentication, wire_fingerprint,
 };
 
 use std::{
     error::Error,
     fs,
-    io::{BufRead, BufReader, Read, Write},
+    io::{Read, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -285,8 +286,8 @@ impl ProcessFixture {
         );
         for (tunnel, public) in tunnels.iter().zip(&public_ports) {
             client_toml.push_str(&format!(
-                "\n[[tunnels]]\nname = \"{}\"\nprotocol = \"tcp\"\nlocal_addr = \"{}\"\nremote_port = {}\n",
-                tunnel.name,
+                "\n[[tunnels]]\nname = {}\nprotocol = \"tcp\"\nlocal_addr = \"{}\"\nremote_port = {}\n",
+                toml_basic_string(&tunnel.name),
                 tunnel.local_address,
                 public.address.port(),
             ));
@@ -377,8 +378,8 @@ impl ProcessFixture {
         );
         for (tunnel, public) in tunnels.iter().zip(&public_ports) {
             client_toml.push_str(&format!(
-                "\n[[tunnels]]\nname = \"{}\"\nprotocol = \"udp\"\nlocal_addr = \"{}\"\nremote_port = {}\n",
-                tunnel.name,
+                "\n[[tunnels]]\nname = {}\nprotocol = \"udp\"\nlocal_addr = \"{}\"\nremote_port = {}\n",
+                toml_basic_string(&tunnel.name),
                 tunnel.local_address,
                 public.address.port(),
             ));
@@ -491,6 +492,35 @@ fn toml_path(path: &Path) -> TestResult<String> {
     Ok(format!("'{value}'"))
 }
 
+fn toml_basic_string(value: &str) -> String {
+    use std::fmt::Write as _;
+
+    let mut rendered = String::with_capacity(value.len() + 2);
+    rendered.push('"');
+    for character in value.chars() {
+        match character {
+            '\u{0008}' => rendered.push_str("\\b"),
+            '\t' => rendered.push_str("\\t"),
+            '\n' => rendered.push_str("\\n"),
+            '\u{000c}' => rendered.push_str("\\f"),
+            '\r' => rendered.push_str("\\r"),
+            '"' => rendered.push_str("\\\""),
+            '\\' => rendered.push_str("\\\\"),
+            character if character.is_control() && u32::from(character) <= 0xffff => {
+                write!(&mut rendered, "\\u{:04X}", u32::from(character))
+                    .expect("writing to a String cannot fail");
+            }
+            character if character.is_control() => {
+                write!(&mut rendered, "\\U{:08X}", u32::from(character))
+                    .expect("writing to a String cannot fail");
+            }
+            character => rendered.push(character),
+        }
+    }
+    rendered.push('"');
+    rendered
+}
+
 fn certificate_authority() -> TestResult<(String, Issuer<'static, KeyPair>)> {
     let mut parameters = CertificateParams::new(Vec::<String>::new())?;
     parameters.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
@@ -523,9 +553,9 @@ pub struct ManagedChild {
     name: &'static str,
     child: Child,
     lines: mpsc::Receiver<String>,
-    captured: Arc<Mutex<Vec<String>>>,
-    stdout: Arc<Mutex<Vec<String>>>,
-    stderr: Arc<Mutex<Vec<String>>>,
+    captured: Arc<Mutex<Vec<u8>>>,
+    stdout: Arc<Mutex<Vec<u8>>>,
+    stderr: Arc<Mutex<Vec<u8>>>,
     readers: Vec<thread::JoinHandle<()>>,
 }
 
@@ -614,23 +644,35 @@ impl ManagedChild {
         captured_output(&self.captured)
     }
 
+    pub fn output_bytes(&self) -> Vec<u8> {
+        captured_bytes(&self.captured)
+    }
+
     pub fn stdout_output(&self) -> String {
         captured_output(&self.stdout)
+    }
+
+    pub fn stdout_bytes(&self) -> Vec<u8> {
+        captured_bytes(&self.stdout)
     }
 
     pub fn stderr_output(&self) -> String {
         captured_output(&self.stderr)
     }
 
+    pub fn stderr_bytes(&self) -> Vec<u8> {
+        captured_bytes(&self.stderr)
+    }
+
     pub fn wait_for_stderr_line(&mut self, needle: &str, timeout: Duration) -> TestResult<String> {
         let deadline = Instant::now() + timeout;
         loop {
-            if let Some(line) = self
-                .stderr
-                .lock()
-                .ok()
-                .and_then(|lines| lines.iter().find(|line| line.contains(needle)).cloned())
-            {
+            if let Some(line) = self.stderr.lock().ok().and_then(|bytes| {
+                String::from_utf8_lossy(&bytes)
+                    .lines()
+                    .find(|line| line.contains(needle))
+                    .map(str::to_owned)
+            }) {
                 return Ok(line);
             }
             if let Some(status) = self.child.try_wait()? {
@@ -680,30 +722,58 @@ impl Drop for ManagedChild {
 fn spawn_log_reader<R>(
     stream: R,
     sender: mpsc::Sender<String>,
-    captured: Arc<Mutex<Vec<String>>>,
-    stream_captured: Arc<Mutex<Vec<String>>>,
+    captured: Arc<Mutex<Vec<u8>>>,
+    stream_captured: Arc<Mutex<Vec<u8>>>,
 ) -> thread::JoinHandle<()>
 where
     R: Read + Send + 'static,
 {
     thread::spawn(move || {
-        for line in BufReader::new(stream).lines().map_while(Result::ok) {
+        let mut stream = stream;
+        let mut buffer = [0_u8; 4096];
+        let mut pending_line = Vec::new();
+        loop {
+            let read = match stream.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            };
+            let bytes = &buffer[..read];
             if let Ok(mut output) = captured.lock() {
-                output.push(line.clone());
+                output.extend_from_slice(bytes);
             }
             if let Ok(mut output) = stream_captured.lock() {
-                output.push(line.clone());
+                output.extend_from_slice(bytes);
             }
-            let _ = sender.send(line);
+            pending_line.extend_from_slice(bytes);
+            while let Some(newline) = pending_line.iter().position(|byte| *byte == b'\n') {
+                let mut raw_line: Vec<u8> = pending_line.drain(..=newline).collect();
+                raw_line.pop();
+                if raw_line.last() == Some(&b'\r') {
+                    raw_line.pop();
+                }
+                let _ = sender.send(String::from_utf8_lossy(&raw_line).into_owned());
+            }
+        }
+        if !pending_line.is_empty() {
+            let _ = sender.send(String::from_utf8_lossy(&pending_line).into_owned());
         }
     })
 }
 
-fn captured_output(captured: &Arc<Mutex<Vec<String>>>) -> String {
+fn captured_output(captured: &Arc<Mutex<Vec<u8>>>) -> String {
     captured
         .lock()
-        .map(|lines| lines.join("\n"))
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
         .unwrap_or_else(|_| "<poisoned log capture>".to_owned())
+}
+
+fn captured_bytes(captured: &Arc<Mutex<Vec<u8>>>) -> Vec<u8> {
+    captured
+        .lock()
+        .map(|bytes| bytes.clone())
+        .unwrap_or_default()
 }
 
 pub struct EchoServer {
@@ -893,5 +963,38 @@ impl Drop for EchoServer {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io::Cursor,
+        sync::{Arc, Mutex, mpsc},
+    };
+
+    use super::{captured_bytes, spawn_log_reader};
+
+    #[test]
+    fn byte_capture_keeps_invalid_utf8_and_every_following_byte() {
+        let expected = b"before\n\xffraw\nafter\n".to_vec();
+        let (sender, receiver) = mpsc::channel();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let stream_captured = Arc::new(Mutex::new(Vec::new()));
+        let reader = spawn_log_reader(
+            Cursor::new(expected.clone()),
+            sender,
+            captured.clone(),
+            stream_captured.clone(),
+        );
+        reader.join().expect("log reader must finish");
+
+        assert_eq!(captured_bytes(&captured), expected);
+        assert_eq!(captured_bytes(&stream_captured), expected);
+        let lines: Vec<_> = receiver.into_iter().collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], "before");
+        assert!(lines[1].ends_with("raw"));
+        assert_eq!(lines[2], "after");
     }
 }

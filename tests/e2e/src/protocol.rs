@@ -127,12 +127,27 @@ pub async fn begin_authentication(
     name: &str,
     fingerprint_key: &DeviceKeypair,
 ) -> Result<AuthenticationChallenge, ScriptedProtocolError> {
+    begin_authentication_with_fingerprint(
+        client,
+        version,
+        name,
+        wire_fingerprint(fingerprint_key).as_slice(),
+    )
+    .await
+}
+
+pub async fn begin_authentication_with_fingerprint(
+    client: &mut ScriptedProtocolClient,
+    version: ProtocolVersion,
+    name: &str,
+    fingerprint: &[u8],
+) -> Result<AuthenticationChallenge, ScriptedProtocolError> {
     client
         .send(
             version,
             Message::ClientHello(ClientHello {
                 client_name: BoundedString::try_from(name)?,
-                fingerprint: BoundedBytes::try_from(wire_fingerprint(fingerprint_key))?,
+                fingerprint: BoundedBytes::try_from(fingerprint)?,
                 heartbeat_interval_secs: 1,
             }),
         )

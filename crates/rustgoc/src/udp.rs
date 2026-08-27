@@ -18,7 +18,7 @@ use rustgo_protocol::{
     MAX_CLIENT_NAME_BYTES, MAX_SESSION_ID_BYTES, MAX_UDP_PAYLOAD_BYTES, Message, OpenUdpChannel,
     SocketAddress, UDP_METADATA_LEN, UdpDatagram,
 };
-use rustgo_transport::{TlsClient, safe_context, short_id};
+use rustgo_transport::{TlsClient, safe_display, short_id};
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -178,7 +178,7 @@ impl ChildSessionSupervisor for UdpSessionSupervisor {
             let limits = match NegotiatedUdpLimits::try_from(&request) {
                 Ok(limits) => limits,
                 Err(error) => {
-                    tracing::warn!(tunnel_id = request.tunnel_id, %error, "invalid negotiated UDP limits");
+                    tracing::warn!(tunnel_id = request.tunnel_id, error = %safe_display(&error), "invalid negotiated UDP limits");
                     return;
                 }
             };
@@ -205,7 +205,7 @@ impl ChildSessionSupervisor for UdpSessionSupervisor {
                 result = tokio::time::timeout(UDP_SETUP_TIMEOUT, setup) => match result {
                     Ok(Ok(data)) => data,
                     Ok(Err(error)) => {
-                        tracing::warn!(tunnel_id = request.tunnel_id, %error, "UDP data setup failed");
+                        tracing::warn!(tunnel_id = request.tunnel_id, error = %safe_display(&error), "UDP data setup failed");
                         return;
                     }
                     Err(_) => {
@@ -238,7 +238,7 @@ impl ChildSessionSupervisor for UdpSessionSupervisor {
                 tracing::debug!(
                     tunnel_id = request.tunnel_id,
                     channel_id = request.channel_id,
-                    %error,
+                    error = %safe_display(&error),
                     "UDP local relay ended"
                 );
             }
@@ -563,7 +563,7 @@ async fn relay_local_datagrams(
                 sessions.remove_if_lease(session_id, lease);
                 metrics.sessions.store(sessions.sessions.len(), Ordering::Release);
                 if let Err(error) = result {
-                    tracing::warn!(tunnel_id, session_id, %error, "event=udp_session_end local UDP session ended");
+                    tracing::warn!(tunnel_id, session_id, error = %safe_display(&error), "event=udp_session_end local UDP session ended");
                 }
             }
             frame = reader.receive() => {
@@ -661,8 +661,8 @@ async fn relay_local_datagrams(
                     }
                     metrics.sessions.store(sessions.sessions.len(), Ordering::Release);
                     tracing::info!(
-                        client = %safe_context(client_name),
-                        tunnel = %safe_context(&tunnel_name),
+                        client = %safe_display(client_name),
+                        tunnel = %safe_display(&tunnel_name),
                         conn = %short_id(datagram.session_id),
                         event = %"udp_session_open",
                         "UDP local relay session opened"

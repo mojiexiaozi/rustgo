@@ -2,7 +2,7 @@ use std::{path::PathBuf, process::ExitCode};
 
 use clap::{Parser, Subcommand};
 use rustgo_config::{ConfigError, check_server_references, load_server};
-use rustgo_transport::init_logging;
+use rustgo_transport::{init_logging, safe_display};
 use rustgos::{ServerApp, ServerError};
 use thiserror::Error;
 
@@ -35,7 +35,7 @@ async fn main() -> ExitCode {
     match execute(Cli::parse()).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("rustgos: {error}");
+            eprintln!("rustgos: {}", safe_display(&error));
             eprintln!("Use -c <path> to select a server configuration file.");
             ExitCode::FAILURE
         }

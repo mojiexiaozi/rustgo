@@ -3,7 +3,7 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use rustgo_protocol::{
     FrameCodec, Message, OpenTcpStream, ProtocolVersion, SocketAddress, TcpStreamReady,
 };
-use rustgo_transport::{copy_bidirectional_bounded, safe_context, short_id};
+use rustgo_transport::{copy_bidirectional_bounded, safe_display, short_id};
 use thiserror::Error;
 use tokio::{
     io::{AsyncWrite, AsyncWriteExt},
@@ -39,8 +39,8 @@ impl TcpListenerTask {
             .expect("a bound TCP listener has a local address");
         let span = tracing::info_span!(
             "tcp_tunnel",
-            client = %safe_context(runtime.client()),
-            tunnel = %safe_context(&tunnel_name),
+            client = %safe_display(runtime.client()),
+            tunnel = %safe_display(&tunnel_name),
             event = %"tcp_tunnel"
         );
         let handle = tokio::spawn(
@@ -93,18 +93,18 @@ async fn run_listener(
             () = cancellation.cancelled() => break,
             joined = connections.join_next(), if !connections.is_empty() => {
                 if joined.is_some_and(|result| result.is_err()) {
-                    tracing::warn!(tunnel = %tunnel_name, "TCP relay task failed to join");
+                    tracing::warn!(tunnel = %safe_display(&tunnel_name), "TCP relay task failed to join");
                 }
             }
             accepted = listener.accept() => {
                 let Ok((public, peer)) = accepted else {
                     if !cancellation.is_cancelled() {
-                        tracing::warn!(tunnel = %tunnel_name, "TCP public listener failed");
+                        tracing::warn!(tunnel = %safe_display(&tunnel_name), "TCP public listener failed");
                     }
                     break;
                 };
                 let Ok(permit) = permits.clone().try_acquire_owned() else {
-                    tracing::warn!(tunnel = %tunnel_name, peer = %peer, "TCP tunnel connection limit reached");
+                    tracing::warn!(tunnel = %safe_display(&tunnel_name), peer = %safe_display(peer), "TCP tunnel connection limit reached");
                     drop(public);
                     continue;
                 };
@@ -134,7 +134,7 @@ async fn relay_public_connection(
     let pending = match runtime.prepare_tcp(tunnel_id) {
         Ok(pending) => pending,
         Err(error) => {
-            tracing::warn!(tunnel = %tunnel_name, peer = %peer, %error, "TCP binding allocation failed");
+            tracing::warn!(tunnel = %safe_display(&tunnel_name), peer = %safe_display(peer), error = %safe_display(&error), "TCP binding allocation failed");
             return;
         }
     };
@@ -171,12 +171,12 @@ async fn relay_public_connection(
 
     let connection = tracing::info_span!(
         "tcp_connection",
-        client = %safe_context(runtime.client()),
-        tunnel = %safe_context(&tunnel_name),
+        client = %safe_display(runtime.client()),
+        tunnel = %safe_display(&tunnel_name),
         conn = %short_id(connection_id),
         event = %"tcp_open"
     );
-    tracing::info!(parent: &connection, peer = %peer, "TCP relay connected");
+    tracing::info!(parent: &connection, peer = %safe_display(peer), "TCP relay connected");
     if let Err(error) = copy_bidirectional_bounded(
         &mut public,
         &mut data_channel,
@@ -185,7 +185,7 @@ async fn relay_public_connection(
     )
     .await
     {
-        tracing::debug!(parent: &connection, peer = %peer, %error, "TCP relay ended");
+        tracing::debug!(parent: &connection, peer = %safe_display(peer), error = %safe_display(&error), "TCP relay ended");
     }
 }
 

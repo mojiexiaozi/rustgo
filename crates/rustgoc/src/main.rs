@@ -3,7 +3,7 @@ use std::{path::PathBuf, process::ExitCode};
 use clap::{Parser, Subcommand};
 use rustgo_config::{ClientConfig, check_client_references, load_client};
 use rustgo_crypto::generate_key_file;
-use rustgo_transport::init_logging;
+use rustgo_transport::{init_logging, safe_display};
 use rustgoc::ClientApp;
 
 /// Rustgo private-network client.
@@ -68,7 +68,7 @@ fn main() -> ExitCode {
     match execute(cli, &LocalCommandHandler) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("rustgoc: {error}");
+            eprintln!("rustgoc: {}", safe_display(&error));
             if show_config_hint {
                 eprintln!("Use -c <path> to select a client configuration file.");
             }

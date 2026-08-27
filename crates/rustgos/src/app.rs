@@ -1,7 +1,7 @@
 use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 
 use rustgo_config::ServerConfig;
-use rustgo_transport::{TlsError, TlsServer};
+use rustgo_transport::{TlsError, TlsServer, safe_display};
 use thiserror::Error;
 use tokio::{sync::Semaphore, task::JoinSet};
 use tokio_util::sync::CancellationToken;
@@ -287,7 +287,7 @@ impl ServerApp {
                         )
                         .await
                         {
-                            tracing::debug!(peer = %peer, %error, "control session ended");
+                            tracing::debug!(peer = %safe_display(peer), error = %safe_display(&error), "control session ended");
                         }
                     });
                 }

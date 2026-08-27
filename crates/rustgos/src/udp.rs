@@ -16,7 +16,7 @@ use rustgo_protocol::{
     OpenUdpChannel, ProtocolVersion, SocketAddress, UDP_METADATA_LEN, UdpDatagram,
     UdpSessionRetired,
 };
-use rustgo_transport::{safe_context, short_id};
+use rustgo_transport::{safe_display, short_id};
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -119,8 +119,8 @@ impl UdpListenerTask {
             .expect("a bound UDP listener has a local address");
         let span = tracing::info_span!(
             "udp_tunnel",
-            client = %safe_context(runtime.client()),
-            tunnel = %safe_context(&tunnel_name),
+            client = %safe_display(runtime.client()),
+            tunnel = %safe_display(&tunnel_name),
             event = %"udp_tunnel"
         );
         let handle = tokio::spawn(
@@ -192,9 +192,9 @@ async fn run_listener(
     .await;
     if let Err(error) = result {
         tracing::warn!(
-            tunnel = %tunnel_name,
+            tunnel = %safe_display(&tunnel_name),
             tunnel_id,
-            %error,
+            error = %safe_display(&error),
             "event=udp_generation_fatal UDP listener ended its control generation"
         );
         if !cancellation.is_cancelled() {
@@ -245,7 +245,7 @@ async fn run_listener_inner(
         }
     };
 
-    tracing::info!(tunnel = %tunnel_name, tunnel_id, channel_id, "event=udp_channel_ready server UDP data channel ready");
+    tracing::info!(tunnel = %safe_display(tunnel_name), tunnel_id, channel_id, "event=udp_channel_ready server UDP data channel ready");
     relay_datagrams(
         listener,
         data_channel,
@@ -477,7 +477,7 @@ impl UdpMetrics {
     fn record_drop(counter: &AtomicU64, tunnel_name: &str, reason: &'static str) {
         let total = counter.fetch_add(1, Ordering::Relaxed).saturating_add(1);
         if total == 1 || total.is_power_of_two() {
-            tracing::warn!(tunnel = %tunnel_name, reason, total, "event=udp_drop UDP datagram dropped");
+            tracing::warn!(tunnel = %safe_display(tunnel_name), reason, total, "event=udp_drop UDP datagram dropped");
         }
     }
 }
@@ -581,7 +581,7 @@ async fn relay_datagrams(
                             }
                         }
                     }
-                    tracing::debug!(tunnel = %tunnel_name, expired = expired_count, sessions = flows.len(), "event=udp_idle_sweep expired UDP sessions");
+                    tracing::debug!(tunnel = %safe_display(tunnel_name), expired = expired_count, sessions = flows.len(), "event=udp_idle_sweep expired UDP sessions");
                 }
             }
             received = public.recv_from(&mut receive_buffer) => {
@@ -685,7 +685,7 @@ async fn relay_datagrams(
                 forwarded_replies = forwarded_replies.saturating_add(1);
                 if limits.test_disconnect_after_replies == Some(forwarded_replies) {
                     tracing::warn!(
-                        tunnel = %tunnel_name,
+                        tunnel = %safe_display(tunnel_name),
                         forwarded_replies,
                         "event=udp_test_data_disconnect internal test closed UDP data channel"
                     );
@@ -704,7 +704,7 @@ async fn relay_datagrams(
     metrics.set_sessions(0);
     metrics.queued.store(0, Ordering::Release);
     tracing::info!(
-        tunnel = %tunnel_name,
+        tunnel = %safe_display(tunnel_name),
         sessions = metrics.sessions.load(Ordering::Acquire),
         queue = metrics.queued.load(Ordering::Acquire),
         drops_queue = metrics.queue_drops.load(Ordering::Relaxed),

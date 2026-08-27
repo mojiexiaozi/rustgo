@@ -3,6 +3,7 @@ use std::{sync::Arc, time::Duration};
 use rustgo_config::ClientConfig;
 use rustgo_transport::{
     Backoff, BackoffClock, BackoffConfig, JitterSource, RandomJitter, SystemBackoffClock,
+    safe_display,
 };
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -146,7 +147,7 @@ impl ClientApp {
                         }),
                     });
                     tracing::info!(
-                        client = %self.control.config().client.name,
+                        client = %safe_display(&self.control.config().client.name),
                         generation = generation.get(),
                         event = %"registration_ready",
                         "client tunnel registration ready"
@@ -165,8 +166,8 @@ impl ClientApp {
                     }
                     if let Err(error) = result {
                         tracing::warn!(
-                            client = %self.control.config().client.name,
-                            %error,
+                            client = %safe_display(&self.control.config().client.name),
+                            error = %safe_display(&error),
                             generation = generation.get(),
                             event = %"control_ended",
                             "client control generation ended"
@@ -176,8 +177,8 @@ impl ClientApp {
                 Err(error) => {
                     self.status.send_replace(ClientStatus::default());
                     tracing::warn!(
-                        client = %self.control.config().client.name,
-                        %error,
+                        client = %safe_display(&self.control.config().client.name),
+                        error = %safe_display(&error),
                         event = %"control_connect_failed",
                         "client control connection failed"
                     );

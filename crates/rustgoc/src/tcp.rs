@@ -5,7 +5,7 @@ use rustgo_protocol::{
     BoundedBytes, BoundedString, DataChannelBind, DataChannelKind, Frame, FrameCodec, FrameError,
     MAX_CLIENT_NAME_BYTES, MAX_SESSION_ID_BYTES, Message, ProtocolErrorCode, TcpStreamReady,
 };
-use rustgo_transport::{TlsClient, copy_bidirectional_bounded, safe_context, short_id};
+use rustgo_transport::{TlsClient, copy_bidirectional_bounded, safe_display, short_id};
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
@@ -160,7 +160,7 @@ async fn run_tcp(
     let (mut local, mut data) = match setup {
         Ok(Ok(streams)) => streams,
         Ok(Err(error)) => {
-            tracing::warn!(connection_id = request.connection_id, %error, "TCP data setup failed");
+            tracing::warn!(connection_id = request.connection_id, error = %safe_display(&error), "TCP data setup failed");
             report_failure(&context, request.connection_id, &shutdown).await;
             return;
         }
@@ -175,8 +175,8 @@ async fn run_tcp(
     };
 
     tracing::info!(
-        client = %safe_context(&client_name),
-        tunnel = %safe_context(&target.name),
+        client = %safe_display(&client_name),
+        tunnel = %safe_display(&target.name),
         conn = %short_id(request.connection_id),
         event = %"tcp_open",
         "TCP local relay connected"
@@ -285,7 +285,7 @@ async fn relay_local_connection(
     _permit: OwnedSemaphorePermit,
 ) {
     if let Err(error) = copy_bidirectional_bounded(local, data, TCP_IDLE_TIMEOUT, shutdown).await {
-        tracing::debug!(connection_id, %error, "TCP local relay ended");
+        tracing::debug!(connection_id, error = %safe_display(&error), "TCP local relay ended");
     }
 }
 
