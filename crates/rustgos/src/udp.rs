@@ -16,6 +16,7 @@ use rustgo_protocol::{
     OpenUdpChannel, ProtocolVersion, SocketAddress, UDP_METADATA_LEN, UdpDatagram,
     UdpSessionRetired,
 };
+use rustgo_transport::safe_context;
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -118,8 +119,8 @@ impl UdpListenerTask {
             .expect("a bound UDP listener has a local address");
         let span = tracing::info_span!(
             "udp_tunnel",
-            client = %runtime.client(),
-            tunnel = %tunnel_name,
+            client = %safe_context(runtime.client()),
+            tunnel = %safe_context(&tunnel_name),
             event = %"udp_tunnel"
         );
         let handle = tokio::spawn(
@@ -629,7 +630,7 @@ async fn relay_datagrams(
                                 conn = session_id,
                                 event = %"udp_session_open"
                             );
-                            tracing::debug!(parent: &session, "UDP relay session opened");
+                            tracing::info!(parent: &session, "UDP relay session opened");
                         }
                     }
                     EnqueueResult::Full => {

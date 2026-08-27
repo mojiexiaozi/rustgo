@@ -17,8 +17,9 @@ const SENTINEL_PAYLOAD: &[u8] = b"RUSTGO_APPLICATION_PAYLOAD_SENTINEL_8d1d";
 #[test]
 fn successful_relay_logs_text_lifecycle_context_without_payload() -> TestResult {
     let echo = EchoServer::start()?;
-    let mut fixture =
-        ProcessFixture::single_tcp(echo.address())?.with_server_env("RUST_LOG", "trace");
+    let mut fixture = ProcessFixture::single_tcp(echo.address())?
+        .with_server_env("RUST_LOG", "info")
+        .with_client_env("RUST_LOG", "info");
     let mut server = fixture.start_server()?;
     let mut client = fixture.start_client()?;
     client.wait_for_line("event=registration_ready", READY_TIMEOUT)?;
@@ -31,8 +32,10 @@ fn successful_relay_logs_text_lifecycle_context_without_payload() -> TestResult 
     assert_eq!(echoed, SENTINEL_PAYLOAD);
 
     server.wait_for_line("event=tcp_open", READY_TIMEOUT)?;
-    let output = format!("{}\n{}", server.output(), client.output());
-    let lifecycle_line = output
+    let server_output = server.output();
+    let client_output = client.output();
+    let output = format!("{server_output}\n{client_output}");
+    let lifecycle_line = server_output
         .lines()
         .find(|line| line.contains("event=tcp_open"))
         .ok_or("missing TCP lifecycle log")?;
@@ -43,6 +46,8 @@ fn successful_relay_logs_text_lifecycle_context_without_payload() -> TestResult 
     assert!(lifecycle_line.contains("client=home-pc"));
     assert!(lifecycle_line.contains("tunnel=echo"));
     assert!(lifecycle_line.contains("conn="));
+    assert!(client_output.contains("client=home-pc"));
+    assert!(client_output.contains("event=registration_ready"));
     assert!(
         output
             .lines()

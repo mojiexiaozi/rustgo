@@ -48,6 +48,22 @@ pub fn short_fingerprint(fingerprint: &str) -> String {
     format!("sha256:{prefix}")
 }
 
+/// Escapes control characters before an untrusted value is used in a text log.
+#[must_use]
+pub fn safe_context(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        if character.is_control() {
+            for byte in character.escape_default() {
+                escaped.push(byte);
+            }
+        } else {
+            escaped.push(character);
+        }
+    }
+    escaped
+}
+
 /// A constant-memory limiter for repeated diagnostic events.
 pub struct EventRateLimit {
     interval: Duration,

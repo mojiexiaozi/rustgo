@@ -3,7 +3,7 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use rustgo_protocol::{
     FrameCodec, Message, OpenTcpStream, ProtocolVersion, SocketAddress, TcpStreamReady,
 };
-use rustgo_transport::copy_bidirectional_bounded;
+use rustgo_transport::{copy_bidirectional_bounded, safe_context};
 use thiserror::Error;
 use tokio::{
     io::{AsyncWrite, AsyncWriteExt},
@@ -39,8 +39,8 @@ impl TcpListenerTask {
             .expect("a bound TCP listener has a local address");
         let span = tracing::info_span!(
             "tcp_tunnel",
-            client = %runtime.client(),
-            tunnel = %tunnel_name,
+            client = %safe_context(runtime.client()),
+            tunnel = %safe_context(&tunnel_name),
             event = %"tcp_tunnel"
         );
         let handle = tokio::spawn(
@@ -171,12 +171,12 @@ async fn relay_public_connection(
 
     let connection = tracing::info_span!(
         "tcp_connection",
-        client = %runtime.client(),
-        tunnel = %tunnel_name,
+        client = %safe_context(runtime.client()),
+        tunnel = %safe_context(&tunnel_name),
         conn = connection_id,
         event = %"tcp_open"
     );
-    tracing::debug!(parent: &connection, peer = %peer, "TCP relay connected");
+    tracing::info!(parent: &connection, peer = %peer, "TCP relay connected");
     if let Err(error) = copy_bidirectional_bounded(
         &mut public,
         &mut data_channel,

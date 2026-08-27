@@ -10,7 +10,7 @@ use rustgo_protocol::{
     AuthResult, BoundedString, ClientHandshakeState, ErrorMessage, Frame, FrameCodec, FrameError,
     MAX_ERROR_DETAIL_BYTES, Message, ProtocolErrorCode, ProtocolVersion,
 };
-use rustgo_transport::{EventRateLimit, TlsServer, short_fingerprint};
+use rustgo_transport::{EventRateLimit, TlsServer, safe_context, short_fingerprint};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -115,7 +115,7 @@ pub(crate) async fn serve_connection(
     let Message::ClientHello(hello) = first_frame.message else {
         return Err(ControlError::InvalidState);
     };
-    let claimed_client = hello.client_name.as_str().to_owned();
+    let claimed_client = safe_context(hello.client_name.as_str());
     let claimed_fingerprint = std::str::from_utf8(hello.fingerprint.as_slice())
         .ok()
         .map(|value| short_fingerprint(&format!("sha256:{value}")))
@@ -174,7 +174,7 @@ pub(crate) async fn serve_connection(
             let accepted = guard.is_some();
             if let Some(guard) = guard.as_ref() {
                 tracing::info!(
-                    client = %guard.identity().name(),
+                    client = %safe_context(guard.identity().name()),
                     fingerprint = %short_fingerprint(guard.identity().fingerprint()),
                     event = %"auth_ok",
                     "client authenticated"
@@ -236,7 +236,7 @@ where
 {
     let span = tracing::info_span!(
         "control_session",
-        client = %guard.identity().name(),
+        client = %safe_context(guard.identity().name()),
         fingerprint = %short_fingerprint(guard.identity().fingerprint()),
         event = %"control_session"
     );
@@ -286,7 +286,7 @@ where
         .send(negotiated, Message::TunnelResults(results))
         .await?;
 
-    tracing::info!(client = %guard.identity().name(), listeners = guard.listener_count(), "event=registration_ready server tunnel registration ready");
+    tracing::info!(client = %safe_context(guard.identity().name()), listeners = guard.listener_count(), "event=registration_ready server tunnel registration ready");
     run_active_control(
         framed,
         guard,
