@@ -259,11 +259,11 @@ pub struct RegisteredTunnel {
 
 impl RegisteredTunnel {
     #[cfg(test)]
-    pub(crate) fn accepted_for_test(tunnel_id: u32) -> Self {
+    pub(crate) fn accepted_for_test(tunnel_id: u32, protocol: ConfigTunnelProtocol) -> Self {
         Self {
             tunnel_id,
             name: format!("test-{tunnel_id}"),
-            protocol: ConfigTunnelProtocol::Tcp,
+            protocol,
             local_addr: "127.0.0.1:1".to_owned(),
             remote_port: 1,
             accepted: true,
@@ -423,6 +423,8 @@ pub enum ClientError {
     FrameTooLarge,
     #[error("client task failed to join")]
     TaskJoin,
+    #[error("a persistent data session terminated while its control generation was active")]
+    DataSessionTerminated,
     #[error("client session generation exhausted")]
     GenerationExhausted,
     #[error("client heartbeat sequence exhausted")]

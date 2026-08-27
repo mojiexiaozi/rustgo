@@ -6,7 +6,7 @@ use rustgo_protocol::{
     MAGIC, MAX_BINDING_TOKEN_BYTES, MAX_UDP_PAYLOAD_BYTES, Message, MessageId, OpenTcpStream,
     OpenUdpChannel, ProtocolErrorCode, ProtocolVersion, RegisterTunnels, ServerChallenge,
     SocketAddress, TcpStreamReady, TunnelProtocol, TunnelRegistration, TunnelResult, TunnelResults,
-    UDP_METADATA_LEN, UdpDatagram,
+    UDP_METADATA_LEN, UdpDatagram, UdpSessionRetired,
 };
 
 const VERSION: ProtocolVersion = ProtocolVersion::new(1, 7);
@@ -87,6 +87,14 @@ fn messages() -> Vec<Message> {
             tunnel_id: 42,
             channel_id: 9002,
             binding_token: bytes(&[0x77; MAX_BINDING_TOKEN_BYTES]),
+            max_sessions: 1024,
+            idle_timeout_millis: 60_000,
+            max_payload_bytes: 65_507,
+            queue_capacity: 1024,
+        }),
+        Message::UdpSessionRetired(UdpSessionRetired {
+            tunnel_id: 42,
+            session_id: 73,
         }),
         Message::DataChannelBind(DataChannelBind {
             client_name: text("home-pc"),
@@ -146,6 +154,64 @@ fn message_ids_are_explicit_and_stable() {
     assert_eq!(MessageId::ERROR.as_u16(), 11);
     assert_eq!(MessageId::OPEN_UDP_CHANNEL.as_u16(), 12);
     assert_eq!(MessageId::DATA_CHANNEL_BIND.as_u16(), 13);
+    assert_eq!(MessageId::UDP_SESSION_RETIRED.as_u16(), 14);
+}
+
+#[test]
+fn udp_channel_limits_and_retirement_round_trip_as_bounded_explicit_messages() {
+    let codec = FrameCodec::new(4096);
+    let open = Message::OpenUdpChannel(OpenUdpChannel {
+        tunnel_id: 7,
+        channel_id: 9,
+        binding_token: bytes(&[0xA5; MAX_BINDING_TOKEN_BYTES]),
+        max_sessions: 1,
+        idle_timeout_millis: 150,
+        max_payload_bytes: 16,
+        queue_capacity: 1,
+    });
+    let retired = Message::UdpSessionRetired(UdpSessionRetired {
+        tunnel_id: 7,
+        session_id: 11,
+    });
+
+    for message in [open, retired] {
+        let encoded = codec.encode(VERSION, 0, &message).unwrap();
+        assert_eq!(codec.decode_exact(&encoded).unwrap().message, message);
+    }
+}
+
+#[test]
+fn udp_negotiation_and_retirement_reject_invalid_numeric_metadata_on_decode() {
+    let codec = FrameCodec::new(4096);
+    let invalid_open = Message::OpenUdpChannel(OpenUdpChannel {
+        max_sessions: 0,
+        ..OpenUdpChannel {
+            tunnel_id: 7,
+            channel_id: 9,
+            binding_token: bytes(&[0xA5; MAX_BINDING_TOKEN_BYTES]),
+            max_sessions: 1,
+            idle_timeout_millis: 150,
+            max_payload_bytes: 16,
+            queue_capacity: 1,
+        }
+    });
+    let invalid_retirement = Message::UdpSessionRetired(UdpSessionRetired {
+        tunnel_id: 7,
+        session_id: 0,
+    });
+
+    for (message, message_id) in [
+        (invalid_open, MessageId::OPEN_UDP_CHANNEL),
+        (invalid_retirement, MessageId::UDP_SESSION_RETIRED),
+    ] {
+        let encoded = codec.encode(VERSION, 0, &message).unwrap();
+        assert_eq!(
+            codec.decode_exact(&encoded),
+            Err(FrameError::MalformedPayload {
+                message: message_id
+            })
+        );
+    }
 }
 
 #[test]

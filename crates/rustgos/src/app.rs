@@ -41,6 +41,8 @@ pub struct ServerRuntimeLimits {
     pub udp_sweep_interval: Duration,
     pub udp_sweep_batch: usize,
     pub udp_writer_delay: Duration,
+    #[doc(hidden)]
+    pub udp_test_disconnect_after_replies: Option<u64>,
 }
 
 impl Default for ServerRuntimeLimits {
@@ -61,6 +63,7 @@ impl Default for ServerRuntimeLimits {
             udp_sweep_interval: Duration::from_secs(1),
             udp_sweep_batch: 64,
             udp_writer_delay: Duration::ZERO,
+            udp_test_disconnect_after_replies: None,
         }
     }
 }
@@ -96,6 +99,7 @@ impl ServerRuntimeLimits {
             || self.udp_queue_capacity > MAX_UDP_QUEUE_CAPACITY
             || self.udp_sweep_batch > MAX_UDP_SWEEP_BATCH
             || self.udp_writer_delay > Duration::from_secs(60)
+            || self.udp_test_disconnect_after_replies == Some(0)
             || self.max_failed_auth_attempts_per_peer > self.max_auth_attempt_records
             || self.max_tracked_auth_peers > self.max_auth_attempt_records
             || tokio::time::Instant::now()
@@ -201,6 +205,7 @@ impl ServerApp {
                 sweep_interval: runtime_limits.udp_sweep_interval,
                 sweep_batch: runtime_limits.udp_sweep_batch,
                 writer_delay: runtime_limits.udp_writer_delay,
+                test_disconnect_after_replies: runtime_limits.udp_test_disconnect_after_replies,
             },
         )?;
         let limiter = FailedAuthLimiter::new_with_attempt_budget(
@@ -328,6 +333,9 @@ impl ServerRuntimeLimits {
         }
         if let Some(value) = parse("RUSTGO_TEST_UDP_WRITE_DELAY_MS")? {
             self.udp_writer_delay = Duration::from_millis(value);
+        }
+        if let Some(value) = parse("RUSTGO_TEST_UDP_DISCONNECT_AFTER_REPLIES")? {
+            self.udp_test_disconnect_after_replies = Some(value);
         }
         Ok(())
     }

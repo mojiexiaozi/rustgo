@@ -14,6 +14,7 @@ use rand::{TryRngCore, rngs::OsRng};
 use rustgo_protocol::{
     BoundedBytes, DataChannelKind, Frame, FrameCodec, FrameError, MAX_UDP_PAYLOAD_BYTES, Message,
     OpenUdpChannel, ProtocolVersion, SocketAddress, UDP_METADATA_LEN, UdpDatagram,
+    UdpSessionRetired,
 };
 use thiserror::Error;
 use tokio::{
@@ -41,6 +42,7 @@ pub(crate) struct UdpRuntimeLimits {
     pub(crate) sweep_interval: Duration,
     pub(crate) sweep_batch: usize,
     pub(crate) writer_delay: Duration,
+    pub(crate) test_disconnect_after_replies: Option<u64>,
 }
 
 impl Default for UdpRuntimeLimits {
@@ -51,6 +53,7 @@ impl Default for UdpRuntimeLimits {
             sweep_interval: Duration::from_secs(1),
             sweep_batch: 64,
             writer_delay: Duration::ZERO,
+            test_disconnect_after_replies: None,
         }
     }
 }
@@ -59,8 +62,36 @@ impl UdpRuntimeLimits {
     pub(crate) fn is_valid(self) -> bool {
         self.queue_capacity > 0
             && !self.idle_timeout.is_zero()
+            && self.idle_timeout.as_millis() <= u128::from(u32::MAX)
             && !self.sweep_interval.is_zero()
             && self.sweep_batch > 0
+            && self.test_disconnect_after_replies != Some(0)
+    }
+
+    pub(crate) fn open_channel(
+        self,
+        tunnel_id: u32,
+        channel_id: u64,
+        binding_token: BoundedBytes<{ rustgo_protocol::MAX_BINDING_TOKEN_BYTES }>,
+        max_sessions: usize,
+        max_payload: usize,
+    ) -> Result<OpenUdpChannel, UdpRelayError> {
+        let request = OpenUdpChannel {
+            tunnel_id,
+            channel_id,
+            binding_token,
+            max_sessions: u32::try_from(max_sessions).map_err(|_| UdpRelayError::InvalidLimits)?,
+            idle_timeout_millis: u32::try_from(self.idle_timeout.as_millis())
+                .map_err(|_| UdpRelayError::InvalidLimits)?,
+            max_payload_bytes: u32::try_from(max_payload)
+                .map_err(|_| UdpRelayError::InvalidLimits)?,
+            queue_capacity: u32::try_from(self.queue_capacity)
+                .map_err(|_| UdpRelayError::InvalidLimits)?,
+        };
+        request
+            .has_valid_limits()
+            .then_some(request)
+            .ok_or(UdpRelayError::InvalidLimits)
     }
 }
 
@@ -141,11 +172,20 @@ async fn run_listener(
     };
     let channel_id = pending.channel_id;
     let cancellation = runtime.cancellation();
-    let request = Message::OpenUdpChannel(OpenUdpChannel {
+    let request = match limits.open_channel(
         tunnel_id,
         channel_id,
-        binding_token: pending.binding_token,
-    });
+        pending.binding_token,
+        max_sessions,
+        max_payload,
+    ) {
+        Ok(request) => Message::OpenUdpChannel(request),
+        Err(error) => {
+            runtime.cancel_pending_udp(channel_id);
+            tracing::warn!(tunnel = %tunnel_name, %error, "invalid negotiated UDP limits");
+            return;
+        }
+    };
     let control_outbound = runtime.outbound();
     let sent = tokio::select! {
         biased;
@@ -345,8 +385,8 @@ impl FlowTable {
         now: tokio::time::Instant,
         idle_timeout: Duration,
         maximum: usize,
-    ) -> Result<usize, FlowError> {
-        let mut expired = 0;
+    ) -> Result<Vec<u64>, FlowError> {
+        let mut expired = Vec::with_capacity(maximum.min(self.by_id.len()));
         let inspected = maximum.min(self.by_id.len());
         for _ in 0..inspected {
             let Some(session_id) = self.sweep_head else {
@@ -356,7 +396,9 @@ impl FlowTable {
                 now.saturating_duration_since(entry.last_activity) >= idle_timeout
             });
             if is_expired {
-                expired += usize::from(self.remove(session_id));
+                if self.remove(session_id) {
+                    expired.push(session_id);
+                }
             } else {
                 self.rotate_sweep_head(session_id)?;
             }
@@ -457,6 +499,7 @@ async fn relay_datagrams(
     ));
     let mut writer_finished = false;
     let mut flows = FlowTable::new(max_sessions);
+    let mut forwarded_replies = 0_u64;
     let mut receive_buffer = vec![0_u8; max_payload.saturating_add(1)];
     let first_sweep = tokio::time::Instant::now()
         .checked_add(limits.sweep_interval)
@@ -481,9 +524,29 @@ async fn relay_datagrams(
                     limits.idle_timeout,
                     limits.sweep_batch,
                 ).map_err(|_| UdpRelayError::SessionAllocation)?;
-                if expired != 0 {
+                if !expired.is_empty() {
                     metrics.set_sessions(flows.len());
-                    tracing::debug!(tunnel = %tunnel_name, expired, sessions = flows.len(), "event=udp_idle_sweep expired UDP sessions");
+                    let expired_count = expired.len();
+                    let mut channel_closed = false;
+                    for session_id in expired {
+                        let retirement = Message::UdpSessionRetired(UdpSessionRetired {
+                            tunnel_id,
+                            session_id,
+                        });
+                        match try_enqueue(&outbound, retirement, &metrics) {
+                            EnqueueResult::Queued => {}
+                            EnqueueResult::Full => UdpMetrics::record_drop(
+                                &metrics.queue_drops,
+                                tunnel_name,
+                                "retirement_queue_full",
+                            ),
+                            EnqueueResult::Closed => channel_closed = true,
+                        }
+                    }
+                    tracing::debug!(tunnel = %tunnel_name, expired = expired_count, sessions = flows.len(), "event=udp_idle_sweep expired UDP sessions");
+                    if channel_closed {
+                        break Err(UdpRelayError::DataChannelClosed);
+                    }
                 }
             }
             received = public.recv_from(&mut receive_buffer) => {
@@ -577,6 +640,15 @@ async fn relay_datagrams(
                 };
                 if sent != datagram.payload.as_slice().len() {
                     break Err(UdpRelayError::ShortDatagramWrite);
+                }
+                forwarded_replies = forwarded_replies.saturating_add(1);
+                if limits.test_disconnect_after_replies == Some(forwarded_replies) {
+                    tracing::warn!(
+                        tunnel = %tunnel_name,
+                        forwarded_replies,
+                        "event=udp_test_data_disconnect internal test closed UDP data channel"
+                    );
+                    break Err(UdpRelayError::InternalTestDisconnect);
                 }
             }
         }
@@ -732,15 +804,16 @@ pub(crate) async fn serve_data_connection(
         return Err(UdpDataError::InvalidFirstFrame);
     }
     let stream = framed.into_stream().map_err(UdpDataError::Control)?;
+    let acknowledgement = registry.udp_open_channel(
+        request.tunnel_id,
+        request.target_id,
+        request.binding_token.clone(),
+    )?;
     let mut authenticated = registry.authenticate_data_channel(stream, &request)?;
     let acknowledgement = FrameCodec::new(1024).encode(
         SERVER_VERSION,
         0,
-        &Message::OpenUdpChannel(OpenUdpChannel {
-            tunnel_id: request.tunnel_id,
-            channel_id: request.target_id,
-            binding_token: request.binding_token,
-        }),
+        &Message::OpenUdpChannel(acknowledgement),
     )?;
     let cancellation = authenticated.cancellation();
     let write = authenticated.stream_mut()?.write_all(&acknowledgement);
@@ -756,7 +829,7 @@ pub(crate) async fn serve_data_connection(
 }
 
 #[derive(Debug, Error)]
-enum UdpRelayError {
+pub(crate) enum UdpRelayError {
     #[error("UDP relay I/O failed: {0}")]
     Io(#[from] io::Error),
     #[error("UDP data frame failed: {0}")]
@@ -775,6 +848,8 @@ enum UdpRelayError {
     ShortDatagramWrite,
     #[error("UDP data writer task failed")]
     TaskJoin,
+    #[error("internal test disconnected the UDP data channel")]
+    InternalTestDisconnect,
     #[error("invalid UDP runtime limits")]
     InvalidLimits,
 }
@@ -910,7 +985,7 @@ mod tests {
             .sweep_expired(started + Duration::from_secs(2), Duration::from_secs(1), 1)
             .unwrap();
 
-        assert_eq!(expired, 1);
+        assert_eq!(expired.len(), 1);
         assert_eq!(flows.len(), 2);
         assert!(flows.sweep_head.is_some());
         assert!(flows.sweep_tail.is_some());
@@ -942,9 +1017,11 @@ mod tests {
         assert_eq!(flows.sweep_tail, Some(identifiers[2]));
         assert_eq!(flows.by_id[&identifiers[0]].next, Some(identifiers[2]));
         assert_eq!(flows.by_id[&identifiers[2]].previous, Some(identifiers[0]));
-        assert_eq!(
-            flows.sweep_expired(now, Duration::from_secs(1), 1).unwrap(),
-            0
+        assert!(
+            flows
+                .sweep_expired(now, Duration::from_secs(1), 1)
+                .unwrap()
+                .is_empty()
         );
         assert_eq!(flows.sweep_head, Some(identifiers[2]));
         assert_eq!(flows.sweep_tail, Some(identifiers[0]));

@@ -840,6 +840,10 @@ async fn heartbeat_loss_clears_active_then_cancels_and_joins_all_children_before
                 tunnel_id: 2,
                 channel_id: 12,
                 binding_token: bytes(&[0x82; MAX_BINDING_TOKEN_BYTES]),
+                max_sessions: 8,
+                idle_timeout_millis: 60_000,
+                max_payload_bytes: 65_507,
+                queue_capacity: 1024,
             }))
             .await?;
 

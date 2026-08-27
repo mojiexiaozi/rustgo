@@ -217,3 +217,200 @@ git diff --check
 - Only Windows x86_64 GNU was exercised in this task. IPv4-mapped normalization
   has unit coverage, but live IPv6 and cross-platform Windows/Linux process
   interoperability remain release-matrix work.
+
+---
+
+## Review fix round 1 (2026-08-28)
+
+Repair commit: `fix: harden UDP generation and flow leases` (the commit
+containing this appendix).
+
+This appendix records the controller-requested repair pass and supersedes the
+base report's fourth invariant plus its second and third deferred concerns. The
+controller accepted one connected local UDP socket per active external flow as
+the only application-agnostic way to preserve arbitrary multi-source,
+out-of-order reply routing. Those sockets and their tasks are now governed by
+the server-negotiated flow limit and lease rather than a client hard-coded
+ceiling.
+
+### Findings and implemented corrections
+
+1. **A dead persistent UDP data child now ends its control generation.** Every
+   UDP child installs a generation-fatal drop guard before data-channel setup.
+   TLS EOF, writer failure, setup failure, task panic, or any other exit not
+   caused by generation cancellation signals the control loop through a
+   one-entry bounded channel. The control stream is then dropped, client status
+   is cleared before children are cancelled/joined, and normal capped reconnect
+   and complete tunnel re-registration restore the public listener. This is the
+   minimal reliable option chosen over same-generation data-channel reissue,
+   because the server listener currently owns and drops the public socket when
+   its relay ends.
+2. **`OpenUdpChannel` now carries the authoritative per-tunnel limits.** The
+   stable explicit message includes `max_sessions`, `idle_timeout_millis`,
+   `max_payload_bytes`, and `queue_capacity`; the data-channel acknowledgement
+   must equal the complete control request. Decode rejects zero or out-of-range
+   values. Rustgoc converts these values before opening the data TLS connection
+   and uses them for the session table, live local-task/socket admission, idle
+   sweep, TLS queue, per-flow queue, and receive buffer. The former
+   1,000,000/60-second/65507-byte/1024-entry client constants are gone.
+3. **Server expiry explicitly retires client flows.** New explicit message ID
+   14 is `UdpSessionRetired { tunnel_id, session_id }`; its strict decoder
+   rejects zero IDs. Each bounded server sweep returns at most its configured
+   batch of expired IDs and nonblockingly enqueues retirement frames. A full
+   data queue drops and counts retirement rather than blocking. Rustgoc cancels
+   and removes the matching connected local socket/task. Its identical
+   negotiated idle lease remains the bounded fallback when the retirement frame
+   itself is dropped.
+4. **Client activity is genuinely bidirectional and validity-gated.** A flow's
+   activity instant is shared between its table owner and connected local task.
+   A valid local reply refreshes it before bounded TLS queue admission. Socket
+   errors, configured-oversize replies, and non-target senders do not refresh
+   it: oversize is rejected first, and a connected UDP socket lets the OS admit
+   packets only from the resolved local target. A mismatched session/source
+   frame on the TLS side is likewise dropped before activity changes.
+5. **Configured payload rejection moved to the client edge.** An oversized
+   server datagram is discarded before a flow entry, socket, task, per-flow
+   queue entry, or TLS work can be created. A local reply buffer is exactly the
+   negotiated maximum plus one byte; an oversized reply is dropped before
+   `UdpDatagram` construction or TLS queue admission. The server no longer has
+   to receive a protocol-valid but tunnel-invalid reverse payload in the tested
+   path.
+
+### Repair RED / GREEN evidence
+
+- `udp_data_channel_failure_reconnects_generation_and_restores_mapping` was
+  introduced as a real-process RED. The initial run timed out waiting for a
+  deterministic data-only disconnect because no bounded hook or recovery path
+  existed. The internal-only, `RUSTGO_INTERNAL_TESTING=1` hook now closes only
+  the UDP data relay after one reply. GREEN observes generation-1 zero-count
+  cleanup, a new `registration_ready`/`udp_channel_ready`, and an exact reply on
+  the same fixed public port. The focused unit
+  `persistent_udp_child_exit_marks_the_generation_inactive` additionally proves
+  `DataSessionTerminated` invokes the inactive callback before return.
+- The first protocol negotiation test did not compile because
+  `OpenUdpChannel` lacked all four limits and the retirement message/ID. GREEN
+  round-trips both explicit messages and rejects invalid numeric metadata during
+  decode. A separate Rustgoc boundary test checks all seven zero/above-maximum
+  limit cases at the pre-data-connect conversion gate.
+- The real `max_sessions=1`, `idle=150ms`, `max_payload=16`, `queue=1` test first
+  failed because Rustgoc's readiness line exposed none of the server values.
+  An intermediate run then showed the identical local lease could expire just
+  before the retirement frame arrived. GREEN records retirement even when the
+  idempotent local removal already won, observes `sessions=0`, and reuses
+  capacity from a second external source.
+- `oversized_local_reply_is_dropped_without_poisoning_the_channel` initially
+  timed out waiting for a client-edge drop because the 17-byte reply was sent
+  over TLS against a negotiated 16-byte tunnel. GREEN observes
+  `reason="oversize_local_reply"`, proves the server never logs
+  `oversize_data_frame`, and then relays a valid reply on the same channel.
+- `valid_reverse_only_replies_keep_the_negotiated_client_lease_alive` first
+  stopped at sequence 6 when the client unilaterally expired at 150ms. GREEN
+  receives sequence 10 and beyond with no additional public request.
+  `oversized_reverse_replies_do_not_refresh_the_client_lease` then exposed an
+  over-broad first fix by timing out waiting for client expiry while 17-byte
+  invalid replies arrived every 30ms. GREEN sees those drops and still expires
+  the one flow within the negotiated lease.
+- Strict-decode RED accepted `UdpSessionRetired { session_id: 0 }`. GREEN returns
+  `FrameError::MalformedPayload` for both that frame and a zero-session-limit
+  `OpenUdpChannel`.
+
+### Revised session, queue, and lease invariants
+
+1. For one tunnel generation, Rustgoc has no more than the negotiated
+   `max_sessions` table entries and no more than that many live-or-cancelling
+   local tasks/sockets. Admission checks both counts, so retirement cannot open
+   a replacement socket until the cancelled task has joined.
+2. One server flow ID has at most one client table entry, one connected local
+   socket/task, and one bounded per-flow input queue. Retirement and local idle
+   expiry are idempotent; both cancel through the same token and unlink the
+   table's O(1) sweep node.
+3. The negotiated TLS queue is positive and at most 65,536 entries. Each
+   per-flow queue is `min(queue_capacity, 64)`. All producers use `try_send`;
+   queue saturation drops work and increments the corresponding monotonic
+   counter without growing memory or waiting.
+4. Payloads larger than the negotiated tunnel maximum cannot allocate a new
+   client flow or enter either client queue. Zero-byte datagrams remain legal
+   and distinct from TLS/UDP socket closure.
+5. Server and client use the same positive millisecond idle lease. Server
+   expiry removes authority before sending a bounded best-effort retirement;
+   client expiry independently closes any old socket if that notification was
+   dropped. Only validated forward traffic or a valid connected-target reply
+   refreshes activity.
+6. A persistent UDP child may end normally only after its generation token is
+   cancelled. Every other terminal path sends one bounded fatal signal. Status
+   becomes inactive and the old control stream is dropped before child
+   cancellation/join; the next generation cannot overlap it.
+
+### Drop and metrics evidence added in this round
+
+- Retirement queue saturation uses the existing rate-limited
+  `event=udp_drop reason="retirement_queue_full"` counter; client same-idle
+  cleanup supplies bounded convergence when that best-effort frame is lost.
+- Configured local oversize logs and counts
+  `reason="oversize_local_reply"` on Rustgoc, before frame construction. The
+  regression asserts no matching server `oversize_data_frame` event.
+- Invalid oversized reverse traffic repeatedly emits only the rate-limited drop
+  series and cannot keep a lease alive. Valid reverse traffic refreshes the
+  lease even if the bounded outbound queue later drops that otherwise valid
+  reply.
+- Data-only failure still emits both server and client `event=udp_cleanup`
+  zero-count records; generation replacement does not reuse an old table,
+  queue, task, socket, token, or TLS stream.
+
+### Expanded real-process matrix
+
+The UDP process suite now contains 14 tests. In addition to the original ten,
+it covers:
+
+1. negotiated one-flow/150ms/16-byte/one-entry limits, explicit retirement, and
+   capacity reuse from a second external source;
+2. data-TLS-only failure, inactive generation cleanup, reconnect,
+   re-registration, and restored fixed-port mapping;
+3. reverse-only valid replies continuing across multiple idle periods; and
+4. periodic configured-oversize reverse replies being dropped without
+   refreshing the client lease.
+
+### Review-round verification
+
+Observed on the final review tree:
+
+```text
+cargo test -p rustgo-e2e --test udp -- --nocapture
+cargo test -p rustgo-protocol -p rustgoc -p rustgos -- --nocapture
+cargo test -p rustgo-e2e --test tcp -- --nocapture
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --no-fail-fast
+git diff --check
+```
+
+- UDP real-process E2E: 14 passed, 0 failed. The final tree passed once inside
+  the workspace run and once again as an independent focused rerun.
+- TCP real-process regression: 10 passed, 0 failed.
+- Protocol/server/client focused run: 115 passed, 0 failed (protocol 32,
+  Rustgoc 28, Rustgos 55).
+- Full workspace: 188 passed, 0 failed; every doc test passed.
+- Format check and workspace/all-target Clippy with warnings denied exited 0.
+- `git diff --check` had no whitespace errors; Git printed only the repository's
+  existing LF-to-CRLF checkout notices.
+
+### Remaining concerns after repair
+
+- The controller-approved per-flow connected socket topology remains necessary
+  for generic reordered replies. It is now strictly bounded by negotiated
+  sessions and idle lifetime, but configurations near the one-million protocol
+  ceiling still deliberately authorize correspondingly high socket/task
+  pressure; operators should choose a realistic server limit.
+- A UDP data-child failure intentionally tears down and re-registers the whole
+  client generation. This restores one unambiguous listener owner and avoids a
+  false-active status, but briefly interrupts unrelated tunnels. A later
+  same-generation channel reissue would need a design that retains the public
+  listener and prevents two concurrent channel owners.
+- Retirement delivery is best effort under the same bounded queue as data. The
+  identical client lease guarantees bounded cleanup, but a newly recycled
+  server flow can lose initial UDP datagrams while the prior cancelled local
+  task is still joining; the implementation preserves the hard socket/task
+  bound instead of transiently exceeding it.
+- The original report's bounded token-owner linear lookup and Windows ephemeral
+  fixture bind race remain. Live IPv6 and Windows/Linux interoperability also
+  remain release-matrix work; this repair was verified on Windows x86_64 GNU.

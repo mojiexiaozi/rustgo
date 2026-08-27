@@ -8,8 +8,8 @@ use std::{
 use rand::{TryRngCore, rngs::OsRng};
 use rustgo_protocol::{
     BoundedBytes, BoundedVec, DataChannelBind, DataChannelKind, MAX_BINDING_TOKEN_BYTES,
-    MAX_TUNNELS, Message, ProtocolErrorCode, RegisterTunnels, TunnelProtocol, TunnelResult,
-    TunnelResults,
+    MAX_TUNNELS, Message, OpenUdpChannel, ProtocolErrorCode, RegisterTunnels, TunnelProtocol,
+    TunnelResult, TunnelResults,
 };
 use rustgo_transport::{BindingError, ChannelBinding, ChannelBindingStore, ChannelKind};
 use thiserror::Error;
@@ -254,6 +254,23 @@ impl ClientRegistry {
             }
         }
         Err(RegistryError::Binding(BindingError::Rejected))
+    }
+
+    pub(crate) fn udp_open_channel(
+        &self,
+        tunnel_id: u32,
+        channel_id: u64,
+        binding_token: BoundedBytes<MAX_BINDING_TOKEN_BYTES>,
+    ) -> Result<OpenUdpChannel, RegistryError> {
+        self.udp_runtime_limits
+            .open_channel(
+                tunnel_id,
+                channel_id,
+                binding_token,
+                self.max_udp_sessions_per_tunnel,
+                self.max_udp_payload_bytes,
+            )
+            .map_err(|_| RegistryError::InvalidConfiguration)
     }
 
     fn release(&self, identity: &AuthenticatedClient) {

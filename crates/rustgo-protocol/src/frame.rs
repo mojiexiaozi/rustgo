@@ -8,7 +8,7 @@ use crate::message::{
     AuthResult, BoundedBytes, ClientAuthenticate, ClientHello, DataChannelBind, ErrorMessage,
     Heartbeat, MAX_UDP_PAYLOAD_BYTES, Message, MessageId, OpenTcpStream, OpenUdpChannel,
     RegisterTunnels, ServerChallenge, SocketAddress, TcpStreamReady, TunnelResults,
-    UDP_METADATA_LEN, UdpDatagram,
+    UDP_METADATA_LEN, UdpDatagram, UdpSessionRetired,
 };
 
 pub const MAGIC: [u8; 4] = *b"RSGO";
@@ -208,6 +208,7 @@ fn encode_payload(message: &Message) -> Result<Vec<u8>, FrameError> {
         Message::Error(value) => serialize(value),
         Message::OpenUdpChannel(value) => serialize(value),
         Message::DataChannelBind(value) => serialize(value),
+        Message::UdpSessionRetired(value) => serialize(value),
     }
 }
 
@@ -254,6 +255,9 @@ fn decode_payload(message: MessageId, payload: &[u8]) -> Result<Message, FrameEr
         }
         MessageId::DATA_CHANNEL_BIND => {
             deserialize::<DataChannelBind>(message, payload).map(Message::DataChannelBind)
+        }
+        MessageId::UDP_SESSION_RETIRED => {
+            deserialize::<UdpSessionRetired>(message, payload).map(Message::UdpSessionRetired)
         }
         _ => unreachable!("all valid message IDs are handled"),
     }

@@ -14,6 +14,8 @@ pub const MAX_BINDING_TOKEN_BYTES: usize = 64;
 pub const MAX_TUNNELS: usize = 64;
 pub const MAX_TUNNEL_NAME_BYTES: usize = 128;
 pub const MAX_UDP_PAYLOAD_BYTES: usize = 65_507;
+pub const MAX_UDP_SESSIONS_PER_TUNNEL: u32 = 1_000_000;
+pub const MAX_UDP_QUEUE_CAPACITY: u32 = 65_536;
 pub const UDP_METADATA_LEN: usize = 31;
 pub const MAX_ERROR_DETAIL_BYTES: usize = 512;
 
@@ -275,6 +277,7 @@ impl MessageId {
     pub const ERROR: Self = Self(11);
     pub const OPEN_UDP_CHANNEL: Self = Self(12);
     pub const DATA_CHANNEL_BIND: Self = Self(13);
+    pub const UDP_SESSION_RETIRED: Self = Self(14);
 
     pub const fn as_u16(self) -> u16 {
         self.0
@@ -295,6 +298,7 @@ impl MessageId {
             11 => 1024,
             12 => 96,
             13 => 384,
+            14 => 32,
             _ => 0,
         }
     }
@@ -305,7 +309,7 @@ impl TryFrom<u16> for MessageId {
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
         match value {
-            1..=13 => Ok(Self(value)),
+            1..=14 => Ok(Self(value)),
             _ => Err(value),
         }
     }
@@ -485,11 +489,89 @@ pub struct OpenTcpStream {
     pub binding_token: BoundedBytes<MAX_BINDING_TOKEN_BYTES>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct OpenUdpChannel {
     pub tunnel_id: u32,
     pub channel_id: u64,
     pub binding_token: BoundedBytes<MAX_BINDING_TOKEN_BYTES>,
+    pub max_sessions: u32,
+    pub idle_timeout_millis: u32,
+    pub max_payload_bytes: u32,
+    pub queue_capacity: u32,
+}
+
+impl OpenUdpChannel {
+    pub const fn has_valid_limits(&self) -> bool {
+        self.max_sessions > 0
+            && self.max_sessions <= MAX_UDP_SESSIONS_PER_TUNNEL
+            && self.idle_timeout_millis > 0
+            && self.max_payload_bytes > 0
+            && self.max_payload_bytes <= MAX_UDP_PAYLOAD_BYTES as u32
+            && self.queue_capacity > 0
+            && self.queue_capacity <= MAX_UDP_QUEUE_CAPACITY
+    }
+}
+
+impl<'de> Deserialize<'de> for OpenUdpChannel {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct WireOpenUdpChannel {
+            tunnel_id: u32,
+            channel_id: u64,
+            binding_token: BoundedBytes<MAX_BINDING_TOKEN_BYTES>,
+            max_sessions: u32,
+            idle_timeout_millis: u32,
+            max_payload_bytes: u32,
+            queue_capacity: u32,
+        }
+
+        let wire = WireOpenUdpChannel::deserialize(deserializer)?;
+        let value = Self {
+            tunnel_id: wire.tunnel_id,
+            channel_id: wire.channel_id,
+            binding_token: wire.binding_token,
+            max_sessions: wire.max_sessions,
+            idle_timeout_millis: wire.idle_timeout_millis,
+            max_payload_bytes: wire.max_payload_bytes,
+            queue_capacity: wire.queue_capacity,
+        };
+        if value.has_valid_limits() {
+            Ok(value)
+        } else {
+            Err(de::Error::custom("invalid UDP channel limits"))
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UdpSessionRetired {
+    pub tunnel_id: u32,
+    pub session_id: u64,
+}
+
+impl<'de> Deserialize<'de> for UdpSessionRetired {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct WireUdpSessionRetired {
+            tunnel_id: u32,
+            session_id: u64,
+        }
+
+        let wire = WireUdpSessionRetired::deserialize(deserializer)?;
+        if wire.tunnel_id == 0 || wire.session_id == 0 {
+            return Err(de::Error::custom("invalid UDP session retirement"));
+        }
+        Ok(Self {
+            tunnel_id: wire.tunnel_id,
+            session_id: wire.session_id,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -543,6 +625,7 @@ pub enum Message {
     Error(ErrorMessage),
     OpenUdpChannel(OpenUdpChannel),
     DataChannelBind(DataChannelBind),
+    UdpSessionRetired(UdpSessionRetired),
 }
 
 impl Message {
@@ -561,6 +644,7 @@ impl Message {
             Self::Error(_) => MessageId::ERROR,
             Self::OpenUdpChannel(_) => MessageId::OPEN_UDP_CHANNEL,
             Self::DataChannelBind(_) => MessageId::DATA_CHANNEL_BIND,
+            Self::UdpSessionRetired(_) => MessageId::UDP_SESSION_RETIRED,
         }
     }
 }

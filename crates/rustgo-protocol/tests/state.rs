@@ -204,6 +204,10 @@ fn active_state_accepts_data_channel_control_notifications() {
         tunnel_id: 1,
         channel_id: 3,
         binding_token: token,
+        max_sessions: 8,
+        idle_timeout_millis: 60_000,
+        max_payload_bytes: 65_507,
+        queue_capacity: 1024,
     });
 
     assert_eq!(state.transition(&tcp), Ok(state.clone()));

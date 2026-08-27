@@ -5,7 +5,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     pin::Pin,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
@@ -36,17 +36,46 @@ use crate::{
 };
 
 const MAX_CLIENT_UDP_CHANNELS: usize = rustgo_protocol::MAX_TUNNELS;
-// Matches rustgo-config's documented hard ceiling. The server's lower configured
-// per-tunnel limit remains authoritative because it alone allocates session IDs.
-const MAX_CLIENT_UDP_SESSIONS: usize = 1_000_000;
-const UDP_DATA_QUEUE_CAPACITY: usize = 1024;
-const UDP_SESSION_QUEUE_CAPACITY: usize = 64;
-const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
-const UDP_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
-const UDP_SWEEP_BATCH: usize = 64;
 const UDP_SETUP_TIMEOUT: Duration = Duration::from_secs(10);
 const UDP_LOCAL_SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const DATA_FRAME_MAX: usize = UDP_METADATA_LEN + MAX_UDP_PAYLOAD_BYTES;
+
+#[derive(Debug, Clone, Copy)]
+struct NegotiatedUdpLimits {
+    max_sessions: usize,
+    idle_timeout: Duration,
+    max_payload: usize,
+    queue_capacity: usize,
+    session_queue_capacity: usize,
+    sweep_interval: Duration,
+    sweep_batch: usize,
+}
+
+impl TryFrom<&OpenUdpChannel> for NegotiatedUdpLimits {
+    type Error = UdpClientError;
+
+    fn try_from(request: &OpenUdpChannel) -> Result<Self, Self::Error> {
+        if !request.has_valid_limits() {
+            return Err(UdpClientError::InvalidNegotiatedLimits);
+        }
+        let max_sessions = usize::try_from(request.max_sessions)
+            .map_err(|_| UdpClientError::InvalidNegotiatedLimits)?;
+        let max_payload = usize::try_from(request.max_payload_bytes)
+            .map_err(|_| UdpClientError::InvalidNegotiatedLimits)?;
+        let queue_capacity = usize::try_from(request.queue_capacity)
+            .map_err(|_| UdpClientError::InvalidNegotiatedLimits)?;
+        let idle_timeout = Duration::from_millis(u64::from(request.idle_timeout_millis));
+        Ok(Self {
+            max_sessions,
+            idle_timeout,
+            max_payload,
+            queue_capacity,
+            session_queue_capacity: queue_capacity.min(64),
+            sweep_interval: idle_timeout.min(Duration::from_secs(1)),
+            sweep_batch: max_sessions.min(64),
+        })
+    }
+}
 
 pub(crate) struct RelaySessionSupervisor {
     tcp: TcpSessionSupervisor,
@@ -131,6 +160,14 @@ impl ChildSessionSupervisor for UdpSessionSupervisor {
             let ChildSessionRequest::Udp(request) = request else {
                 return;
             };
+            let _fatal_on_exit = context.fatal_on_exit(shutdown.clone());
+            let limits = match NegotiatedUdpLimits::try_from(&request) {
+                Ok(limits) => limits,
+                Err(error) => {
+                    tracing::warn!(tunnel_id = request.tunnel_id, %error, "invalid negotiated UDP limits");
+                    return;
+                }
+            };
             let Ok(permit) = permits.try_acquire_owned() else {
                 tracing::warn!(
                     tunnel_id = request.tunnel_id,
@@ -167,6 +204,10 @@ impl ChildSessionSupervisor for UdpSessionSupervisor {
                 tunnel_id = request.tunnel_id,
                 channel_id = request.channel_id,
                 generation = context.generation().get(),
+                max_sessions = request.max_sessions,
+                idle_timeout_millis = request.idle_timeout_millis,
+                max_payload_bytes = request.max_payload_bytes,
+                queue_capacity = request.queue_capacity,
                 "event=udp_channel_ready client UDP data channel ready"
             );
             if let Err(error) = relay_local_datagrams(
@@ -174,6 +215,7 @@ impl ChildSessionSupervisor for UdpSessionSupervisor {
                 request.tunnel_id,
                 local_target,
                 context.generation().get(),
+                limits,
                 shutdown,
             )
             .await
@@ -219,10 +261,7 @@ async fn setup_data_channel(
     let Message::OpenUdpChannel(ready) = acknowledgement.message else {
         return Err(UdpClientError::InvalidAcknowledgement);
     };
-    if ready.tunnel_id != request.tunnel_id
-        || ready.channel_id != request.channel_id
-        || ready.binding_token != request.binding_token
-    {
+    if &ready != request {
         return Err(UdpClientError::InvalidAcknowledgement);
     }
     Ok(data)
@@ -251,7 +290,7 @@ struct ClientSession {
     external: SocketAddr,
     sender: mpsc::Sender<Vec<u8>>,
     cancellation: CancellationToken,
-    last_activity: tokio::time::Instant,
+    last_activity: Arc<Mutex<tokio::time::Instant>>,
     previous: Option<u64>,
     next: Option<u64>,
 }
@@ -347,23 +386,34 @@ impl ClientSessionTable {
         true
     }
 
-    fn sweep_expired(&mut self, now: tokio::time::Instant, maximum: usize) -> usize {
+    fn sweep_expired(
+        &mut self,
+        now: tokio::time::Instant,
+        idle_timeout: Duration,
+        maximum: usize,
+    ) -> Result<usize, UdpClientError> {
         let mut expired = 0;
         let inspected = maximum.min(self.sessions.len());
         for _ in 0..inspected {
             let Some(session_id) = self.sweep_head else {
                 break;
             };
-            let is_expired = self.sessions.get(&session_id).is_some_and(|session| {
-                now.saturating_duration_since(session.last_activity) >= UDP_SESSION_IDLE_TIMEOUT
-            });
+            let is_expired = if let Some(session) = self.sessions.get(&session_id) {
+                let last_activity = *session
+                    .last_activity
+                    .lock()
+                    .map_err(|_| UdpClientError::ActivityState)?;
+                now.saturating_duration_since(last_activity) >= idle_timeout
+            } else {
+                false
+            };
             if is_expired {
                 expired += usize::from(self.remove(session_id));
             } else if !self.rotate_sweep_head(session_id) {
                 break;
             }
         }
-        expired
+        Ok(expired)
     }
 
     fn clear(&mut self) {
@@ -427,11 +477,12 @@ async fn relay_local_datagrams(
     tunnel_id: u32,
     local_target: String,
     generation: u64,
+    limits: NegotiatedUdpLimits,
     shutdown: CancellationToken,
 ) -> Result<(), UdpClientError> {
     let (reader, writer) = tokio::io::split(data);
     let mut reader = UdpFrameReader::new(reader);
-    let (data_outbound, data_receiver) = mpsc::channel(UDP_DATA_QUEUE_CAPACITY);
+    let (data_outbound, data_receiver) = mpsc::channel(limits.queue_capacity);
     let metrics = Arc::new(UdpMetrics::default());
     let relay_shutdown = CancellationToken::new();
     let mut writer_task = tokio::spawn(write_frames(
@@ -444,9 +495,9 @@ async fn relay_local_datagrams(
     let mut sessions = ClientSessionTable::new();
     let mut local_tasks = JoinSet::new();
     let first_sweep = tokio::time::Instant::now()
-        .checked_add(UDP_SWEEP_INTERVAL)
+        .checked_add(limits.sweep_interval)
         .ok_or(UdpClientError::InvalidRuntime)?;
-    let mut sweep = tokio::time::interval_at(first_sweep, UDP_SWEEP_INTERVAL);
+    let mut sweep = tokio::time::interval_at(first_sweep, limits.sweep_interval);
     sweep.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     let result = loop {
@@ -461,7 +512,11 @@ async fn relay_local_datagrams(
                 };
             }
             _ = sweep.tick() => {
-                let expired = sessions.sweep_expired(tokio::time::Instant::now(), UDP_SWEEP_BATCH);
+                let expired = sessions.sweep_expired(
+                    tokio::time::Instant::now(),
+                    limits.idle_timeout,
+                    limits.sweep_batch,
+                )?;
                 if expired != 0 {
                     metrics.sessions.store(sessions.sessions.len(), Ordering::Release);
                     tracing::debug!(tunnel_id, generation, expired, sessions = sessions.sessions.len(), "event=udp_idle_sweep expired local UDP sessions");
@@ -486,26 +541,57 @@ async fn relay_local_datagrams(
                 if frame.version != crate::CLIENT_VERSION {
                     break Err(UdpClientError::InvalidFrame);
                 }
-                let Message::UdpDatagram(datagram) = frame.message else {
-                    break Err(UdpClientError::InvalidFrame);
+                let datagram = match frame.message {
+                    Message::UdpDatagram(datagram) => datagram,
+                    Message::UdpSessionRetired(retired) => {
+                        if retired.tunnel_id != tunnel_id || retired.session_id == 0 {
+                            break Err(UdpClientError::InvalidFrame);
+                        }
+                        let removed = sessions.remove(retired.session_id);
+                        if removed {
+                            metrics.sessions.store(sessions.sessions.len(), Ordering::Release);
+                        }
+                        tracing::info!(
+                            tunnel_id,
+                            generation,
+                            session_id = retired.session_id,
+                            removed,
+                            sessions = sessions.sessions.len(),
+                            "event=udp_session_retired server retired local UDP flow"
+                        );
+                        continue;
+                    }
+                    _ => break Err(UdpClientError::InvalidFrame),
                 };
                 if datagram.tunnel_id != tunnel_id || datagram.session_id == 0 {
                     break Err(UdpClientError::InvalidFrame);
                 }
+                if datagram.payload.as_slice().len() > limits.max_payload {
+                    UdpMetrics::record_drop(
+                        &metrics.invalid_drops,
+                        tunnel_id,
+                        "oversize_server_datagram",
+                    );
+                    continue;
+                }
                 let external = socket_addr_from_wire(&datagram.source);
                 let now = tokio::time::Instant::now();
                 if !sessions.sessions.contains_key(&datagram.session_id) {
-                    if sessions.sessions.len() >= MAX_CLIENT_UDP_SESSIONS {
+                    if sessions.sessions.len() >= limits.max_sessions
+                        || local_tasks.len() >= limits.max_sessions
+                    {
                         UdpMetrics::record_drop(&metrics.session_limit_drops, tunnel_id, "client_session_limit");
                         continue;
                     }
                     let session_shutdown = relay_shutdown.child_token();
-                    let (sender, receiver) = mpsc::channel(UDP_SESSION_QUEUE_CAPACITY);
+                    let (sender, receiver) = mpsc::channel(limits.session_queue_capacity);
                     let local_target = local_target.clone();
                     let session_id = datagram.session_id;
                     let data_outbound = data_outbound.clone();
                     let task_metrics = metrics.clone();
                     let task_shutdown = session_shutdown.clone();
+                    let last_activity = Arc::new(Mutex::new(now));
+                    let task_activity = last_activity.clone();
                     local_tasks.spawn(async move {
                         let result = run_local_session(
                             local_target,
@@ -515,6 +601,8 @@ async fn relay_local_datagrams(
                             receiver,
                             data_outbound,
                             task_metrics,
+                            task_activity,
+                            limits.max_payload,
                             task_shutdown,
                         )
                         .await;
@@ -526,7 +614,7 @@ async fn relay_local_datagrams(
                             external,
                             sender,
                             cancellation: session_shutdown,
-                            last_activity: now,
+                            last_activity,
                             previous: None,
                             next: None,
                         },
@@ -542,7 +630,10 @@ async fn relay_local_datagrams(
                     UdpMetrics::record_drop(&metrics.invalid_drops, tunnel_id, "mismatched_session_source");
                     continue;
                 }
-                session.last_activity = now;
+                *session
+                    .last_activity
+                    .lock()
+                    .map_err(|_| UdpClientError::ActivityState)? = now;
                 match try_queue(
                     &session.sender,
                     datagram.payload.into_vec(),
@@ -597,6 +688,8 @@ async fn run_local_session(
     mut requests: mpsc::Receiver<Vec<u8>>,
     data_outbound: mpsc::Sender<Message>,
     metrics: Arc<UdpMetrics>,
+    last_activity: Arc<Mutex<tokio::time::Instant>>,
+    max_payload: usize,
     cancellation: CancellationToken,
 ) -> Result<(), UdpClientError> {
     let setup = async {
@@ -620,7 +713,7 @@ async fn run_local_session(
             result.map_err(|_| UdpClientError::LocalSetupTimeout)??
         }
     };
-    let mut response = vec![0_u8; MAX_UDP_PAYLOAD_BYTES + 1];
+    let mut response = vec![0_u8; max_payload.saturating_add(1)];
     loop {
         tokio::select! {
             () = cancellation.cancelled() => break,
@@ -648,12 +741,15 @@ async fn run_local_session(
                     }
                     Err(error) => return Err(error.into()),
                 };
-                if received > MAX_UDP_PAYLOAD_BYTES {
+                if received > max_payload {
                     UdpMetrics::record_drop(&metrics.invalid_drops, tunnel_id, "oversize_local_reply");
                     continue;
                 }
                 let payload = BoundedBytes::<MAX_UDP_PAYLOAD_BYTES>::try_from(&response[..received])
                     .map_err(|_| UdpClientError::InvalidFrame)?;
+                *last_activity
+                    .lock()
+                    .map_err(|_| UdpClientError::ActivityState)? = tokio::time::Instant::now();
                 let message = Message::UdpDatagram(UdpDatagram {
                     tunnel_id,
                     session_id,
@@ -794,6 +890,8 @@ enum UdpClientError {
     InvalidBinding,
     #[error("invalid UDP data-channel acknowledgement")]
     InvalidAcknowledgement,
+    #[error("invalid negotiated UDP channel limits")]
+    InvalidNegotiatedLimits,
     #[error("invalid UDP data frame")]
     InvalidFrame,
     #[error("UDP frame exceeded its maximum")]
@@ -810,16 +908,80 @@ enum UdpClientError {
     TaskJoin,
     #[error("invalid UDP runtime deadline")]
     InvalidRuntime,
+    #[error("UDP activity state was poisoned")]
+    ActivityState,
 }
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+    use std::{
+        net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+        sync::{Arc, Mutex},
+    };
 
+    use rustgo_protocol::{
+        BoundedBytes, MAX_BINDING_TOKEN_BYTES, MAX_UDP_PAYLOAD_BYTES, MAX_UDP_QUEUE_CAPACITY,
+        MAX_UDP_SESSIONS_PER_TUNNEL, OpenUdpChannel,
+    };
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
 
-    use super::{ClientSession, ClientSessionTable, canonical_socket_addr};
+    use super::{ClientSession, ClientSessionTable, NegotiatedUdpLimits, canonical_socket_addr};
+
+    fn negotiated_request() -> OpenUdpChannel {
+        OpenUdpChannel {
+            tunnel_id: 1,
+            channel_id: 2,
+            binding_token: BoundedBytes::<MAX_BINDING_TOKEN_BYTES>::try_from(&[3; 32][..]).unwrap(),
+            max_sessions: 1,
+            idle_timeout_millis: 150,
+            max_payload_bytes: 16,
+            queue_capacity: 1,
+        }
+    }
+
+    #[test]
+    fn invalid_negotiated_limits_are_rejected_by_the_preconnect_gate() {
+        let valid = negotiated_request();
+        let limits = NegotiatedUdpLimits::try_from(&valid).unwrap();
+        assert_eq!(limits.max_sessions, 1);
+        assert_eq!(limits.idle_timeout, std::time::Duration::from_millis(150));
+        assert_eq!(limits.max_payload, 16);
+        assert_eq!(limits.queue_capacity, 1);
+
+        for invalid in [
+            OpenUdpChannel {
+                max_sessions: 0,
+                ..valid.clone()
+            },
+            OpenUdpChannel {
+                max_sessions: MAX_UDP_SESSIONS_PER_TUNNEL + 1,
+                ..valid.clone()
+            },
+            OpenUdpChannel {
+                idle_timeout_millis: 0,
+                ..valid.clone()
+            },
+            OpenUdpChannel {
+                max_payload_bytes: 0,
+                ..valid.clone()
+            },
+            OpenUdpChannel {
+                max_payload_bytes: MAX_UDP_PAYLOAD_BYTES as u32 + 1,
+                ..valid.clone()
+            },
+            OpenUdpChannel {
+                queue_capacity: 0,
+                ..valid.clone()
+            },
+            OpenUdpChannel {
+                queue_capacity: MAX_UDP_QUEUE_CAPACITY + 1,
+                ..valid.clone()
+            },
+        ] {
+            assert!(NegotiatedUdpLimits::try_from(&invalid).is_err());
+        }
+    }
 
     #[test]
     fn removed_local_sessions_do_not_grow_the_bounded_sweep_ring() {
@@ -833,7 +995,7 @@ mod tests {
                     external: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 10_000),
                     sender,
                     cancellation: CancellationToken::new(),
-                    last_activity: tokio::time::Instant::now(),
+                    last_activity: Arc::new(Mutex::new(tokio::time::Instant::now())),
                     previous: None,
                     next: None,
                 },
@@ -871,7 +1033,7 @@ mod tests {
                     external: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 10_000),
                     sender,
                     cancellation: CancellationToken::new(),
-                    last_activity: tokio::time::Instant::now(),
+                    last_activity: Arc::new(Mutex::new(tokio::time::Instant::now())),
                     previous: None,
                     next: None,
                 },

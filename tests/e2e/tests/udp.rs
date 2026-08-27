@@ -131,6 +131,73 @@ struct ConditionalOversizeUdpServer {
     thread: Option<thread::JoinHandle<()>>,
 }
 
+struct PeriodicReplyUdpServer {
+    address: SocketAddr,
+    shutdown: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl PeriodicReplyUdpServer {
+    fn start(reply_len: usize) -> TestResult<Self> {
+        if reply_len < 2 {
+            return Err("periodic UDP replies require two sequence bytes".into());
+        }
+        let socket = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))?;
+        socket.set_nonblocking(true)?;
+        let address = socket.local_addr()?;
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_shutdown = shutdown.clone();
+        let thread = thread::spawn(move || {
+            let mut buffer = [0_u8; 64];
+            let mut peer = None;
+            let mut sequence = 0_u16;
+            let mut next_reply = std::time::Instant::now();
+            while !thread_shutdown.load(Ordering::Acquire) {
+                match socket.recv_from(&mut buffer) {
+                    Ok((_, source)) => {
+                        peer = Some(source);
+                        next_reply = std::time::Instant::now();
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+                if let Some(source) = peer
+                    && std::time::Instant::now() >= next_reply
+                {
+                    sequence = sequence.saturating_add(1);
+                    let mut response = vec![0x5A; reply_len];
+                    response[..2].copy_from_slice(&sequence.to_be_bytes());
+                    let _ = socket.send_to(&response, source);
+                    next_reply = std::time::Instant::now() + Duration::from_millis(30);
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+        });
+        Ok(Self {
+            address,
+            shutdown,
+            thread: Some(thread),
+        })
+    }
+
+    fn address(&self) -> SocketAddr {
+        self.address
+    }
+}
+
+impl Drop for PeriodicReplyUdpServer {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        if let Ok(wakeup) = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)) {
+            let _ = wakeup.send_to(&[], self.address);
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 impl ConditionalOversizeUdpServer {
     fn start() -> TestResult<Self> {
         let socket = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))?;
@@ -350,6 +417,36 @@ fn session_limit_drops_then_idle_sweep_reclaims_capacity() -> TestResult {
 }
 
 #[test]
+fn negotiated_limits_retire_idle_client_flow_before_capacity_reuse() -> TestResult {
+    let echo = UdpEchoServer::start()?;
+    let fixture = ProcessFixture::single_udp(echo.address(), 1, 16)?
+        .with_server_env("RUSTGO_INTERNAL_TESTING", "1")
+        .with_server_env("RUSTGO_TEST_UDP_QUEUE_CAPACITY", "1")
+        .with_server_env("RUSTGO_TEST_UDP_IDLE_TIMEOUT_MS", "150")
+        .with_server_env("RUSTGO_TEST_UDP_SWEEP_INTERVAL_MS", "25")
+        .with_server_env("RUSTGO_TEST_UDP_SWEEP_BATCH", "1");
+    let (fixture, mut server, mut client) = launch(fixture)?;
+    let ready = client.wait_for_line("event=udp_channel_ready", READY_TIMEOUT)?;
+    assert!(ready.contains("max_sessions=1"), "{ready}");
+    assert!(ready.contains("idle_timeout_millis=150"), "{ready}");
+    assert!(ready.contains("max_payload_bytes=16"), "{ready}");
+    assert!(ready.contains("queue_capacity=1"), "{ready}");
+    let public = fixture.public_address();
+    let first = public_socket()?;
+    let second = public_socket()?;
+
+    assert_datagram_echo(&first, public, &[0xA1; 16])?;
+    server.wait_for_line("event=udp_idle_sweep", Duration::from_secs(3))?;
+    let retired = client.wait_for_line("event=udp_session_retired", Duration::from_secs(3))?;
+    assert!(retired.contains("sessions=0"), "{retired}");
+    assert_datagram_echo(&second, public, &[0xB2; 16])?;
+
+    client.terminate()?;
+    server.terminate()?;
+    Ok(())
+}
+
+#[test]
 fn bounded_queue_overflow_drops_without_killing_the_tunnel() -> TestResult {
     let echo = UdpEchoServer::start()?;
     let fixture = ProcessFixture::single_udp(echo.address(), 8, 1024)?
@@ -408,7 +505,12 @@ fn oversized_local_reply_is_dropped_without_poisoning_the_channel() -> TestResul
 
     socket.send_to(&[0xEE], public)?;
     expect_no_datagram(&socket)?;
-    server.wait_for_line("reason=\"oversize_data_frame\"", Duration::from_secs(3))?;
+    client.wait_for_line("reason=\"oversize_local_reply\"", Duration::from_secs(3))?;
+    assert!(
+        !server.output().contains("reason=\"oversize_data_frame\""),
+        "configured oversize reply reached the server TLS reader:\n{}",
+        server.output()
+    );
     assert_datagram_echo(&socket, public, b"still live")?;
 
     client.terminate()?;
@@ -494,6 +596,29 @@ fn server_restart_cleans_stale_generation_and_restores_mapping() -> TestResult {
 }
 
 #[test]
+fn udp_data_channel_failure_reconnects_generation_and_restores_mapping() -> TestResult {
+    let echo = UdpEchoServer::start()?;
+    let fixture = ProcessFixture::single_udp(echo.address(), 8, 1024)?
+        .with_server_env("RUSTGO_INTERNAL_TESTING", "1")
+        .with_server_env("RUSTGO_TEST_UDP_DISCONNECT_AFTER_REPLIES", "1");
+    let (fixture, mut server, mut client) = launch(fixture)?;
+    let public = fixture.public_address();
+    let socket = public_socket()?;
+
+    assert_datagram_echo(&socket, public, b"generation one")?;
+    server.wait_for_line("event=udp_test_data_disconnect", Duration::from_secs(3))?;
+    let cleanup = client.wait_for_line("event=udp_cleanup", Duration::from_secs(5))?;
+    assert!(cleanup.contains("generation=1"), "{cleanup}");
+    client.wait_for_line("event=registration_ready", Duration::from_secs(12))?;
+    client.wait_for_line("event=udp_channel_ready", READY_TIMEOUT)?;
+    assert_datagram_echo(&socket, public, b"generation two")?;
+
+    client.terminate()?;
+    server.terminate()?;
+    Ok(())
+}
+
+#[test]
 fn continuous_public_flood_does_not_starve_tls_replies() -> TestResult {
     let echo = UdpEchoServer::start()?;
     let (fixture, mut server, mut client) =
@@ -541,6 +666,72 @@ fn continuous_public_flood_does_not_starve_tls_replies() -> TestResult {
         )
         .into());
     }
+
+    client.terminate()?;
+    server.terminate()?;
+    Ok(())
+}
+
+#[test]
+fn valid_reverse_only_replies_keep_the_negotiated_client_lease_alive() -> TestResult {
+    let service = PeriodicReplyUdpServer::start(2)?;
+    let fixture = ProcessFixture::single_udp(service.address(), 1, 16)?
+        .with_server_env("RUSTGO_INTERNAL_TESTING", "1")
+        .with_server_env("RUSTGO_TEST_UDP_IDLE_TIMEOUT_MS", "150")
+        .with_server_env("RUSTGO_TEST_UDP_SWEEP_INTERVAL_MS", "25");
+    let (fixture, mut server, mut client) = launch(fixture)?;
+    client.wait_for_line("event=udp_channel_ready", READY_TIMEOUT)?;
+    let public = fixture.public_address();
+    let socket = public_socket_with_timeout(Duration::from_millis(100))?;
+    socket.send_to(b"start", public)?;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let mut highest_sequence = 0_u16;
+    let mut response = [0_u8; 16];
+    while highest_sequence < 10 && std::time::Instant::now() < deadline {
+        match socket.recv_from(&mut response) {
+            Ok((length, source)) if source == public && length == 2 => {
+                highest_sequence =
+                    highest_sequence.max(u16::from_be_bytes([response[0], response[1]]));
+            }
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if highest_sequence < 10 {
+        return Err(format!(
+            "reverse-only UDP lease expired at sequence {highest_sequence}; client output:\n{}\nserver output:\n{}",
+            client.output(),
+            server.output(),
+        )
+        .into());
+    }
+
+    client.terminate()?;
+    server.terminate()?;
+    Ok(())
+}
+
+#[test]
+fn oversized_reverse_replies_do_not_refresh_the_client_lease() -> TestResult {
+    let service = PeriodicReplyUdpServer::start(17)?;
+    let fixture = ProcessFixture::single_udp(service.address(), 1, 16)?
+        .with_server_env("RUSTGO_INTERNAL_TESTING", "1")
+        .with_server_env("RUSTGO_TEST_UDP_IDLE_TIMEOUT_MS", "150")
+        .with_server_env("RUSTGO_TEST_UDP_SWEEP_INTERVAL_MS", "1000");
+    let (fixture, mut server, mut client) = launch(fixture)?;
+    client.wait_for_line("event=udp_channel_ready", READY_TIMEOUT)?;
+    let socket = public_socket()?;
+    socket.send_to(b"start", fixture.public_address())?;
+
+    client.wait_for_line("reason=\"oversize_local_reply\"", Duration::from_secs(2))?;
+    let expired = client.wait_for_line("event=udp_idle_sweep", Duration::from_millis(600))?;
+    assert!(expired.contains("sessions=0"), "{expired}");
 
     client.terminate()?;
     server.terminate()?;

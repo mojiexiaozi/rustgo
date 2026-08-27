@@ -36,6 +36,7 @@ pub struct ChildSessionContext {
     generation: SessionGeneration,
     session_id: Arc<[u8]>,
     control_outbound: mpsc::Sender<Message>,
+    generation_fatal: mpsc::Sender<()>,
 }
 
 impl ChildSessionContext {
@@ -52,6 +53,31 @@ impl ChildSessionContext {
             biased;
             () = shutdown.cancelled() => {}
             _ = self.control_outbound.send(message) => {}
+        }
+    }
+
+    pub(crate) fn fatal_on_exit(&self, shutdown: CancellationToken) -> GenerationFatalGuard {
+        GenerationFatalGuard {
+            generation_fatal: self.generation_fatal.clone(),
+            shutdown,
+        }
+    }
+}
+
+pub(crate) struct GenerationFatalGuard {
+    generation_fatal: mpsc::Sender<()>,
+    shutdown: CancellationToken,
+}
+
+struct ChildSignals<'a> {
+    control: &'a mut mpsc::Receiver<Message>,
+    fatal: &'a mut mpsc::Receiver<()>,
+}
+
+impl Drop for GenerationFatalGuard {
+    fn drop(&mut self) {
+        if !self.shutdown.is_cancelled() {
+            let _ = self.generation_fatal.try_send(());
         }
     }
 }
@@ -104,10 +130,16 @@ impl ControlSession {
         let child_shutdown = CancellationToken::new();
         let mut children = JoinSet::new();
         let (control_outbound, mut child_control) = mpsc::channel(CHILD_CONTROL_CAPACITY);
+        let (generation_fatal, mut generation_failures) = mpsc::channel(1);
         let child_context = ChildSessionContext {
             generation,
             session_id: Arc::from(self.session_id.clone()),
             control_outbound,
+            generation_fatal,
+        };
+        let mut child_signals = ChildSignals {
+            control: &mut child_control,
+            fatal: &mut generation_failures,
         };
         let result = self
             .run_control_loop(
@@ -116,7 +148,7 @@ impl ControlSession {
                 &child_shutdown,
                 &supervisor,
                 &mut children,
-                &mut child_control,
+                &mut child_signals,
             )
             .await;
 
@@ -145,7 +177,7 @@ impl ControlSession {
         child_shutdown: &CancellationToken,
         supervisor: &Arc<dyn ChildSessionSupervisor>,
         children: &mut JoinSet<()>,
-        child_control: &mut mpsc::Receiver<Message>,
+        child_signals: &mut ChildSignals<'_>,
     ) -> Result<(), ClientError> {
         let heartbeat_timeout = self
             .heartbeat_interval
@@ -197,7 +229,13 @@ impl ControlSession {
                         return Err(ClientError::TaskJoin);
                     }
                 }
-                child_message = child_control.recv() => {
+                fatal = child_signals.fatal.recv() => {
+                    if fatal.is_some() {
+                        return Err(ClientError::DataSessionTerminated);
+                    }
+                    return Err(ClientError::InvalidState);
+                }
+                child_message = child_signals.control.recv() => {
                     let Some(message) = child_message else {
                         return Err(ClientError::InvalidState);
                     };
@@ -291,6 +329,7 @@ mod tests {
         time::Duration,
     };
 
+    use rustgo_config::TunnelProtocol as ConfigTunnelProtocol;
     use rustgo_protocol::{
         BoundedBytes, Heartbeat, MAX_BINDING_TOKEN_BYTES, Message, OpenTcpStream, OpenUdpChannel,
         SocketAddress,
@@ -328,6 +367,24 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct TerminatingUdpSupervisor;
+
+    impl ChildSessionSupervisor for TerminatingUdpSupervisor {
+        fn run_child(
+            &self,
+            context: ChildSessionContext,
+            request: ChildSessionRequest,
+            shutdown: CancellationToken,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+            Box::pin(async move {
+                if matches!(request, ChildSessionRequest::Udp(_)) {
+                    let _fatal_on_exit = context.fatal_on_exit(shutdown);
+                }
+            })
+        }
+    }
+
     fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
         let mut context = Context::from_waker(Waker::noop());
         future.poll(&mut context)
@@ -346,7 +403,10 @@ mod tests {
             CLIENT_VERSION,
             vec![0x41; 32],
             Duration::from_secs(1),
-            Arc::from([RegisteredTunnel::accepted_for_test(1)]),
+            Arc::from([RegisteredTunnel::accepted_for_test(
+                1,
+                ConfigTunnelProtocol::Tcp,
+            )]),
         );
         let supervisor = CountingSupervisor::default();
         let requested = supervisor.requested.clone();
@@ -363,6 +423,10 @@ mod tests {
                 tunnel_id: 1,
                 channel_id: 7,
                 binding_token: token(0x42),
+                max_sessions: 8,
+                idle_timeout_millis: 60_000,
+                max_payload_bytes: 65_507,
+                queue_capacity: 1024,
             }),
         )
         .await
@@ -371,6 +435,52 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_millis(100), runtime).await;
         assert!(matches!(result, Ok(Ok(Err(ClientError::InvalidState)))));
         assert_eq!(requested.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn persistent_udp_child_exit_marks_the_generation_inactive() {
+        let (client_stream, server_stream) = duplex(16 * 1024);
+        let mut peer = FramedControl::new(server_stream);
+        let session = ControlSession::new(
+            FramedControl::new(client_stream),
+            CLIENT_VERSION,
+            vec![0x43; 32],
+            Duration::from_secs(1),
+            Arc::from([RegisteredTunnel::accepted_for_test(
+                1,
+                ConfigTunnelProtocol::Udp,
+            )]),
+        );
+        let inactive = Arc::new(AtomicBool::new(false));
+        let inactive_callback = inactive.clone();
+        let runtime = tokio::spawn(session.run_generation(
+            SessionGeneration(1),
+            CancellationToken::new(),
+            Arc::new(TerminatingUdpSupervisor),
+            move || inactive_callback.store(true, Ordering::SeqCst),
+        ));
+
+        peer.send(
+            CLIENT_VERSION,
+            Message::OpenUdpChannel(OpenUdpChannel {
+                tunnel_id: 1,
+                channel_id: 7,
+                binding_token: token(0x43),
+                max_sessions: 1,
+                idle_timeout_millis: 150,
+                max_payload_bytes: 16,
+                queue_capacity: 1,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let result = tokio::time::timeout(Duration::from_millis(100), runtime)
+            .await
+            .expect("a dead persistent UDP child must end its generation")
+            .unwrap();
+        assert!(matches!(result, Err(ClientError::DataSessionTerminated)));
+        assert!(inactive.load(Ordering::SeqCst));
     }
 
     #[tokio::test(start_paused = true)]
@@ -382,7 +492,10 @@ mod tests {
             CLIENT_VERSION,
             vec![0x61; 32],
             Duration::from_millis(10),
-            Arc::from([RegisteredTunnel::accepted_for_test(1)]),
+            Arc::from([RegisteredTunnel::accepted_for_test(
+                1,
+                ConfigTunnelProtocol::Tcp,
+            )]),
         );
         let supervisor = CountingSupervisor::default();
         let requested = supervisor.requested.clone();
@@ -429,6 +542,10 @@ mod tests {
                     tunnel_id: 1,
                     channel_id: index + 2,
                     binding_token: token(0x63),
+                    max_sessions: 8,
+                    idle_timeout_millis: 60_000,
+                    max_payload_bytes: 65_507,
+                    queue_capacity: 1024,
                 })
             };
             peer.send(CLIENT_VERSION, message).await.unwrap();
