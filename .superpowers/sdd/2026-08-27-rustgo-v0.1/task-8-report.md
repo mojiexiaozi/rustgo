@@ -478,3 +478,83 @@ Final observed result:
 - The dynamic producer has a 512 MiB no-saturation safety ceiling. Reaching it
   fails the test instead of accepting an unproven platform socket path.
 - The earlier runtime and Windows port-allocation concerns remain unchanged.
+
+## Review fix round 3 (2026-08-28)
+
+Status: the causal backpressure regression is now fail-closed under a small,
+independent pre-saturation resource budget. This section supersedes the
+round-2 512 MiB safety-ceiling concern; the relay runtime is unchanged.
+
+### Resource-bound design
+
+- The minimum requested candidate, 32 MiB, replaces the 512 MiB
+  pre-saturation byte ceiling. Before the required saturation barriers are
+  established, each nonblocking write is sliced to the remaining budget, so
+  the producer cannot overshoot it by one chunk.
+- A producer-owned five-second wall-clock deadline starts with the producer and
+  covers both its nonblocking write/retry loop and waits for saturation
+  coordination commands. It is independent of the test thread's event timeout.
+- Reaching either limit before the required `WouldBlock` returns an error that
+  includes the actual configured limit and written-byte count. The producer
+  then sends its terminal result, returns from its thread, and drops its public
+  socket; normal E2E RAII terminates only this fixture's rustgoc/rustgos
+  processes on failure.
+- Once the causal saturation protocol has armed the post-saturation target, the
+  existing bounded 8 MiB completion tail, target gate, queued-data `peek`,
+  `WouldBlock` barriers, half-close, and exact echo validation are unchanged.
+
+### RED / GREEN evidence
+
+Byte-limit RED temporarily set the budget to the single 16 KiB progress chunk.
+The real-process regression failed from the producer in 0.52 seconds with:
+
+```text
+Error: "producer never observed socket saturation"
+```
+
+The time-limit mutation set the producer deadline to zero. It failed from the
+producer in 0.49 seconds, rather than the outer eight-second event wait, with
+the corrected configuration-derived diagnostic:
+
+```text
+Error: "producer reached the 0ns pre-saturation deadline after 0 bytes without the required WouldBlock"
+```
+
+GREEN restored five seconds and selected 32 MiB. Eleven consecutive runs of
+the unchanged real-process causal regression all passed; observed durations
+were 0.50 to 0.53 seconds. Because 32 MiB is the smallest allowed candidate and
+was stable for all 11 runs on this Windows loopback path, no 64 MiB fallback was
+needed.
+
+### Fix-round-3 verification
+
+Commands on the final follow-up tree:
+
+```text
+for ($run = 1; $run -le 11; $run++) { cargo test -q -p rustgo-e2e --test tcp slow_reader_applies_backpressure_without_losing_bytes -- --exact }
+cargo test -p rustgo-e2e --test tcp -- --nocapture
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --no-fail-fast
+git diff --check
+```
+
+Final observed result:
+
+- 32 MiB targeted stability run: 11/11 passed, each in 0.50 to 0.53
+  seconds.
+- Complete real-process TCP E2E: 10 passed in 25.31 seconds; the workspace
+  rerun also passed all 10 in 25.41 seconds.
+- Full workspace: 162 passed, 0 failed.
+- Format check, workspace/all-target Clippy with warnings denied, and
+  `git diff --check`: passed.
+
+### Round-3 residual concerns
+
+- The five-second producer deadline is deliberately independent and
+  fail-closed; an unusually slow or heavily loaded platform can fail clearly
+  instead of consuming unbounded traffic.
+- A successful causal run can still send the bounded 8 MiB completion tail
+  after saturation; the 32 MiB ceiling specifically bounds the unproven
+  pre-saturation phase.
+- The earlier runtime and Windows port-allocation concerns remain unchanged.

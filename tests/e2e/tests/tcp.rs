@@ -22,7 +22,8 @@ const BACKPRESSURE_HANDSHAKE: &[u8] = b"rustgo-backpressure-handshake";
 const BACKPRESSURE_ACK: &[u8] = b"rustgo-local-target-ready";
 const BACKPRESSURE_CHUNK: usize = 16 * 1024;
 const BACKPRESSURE_MIN_PROGRESS: usize = BACKPRESSURE_CHUNK;
-const BACKPRESSURE_MAX_BEFORE_SATURATION: usize = 512 * 1024 * 1024;
+const BACKPRESSURE_MAX_BEFORE_SATURATION: usize = 32 * 1024 * 1024;
+const BACKPRESSURE_SATURATION_TIMEOUT: Duration = Duration::from_secs(5);
 const BACKPRESSURE_AFTER_SATURATION: usize = 8 * 1024 * 1024;
 
 enum TargetGateCommand {
@@ -285,16 +286,36 @@ fn run_nonblocking_producer(
     let _ = events.send(ProducerEvent::Started);
     let result = (|| -> TestResult<usize> {
         let payload = [0x5a_u8; BACKPRESSURE_CHUNK];
+        let saturation_deadline = Instant::now() + BACKPRESSURE_SATURATION_TIMEOUT;
         let mut written = 0_usize;
         let mut reported_progress = false;
         let mut reported_drain_block = false;
         let mut target = None;
         loop {
+            if target.is_none() {
+                if written >= BACKPRESSURE_MAX_BEFORE_SATURATION {
+                    return Err(format!(
+                        "producer reached the {} MiB pre-saturation byte limit after {written} bytes without the required WouldBlock",
+                        BACKPRESSURE_MAX_BEFORE_SATURATION / (1024 * 1024),
+                    )
+                    .into());
+                }
+                if Instant::now() >= saturation_deadline {
+                    return Err(format!(
+                        "producer reached the {:?} pre-saturation deadline after {written} bytes without the required WouldBlock",
+                        BACKPRESSURE_SATURATION_TIMEOUT,
+                    )
+                    .into());
+                }
+            }
             if target.is_some_and(|target| written >= target) {
                 stream.shutdown(Shutdown::Write)?;
                 return Ok(written);
             }
-            let remaining = target.map_or(payload.len(), |target| target - written);
+            let remaining = target.map_or_else(
+                || BACKPRESSURE_MAX_BEFORE_SATURATION - written,
+                |target| target - written,
+            );
             match stream.write(&payload[..remaining.min(payload.len())]) {
                 Ok(0) => return Err("backpressure producer wrote zero bytes".into()),
                 Ok(count) => {
@@ -302,9 +323,6 @@ fn run_nonblocking_producer(
                     if !reported_progress && written >= BACKPRESSURE_MIN_PROGRESS {
                         events.send(ProducerEvent::Progress(written))?;
                         reported_progress = true;
-                    }
-                    if target.is_none() && written >= BACKPRESSURE_MAX_BEFORE_SATURATION {
-                        return Err("producer never observed socket saturation".into());
                     }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -323,7 +341,29 @@ fn run_nonblocking_producer(
                         thread::sleep(Duration::from_millis(1));
                     } else {
                         events.send(ProducerEvent::Saturated(written))?;
-                        match commands.recv_timeout(Duration::from_secs(30))? {
+                        let command_wait =
+                            saturation_deadline.saturating_duration_since(Instant::now());
+                        if command_wait.is_zero() {
+                            return Err(format!(
+                                "producer reached the {:?} pre-saturation deadline after {written} bytes while awaiting saturation coordination",
+                                BACKPRESSURE_SATURATION_TIMEOUT,
+                            )
+                            .into());
+                        }
+                        let command = match commands.recv_timeout(command_wait) {
+                            Ok(command) => command,
+                            Err(mpsc::RecvTimeoutError::Timeout) => {
+                                return Err(format!(
+                                    "producer reached the {:?} pre-saturation deadline after {written} bytes while awaiting saturation coordination",
+                                    BACKPRESSURE_SATURATION_TIMEOUT,
+                                )
+                                .into());
+                            }
+                            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                                return Err("backpressure producer command channel closed".into());
+                            }
+                        };
+                        match command {
                             ProducerCommand::Probe => {}
                             ProducerCommand::Drain { additional_bytes } => {
                                 target = Some(
