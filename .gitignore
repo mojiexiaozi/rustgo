@@ -1,2 +1,10 @@
 .worktrees/
 .superpowers/
+/target
+.idea/
+.vscode/
+*.key
+*.pem
+*.crt
+test-artifacts/
+test-results/

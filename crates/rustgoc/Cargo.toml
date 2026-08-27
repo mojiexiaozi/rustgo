@@ -1,0 +1,11 @@
+[package]
+name = "rustgoc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+clap.workspace = true
+
+[dev-dependencies]
+assert_cmd = "2.0.17"
