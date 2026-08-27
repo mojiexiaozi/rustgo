@@ -12,7 +12,7 @@ use tokio::net::TcpStream;
 use tokio::sync::OwnedSemaphorePermit;
 
 use crate::{
-    auth::{AuthAttemptReservation, Authenticator, FailedAuthLimiter},
+    auth::{AuthAttemptReservation, Authenticator, FailedAuthLimiter, TlsHandshakePermit},
     registry::ClientRegistry,
 };
 
@@ -53,6 +53,7 @@ pub(crate) async fn serve_connection(
     socket: TcpStream,
     peer: SocketAddr,
     unauthenticated_permit: OwnedSemaphorePermit,
+    tls_peer_permit: TlsHandshakePermit,
 ) -> Result<(), ControlError> {
     let handshake_deadline = tokio::time::Instant::now()
         .checked_add(context.handshake_timeout)
@@ -112,6 +113,7 @@ pub(crate) async fn serve_connection(
     .map_err(|_| ControlError::HandshakeTimeout)??;
 
     drop(unauthenticated_permit);
+    drop(tls_peer_permit);
     let Some((mut guard, mut state, negotiated)) = authenticated else {
         return Ok(());
     };

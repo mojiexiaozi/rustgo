@@ -16,7 +16,7 @@ use rustgo_transport::{TlsClient, TlsError};
 use rustgos::{ServerApp, ServerRuntimeLimits};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpSocket, TcpStream};
 use tokio::time::{sleep, timeout};
 use tokio_rustls::client::TlsStream;
 use tokio_util::sync::CancellationToken;
@@ -142,6 +142,23 @@ impl FramedClient {
     async fn connect(pki: &TestPki, address: std::net::SocketAddr) -> Result<Self, TlsError> {
         let tls = TlsClient::from_ca_file(&pki.ca_file, SERVER_NAME)?;
         let stream = tls.connect(address).await?;
+        Ok(Self {
+            stream,
+            read_buffer: BytesMut::new(),
+            codec: FrameCodec::new(FRAME_MAX),
+        })
+    }
+
+    async fn connect_from(
+        pki: &TestPki,
+        address: std::net::SocketAddr,
+        source: std::net::Ipv4Addr,
+    ) -> Result<Self, Box<dyn Error>> {
+        let socket = TcpSocket::new_v4()?;
+        socket.bind((source, 0).into())?;
+        let socket = socket.connect(address).await?;
+        let tls = TlsClient::from_ca_file(&pki.ca_file, SERVER_NAME)?;
+        let stream = tls.handshake(socket).await?;
         Ok(Self {
             stream,
             read_buffer: BytesMut::new(),
@@ -508,6 +525,7 @@ async fn handshake_timeout_releases_the_bounded_unauthenticated_permit()
     let runtime_limits = ServerRuntimeLimits {
         handshake_timeout: Duration::from_millis(120),
         max_unauthenticated_connections: 1,
+        max_unauthenticated_connections_per_peer: 1,
         ..ServerRuntimeLimits::default()
     };
     let app = ServerApp::bind_with_runtime_limits(
@@ -583,6 +601,46 @@ async fn tls_aborts_malformed_inputs_and_timeout_do_not_consume_auth_failures()
     );
 
     drop(client);
+    shutdown.cancel();
+    server_task.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn one_slow_peer_cannot_consume_the_tls_slot_reserved_for_another_peer()
+-> Result<(), Box<dyn Error>> {
+    let pki = TestPki::generate()?;
+    let key = DeviceKeypair::from_secret_bytes([23; 32]);
+    let runtime_limits = ServerRuntimeLimits {
+        handshake_timeout: Duration::from_millis(300),
+        max_unauthenticated_connections: 2,
+        max_unauthenticated_connections_per_peer: 1,
+        ..ServerRuntimeLimits::default()
+    };
+    let app = ServerApp::bind_with_runtime_limits(
+        server_config(&pki, vec![authorized("home-pc", &key, true)]),
+        runtime_limits,
+    )
+    .await?;
+    let address = app.local_addr()?;
+    let shutdown = CancellationToken::new();
+    let server_task = tokio::spawn(app.run_until(shutdown.clone()));
+
+    let first_slow = TcpStream::connect(address).await?;
+    let second_slow = TcpStream::connect(address).await?;
+    sleep(Duration::from_millis(25)).await;
+
+    let mut other_peer =
+        FramedClient::connect_from(&pki, address, std::net::Ipv4Addr::new(127, 0, 0, 2)).await?;
+    assert!(
+        authenticate(&mut other_peer, "home-pc", &key)
+            .await?
+            .accepted
+    );
+
+    drop(other_peer);
+    drop(second_slow);
+    drop(first_slow);
     shutdown.cancel();
     server_task.await??;
     Ok(())

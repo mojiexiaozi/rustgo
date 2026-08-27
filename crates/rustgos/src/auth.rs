@@ -21,6 +21,8 @@ use thiserror::Error;
 const CHALLENGE_BYTES: usize = 32;
 const SESSION_ID_BYTES: usize = 32;
 const SESSION_RANDOM_BYTES: usize = SESSION_ID_BYTES - size_of::<u64>();
+const AUTH_ATTEMPT_SHARDS_PER_FAMILY: usize = 8;
+const AUTH_ATTEMPT_SHARDS: usize = AUTH_ATTEMPT_SHARDS_PER_FAMILY * 2;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct AuthenticatedClient {
@@ -224,12 +226,14 @@ pub(crate) struct FailedAuthLimiter {
     max_attempt_records: usize,
 }
 
-#[derive(Default)]
 struct FailedAuthState {
     buckets: HashMap<PeerBucket, PeerAttempts>,
-    idle_failures_by_last_attempt: BTreeSet<(tokio::time::Instant, PeerBucket)>,
+    evictable_idle_failures: BTreeSet<(tokio::time::Instant, PeerBucket)>,
+    protected_idle_failures: BTreeSet<(tokio::time::Instant, PeerBucket)>,
+    attempt_budget: Vec<AttemptBudgetShard>,
     total_failure_records: usize,
     total_pending: usize,
+    total_overflow_pending: usize,
     #[cfg(test)]
     last_admission_bucket_visits: usize,
 }
@@ -239,10 +243,66 @@ struct PeerAttempts {
     pending: usize,
 }
 
+struct AttemptBudgetShard {
+    window_started: Option<tokio::time::Instant>,
+    used: usize,
+    capacity: usize,
+    overflow_pending: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum PeerBucket {
     V4([u8; 4]),
     V6Prefix64([u8; 8]),
+}
+
+#[derive(Clone)]
+pub(crate) struct TlsHandshakeLimiter {
+    state: Arc<Mutex<HashMap<PeerBucket, usize>>>,
+    max_in_flight_per_peer: usize,
+}
+
+pub(crate) struct TlsHandshakePermit {
+    limiter: TlsHandshakeLimiter,
+    peer: PeerBucket,
+}
+
+impl TlsHandshakeLimiter {
+    pub(crate) fn new(max_in_flight_per_peer: usize) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(HashMap::new())),
+            max_in_flight_per_peer,
+        }
+    }
+
+    pub(crate) fn try_acquire(&self, peer: IpAddr) -> Option<TlsHandshakePermit> {
+        let peer = PeerBucket::from(peer);
+        let mut state = self.state.lock().ok()?;
+        let in_flight = state.entry(peer).or_default();
+        if *in_flight >= self.max_in_flight_per_peer {
+            return None;
+        }
+        *in_flight += 1;
+        Some(TlsHandshakePermit {
+            limiter: self.clone(),
+            peer,
+        })
+    }
+}
+
+impl Drop for TlsHandshakePermit {
+    fn drop(&mut self) {
+        let Ok(mut state) = self.limiter.state.lock() else {
+            return;
+        };
+        let Some(in_flight) = state.get_mut(&self.peer) else {
+            return;
+        };
+        *in_flight -= 1;
+        if *in_flight == 0 {
+            state.remove(&self.peer);
+        }
+    }
 }
 
 impl From<IpAddr> for PeerBucket {
@@ -260,9 +320,25 @@ impl From<IpAddr> for PeerBucket {
     }
 }
 
+impl PeerBucket {
+    fn attempt_shard(self) -> usize {
+        let (family_offset, bytes): (usize, &[u8]) = match &self {
+            Self::V4(bytes) => (0, bytes),
+            Self::V6Prefix64(bytes) => (AUTH_ATTEMPT_SHARDS_PER_FAMILY, bytes),
+        };
+        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        family_offset + (hash % AUTH_ATTEMPT_SHARDS_PER_FAMILY as u64) as usize
+    }
+}
+
 pub(crate) struct AuthAttemptReservation {
     limiter: FailedAuthLimiter,
     peer: PeerBucket,
+    tracked: bool,
     resolved: bool,
 }
 
@@ -274,19 +350,41 @@ enum ReservationOutcome {
 }
 
 impl FailedAuthLimiter {
+    #[cfg(test)]
     pub(crate) fn new(
         max_attempts: usize,
         window: Duration,
         max_tracked_peers: usize,
         max_attempt_records: usize,
     ) -> Self {
+        Self::new_with_attempt_budget(
+            max_attempts,
+            window,
+            max_tracked_peers,
+            max_attempt_records,
+            usize::MAX,
+        )
+    }
+
+    pub(crate) fn new_with_attempt_budget(
+        max_attempts: usize,
+        window: Duration,
+        max_tracked_peers: usize,
+        max_attempt_records: usize,
+        max_attempts_per_window: usize,
+    ) -> Self {
         Self {
-            state: Arc::new(Mutex::new(FailedAuthState::default())),
+            state: Arc::new(Mutex::new(FailedAuthState::new(max_attempts_per_window))),
             max_attempts,
             window,
             max_tracked_peers,
             max_attempt_records,
         }
+    }
+
+    #[cfg(test)]
+    fn attempt_shard_for_test(&self, peer: IpAddr) -> usize {
+        PeerBucket::from(peer).attempt_shard()
     }
 
     pub(crate) fn reserve(&self, peer: IpAddr) -> Option<AuthAttemptReservation> {
@@ -305,9 +403,9 @@ impl FailedAuthLimiter {
             if existing.pending == 0
                 && let Some(last_failure) = existing.failures.back()
             {
-                state
-                    .idle_failures_by_last_attempt
-                    .remove(&(*last_failure, peer));
+                let key = (*last_failure, peer);
+                state.evictable_idle_failures.remove(&key);
+                state.protected_idle_failures.remove(&key);
             }
             let removed = trim_expired(&mut existing.failures, now, self.window);
             state.total_failure_records -= removed;
@@ -316,25 +414,71 @@ impl FailedAuthLimiter {
             false
         };
         if denied_by_peer_limit {
-            state.insert_bucket(peer, bucket.expect("existing peer bucket"));
+            state.insert_bucket(
+                peer,
+                bucket.expect("existing peer bucket"),
+                self.max_attempts,
+            );
+            return None;
+        }
+        if state
+            .total_pending
+            .saturating_add(state.total_overflow_pending)
+            >= self.max_attempt_records
+        {
+            if let Some(bucket) = bucket {
+                state.insert_bucket(peer, bucket, self.max_attempts);
+            }
+            return None;
+        }
+        if !state.consume_attempt_budget(peer, now, self.window) {
+            if let Some(bucket) = bucket {
+                state.insert_bucket(peer, bucket, self.max_attempts);
+            }
             return None;
         }
 
         let is_new_peer = bucket.is_none();
-        // Failure history is a live penalty, not an evictable cache. Capacity is
-        // recovered only after an idle bucket's entire failure window expires.
+        // Below-threshold idle history is replaceable because the sharded global
+        // budget still bounds churn. Threshold history and pending work are not.
         while (is_new_peer && state.buckets.len() >= self.max_tracked_peers)
             || state
                 .total_failure_records
                 .saturating_add(state.total_pending)
                 >= self.max_attempt_records
         {
-            if !state.reclaim_one_expired_idle(now, self.window) {
+            if state.evict_one_low_value_idle()
+                || state.reclaim_one_expired_protected(now, self.window)
+            {
+                continue;
+            }
+            let overflow_headroom = bucket.as_ref().map_or(self.max_attempts, |bucket| {
+                self.max_attempts
+                    .saturating_sub(bucket.failures.len().saturating_add(bucket.pending))
+            });
+            if state.total_failure_records == 0
+                || state
+                    .total_pending
+                    .saturating_add(state.total_overflow_pending)
+                    >= self.max_attempt_records
+                || !state.try_reserve_overflow(peer, overflow_headroom)
+            {
                 if let Some(bucket) = bucket {
-                    state.insert_bucket(peer, bucket);
+                    state.insert_bucket(peer, bucket, self.max_attempts);
                 }
+                state.refund_attempt_budget(peer);
                 return None;
             }
+            if let Some(bucket) = bucket {
+                state.insert_bucket(peer, bucket, self.max_attempts);
+            }
+            state.total_overflow_pending += 1;
+            return Some(AuthAttemptReservation {
+                limiter: self.clone(),
+                peer,
+                tracked: false,
+                resolved: false,
+            });
         }
 
         let mut bucket = bucket.unwrap_or_else(|| PeerAttempts {
@@ -347,11 +491,22 @@ impl FailedAuthLimiter {
         Some(AuthAttemptReservation {
             limiter: self.clone(),
             peer,
+            tracked: true,
             resolved: false,
         })
     }
 
-    fn resolve(&self, peer: PeerBucket, outcome: ReservationOutcome) {
+    fn resolve(&self, peer: PeerBucket, tracked: bool, outcome: ReservationOutcome) {
+        if !tracked {
+            if let Ok(mut state) = self.state.lock() {
+                state.total_overflow_pending = state.total_overflow_pending.saturating_sub(1);
+                state.release_overflow(peer);
+                if matches!(outcome, ReservationOutcome::Succeeded) {
+                    state.clear_peer_failures(peer);
+                }
+            }
+            return;
+        }
         let Ok(mut state) = self.state.lock() else {
             return;
         };
@@ -359,7 +514,7 @@ impl FailedAuthLimiter {
             return;
         };
         if bucket.pending == 0 {
-            state.insert_bucket(peer, bucket);
+            state.insert_bucket(peer, bucket, self.max_attempts);
             return;
         }
         bucket.pending -= 1;
@@ -382,7 +537,7 @@ impl FailedAuthLimiter {
             ReservationOutcome::Neutral => {}
         }
         if bucket.pending != 0 || !bucket.failures.is_empty() {
-            state.insert_bucket(peer, bucket);
+            state.insert_bucket(peer, bucket, self.max_attempts);
         }
     }
 
@@ -413,7 +568,7 @@ impl AuthAttemptReservation {
 
     fn finish(&mut self, outcome: ReservationOutcome) {
         if !self.resolved {
-            self.limiter.resolve(self.peer, outcome);
+            self.limiter.resolve(self.peer, self.tracked, outcome);
             self.resolved = true;
         }
     }
@@ -428,24 +583,126 @@ impl Drop for AuthAttemptReservation {
 }
 
 impl FailedAuthState {
-    fn insert_bucket(&mut self, peer: PeerBucket, bucket: PeerAttempts) {
+    fn new(max_attempts_per_window: usize) -> Self {
+        let base_capacity = max_attempts_per_window / AUTH_ATTEMPT_SHARDS;
+        let extra_capacity = max_attempts_per_window % AUTH_ATTEMPT_SHARDS;
+        let attempt_budget = (0..AUTH_ATTEMPT_SHARDS)
+            .map(|shard| AttemptBudgetShard {
+                window_started: None,
+                used: 0,
+                capacity: base_capacity + usize::from(shard < extra_capacity),
+                overflow_pending: 0,
+            })
+            .collect();
+        Self {
+            buckets: HashMap::new(),
+            evictable_idle_failures: BTreeSet::new(),
+            protected_idle_failures: BTreeSet::new(),
+            attempt_budget,
+            total_failure_records: 0,
+            total_pending: 0,
+            total_overflow_pending: 0,
+            #[cfg(test)]
+            last_admission_bucket_visits: 0,
+        }
+    }
+
+    fn consume_attempt_budget(
+        &mut self,
+        peer: PeerBucket,
+        now: tokio::time::Instant,
+        window: Duration,
+    ) -> bool {
+        let shard = &mut self.attempt_budget[peer.attempt_shard()];
+        if shard
+            .window_started
+            .is_none_or(|started| now.duration_since(started) >= window)
+        {
+            shard.window_started = Some(now);
+            shard.used = 0;
+        }
+        if shard.used >= shard.capacity {
+            return false;
+        }
+        shard.used += 1;
+        true
+    }
+
+    fn refund_attempt_budget(&mut self, peer: PeerBucket) {
+        let shard = &mut self.attempt_budget[peer.attempt_shard()];
+        shard.used = shard.used.saturating_sub(1);
+    }
+
+    fn try_reserve_overflow(&mut self, peer: PeerBucket, peer_headroom: usize) -> bool {
+        let shard = &mut self.attempt_budget[peer.attempt_shard()];
+        if shard.overflow_pending >= peer_headroom {
+            return false;
+        }
+        shard.overflow_pending += 1;
+        true
+    }
+
+    fn release_overflow(&mut self, peer: PeerBucket) {
+        let shard = &mut self.attempt_budget[peer.attempt_shard()];
+        shard.overflow_pending = shard.overflow_pending.saturating_sub(1);
+    }
+
+    fn clear_peer_failures(&mut self, peer: PeerBucket) {
+        let Some(mut bucket) = self.buckets.remove(&peer) else {
+            return;
+        };
         if bucket.pending == 0
             && let Some(last_failure) = bucket.failures.back()
         {
-            self.idle_failures_by_last_attempt
-                .insert((*last_failure, peer));
+            let key = (*last_failure, peer);
+            self.evictable_idle_failures.remove(&key);
+            self.protected_idle_failures.remove(&key);
+        }
+        self.total_failure_records -= bucket.failures.len();
+        bucket.failures.clear();
+        if bucket.pending != 0 {
+            self.buckets.insert(peer, bucket);
+        }
+    }
+
+    fn insert_bucket(&mut self, peer: PeerBucket, bucket: PeerAttempts, max_attempts: usize) {
+        if bucket.pending == 0
+            && let Some(last_failure) = bucket.failures.back()
+        {
+            let index = if bucket.failures.len() >= max_attempts {
+                &mut self.protected_idle_failures
+            } else {
+                &mut self.evictable_idle_failures
+            };
+            index.insert((*last_failure, peer));
         }
         self.buckets.insert(peer, bucket);
     }
 
-    fn reclaim_one_expired_idle(&mut self, now: tokio::time::Instant, window: Duration) -> bool {
-        let Some((last_failure, peer)) = self.idle_failures_by_last_attempt.first().copied() else {
+    fn evict_one_low_value_idle(&mut self) -> bool {
+        let Some((_, peer)) = self.evictable_idle_failures.pop_first() else {
+            return false;
+        };
+        self.visit_bucket();
+        let Some(bucket) = self.buckets.remove(&peer) else {
+            return false;
+        };
+        self.total_failure_records -= bucket.failures.len();
+        true
+    }
+
+    fn reclaim_one_expired_protected(
+        &mut self,
+        now: tokio::time::Instant,
+        window: Duration,
+    ) -> bool {
+        let Some((last_failure, peer)) = self.protected_idle_failures.first().copied() else {
             return false;
         };
         if now.duration_since(last_failure) < window {
             return false;
         }
-        self.idle_failures_by_last_attempt.pop_first();
+        self.protected_idle_failures.pop_first();
         self.visit_bucket();
         let Some(bucket) = self.buckets.remove(&peer) else {
             return false;
@@ -498,7 +755,25 @@ mod tests {
         time::Duration,
     };
 
-    use super::{AuthenticatedClient, FailedAuthLimiter};
+    use super::{
+        AUTH_ATTEMPT_SHARDS_PER_FAMILY, AuthenticatedClient, FailedAuthLimiter, TlsHandshakeLimiter,
+    };
+
+    #[test]
+    fn tls_handshake_admission_is_per_canonical_peer_and_releases_neutrally() {
+        let limiter = TlsHandshakeLimiter::new(2);
+        let native = IpAddr::from([192, 0, 2, 90]);
+        let mapped_same = "::ffff:192.0.2.90".parse().unwrap();
+        let other = IpAddr::from([192, 0, 2, 91]);
+        let first = limiter.try_acquire(native).unwrap();
+        let _second = limiter.try_acquire(mapped_same).unwrap();
+
+        assert!(limiter.try_acquire(native).is_none());
+        assert!(limiter.try_acquire(other).is_some());
+
+        drop(first);
+        assert!(limiter.try_acquire(mapped_same).is_some());
+    }
 
     #[test]
     fn all_pending_table_fails_closed_for_an_untracked_peer() {
@@ -559,6 +834,108 @@ mod tests {
         for thread in threads {
             thread.join().unwrap();
         }
+    }
+
+    #[test]
+    fn sixty_four_concurrent_overflow_attempts_still_respect_the_peer_limit() {
+        const ATTEMPTS: usize = 64;
+        const PEER_LIMIT: usize = 8;
+        let limiter = FailedAuthLimiter::new_with_attempt_budget(
+            PEER_LIMIT,
+            Duration::from_secs(60),
+            1,
+            ATTEMPTS,
+            256,
+        );
+        let protected_peer = IpAddr::from([192, 0, 2, 11]);
+        for _ in 0..PEER_LIMIT {
+            limiter.reserve(protected_peer).unwrap().fail();
+        }
+        let overflow_peer = IpAddr::from([192, 0, 2, 12]);
+        let start = Arc::new(Barrier::new(ATTEMPTS + 1));
+        let release = Arc::new(Barrier::new(ATTEMPTS + 1));
+        let (sender, receiver) = mpsc::channel();
+        let mut threads = Vec::new();
+
+        for _ in 0..ATTEMPTS {
+            let limiter = limiter.clone();
+            let start = start.clone();
+            let release = release.clone();
+            let sender = sender.clone();
+            threads.push(thread::spawn(move || {
+                start.wait();
+                let reservation = limiter.reserve(overflow_peer);
+                sender.send(reservation.is_some()).unwrap();
+                release.wait();
+                drop(reservation);
+            }));
+        }
+        drop(sender);
+        start.wait();
+        let admitted = receiver
+            .iter()
+            .take(ATTEMPTS)
+            .filter(|value| *value)
+            .count();
+        assert_eq!(admitted, PEER_LIMIT);
+        release.wait();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        let released: Vec<_> = (0..PEER_LIMIT)
+            .map(|_| {
+                limiter
+                    .reserve(overflow_peer)
+                    .expect("dropped overflow reservation releases its pending slot")
+            })
+            .collect();
+        assert!(limiter.reserve(overflow_peer).is_none());
+        drop(released);
+    }
+
+    #[test]
+    fn overflow_admission_counts_existing_failures_toward_the_peer_limit() {
+        const PEER_LIMIT: usize = 8;
+        let limiter = FailedAuthLimiter::new_with_attempt_budget(
+            PEER_LIMIT,
+            Duration::from_secs(60),
+            3,
+            16,
+            1024,
+        );
+        let protected_peer = IpAddr::from([192, 0, 2, 13]);
+        let nearly_limited_peer = IpAddr::from([192, 0, 2, 14]);
+        let pending_peer = IpAddr::from([192, 0, 2, 15]);
+        for _ in 0..PEER_LIMIT {
+            limiter.reserve(protected_peer).unwrap().fail();
+        }
+        for _ in 0..(PEER_LIMIT - 1) {
+            limiter.reserve(nearly_limited_peer).unwrap().fail();
+        }
+        let _pending = limiter.reserve(pending_peer).unwrap();
+
+        let mut last_peer_slot = limiter.reserve(nearly_limited_peer).unwrap();
+        assert!(limiter.reserve(nearly_limited_peer).is_none());
+        last_peer_slot.succeed();
+        assert_eq!(limiter.failure_record_count(), PEER_LIMIT);
+    }
+
+    #[test]
+    fn overflow_and_tracked_reservations_share_the_global_pending_cap() {
+        let window = Duration::from_millis(40);
+        let limiter = FailedAuthLimiter::new_with_attempt_budget(2, window, 1, 2, 1024);
+        let protected_peer = IpAddr::from([192, 0, 2, 16]);
+        limiter.reserve(protected_peer).unwrap().fail();
+        limiter.reserve(protected_peer).unwrap().fail();
+        let first_overflow = limiter.reserve(IpAddr::from([192, 0, 2, 17])).unwrap();
+        let _second_overflow = limiter.reserve(IpAddr::from([192, 0, 2, 18])).unwrap();
+        thread::sleep(window + Duration::from_millis(20));
+        let recovering_peer = IpAddr::from([192, 0, 2, 19]);
+
+        assert!(limiter.reserve(recovering_peer).is_none());
+        drop(first_overflow);
+        assert!(limiter.reserve(recovering_peer).is_some());
     }
 
     #[test]
@@ -660,20 +1037,78 @@ mod tests {
     }
 
     #[test]
-    fn churn_cannot_evict_unexpired_failure_history_but_capacity_recovers_after_window() {
+    fn protected_penalty_survives_churn_while_new_peer_remains_admissible_and_window_recovers() {
         let window = Duration::from_millis(40);
-        let limiter = FailedAuthLimiter::new(1, window, 2, 2);
+        let limiter = FailedAuthLimiter::new_with_attempt_budget(1, window, 2, 2, 128);
         let first = IpAddr::from([192, 0, 2, 30]);
-        let second = IpAddr::from([192, 0, 2, 31]);
-        let rotating = IpAddr::from([192, 0, 2, 32]);
         limiter.reserve(first).unwrap().fail();
-        limiter.reserve(second).unwrap().fail();
 
-        assert!(limiter.reserve(rotating).is_none());
+        for suffix in 31..=94 {
+            if let Some(mut attempt) = limiter.reserve(IpAddr::from([192, 0, 2, suffix])) {
+                attempt.fail();
+            }
+        }
+
         assert!(limiter.reserve(first).is_none());
+        assert!(
+            limiter
+                .reserve("2001:db8:ffff::1".parse().unwrap())
+                .is_some()
+        );
 
         thread::sleep(window + Duration::from_millis(20));
-        assert!(limiter.reserve(rotating).is_some());
+        assert!(limiter.reserve(first).is_some());
+    }
+
+    #[test]
+    fn sharded_attempt_budget_limits_collisions_without_blocking_other_shards_or_families() {
+        let window = Duration::from_millis(40);
+        let limiter = FailedAuthLimiter::new_with_attempt_budget(8, window, 32, 128, 16);
+        let first = IpAddr::from([198, 51, 100, 1]);
+        let first_shard = limiter.attempt_shard_for_test(first);
+        let mut collision = None;
+        let mut other_shard = None;
+        for suffix in 2..=254 {
+            let candidate = IpAddr::from([198, 51, 100, suffix]);
+            if limiter.attempt_shard_for_test(candidate) == first_shard {
+                collision.get_or_insert(candidate);
+            } else {
+                other_shard.get_or_insert(candidate);
+            }
+            if collision.is_some() && other_shard.is_some() {
+                break;
+            }
+        }
+        let collision = collision.expect("IPv4 shard collision");
+        let other_shard = other_shard.expect("different IPv4 shard");
+
+        drop(limiter.reserve(first).unwrap());
+
+        assert!(limiter.reserve(collision).is_none());
+        assert!(limiter.reserve(other_shard).is_some());
+        let mut used_ipv4_shards = [false; AUTH_ATTEMPT_SHARDS_PER_FAMILY];
+        used_ipv4_shards[first_shard] = true;
+        used_ipv4_shards[limiter.attempt_shard_for_test(other_shard)] = true;
+        for suffix in 2..=254 {
+            let candidate = IpAddr::from([203, 0, 113, suffix]);
+            let shard = limiter.attempt_shard_for_test(candidate);
+            if !used_ipv4_shards[shard] {
+                drop(limiter.reserve(candidate).unwrap());
+                used_ipv4_shards[shard] = true;
+            }
+            if used_ipv4_shards.into_iter().all(|used| used) {
+                break;
+            }
+        }
+        assert!(used_ipv4_shards.into_iter().all(|used| used));
+        assert!(
+            limiter
+                .reserve("2001:db8:abcd::1".parse().unwrap())
+                .is_some()
+        );
+
+        thread::sleep(window + Duration::from_millis(20));
+        assert!(limiter.reserve(collision).is_some());
     }
 
     #[test]

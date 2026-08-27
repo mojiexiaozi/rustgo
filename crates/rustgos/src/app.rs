@@ -7,25 +7,30 @@ use tokio::{sync::Semaphore, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    auth::{Authenticator, FailedAuthLimiter},
+    auth::{Authenticator, FailedAuthLimiter, TlsHandshakeLimiter},
     control,
     registry::{ClientRegistry, RegistryError},
 };
 
 const MAX_UNAUTHENTICATED_CONNECTIONS: usize = 1024;
+const MAX_UNAUTHENTICATED_CONNECTIONS_PER_PEER: usize = 64;
 const MAX_FAILED_AUTH_ATTEMPTS_PER_PEER: usize = 64;
 const MAX_TRACKED_AUTH_PEERS: usize = 16_384;
 const MAX_AUTH_ATTEMPT_RECORDS: usize = 65_536;
+const MIN_AUTH_ATTEMPTS_PER_WINDOW: usize = 16;
+const MAX_AUTH_ATTEMPTS_PER_WINDOW: usize = 65_536;
 const MAX_PENDING_DATA_CHANNEL_TOKENS_PER_CLIENT: usize = 65_536;
 
 #[derive(Debug, Clone)]
 pub struct ServerRuntimeLimits {
     pub handshake_timeout: Duration,
     pub max_unauthenticated_connections: usize,
+    pub max_unauthenticated_connections_per_peer: usize,
     pub max_failed_auth_attempts_per_peer: usize,
     pub failed_auth_window: Duration,
     pub max_tracked_auth_peers: usize,
     pub max_auth_attempt_records: usize,
+    pub max_auth_attempts_per_window: usize,
     pub max_pending_data_channel_tokens_per_client: usize,
     pub binding_token_ttl: Duration,
 }
@@ -35,10 +40,12 @@ impl Default for ServerRuntimeLimits {
         Self {
             handshake_timeout: Duration::from_secs(10),
             max_unauthenticated_connections: 64,
+            max_unauthenticated_connections_per_peer: 4,
             max_failed_auth_attempts_per_peer: 8,
             failed_auth_window: Duration::from_secs(60),
             max_tracked_auth_peers: 1024,
             max_auth_attempt_records: 8192,
+            max_auth_attempts_per_window: 8192,
             max_pending_data_channel_tokens_per_client: 4096,
             binding_token_ttl: Duration::from_secs(30),
         }
@@ -49,16 +56,24 @@ impl ServerRuntimeLimits {
     fn validate(&self) -> Result<(), ServerError> {
         if self.handshake_timeout.is_zero()
             || self.max_unauthenticated_connections == 0
+            || self.max_unauthenticated_connections_per_peer == 0
             || self.max_failed_auth_attempts_per_peer == 0
             || self.failed_auth_window.is_zero()
             || self.max_tracked_auth_peers == 0
             || self.max_auth_attempt_records == 0
+            || self.max_auth_attempts_per_window < MIN_AUTH_ATTEMPTS_PER_WINDOW
             || self.max_pending_data_channel_tokens_per_client == 0
             || self.binding_token_ttl.is_zero()
             || self.max_unauthenticated_connections > MAX_UNAUTHENTICATED_CONNECTIONS
+            || self.max_unauthenticated_connections_per_peer
+                > MAX_UNAUTHENTICATED_CONNECTIONS_PER_PEER
+            || (self.max_unauthenticated_connections > 1
+                && self.max_unauthenticated_connections_per_peer
+                    >= self.max_unauthenticated_connections)
             || self.max_failed_auth_attempts_per_peer > MAX_FAILED_AUTH_ATTEMPTS_PER_PEER
             || self.max_tracked_auth_peers > MAX_TRACKED_AUTH_PEERS
             || self.max_auth_attempt_records > MAX_AUTH_ATTEMPT_RECORDS
+            || self.max_auth_attempts_per_window > MAX_AUTH_ATTEMPTS_PER_WINDOW
             || self.max_pending_data_channel_tokens_per_client
                 > MAX_PENDING_DATA_CHANNEL_TOKENS_PER_CLIENT
             || self.max_failed_auth_attempts_per_peer > self.max_auth_attempt_records
@@ -84,6 +99,7 @@ pub struct ServerApp {
     authenticator: Authenticator,
     registry: ClientRegistry,
     unauthenticated: Arc<Semaphore>,
+    tls_handshakes: TlsHandshakeLimiter,
     limiter: FailedAuthLimiter,
     runtime_limits: ServerRuntimeLimits,
     heartbeat_timeout: Duration,
@@ -140,20 +156,24 @@ impl ServerApp {
             binding_capacity,
             runtime_limits.binding_token_ttl,
         )?;
-        let limiter = FailedAuthLimiter::new(
+        let limiter = FailedAuthLimiter::new_with_attempt_budget(
             runtime_limits.max_failed_auth_attempts_per_peer,
             runtime_limits.failed_auth_window,
             runtime_limits.max_tracked_auth_peers,
             runtime_limits.max_auth_attempt_records,
+            runtime_limits.max_auth_attempts_per_window,
         );
         let unauthenticated = Arc::new(Semaphore::new(
             runtime_limits.max_unauthenticated_connections,
         ));
+        let tls_handshakes =
+            TlsHandshakeLimiter::new(runtime_limits.max_unauthenticated_connections_per_peer);
         Ok(Self {
             tls_server,
             authenticator,
             registry,
             unauthenticated,
+            tls_handshakes,
             limiter,
             heartbeat_timeout,
             runtime_limits,
@@ -180,6 +200,9 @@ impl ServerApp {
                 () = shutdown.cancelled() => break,
                 accepted = self.tls_server.accept_tcp() => {
                     let (socket, peer) = accepted?;
+                    let Some(peer_permit) = self.tls_handshakes.try_acquire(peer.ip()) else {
+                        continue;
+                    };
                     let Ok(permit) = self.unauthenticated.clone().try_acquire_owned() else {
                         continue;
                     };
@@ -206,6 +229,7 @@ impl ServerApp {
                                 socket,
                                 peer,
                                 permit,
+                                peer_permit,
                             ) => {
                                 if let Err(error) = result {
                                     tracing::debug!(peer = %peer, %error, "control session ended");
@@ -262,9 +286,11 @@ mod tests {
     fn runtime_count_limits_accept_documented_hard_boundaries() {
         let limits = ServerRuntimeLimits {
             max_unauthenticated_connections: 1024,
+            max_unauthenticated_connections_per_peer: 64,
             max_failed_auth_attempts_per_peer: 64,
             max_tracked_auth_peers: 16_384,
             max_auth_attempt_records: 65_536,
+            max_auth_attempts_per_window: 65_536,
             max_pending_data_channel_tokens_per_client: 65_536,
             ..ServerRuntimeLimits::default()
         };
@@ -274,11 +300,13 @@ mod tests {
 
     #[test]
     fn runtime_count_limits_reject_values_above_each_hard_boundary() {
-        let cases: [fn(&mut ServerRuntimeLimits); 5] = [
+        let cases: [fn(&mut ServerRuntimeLimits); 7] = [
             |limits| limits.max_unauthenticated_connections = 1025,
+            |limits| limits.max_unauthenticated_connections_per_peer = 65,
             |limits| limits.max_failed_auth_attempts_per_peer = 65,
             |limits| limits.max_tracked_auth_peers = 16_385,
             |limits| limits.max_auth_attempt_records = 65_537,
+            |limits| limits.max_auth_attempts_per_window = 65_537,
             |limits| limits.max_pending_data_channel_tokens_per_client = 65_537,
         ];
 
@@ -303,5 +331,18 @@ mod tests {
             ..ServerRuntimeLimits::default()
         };
         assert_invalid(too_few_for_tracked_peers);
+
+        let peer_tls_leaves_no_global_fairness_slot = ServerRuntimeLimits {
+            max_unauthenticated_connections: 4,
+            max_unauthenticated_connections_per_peer: 4,
+            ..ServerRuntimeLimits::default()
+        };
+        assert_invalid(peer_tls_leaves_no_global_fairness_slot);
+
+        let too_few_global_attempts_for_fair_shards = ServerRuntimeLimits {
+            max_auth_attempts_per_window: 15,
+            ..ServerRuntimeLimits::default()
+        };
+        assert_invalid(too_few_global_attempts_for_fair_shards);
     }
 }
