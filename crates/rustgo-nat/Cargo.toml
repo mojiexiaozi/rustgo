@@ -8,6 +8,10 @@ license.workspace = true
 rustgo-config = { path = "../rustgo-config" }
 rustgo-protocol = { path = "../rustgo-protocol" }
 rustgo-rendezvous = { path = "../rustgo-rendezvous" }
+socket2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

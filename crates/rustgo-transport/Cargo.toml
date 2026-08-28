@@ -13,6 +13,9 @@ rcgen.workspace = true
 rustgo-crypto = { path = "../rustgo-crypto" }
 rustgo-path = { path = "../rustgo-path" }
 rustgo-protocol = { path = "../rustgo-protocol" }
+rustgo-rendezvous = { path = "../rustgo-rendezvous" }
+rustgo-nat = { path = "../rustgo-nat" }
+postcard.workspace = true
 rustls.workspace = true
 rustls-pemfile.workspace = true
 thiserror.workspace = true
@@ -24,5 +27,4 @@ tracing-subscriber.workspace = true
 x509-parser = "0.18.1"
 
 [dev-dependencies]
-rustgo-rendezvous = { path = "../rustgo-rendezvous" }
 tempfile = "3.27.0"

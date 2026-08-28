@@ -5,6 +5,7 @@
 mod backoff;
 mod copy;
 mod logging;
+mod peer_tcp;
 mod quic;
 mod tls;
 
@@ -16,6 +17,10 @@ pub use copy::{COPY_BUFFER_SIZE, CopyError, CopyReport, copy_bidirectional_bound
 pub use logging::{
     EventRateLimit, SafeDisplay, init as init_logging, safe_context, safe_display,
     short_fingerprint, short_id,
+};
+pub use peer_tcp::{
+    EncryptedPeerTcp, MAX_PEER_TCP_PLAINTEXT_BYTES, PeerTcpAuthentication,
+    PeerTcpAuthenticationFactory, PeerTcpError, TcpPathAttempt,
 };
 pub use quic::{
     MAX_PEER_DATAGRAM_BYTES, PeerAuthentication, PeerAuthenticationFactory, PeerDatagram,
