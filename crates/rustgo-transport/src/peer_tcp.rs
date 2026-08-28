@@ -1,4 +1,9 @@
-use std::{fmt, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    fmt,
+    net::SocketAddr,
+    sync::{Arc, Mutex as StdMutex},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use rand::{TryRngCore as _, rngs::OsRng};
@@ -6,7 +11,7 @@ use rustgo_crypto::{
     EphemeralPeerKey, PEER_HANDSHAKE_TAG_BYTES, PEER_TRANSPORT_BINDING_BYTES, PeerCryptoError,
     PeerFrameOpener, PeerFrameSealer, PeerRole, PeerSessionKeys, PeerTranscript,
 };
-use rustgo_nat::TcpPuncher;
+use rustgo_nat::{TcpPunchMode, TcpPuncher};
 use rustgo_path::{PathAttempt, PathError, PathKind, SelectedPath};
 use rustgo_rendezvous::{PeerRelayFlags, PeerRelayFrame};
 use sha2::{Digest, Sha256};
@@ -45,11 +50,14 @@ pub enum PeerTcpError {
     MalformedFrame,
     #[error("native TCP peer cryptography failed")]
     Crypto(#[from] PeerCryptoError),
+    #[error("native TCP session authentication material was already claimed")]
+    AuthenticationMaterialUnavailable,
 }
 
+#[derive(Clone)]
 pub struct PeerTcpAuthentication {
     role: PeerRole,
-    keys: PeerSessionKeys,
+    keys: Arc<StdMutex<Option<PeerSessionKeys>>>,
 }
 
 impl PeerTcpAuthentication {
@@ -60,8 +68,55 @@ impl PeerTcpAuthentication {
     ) -> Result<Self, PeerTcpError> {
         Ok(Self {
             role,
-            keys: PeerSessionKeys::derive(role, local_ephemeral, &transcript)?,
+            keys: Arc::new(StdMutex::new(Some(PeerSessionKeys::derive(
+                role,
+                local_ephemeral,
+                &transcript,
+            )?))),
         })
+    }
+
+    fn handshake_tag(
+        &self,
+        binding: &[u8; PEER_TRANSPORT_BINDING_BYTES],
+    ) -> Result<[u8; PEER_HANDSHAKE_TAG_BYTES], PeerTcpError> {
+        let guard = self
+            .keys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard
+            .as_ref()
+            .map(|keys| keys.handshake_tag(binding))
+            .ok_or(PeerTcpError::AuthenticationMaterialUnavailable)
+    }
+
+    fn verify_handshake_tag(
+        &self,
+        binding: &[u8; PEER_TRANSPORT_BINDING_BYTES],
+        tag: &[u8; PEER_HANDSHAKE_TAG_BYTES],
+    ) -> Result<(), PeerTcpError> {
+        let guard = self
+            .keys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard
+            .as_ref()
+            .ok_or(PeerTcpError::AuthenticationMaterialUnavailable)?
+            .verify_handshake_tag(binding, tag)?;
+        Ok(())
+    }
+
+    fn claim_keys(&self) -> Result<PeerSessionKeys, PeerTcpError> {
+        self.keys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .ok_or(PeerTcpError::AuthenticationMaterialUnavailable)
+    }
+
+    #[cfg(windows)]
+    const fn role(&self) -> PeerRole {
+        self.role
     }
 }
 
@@ -117,10 +172,8 @@ impl EncryptedPeerTcp {
                 .try_into()
                 .map_err(|_| PeerTcpError::AuthenticationFailed)?;
             let binding = live_binding(authentication.role, &local_challenge, &peer_challenge);
-            let local_proof = proof_record(
-                authentication.role,
-                authentication.keys.handshake_tag(&binding),
-            );
+            let local_proof =
+                proof_record(authentication.role, authentication.handshake_tag(&binding)?);
             let peer_proof = match authentication.role {
                 PeerRole::Initiator => {
                     stream.write_all(&local_proof).await?;
@@ -128,13 +181,13 @@ impl EncryptedPeerTcp {
                 }
                 PeerRole::Responder => {
                     let peer = read_proof_record(&mut stream).await?;
-                    verify_proof(&authentication.keys, expected_role, &binding, &peer)?;
+                    verify_proof(&authentication, expected_role, &binding, &peer)?;
                     stream.write_all(&local_proof).await?;
                     peer
                 }
             };
-            verify_proof(&authentication.keys, expected_role, &binding, &peer_proof)?;
-            Ok::<_, PeerTcpError>((stream, authentication.keys))
+            verify_proof(&authentication, expected_role, &binding, &peer_proof)?;
+            Ok::<_, PeerTcpError>((stream, authentication.claim_keys()?))
         };
         let (stream, mut keys) = tokio::select! {
             biased;
@@ -221,12 +274,26 @@ impl PathAttempt for TcpPathAttempt {
     }
 
     async fn connect(&self, cancellation: CancellationToken) -> Result<SelectedPath, PathError> {
+        // Consume the rendezvous ephemeral exactly once per path-manager invocation. Candidate
+        // pipelines share only this opaque derived authenticator; the private key is never cloned.
+        let session_authentication = self
+            .authentication_factory
+            .create()
+            .map_err(|_| PathError::AttemptFailed(PathKind::NativeTcp))?;
         let deadline = tokio::time::Instant::now() + self.connect_timeout;
-        let mut candidates = TcpPuncher::candidates(
+        #[cfg(windows)]
+        let mode = match session_authentication.role() {
+            PeerRole::Initiator => TcpPunchMode::OutboundOnly,
+            PeerRole::Responder => TcpPunchMode::ListenerOnly,
+        };
+        #[cfg(not(windows))]
+        let mode = TcpPunchMode::Union;
+        let mut candidates = TcpPuncher::candidates_with_mode(
             self.local,
             self.candidates.clone(),
             deadline,
             cancellation.clone(),
+            mode,
         )
         .await
         .map_err(|error| {
@@ -241,28 +308,28 @@ impl PathAttempt for TcpPathAttempt {
             tokio::select! {
                 biased;
                 () = cancellation.cancelled() => {
-                    candidates.cancel();
+                    candidates.close().await;
                     authentication_tasks.abort_all();
+                    while authentication_tasks.join_next().await.is_some() {}
                     return Err(PathError::Cancelled);
                 }
                 () = tokio::time::sleep_until(deadline) => {
-                    candidates.cancel();
+                    candidates.close().await;
                     authentication_tasks.abort_all();
+                    while authentication_tasks.join_next().await.is_some() {}
                     return Err(PathError::AttemptTimedOut(PathKind::NativeTcp));
                 }
                 result = authentication_tasks.join_next(), if !authentication_tasks.is_empty() => {
                     if let Some(Ok(Ok(session))) = result {
-                        candidates.cancel();
+                        candidates.close().await;
                         authentication_tasks.abort_all();
+                        while authentication_tasks.join_next().await.is_some() {}
                         return Ok(SelectedPath::authenticated_with(PathKind::NativeTcp, Arc::new(session)));
                     }
                 }
                 stream = candidates.next() => match stream {
                     Ok(Some(stream)) => {
-                        let authentication = match self.authentication_factory.create() {
-                            Ok(authentication) => authentication,
-                            Err(_) => continue,
-                        };
+                        let authentication = session_authentication.clone();
                         let timeout = self.authentication_timeout;
                         let child = cancellation.child_token();
                         authentication_tasks.spawn(async move {
@@ -271,15 +338,28 @@ impl PathAttempt for TcpPathAttempt {
                     }
                     Ok(None) | Err(rustgo_nat::TcpPunchError::ConnectFailed) => {
                         if authentication_tasks.is_empty() {
+                            candidates.close().await;
                             return Err(PathError::AttemptFailed(PathKind::NativeTcp));
                         }
                     }
-                    Err(rustgo_nat::TcpPunchError::Cancelled) => return Err(PathError::Cancelled),
-                    Err(rustgo_nat::TcpPunchError::Deadline) => {
+                    Err(rustgo_nat::TcpPunchError::Cancelled) => {
+                        candidates.close().await;
                         authentication_tasks.abort_all();
+                        while authentication_tasks.join_next().await.is_some() {}
+                        return Err(PathError::Cancelled);
+                    }
+                    Err(rustgo_nat::TcpPunchError::Deadline) => {
+                        candidates.close().await;
+                        authentication_tasks.abort_all();
+                        while authentication_tasks.join_next().await.is_some() {}
                         return Err(PathError::AttemptTimedOut(PathKind::NativeTcp));
                     }
-                    Err(_) => return Err(PathError::AttemptFailed(PathKind::NativeTcp)),
+                    Err(_) => {
+                        candidates.close().await;
+                        authentication_tasks.abort_all();
+                        while authentication_tasks.join_next().await.is_some() {}
+                        return Err(PathError::AttemptFailed(PathKind::NativeTcp));
+                    }
                 }
             }
         }
@@ -343,7 +423,7 @@ fn live_binding(
 }
 
 fn verify_proof(
-    keys: &PeerSessionKeys,
+    authentication: &PeerTcpAuthentication,
     expected_role: u8,
     binding: &[u8; PEER_TRANSPORT_BINDING_BYTES],
     proof: &[u8; PROOF_RECORD_BYTES],
@@ -354,7 +434,7 @@ fn verify_proof(
     let tag: [u8; PEER_HANDSHAKE_TAG_BYTES] = proof[9..]
         .try_into()
         .map_err(|_| PeerTcpError::AuthenticationFailed)?;
-    keys.verify_handshake_tag(binding, &tag)?;
+    authentication.verify_handshake_tag(binding, &tag)?;
     Ok(())
 }
 

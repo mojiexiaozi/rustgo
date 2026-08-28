@@ -3,7 +3,11 @@ use std::{
     time::Duration,
 };
 
+#[cfg(windows)]
+use rustgo_nat::TcpPunchMode;
 use rustgo_nat::{TcpPunchError, TcpPuncher};
+#[cfg(windows)]
+use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::{TcpListener, TcpSocket};
 use tokio_util::sync::CancellationToken;
 
@@ -28,6 +32,15 @@ async fn accepted_connection_uses_the_fixed_owned_listener_port() {
         TcpListener::bind(local).await.is_err(),
         "fixed port must remain exclusively owned"
     );
+    #[cfg(windows)]
+    {
+        let hostile = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap();
+        hostile.set_reuse_address(true).unwrap();
+        assert!(
+            hostile.bind(&local.into()).is_err(),
+            "a competing Windows SO_REUSEADDR binder must not steal the fixed port"
+        );
+    }
     let peer = TcpSocket::new_v4().unwrap();
     peer.bind(remote).unwrap();
     let peer_stream = peer.connect(local).await.unwrap();
@@ -35,8 +48,7 @@ async fn accepted_connection_uses_the_fixed_owned_listener_port() {
     assert_eq!(stream.local_addr().unwrap().port(), local.port());
     drop(stream);
     drop(peer_stream);
-    drop(candidates);
-    tokio::task::yield_now().await;
+    candidates.close().await;
     let rebound = TcpListener::bind(local).await.unwrap();
     drop(rebound);
 }
@@ -76,14 +88,14 @@ async fn cancellation_releases_the_fixed_port() {
         candidates.next().await.unwrap_err(),
         TcpPunchError::Cancelled
     );
-    drop(candidates);
-    tokio::task::yield_now().await;
+    candidates.close().await;
     let rebound = TcpListener::bind(local).await.unwrap();
     drop(rebound);
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::test]
-async fn two_real_punchers_attempt_same_port_simultaneous_open_when_supported() {
+async fn linux_two_real_punchers_complete_fixed_port_simultaneous_open() {
     let first = free_loopback_addr();
     let second = free_loopback_addr();
     let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
@@ -91,18 +103,51 @@ async fn two_real_punchers_attempt_same_port_simultaneous_open_when_supported() 
         TcpPuncher::connect(first, vec![second], deadline, CancellationToken::new()),
         TcpPuncher::connect(second, vec![first], deadline, CancellationToken::new()),
     );
-    match (left, right) {
-        (Ok(left), Ok(right)) => {
-            assert_eq!(left.local_addr().unwrap(), first);
-            assert_eq!(right.local_addr().unwrap(), second);
-        }
-        (left, right) => {
-            // Windows' safe default exclusive ownership intentionally forbids listener plus
-            // same-port active bind. Kernels without connect/connect support are permitted to
-            // skip this one topology; accepted fallback, bounds, and cleanup remain mandatory.
-            eprintln!("simultaneous-open unsupported: left={left:?}, right={right:?}");
-        }
-    }
+    let left = left.expect("Linux fixed-port simultaneous-open capability regressed");
+    let right = right.expect("Linux fixed-port simultaneous-open capability regressed");
+    assert_eq!(left.local_addr().unwrap(), first);
+    assert_eq!(right.local_addr().unwrap(), second);
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_exclusive_listener_reports_the_explicit_simultaneous_open_fallback() {
+    let first = free_loopback_addr();
+    let second = free_loopback_addr();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+    let (left, right) = tokio::join!(
+        TcpPuncher::connect(first, vec![second], deadline, CancellationToken::new()),
+        TcpPuncher::connect(second, vec![first], deadline, CancellationToken::new()),
+    );
+    assert!(matches!(left, Err(TcpPunchError::Deadline)));
+    assert!(matches!(right, Err(TcpPunchError::Deadline)));
+    assert!(TcpListener::bind(first).await.is_ok());
+    assert!(TcpListener::bind(second).await.is_ok());
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    let mut responder = TcpPuncher::candidates_with_mode(
+        second,
+        vec![first],
+        deadline,
+        CancellationToken::new(),
+        TcpPunchMode::ListenerOnly,
+    )
+    .await
+    .unwrap();
+    let mut initiator = TcpPuncher::candidates_with_mode(
+        first,
+        vec![second],
+        deadline,
+        CancellationToken::new(),
+        TcpPunchMode::OutboundOnly,
+    )
+    .await
+    .unwrap();
+    let (outbound, accepted) = tokio::join!(initiator.next(), responder.next());
+    assert_eq!(outbound.unwrap().unwrap().local_addr().unwrap(), first);
+    assert_eq!(accepted.unwrap().unwrap().local_addr().unwrap(), second);
+    initiator.close().await;
+    responder.close().await;
 }
 
 fn free_loopback_addr() -> SocketAddr {

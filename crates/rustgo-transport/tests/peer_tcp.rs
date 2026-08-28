@@ -67,7 +67,11 @@ async fn connected_pair(
     let address = listener.local_addr().unwrap();
     let (initiator_auth, responder_auth) = authentication_pair(exports);
     let responder = tokio::spawn(async move {
-        let stream = listener.accept().await.unwrap().0;
+        let stream = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .expect("path attempt never reached the fixed-port peer")
+            .unwrap()
+            .0;
         EncryptedPeerTcp::authenticate(
             stream,
             responder_auth,
@@ -189,12 +193,10 @@ async fn stalled_early_socket_does_not_beat_later_authenticated_candidate() {
     let local = free_address();
     let stalled_addr = free_address();
     let valid_addr = free_address();
-    let (first_local, _) = authentication_pair(("ssh", "ssh"));
-    let (second_local, second_peer) = authentication_pair(("ssh", "ssh"));
-    let factory = Arc::new(QueueFactory(Mutex::new(VecDeque::from([
-        first_local,
-        second_local,
-    ]))));
+    let stalled_listener = TcpListener::bind(stalled_addr).await.unwrap();
+    let valid_listener = TcpListener::bind(valid_addr).await.unwrap();
+    let (session_local, session_peer) = authentication_pair(("ssh", "ssh"));
+    let factory = Arc::new(QueueFactory(Mutex::new(VecDeque::from([session_local]))));
     let attempt = Arc::new(TcpPathAttempt::new(
         local,
         vec![stalled_addr, valid_addr],
@@ -206,19 +208,12 @@ async fn stalled_early_socket_does_not_beat_later_authenticated_candidate() {
         let attempt = attempt.clone();
         tokio::spawn(async move { attempt.connect(CancellationToken::new()).await })
     };
-    tokio::time::sleep(Duration::from_millis(20)).await;
-
-    let stalled_socket = TcpSocket::new_v4().unwrap();
-    stalled_socket.bind(stalled_addr).unwrap();
-    let stalled = stalled_socket.connect(local).await.unwrap();
-
-    let valid_socket = TcpSocket::new_v4().unwrap();
-    valid_socket.bind(valid_addr).unwrap();
-    let valid_stream = valid_socket.connect(local).await.unwrap();
+    let stalled = stalled_listener.accept().await.unwrap().0;
+    let valid_stream = valid_listener.accept().await.unwrap().0;
     let peer = tokio::spawn(async move {
         EncryptedPeerTcp::authenticate(
             valid_stream,
-            second_peer,
+            session_peer,
             Duration::from_secs(1),
             CancellationToken::new(),
         )
@@ -231,5 +226,54 @@ async fn stalled_early_socket_does_not_beat_later_authenticated_candidate() {
     drop(selected);
     drop(peer.await.unwrap());
     tokio::task::yield_now().await;
+    assert!(TcpListener::bind(local).await.is_ok());
+}
+
+#[tokio::test]
+async fn reusable_attempt_consumes_one_fresh_session_credential_per_rendezvous_run() {
+    let local_guard = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let remote_guard = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let local = local_guard.local_addr().unwrap();
+    let remote = remote_guard.local_addr().unwrap();
+    drop(local_guard);
+    drop(remote_guard);
+    let (first_peer, first_local) = authentication_pair(("ssh", "ssh"));
+    let (second_peer, second_local) = authentication_pair(("ssh", "ssh"));
+    let factory = Arc::new(QueueFactory(Mutex::new(VecDeque::from([
+        first_local,
+        second_local,
+    ]))));
+    let attempt = Arc::new(TcpPathAttempt::new(
+        local,
+        vec![remote],
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+        factory.clone(),
+    ));
+
+    for peer_authentication in [first_peer, second_peer] {
+        let run = {
+            let attempt = attempt.clone();
+            tokio::spawn(async move { attempt.connect(CancellationToken::new()).await })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let socket = TcpSocket::new_v4().unwrap();
+        socket.bind(remote).unwrap();
+        let stream = socket.connect(local).await.unwrap();
+        let peer = tokio::spawn(async move {
+            EncryptedPeerTcp::authenticate(
+                stream,
+                peer_authentication,
+                Duration::from_secs(1),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap()
+        });
+        let selected = run.await.unwrap().unwrap();
+        drop(selected);
+        drop(peer.await.unwrap());
+    }
+    assert!(factory.0.lock().unwrap().is_empty());
     assert!(TcpListener::bind(local).await.is_ok());
 }

@@ -10,4 +10,6 @@ mod tcp_punch;
 pub use candidate::{CandidateGatherer, CandidateInput};
 pub use observation::{MappingEvidence, Observation, analyze_mappings};
 pub use predict::{PredictionPolicy, predicted_ports};
-pub use tcp_punch::{MAX_TCP_PUNCH_CANDIDATES, TcpPunchCandidates, TcpPunchError, TcpPuncher};
+pub use tcp_punch::{
+    MAX_TCP_PUNCH_CANDIDATES, TcpPunchCandidates, TcpPunchError, TcpPunchMode, TcpPuncher,
+};
