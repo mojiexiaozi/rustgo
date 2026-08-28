@@ -3,7 +3,7 @@ use std::{collections::HashSet, fmt};
 use chacha20poly1305::aead::{Aead, AeadInPlace, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, Tag};
 use hkdf::Hkdf;
-use rand::RngCore as _;
+use rand::{TryRngCore as _, rngs::OsRng};
 use rustgo_protocol::{BoundedBytes, BoundedString, ProtocolVersion, SocketAddress};
 use rustgo_rendezvous::{
     Candidate, CandidateGeneration, CandidateTransport, ConnectivityResult, MAX_EXPORT_NAME_BYTES,
@@ -13,7 +13,7 @@ use rustgo_rendezvous::{
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 use crate::{DeviceKeypair, DevicePublicKey};
 
@@ -72,6 +72,24 @@ pub enum PeerCryptoError {
     FrameTooLarge,
 }
 
+/// A process-local, single-owner ephemeral X25519 key.
+///
+/// Raw secret reconstruction is intentionally not part of the public API:
+///
+/// ```compile_fail
+/// use rustgo_crypto::EphemeralPeerKey;
+///
+/// let _key = EphemeralPeerKey::from_secret_bytes([0x42; 32]);
+/// ```
+///
+/// Ephemeral keys cannot be cloned into a second key schedule:
+///
+/// ```compile_fail
+/// use rustgo_crypto::EphemeralPeerKey;
+///
+/// let key = EphemeralPeerKey::generate();
+/// let _duplicate = key.clone();
+/// ```
 pub struct EphemeralPeerKey {
     secret: StaticSecret,
 }
@@ -79,18 +97,13 @@ pub struct EphemeralPeerKey {
 impl EphemeralPeerKey {
     #[must_use]
     pub fn generate() -> Self {
-        let mut secret = [0_u8; 32];
-        rand::rng().fill_bytes(&mut secret);
-        Self::from_secret_bytes(secret)
-    }
-
-    #[must_use]
-    pub fn from_secret_bytes(mut secret: [u8; 32]) -> Self {
-        let ephemeral = Self {
-            secret: StaticSecret::from(secret),
-        };
-        secret.zeroize();
-        ephemeral
+        let mut secret = Zeroizing::new([0_u8; 32]);
+        OsRng
+            .try_fill_bytes(secret.as_mut())
+            .expect("operating-system randomness unavailable for ephemeral peer key");
+        Self {
+            secret: StaticSecret::from(*secret),
+        }
     }
 
     #[must_use]

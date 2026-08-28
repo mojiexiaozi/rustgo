@@ -15,8 +15,6 @@ use rustgo_rendezvous::{
 const INITIATOR_IDENTITY_SECRET: [u8; 32] = [0x11; 32];
 const RESPONDER_IDENTITY_SECRET: [u8; 32] = [0x22; 32];
 const SUBSTITUTE_IDENTITY_SECRET: [u8; 32] = [0x33; 32];
-const INITIATOR_EPHEMERAL_SECRET: [u8; 32] = [0x44; 32];
-const RESPONDER_EPHEMERAL_SECRET: [u8; 32] = [0x55; 32];
 
 type CandidateMutation = Box<dyn Fn(&mut Candidate)>;
 
@@ -33,14 +31,19 @@ impl PeerFixture {
         }
     }
 
-    fn transcript(&self, export: &str) -> PeerTranscript {
+    fn transcript(
+        &self,
+        export: &str,
+        initiator_ephemeral: [u8; 32],
+        responder_ephemeral: [u8; 32],
+    ) -> PeerTranscript {
         PeerTranscript::new(
             session_id(0x42),
             CandidateGeneration::new(3).unwrap(),
             self.initiator_identity.public_key(),
             self.responder_identity.public_key(),
-            initiator_ephemeral().public_key(),
-            responder_ephemeral().public_key(),
+            initiator_ephemeral,
+            responder_ephemeral,
             BoundedString::try_from(export).unwrap(),
             ProtocolVersion::V0_2,
             [0x66; 32],
@@ -48,23 +51,19 @@ impl PeerFixture {
     }
 
     fn keys(&self, export: &str) -> (PeerSessionKeys, PeerSessionKeys) {
-        let transcript = self.transcript(export);
+        let initiator_ephemeral = EphemeralPeerKey::generate();
+        let responder_ephemeral = EphemeralPeerKey::generate();
+        let transcript = self.transcript(
+            export,
+            initiator_ephemeral.public_key(),
+            responder_ephemeral.public_key(),
+        );
         let initiator =
-            PeerSessionKeys::derive(PeerRole::Initiator, initiator_ephemeral(), &transcript)
-                .unwrap();
+            PeerSessionKeys::derive(PeerRole::Initiator, initiator_ephemeral, &transcript).unwrap();
         let responder =
-            PeerSessionKeys::derive(PeerRole::Responder, responder_ephemeral(), &transcript)
-                .unwrap();
+            PeerSessionKeys::derive(PeerRole::Responder, responder_ephemeral, &transcript).unwrap();
         (initiator, responder)
     }
-}
-
-fn initiator_ephemeral() -> EphemeralPeerKey {
-    EphemeralPeerKey::from_secret_bytes(INITIATOR_EPHEMERAL_SECRET)
-}
-
-fn responder_ephemeral() -> EphemeralPeerKey {
-    EphemeralPeerKey::from_secret_bytes(RESPONDER_EPHEMERAL_SECRET)
 }
 
 fn session_id(byte: u8) -> SessionId {
@@ -140,10 +139,16 @@ fn local_ephemeral_key_must_match_its_claimed_role() {
         &PeerTranscript,
     ) -> Result<PeerSessionKeys, PeerCryptoError> = PeerSessionKeys::derive;
     let fixture = PeerFixture::new();
-    let transcript = fixture.transcript("ssh");
+    let initiator_ephemeral = EphemeralPeerKey::generate();
+    let responder_ephemeral = EphemeralPeerKey::generate();
+    let transcript = fixture.transcript(
+        "ssh",
+        initiator_ephemeral.public_key(),
+        responder_ephemeral.public_key(),
+    );
 
     assert!(matches!(
-        derive(PeerRole::Responder, initiator_ephemeral(), &transcript),
+        derive(PeerRole::Responder, initiator_ephemeral, &transcript),
         Err(PeerCryptoError::LocalEphemeralKeyMismatch)
     ));
 }
@@ -151,20 +156,35 @@ fn local_ephemeral_key_must_match_its_claimed_role() {
 #[test]
 fn initiator_ephemeral_slot_substitution_is_rejected() {
     let fixture = PeerFixture::new();
-    let transcript = PeerTranscript::new(
-        session_id(0x42),
-        CandidateGeneration::new(3).unwrap(),
-        fixture.initiator_identity.public_key(),
-        fixture.responder_identity.public_key(),
-        EphemeralPeerKey::from_secret_bytes([0x77; 32]).public_key(),
-        responder_ephemeral().public_key(),
-        BoundedString::try_from("ssh").unwrap(),
-        ProtocolVersion::V0_2,
-        [0x66; 32],
+    let actual_initiator = EphemeralPeerKey::generate();
+    let substituted_initiator = EphemeralPeerKey::generate();
+    let responder = EphemeralPeerKey::generate();
+    let transcript = fixture.transcript(
+        "ssh",
+        substituted_initiator.public_key(),
+        responder.public_key(),
     );
 
     assert!(matches!(
-        PeerSessionKeys::derive(PeerRole::Initiator, initiator_ephemeral(), &transcript),
+        PeerSessionKeys::derive(PeerRole::Initiator, actual_initiator, &transcript),
+        Err(PeerCryptoError::LocalEphemeralKeyMismatch)
+    ));
+}
+
+#[test]
+fn responder_ephemeral_slot_substitution_is_rejected() {
+    let fixture = PeerFixture::new();
+    let initiator = EphemeralPeerKey::generate();
+    let actual_responder = EphemeralPeerKey::generate();
+    let substituted_responder = EphemeralPeerKey::generate();
+    let transcript = fixture.transcript(
+        "ssh",
+        initiator.public_key(),
+        substituted_responder.public_key(),
+    );
+
+    assert!(matches!(
+        PeerSessionKeys::derive(PeerRole::Responder, actual_responder, &transcript),
         Err(PeerCryptoError::LocalEphemeralKeyMismatch)
     ));
 }
@@ -172,20 +192,11 @@ fn initiator_ephemeral_slot_substitution_is_rejected() {
 #[test]
 fn all_zero_x25519_peer_input_is_rejected() {
     let fixture = PeerFixture::new();
-    let transcript = PeerTranscript::new(
-        session_id(0x42),
-        CandidateGeneration::new(3).unwrap(),
-        fixture.initiator_identity.public_key(),
-        fixture.responder_identity.public_key(),
-        initiator_ephemeral().public_key(),
-        [0_u8; 32],
-        BoundedString::try_from("ssh").unwrap(),
-        ProtocolVersion::V0_2,
-        [0x66; 32],
-    );
+    let initiator = EphemeralPeerKey::generate();
+    let transcript = fixture.transcript("ssh", initiator.public_key(), [0_u8; 32]);
 
     assert!(matches!(
-        PeerSessionKeys::derive(PeerRole::Initiator, initiator_ephemeral(), &transcript),
+        PeerSessionKeys::derive(PeerRole::Initiator, initiator, &transcript),
         Err(PeerCryptoError::InvalidPeerEphemeralKey)
     ));
 }
@@ -193,94 +204,97 @@ fn all_zero_x25519_peer_input_is_rejected() {
 #[test]
 fn export_name_is_bound_into_session_keys() {
     let fixture = PeerFixture::new();
-    let (ssh, _) = fixture.keys("ssh");
-    let (admin, _) = fixture.keys("admin");
+    let initiator = EphemeralPeerKey::generate();
+    let responder = EphemeralPeerKey::generate();
+    let initiator_public = initiator.public_key();
+    let responder_public = responder.public_key();
+    let ssh = fixture.transcript("ssh", initiator_public, responder_public);
+    let admin = fixture.transcript("admin", initiator_public, responder_public);
+    let ssh_initiator = PeerSessionKeys::derive(PeerRole::Initiator, initiator, &ssh).unwrap();
+    let admin_responder = PeerSessionKeys::derive(PeerRole::Responder, responder, &admin).unwrap();
 
-    assert_ne!(ssh.handshake_tag(), admin.handshake_tag());
+    assert_eq!(
+        admin_responder.verify_handshake_tag(&ssh_initiator.handshake_tag()),
+        Err(PeerCryptoError::HandshakeAuthenticationFailed)
+    );
 }
 
 #[test]
-fn session_peer_generation_ephemeral_version_and_rendezvous_hash_are_bound_into_keys() {
+fn session_peer_generation_version_and_rendezvous_hash_are_bound_into_keys() {
     let fixture = PeerFixture::new();
-    let base = fixture.transcript("ssh");
     let substitute = DeviceKeypair::from_secret_bytes(SUBSTITUTE_IDENTITY_SECRET);
-    let substitute_responder_ephemeral =
-        EphemeralPeerKey::from_secret_bytes([0x77; 32]).public_key();
-    let variants = [
-        PeerTranscript::new(
-            session_id(0x43),
-            CandidateGeneration::new(3).unwrap(),
-            fixture.initiator_identity.public_key(),
-            fixture.responder_identity.public_key(),
-            initiator_ephemeral().public_key(),
-            responder_ephemeral().public_key(),
-            BoundedString::try_from("ssh").unwrap(),
-            ProtocolVersion::V0_2,
-            [0x66; 32],
-        ),
-        PeerTranscript::new(
-            session_id(0x42),
-            CandidateGeneration::new(4).unwrap(),
-            fixture.initiator_identity.public_key(),
-            fixture.responder_identity.public_key(),
-            initiator_ephemeral().public_key(),
-            responder_ephemeral().public_key(),
-            BoundedString::try_from("ssh").unwrap(),
-            ProtocolVersion::V0_2,
-            [0x66; 32],
-        ),
-        PeerTranscript::new(
-            session_id(0x42),
-            CandidateGeneration::new(3).unwrap(),
-            fixture.initiator_identity.public_key(),
-            substitute.public_key(),
-            initiator_ephemeral().public_key(),
-            responder_ephemeral().public_key(),
-            BoundedString::try_from("ssh").unwrap(),
-            ProtocolVersion::V0_2,
-            [0x66; 32],
-        ),
-        PeerTranscript::new(
-            session_id(0x42),
-            CandidateGeneration::new(3).unwrap(),
-            fixture.initiator_identity.public_key(),
-            fixture.responder_identity.public_key(),
-            initiator_ephemeral().public_key(),
-            substitute_responder_ephemeral,
-            BoundedString::try_from("ssh").unwrap(),
-            ProtocolVersion::V0_2,
-            [0x66; 32],
-        ),
-        PeerTranscript::new(
-            session_id(0x42),
-            CandidateGeneration::new(3).unwrap(),
-            fixture.initiator_identity.public_key(),
-            fixture.responder_identity.public_key(),
-            initiator_ephemeral().public_key(),
-            responder_ephemeral().public_key(),
-            BoundedString::try_from("ssh").unwrap(),
-            ProtocolVersion::V0_1,
-            [0x66; 32],
-        ),
-        PeerTranscript::new(
-            session_id(0x42),
-            CandidateGeneration::new(3).unwrap(),
-            fixture.initiator_identity.public_key(),
-            fixture.responder_identity.public_key(),
-            initiator_ephemeral().public_key(),
-            responder_ephemeral().public_key(),
-            BoundedString::try_from("ssh").unwrap(),
-            ProtocolVersion::V0_2,
-            [0x67; 32],
-        ),
-    ];
-    let base_keys =
-        PeerSessionKeys::derive(PeerRole::Initiator, initiator_ephemeral(), &base).unwrap();
-
-    for changed in &variants {
-        let changed_keys =
-            PeerSessionKeys::derive(PeerRole::Initiator, initiator_ephemeral(), changed).unwrap();
-        assert_ne!(base_keys.handshake_tag(), changed_keys.handshake_tag());
+    for mutation in 0_u8..5 {
+        let initiator = EphemeralPeerKey::generate();
+        let responder = EphemeralPeerKey::generate();
+        let initiator_public = initiator.public_key();
+        let responder_public = responder.public_key();
+        let base = fixture.transcript("ssh", initiator_public, responder_public);
+        let changed = match mutation {
+            0 => PeerTranscript::new(
+                session_id(0x43),
+                CandidateGeneration::new(3).unwrap(),
+                fixture.initiator_identity.public_key(),
+                fixture.responder_identity.public_key(),
+                initiator_public,
+                responder_public,
+                BoundedString::try_from("ssh").unwrap(),
+                ProtocolVersion::V0_2,
+                [0x66; 32],
+            ),
+            1 => PeerTranscript::new(
+                session_id(0x42),
+                CandidateGeneration::new(4).unwrap(),
+                fixture.initiator_identity.public_key(),
+                fixture.responder_identity.public_key(),
+                initiator_public,
+                responder_public,
+                BoundedString::try_from("ssh").unwrap(),
+                ProtocolVersion::V0_2,
+                [0x66; 32],
+            ),
+            2 => PeerTranscript::new(
+                session_id(0x42),
+                CandidateGeneration::new(3).unwrap(),
+                fixture.initiator_identity.public_key(),
+                substitute.public_key(),
+                initiator_public,
+                responder_public,
+                BoundedString::try_from("ssh").unwrap(),
+                ProtocolVersion::V0_2,
+                [0x66; 32],
+            ),
+            3 => PeerTranscript::new(
+                session_id(0x42),
+                CandidateGeneration::new(3).unwrap(),
+                fixture.initiator_identity.public_key(),
+                fixture.responder_identity.public_key(),
+                initiator_public,
+                responder_public,
+                BoundedString::try_from("ssh").unwrap(),
+                ProtocolVersion::V0_1,
+                [0x66; 32],
+            ),
+            4 => PeerTranscript::new(
+                session_id(0x42),
+                CandidateGeneration::new(3).unwrap(),
+                fixture.initiator_identity.public_key(),
+                fixture.responder_identity.public_key(),
+                initiator_public,
+                responder_public,
+                BoundedString::try_from("ssh").unwrap(),
+                ProtocolVersion::V0_2,
+                [0x67; 32],
+            ),
+            _ => unreachable!(),
+        };
+        let base_initiator =
+            PeerSessionKeys::derive(PeerRole::Initiator, initiator, &base).unwrap();
+        let changed_responder =
+            PeerSessionKeys::derive(PeerRole::Responder, responder, &changed).unwrap();
+        assert_eq!(
+            changed_responder.verify_handshake_tag(&base_initiator.handshake_tag()),
+            Err(PeerCryptoError::HandshakeAuthenticationFailed)
+        );
     }
 }
 
@@ -481,7 +495,7 @@ fn stream_channels_do_not_reuse_the_same_key_and_nonce_pair() {
 }
 
 #[test]
-fn duplicate_sealer_and_opener_domain_issuance_is_rejected() {
+fn single_derived_schedule_rejects_duplicate_sealer_and_opener_domain_issuance() {
     let fixture = PeerFixture::new();
     let (mut initiator, mut responder) = fixture.keys("ssh");
 
@@ -742,7 +756,7 @@ fn frame_header_and_canonical_context_are_authenticated() {
 fn secret_debug_and_errors_do_not_expose_key_or_payload_bytes() {
     let fixture = PeerFixture::new();
     let (keys, _) = fixture.keys("ssh");
-    let ephemeral_debug = format!("{:?}", initiator_ephemeral());
+    let ephemeral_debug = format!("{:?}", EphemeralPeerKey::generate());
     let keys_debug = format!("{keys:?}");
     let error = format!("{:?}", PeerCryptoError::FrameAuthenticationFailed);
 
