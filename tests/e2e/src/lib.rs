@@ -10,6 +10,7 @@ pub use protocol::{
 
 use std::{
     error::Error,
+    ffi::OsStr,
     fs,
     io::{Read, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket},
@@ -43,6 +44,32 @@ struct Binaries {
     client: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BinaryProfile {
+    Debug,
+    Release,
+}
+
+impl BinaryProfile {
+    const fn directory(self) -> &'static str {
+        match self {
+            Self::Debug => "debug",
+            Self::Release => "release",
+        }
+    }
+}
+
+fn select_binary_profile(value: Option<&OsStr>) -> Result<BinaryProfile, String> {
+    match value {
+        None => Ok(BinaryProfile::Debug),
+        Some(value) if value == "release" => Ok(BinaryProfile::Release),
+        Some(value) => Err(format!(
+            "RUSTGO_E2E_BIN_PROFILE must be `release` when set, got `{}`",
+            value.to_string_lossy()
+        )),
+    }
+}
+
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -54,11 +81,16 @@ fn workspace_root() -> PathBuf {
 fn ensure_binaries() -> TestResult<Binaries> {
     let result = BINARIES.get_or_init(|| {
         let root = workspace_root();
+        let profile = select_binary_profile(std::env::var_os("RUSTGO_E2E_BIN_PROFILE").as_deref())?;
+        let mut build_arguments = vec![
+            "build", "--quiet", "-p", "rustgos", "-p", "rustgoc", "--bins",
+        ];
+        if profile == BinaryProfile::Release {
+            build_arguments.push("--release");
+        }
         let status = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
             .current_dir(&root)
-            .args([
-                "build", "--quiet", "-p", "rustgos", "-p", "rustgoc", "--bins",
-            ])
+            .args(build_arguments)
             .status()
             .map_err(|error| format!("could not launch cargo build: {error}"))?;
         if !status.success() {
@@ -80,10 +112,10 @@ fn ensure_binaries() -> TestResult<Binaries> {
         let executable_suffix = std::env::consts::EXE_SUFFIX;
         Ok(Binaries {
             server: target
-                .join("debug")
+                .join(profile.directory())
                 .join(format!("rustgos{executable_suffix}")),
             client: target
-                .join("debug")
+                .join(profile.directory())
                 .join(format!("rustgoc{executable_suffix}")),
         })
     });
@@ -969,11 +1001,22 @@ impl Drop for EchoServer {
 #[cfg(test)]
 mod tests {
     use std::{
+        ffi::OsStr,
         io::Cursor,
         sync::{Arc, Mutex, mpsc},
     };
 
-    use super::{captured_bytes, spawn_log_reader};
+    use super::{BinaryProfile, captured_bytes, select_binary_profile, spawn_log_reader};
+
+    #[test]
+    fn release_entrypoint_selects_release_build_and_rejects_unknown_profiles() {
+        assert_eq!(select_binary_profile(None).unwrap(), BinaryProfile::Debug);
+        assert_eq!(
+            select_binary_profile(Some(OsStr::new("release"))).unwrap(),
+            BinaryProfile::Release
+        );
+        assert!(select_binary_profile(Some(OsStr::new("fast"))).is_err());
+    }
 
     #[test]
     fn byte_capture_keeps_invalid_utf8_and_every_following_byte() {

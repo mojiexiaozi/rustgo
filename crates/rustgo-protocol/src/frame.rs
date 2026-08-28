@@ -80,6 +80,12 @@ impl FrameCodec {
         Ok(output.freeze())
     }
 
+    /// Decodes one complete frame from an incremental input buffer.
+    ///
+    /// An incomplete frame returns `Ok(None)` without consuming input. A
+    /// complete valid frame is consumed. Any validation or payload error also
+    /// leaves the offending frame untouched so the caller can capture
+    /// diagnostic context before closing the owning connection.
     pub fn decode(&self, input: &mut BytesMut) -> Result<Option<Frame>, FrameError> {
         let header = match self.inspect_header(input)? {
             Some(header) => header,

@@ -1,0 +1,32 @@
+[package]
+name = "rustgo-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[features]
+default = ["fuzzing"]
+fuzzing = ["dep:libfuzzer-sys"]
+
+[dependencies]
+bytes = "1.10.1"
+libfuzzer-sys = { version = "0.4", optional = true }
+rustgo-protocol = { path = "../crates/rustgo-protocol" }
+
+[[bin]]
+name = "frame_decode"
+path = "fuzz_targets/frame_decode.rs"
+test = false
+doc = false
+bench = false
+required-features = ["fuzzing"]
+
+[[bin]]
+name = "seed_corpus"
+path = "src/bin/seed_corpus.rs"
+
+[workspace]
+members = ["."]

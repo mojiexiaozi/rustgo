@@ -1,0 +1,19 @@
+[client]
+name = "home-pc"
+server_addr = "tunnel.example.com:7000"
+server_name = "tunnel.example.com"
+certificate_authority_file = "${RUSTGO_CERTIFICATE_AUTHORITY_FILE}"
+private_key_file = "${RUSTGO_DEVICE_PRIVATE_KEY_FILE}"
+heartbeat_interval_secs = 20
+
+[[tunnels]]
+name = "ssh"
+protocol = "tcp"
+local_addr = "127.0.0.1:22"
+remote_port = 2222
+
+[[tunnels]]
+name = "game"
+protocol = "udp"
+local_addr = "127.0.0.1:27015"
+remote_port = 27015

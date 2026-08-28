@@ -1,6 +1,7 @@
 .worktrees/
 .superpowers/
 /target
+/fuzz/target
 .idea/
 .vscode/
 *.key

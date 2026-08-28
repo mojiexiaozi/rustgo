@@ -1,0 +1,17 @@
+[server]
+bind_addr = "0.0.0.0:7000"
+certificate_file = "${RUSTGO_SERVER_CERTIFICATE_FILE}"
+private_key_file = "${RUSTGO_SERVER_PRIVATE_KEY_FILE}"
+heartbeat_timeout_secs = 60
+
+[limits]
+max_clients = 128
+max_tunnels_per_client = 64
+max_tcp_connections_per_tunnel = 256
+max_udp_sessions_per_tunnel = 1024
+max_udp_payload_bytes = 65507
+
+[[clients]]
+name = "home-pc"
+public_key = "${RUSTGO_DEVICE_PUBLIC_KEY}"
+enabled = true
