@@ -10,6 +10,10 @@ pub struct ProtocolVersion {
 }
 
 impl ProtocolVersion {
+    pub const V0_1: Self = Self::new(1, 0);
+    pub const V0_2: Self = Self::new(1, 1);
+    pub const SUPPORTED: Self = Self::V0_2;
+
     pub const fn new(major: u16, minor: u16) -> Self {
         Self { major, minor }
     }

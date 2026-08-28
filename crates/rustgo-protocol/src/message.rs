@@ -18,6 +18,8 @@ pub const MAX_UDP_SESSIONS_PER_TUNNEL: u32 = 1_000_000;
 pub const MAX_UDP_QUEUE_CAPACITY: u32 = 65_536;
 pub const UDP_METADATA_LEN: usize = 31;
 pub const MAX_ERROR_DETAIL_BYTES: usize = 512;
+pub const MAX_RENDEZVOUS_ENVELOPE_BYTES: usize = 16 * 1024;
+pub const MAX_PEER_RELAY_FRAME_BYTES: usize = 65_600;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[error("value length {actual} exceeds bound {max}")]
@@ -278,6 +280,14 @@ impl MessageId {
     pub const OPEN_UDP_CHANNEL: Self = Self(12);
     pub const DATA_CHANNEL_BIND: Self = Self(13);
     pub const UDP_SESSION_RETIRED: Self = Self(14);
+    pub const RENDEZVOUS_REQUEST: Self = Self(15);
+    pub const RENDEZVOUS_PROVIDER_DECISION: Self = Self(16);
+    pub const RENDEZVOUS_CANDIDATE_SET: Self = Self(17);
+    pub const RENDEZVOUS_CONNECTIVITY_RESULT: Self = Self(18);
+    pub const RENDEZVOUS_RELAY_REQUEST: Self = Self(19);
+    pub const RENDEZVOUS_CLOSE: Self = Self(20);
+    pub const RENDEZVOUS_ERROR: Self = Self(21);
+    pub const PEER_RELAY_FRAME: Self = Self(22);
 
     pub const fn as_u16(self) -> u16 {
         self.0
@@ -299,6 +309,8 @@ impl MessageId {
             12 => 96,
             13 => 384,
             14 => 32,
+            15..=21 => MAX_RENDEZVOUS_ENVELOPE_BYTES,
+            22 => MAX_PEER_RELAY_FRAME_BYTES,
             _ => 0,
         }
     }
@@ -309,7 +321,7 @@ impl TryFrom<u16> for MessageId {
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
         match value {
-            1..=14 => Ok(Self(value)),
+            1..=22 => Ok(Self(value)),
             _ => Err(value),
         }
     }
@@ -613,6 +625,9 @@ pub struct ErrorMessage {
     pub detail: BoundedString<MAX_ERROR_DETAIL_BYTES>,
 }
 
+pub type OpaqueRendezvousMessage = BoundedBytes<MAX_RENDEZVOUS_ENVELOPE_BYTES>;
+pub type OpaquePeerRelayFrame = BoundedBytes<MAX_PEER_RELAY_FRAME_BYTES>;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
     ClientHello(ClientHello),
@@ -629,6 +644,14 @@ pub enum Message {
     OpenUdpChannel(OpenUdpChannel),
     DataChannelBind(DataChannelBind),
     UdpSessionRetired(UdpSessionRetired),
+    RendezvousRequest(OpaqueRendezvousMessage),
+    RendezvousProviderDecision(OpaqueRendezvousMessage),
+    RendezvousCandidateSet(OpaqueRendezvousMessage),
+    RendezvousConnectivityResult(OpaqueRendezvousMessage),
+    RendezvousRelayRequest(OpaqueRendezvousMessage),
+    RendezvousClose(OpaqueRendezvousMessage),
+    RendezvousError(OpaqueRendezvousMessage),
+    PeerRelayFrame(OpaquePeerRelayFrame),
 }
 
 impl Message {
@@ -648,6 +671,14 @@ impl Message {
             Self::OpenUdpChannel(_) => MessageId::OPEN_UDP_CHANNEL,
             Self::DataChannelBind(_) => MessageId::DATA_CHANNEL_BIND,
             Self::UdpSessionRetired(_) => MessageId::UDP_SESSION_RETIRED,
+            Self::RendezvousRequest(_) => MessageId::RENDEZVOUS_REQUEST,
+            Self::RendezvousProviderDecision(_) => MessageId::RENDEZVOUS_PROVIDER_DECISION,
+            Self::RendezvousCandidateSet(_) => MessageId::RENDEZVOUS_CANDIDATE_SET,
+            Self::RendezvousConnectivityResult(_) => MessageId::RENDEZVOUS_CONNECTIVITY_RESULT,
+            Self::RendezvousRelayRequest(_) => MessageId::RENDEZVOUS_RELAY_REQUEST,
+            Self::RendezvousClose(_) => MessageId::RENDEZVOUS_CLOSE,
+            Self::RendezvousError(_) => MessageId::RENDEZVOUS_ERROR,
+            Self::PeerRelayFrame(_) => MessageId::PEER_RELAY_FRAME,
         }
     }
 }

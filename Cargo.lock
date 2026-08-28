@@ -1180,6 +1180,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustgo-rendezvous"
+version = "0.1.0"
+dependencies = [
+ "postcard",
+ "rustgo-protocol",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
 name = "rustgo-transport"
 version = "0.1.0"
 dependencies = [

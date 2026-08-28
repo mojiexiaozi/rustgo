@@ -1,0 +1,12 @@
+[package]
+name = "rustgo-rendezvous"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+postcard.workspace = true
+rustgo-protocol = { path = "../rustgo-protocol" }
+serde.workspace = true
+thiserror.workspace = true
+

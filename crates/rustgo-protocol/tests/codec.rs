@@ -155,6 +155,21 @@ fn message_ids_are_explicit_and_stable() {
     assert_eq!(MessageId::OPEN_UDP_CHANNEL.as_u16(), 12);
     assert_eq!(MessageId::DATA_CHANNEL_BIND.as_u16(), 13);
     assert_eq!(MessageId::UDP_SESSION_RETIRED.as_u16(), 14);
+    assert_eq!(MessageId::RENDEZVOUS_REQUEST.as_u16(), 15);
+    assert_eq!(MessageId::RENDEZVOUS_PROVIDER_DECISION.as_u16(), 16);
+    assert_eq!(MessageId::RENDEZVOUS_CANDIDATE_SET.as_u16(), 17);
+    assert_eq!(MessageId::RENDEZVOUS_CONNECTIVITY_RESULT.as_u16(), 18);
+    assert_eq!(MessageId::RENDEZVOUS_RELAY_REQUEST.as_u16(), 19);
+    assert_eq!(MessageId::RENDEZVOUS_CLOSE.as_u16(), 20);
+    assert_eq!(MessageId::RENDEZVOUS_ERROR.as_u16(), 21);
+    assert_eq!(MessageId::PEER_RELAY_FRAME.as_u16(), 22);
+}
+
+#[test]
+fn v02_is_supported_without_changing_the_major_version() {
+    assert_eq!(ProtocolVersion::V0_1, ProtocolVersion::new(1, 0));
+    assert_eq!(ProtocolVersion::V0_2, ProtocolVersion::new(1, 1));
+    assert_eq!(ProtocolVersion::SUPPORTED, ProtocolVersion::V0_2);
 }
 
 #[test]

@@ -215,6 +215,14 @@ fn encode_payload(message: &Message) -> Result<Vec<u8>, FrameError> {
         Message::OpenUdpChannel(value) => serialize(value),
         Message::DataChannelBind(value) => serialize(value),
         Message::UdpSessionRetired(value) => serialize(value),
+        Message::RendezvousRequest(value)
+        | Message::RendezvousProviderDecision(value)
+        | Message::RendezvousCandidateSet(value)
+        | Message::RendezvousConnectivityResult(value)
+        | Message::RendezvousRelayRequest(value)
+        | Message::RendezvousClose(value)
+        | Message::RendezvousError(value) => Ok(value.as_slice().to_vec()),
+        Message::PeerRelayFrame(value) => Ok(value.as_slice().to_vec()),
     }
 }
 
@@ -265,8 +273,28 @@ fn decode_payload(message: MessageId, payload: &[u8]) -> Result<Message, FrameEr
         MessageId::UDP_SESSION_RETIRED => {
             deserialize::<UdpSessionRetired>(message, payload).map(Message::UdpSessionRetired)
         }
-        _ => unreachable!("all valid message IDs are handled"),
+        MessageId::RENDEZVOUS_REQUEST => decode_opaque(payload).map(Message::RendezvousRequest),
+        MessageId::RENDEZVOUS_PROVIDER_DECISION => {
+            decode_opaque(payload).map(Message::RendezvousProviderDecision)
+        }
+        MessageId::RENDEZVOUS_CANDIDATE_SET => {
+            decode_opaque(payload).map(Message::RendezvousCandidateSet)
+        }
+        MessageId::RENDEZVOUS_CONNECTIVITY_RESULT => {
+            decode_opaque(payload).map(Message::RendezvousConnectivityResult)
+        }
+        MessageId::RENDEZVOUS_RELAY_REQUEST => {
+            decode_opaque(payload).map(Message::RendezvousRelayRequest)
+        }
+        MessageId::RENDEZVOUS_CLOSE => decode_opaque(payload).map(Message::RendezvousClose),
+        MessageId::RENDEZVOUS_ERROR => decode_opaque(payload).map(Message::RendezvousError),
+        MessageId::PEER_RELAY_FRAME => decode_opaque(payload).map(Message::PeerRelayFrame),
+        _ => unreachable!("MessageId values are validated before payload dispatch"),
     }
+}
+
+fn decode_opaque<const MAX: usize>(payload: &[u8]) -> Result<BoundedBytes<MAX>, FrameError> {
+    BoundedBytes::try_from(payload).map_err(|_| FrameError::LengthOverflow)
 }
 
 fn encode_udp(datagram: &UdpDatagram) -> Result<Vec<u8>, FrameError> {
