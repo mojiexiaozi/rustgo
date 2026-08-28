@@ -54,6 +54,10 @@ impl DeviceKeypair {
     pub(crate) fn secret_bytes(&self) -> &[u8; 32] {
         self.signing_key.as_bytes()
     }
+
+    pub(crate) fn sign_bytes(&self, message: &[u8]) -> [u8; 64] {
+        self.signing_key.sign(message).to_bytes()
+    }
 }
 
 impl fmt::Debug for DeviceKeypair {
@@ -69,6 +73,19 @@ impl DevicePublicKey {
     #[must_use]
     pub fn fingerprint(&self) -> Fingerprint {
         Fingerprint::from(self)
+    }
+
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        self.0.as_bytes()
+    }
+
+    pub(crate) fn verify_bytes(&self, message: &[u8], signature: &[u8]) -> Result<(), CryptoError> {
+        let signature =
+            Signature::from_slice(signature).map_err(|_| CryptoError::AuthenticationFailed)?;
+        self.0
+            .verify_strict(message, &signature)
+            .map_err(|_| CryptoError::AuthenticationFailed)
     }
 }
 
@@ -147,10 +164,5 @@ pub fn verify_auth(
     transcript: &AuthTranscript,
     signature: &[u8],
 ) -> Result<(), CryptoError> {
-    let signature =
-        Signature::from_slice(signature).map_err(|_| CryptoError::AuthenticationFailed)?;
-    public_key
-        .0
-        .verify_strict(transcript.as_bytes(), &signature)
-        .map_err(|_| CryptoError::AuthenticationFailed)
+    public_key.verify_bytes(transcript.as_bytes(), signature)
 }
