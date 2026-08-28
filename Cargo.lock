@@ -1266,6 +1266,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustgo-nat"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "rustgo-config",
+ "rustgo-protocol",
+ "rustgo-rendezvous",
+]
+
+[[package]]
 name = "rustgo-protocol"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,13 @@
+[package]
+name = "rustgo-nat"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rustgo-config = { path = "../rustgo-config" }
+rustgo-protocol = { path = "../rustgo-protocol" }
+rustgo-rendezvous = { path = "../rustgo-rendezvous" }
+
+[dev-dependencies]
+proptest.workspace = true
