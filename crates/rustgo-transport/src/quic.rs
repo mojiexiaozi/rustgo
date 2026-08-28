@@ -126,18 +126,35 @@ pub trait PeerAuthenticationFactory: Send + Sync {
 }
 
 struct EndpointOwner {
-    endpoint: quinn::Endpoint,
+    endpoint: Mutex<Option<quinn::Endpoint>>,
 }
 
 impl EndpointOwner {
-    fn close(&self, code: u32, reason: &'static [u8]) {
-        self.endpoint.close(quinn::VarInt::from_u32(code), reason);
+    fn endpoint(&self) -> Result<quinn::Endpoint, QuicPeerError> {
+        self.endpoint
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .ok_or(QuicPeerError::ConnectionClosed)
+    }
+
+    fn take(&self) -> Option<quinn::Endpoint> {
+        self.endpoint
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    fn release(&self, code: u32, reason: &'static [u8]) {
+        if let Some(endpoint) = self.take() {
+            endpoint.close(quinn::VarInt::from_u32(code), reason);
+        }
     }
 }
 
 impl Drop for EndpointOwner {
     fn drop(&mut self) {
-        self.close(CLOSE_NORMAL, b"endpoint dropped");
+        self.release(CLOSE_NORMAL, b"endpoint dropped");
     }
 }
 
@@ -154,14 +171,16 @@ impl QuicPeerEndpoint {
             .map_err(QuicPeerError::EndpointIo)?;
         endpoint.set_default_client_config(client_config(&config)?);
         Ok(Self {
-            inner: Arc::new(EndpointOwner { endpoint }),
+            inner: Arc::new(EndpointOwner {
+                endpoint: Mutex::new(Some(endpoint)),
+            }),
             config,
         })
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr, QuicPeerError> {
         self.inner
-            .endpoint
+            .endpoint()?
             .local_addr()
             .map_err(QuicPeerError::EndpointIo)
     }
@@ -170,7 +189,7 @@ impl QuicPeerEndpoint {
         let socket = UdpSocket::bind(local_addr).map_err(QuicPeerError::EndpointIo)?;
         let rebound = socket.local_addr().map_err(QuicPeerError::EndpointIo)?;
         self.inner
-            .endpoint
+            .endpoint()?
             .rebind(socket)
             .map_err(QuicPeerError::EndpointIo)?;
         Ok(rebound)
@@ -185,9 +204,8 @@ impl QuicPeerEndpoint {
         if authentication.role != PeerRole::Initiator {
             return Err(QuicPeerError::WrongAuthenticationRole);
         }
-        let connecting = self
-            .inner
-            .endpoint
+        let endpoint = self.inner.endpoint()?;
+        let connecting = endpoint
             .connect(remote_addr, QUIC_SERVER_NAME)
             .map_err(|_| QuicPeerError::Connection)?;
         let connection = tokio::select! {
@@ -220,10 +238,11 @@ impl QuicPeerEndpoint {
         if authentication.role != PeerRole::Responder {
             return Err(QuicPeerError::WrongAuthenticationRole);
         }
+        let endpoint = self.inner.endpoint()?;
         let incoming = tokio::select! {
             biased;
             () = cancellation.cancelled() => return Err(QuicPeerError::Cancelled),
-            incoming = self.inner.endpoint.accept() => incoming.ok_or(QuicPeerError::ConnectionClosed)?,
+            incoming = endpoint.accept() => incoming.ok_or(QuicPeerError::ConnectionClosed)?,
         };
         let connecting = incoming.accept().map_err(|_| QuicPeerError::Connection)?;
         let connection = tokio::select! {
@@ -248,24 +267,47 @@ impl QuicPeerEndpoint {
         ))
     }
 
-    fn close(&self, code: u32, reason: &'static [u8]) {
-        self.inner.close(code, reason);
+    fn release(&self, code: u32, reason: &'static [u8]) {
+        self.inner.release(code, reason);
     }
 
-    async fn wait_idle(&self) {
-        self.inner.endpoint.wait_idle().await;
+    async fn shutdown(&self, code: u32, reason: &'static [u8]) {
+        if let Some(endpoint) = self.inner.take() {
+            endpoint.close(quinn::VarInt::from_u32(code), reason);
+            endpoint.wait_idle().await;
+        }
     }
 }
 
 struct SessionInner {
     _endpoint: Arc<EndpointOwner>,
-    connection: quinn::Connection,
+    connection: Mutex<Option<quinn::Connection>>,
+}
+
+impl SessionInner {
+    fn connection(&self) -> Result<quinn::Connection, QuicPeerError> {
+        self.connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .ok_or(QuicPeerError::ConnectionClosed)
+    }
+
+    fn release(&self, code: u32, reason: &'static [u8]) {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(connection) = connection {
+            connection.close(quinn::VarInt::from_u32(code), reason);
+        }
+    }
 }
 
 impl Drop for SessionInner {
     fn drop(&mut self) {
-        self.connection
-            .close(quinn::VarInt::from_u32(CLOSE_NORMAL), b"session dropped");
+        self.release(CLOSE_NORMAL, b"session dropped");
     }
 }
 
@@ -279,7 +321,7 @@ impl QuicPeerSession {
         Self {
             inner: Arc::new(SessionInner {
                 _endpoint: endpoint,
-                connection,
+                connection: Mutex::new(Some(connection)),
             }),
         }
     }
@@ -288,10 +330,11 @@ impl QuicPeerSession {
         &self,
         cancellation: CancellationToken,
     ) -> Result<PeerStream, QuicPeerError> {
+        let connection = self.inner.connection()?;
         let (send, recv) = tokio::select! {
             biased;
             () = cancellation.cancelled() => return Err(QuicPeerError::Cancelled),
-            stream = self.inner.connection.open_bi() => stream.map_err(|_| QuicPeerError::Stream)?,
+            stream = connection.open_bi() => stream.map_err(|_| QuicPeerError::Stream)?,
         };
         Ok(PeerStream { send, recv })
     }
@@ -300,10 +343,11 @@ impl QuicPeerSession {
         &self,
         cancellation: CancellationToken,
     ) -> Result<PeerStream, QuicPeerError> {
+        let connection = self.inner.connection()?;
         let (send, recv) = tokio::select! {
             biased;
             () = cancellation.cancelled() => return Err(QuicPeerError::Cancelled),
-            stream = self.inner.connection.accept_bi() => stream.map_err(|_| QuicPeerError::Stream)?,
+            stream = connection.accept_bi() => stream.map_err(|_| QuicPeerError::Stream)?,
         };
         Ok(PeerStream { send, recv })
     }
@@ -315,9 +359,7 @@ impl QuicPeerSession {
     }
 
     pub fn close(&self) {
-        self.inner
-            .connection
-            .close(quinn::VarInt::from_u32(CLOSE_NORMAL), b"session closed");
+        self.inner.release(CLOSE_NORMAL, b"session closed");
     }
 }
 
@@ -373,9 +415,8 @@ impl PeerDatagram {
                 max: MAX_PEER_DATAGRAM_BYTES,
             });
         }
-        let peer_max = self
-            .inner
-            .connection
+        let connection = self.inner.connection()?;
+        let peer_max = connection
             .max_datagram_size()
             .ok_or(QuicPeerError::DatagramsUnsupported)?;
         if payload.len() > peer_max {
@@ -384,8 +425,7 @@ impl PeerDatagram {
                 max: peer_max,
             });
         }
-        self.inner
-            .connection
+        connection
             .send_datagram(Bytes::copy_from_slice(payload))
             .map_err(|error| match error {
                 quinn::SendDatagramError::UnsupportedByPeer => QuicPeerError::DatagramsUnsupported,
@@ -399,10 +439,11 @@ impl PeerDatagram {
     }
 
     pub async fn receive(&self, cancellation: CancellationToken) -> Result<Vec<u8>, QuicPeerError> {
+        let connection = self.inner.connection()?;
         let payload = tokio::select! {
             biased;
             () = cancellation.cancelled() => return Err(QuicPeerError::Cancelled),
-            payload = self.inner.connection.read_datagram() => payload.map_err(|_| QuicPeerError::ConnectionClosed)?,
+            payload = connection.read_datagram() => payload.map_err(|_| QuicPeerError::ConnectionClosed)?,
         };
         if payload.len() > MAX_PEER_DATAGRAM_BYTES {
             return Err(QuicPeerError::DatagramTooLarge {
@@ -459,13 +500,11 @@ impl PathAttempt for QuicPathAttempt {
         let authentication = match self.authentication_factory.create() {
             Ok(authentication) => authentication,
             Err(QuicPeerError::Cancelled) => {
-                endpoint.close(CLOSE_CANCELLED, b"path cancelled");
-                endpoint.wait_idle().await;
+                endpoint.shutdown(CLOSE_CANCELLED, b"path cancelled").await;
                 return Err(PathError::Cancelled);
             }
             Err(_) => {
-                endpoint.close(CLOSE_NORMAL, b"path failed");
-                endpoint.wait_idle().await;
+                endpoint.shutdown(CLOSE_NORMAL, b"path failed").await;
                 return Err(PathError::AttemptFailed(self.kind));
             }
         };
@@ -475,20 +514,17 @@ impl PathAttempt for QuicPathAttempt {
         {
             Ok(session) => session,
             Err(QuicPeerError::Cancelled) => {
-                endpoint.close(CLOSE_CANCELLED, b"path cancelled");
-                endpoint.wait_idle().await;
+                endpoint.shutdown(CLOSE_CANCELLED, b"path cancelled").await;
                 return Err(PathError::Cancelled);
             }
             Err(_) => {
-                endpoint.close(CLOSE_NORMAL, b"path failed");
-                endpoint.wait_idle().await;
+                endpoint.shutdown(CLOSE_NORMAL, b"path failed").await;
                 return Err(PathError::AttemptFailed(self.kind));
             }
         };
         if cancellation.is_cancelled() {
             session.close();
-            endpoint.close(CLOSE_CANCELLED, b"path cancelled");
-            endpoint.wait_idle().await;
+            endpoint.shutdown(CLOSE_CANCELLED, b"path cancelled").await;
             return Err(PathError::Cancelled);
         }
         let handle = Arc::new(QuicPeerPathHandle::new(endpoint, session, cancellation));
@@ -566,7 +602,7 @@ fn close_path_resources(
         .take();
     if let Some(resources) = resources {
         resources.session.close();
-        resources.endpoint.close(code, reason);
+        resources.endpoint.release(code, reason);
     }
 }
 

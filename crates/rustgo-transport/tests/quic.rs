@@ -499,3 +499,65 @@ async fn selected_path_token_releases_socket_while_opaque_handle_is_still_retain
     drop(selected);
     drop(handle);
 }
+
+#[tokio::test]
+async fn selected_path_release_revokes_endpoint_while_session_clone_is_retained() {
+    let config = QuicPeerConfig::default();
+    let server_endpoint = QuicPeerEndpoint::bind(loopback(), config.clone()).unwrap();
+    let (client_auth, server_auth) = authentication_pair();
+    let factory = QueueAuthenticationFactory::new([client_auth]);
+    let attempt = QuicPathAttempt::new(
+        loopback(),
+        server_endpoint.local_addr().unwrap(),
+        config,
+        factory,
+    );
+    let cancellation = CancellationToken::new();
+
+    let (server, selected) = tokio::join!(
+        server_endpoint.accept(server_auth, CancellationToken::new()),
+        attempt.connect(cancellation.clone()),
+    );
+    let server = server.unwrap();
+    let selected = selected.unwrap();
+    let handle = selected.handle::<QuicPeerPathHandle>().unwrap();
+    let local_addr = handle.local_addr().unwrap();
+    let retained_session = handle.session().unwrap();
+
+    cancellation.cancel();
+    drop(selected);
+    drop(handle);
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            match UdpSocket::bind(local_addr) {
+                Ok(socket) => break socket,
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => panic!("unexpected UDP rebind failure: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("path release must revoke the endpoint retained by a session clone");
+
+    assert!(
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            retained_session.open_stream(CancellationToken::new())
+        )
+        .await
+        .unwrap()
+        .is_err()
+    );
+    assert!(
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            server.accept_stream(CancellationToken::new())
+        )
+        .await
+        .unwrap()
+        .is_err()
+    );
+}
