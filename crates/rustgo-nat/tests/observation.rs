@@ -59,6 +59,16 @@ fn destination_port_dependent_mappings_are_labeled_as_evidence() {
 }
 
 #[test]
+fn different_mapped_hosts_are_uncertain_not_destination_port_dependent() {
+    let observations = [
+        Observation::new(v4([198, 51, 100, 10], 7443), v4([8, 8, 8, 8], 40000)),
+        Observation::new(v4([198, 51, 100, 10], 7444), v4([1, 1, 1, 1], 40100)),
+    ];
+
+    assert_eq!(analyze_mappings(&observations), MappingEvidence::Uncertain);
+}
+
+#[test]
 fn sequential_mappings_report_their_delta() {
     let observations = [
         observation(7443, 40000),

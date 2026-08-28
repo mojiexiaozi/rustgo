@@ -34,6 +34,7 @@ pub fn analyze_mappings(observations: &[Observation]) -> MappingEvidence {
                 || !is_usable_address(&observation.mapped_address)
         })
         || !all_share_destination_host(observations)
+        || !all_share_mapped_host(observations)
     {
         return MappingEvidence::Uncertain;
     }
