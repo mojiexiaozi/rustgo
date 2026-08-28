@@ -46,8 +46,13 @@ pub struct AuthorizedClient {
 #[serde(deny_unknown_fields)]
 pub struct ClientConfig {
     pub client: ClientSection,
+    pub p2p: Option<crate::P2pConfig>,
     #[serde(default)]
     pub tunnels: Vec<TunnelConfig>,
+    #[serde(default)]
+    pub exports: Vec<crate::ExportConfig>,
+    #[serde(default)]
+    pub forwards: Vec<crate::ForwardConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -86,5 +91,9 @@ impl ServerConfig {
 impl ClientConfig {
     pub fn validate(&self) -> Result<(), ValidationError> {
         crate::validate::validate_client(self)
+    }
+
+    pub fn validation_warnings(&self) -> Vec<crate::ConfigWarning> {
+        crate::validate::client_validation_warnings(self)
     }
 }

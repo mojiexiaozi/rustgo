@@ -4,6 +4,7 @@
 
 mod load;
 mod model;
+mod p2p;
 mod validate;
 
 pub use load::{
@@ -14,4 +15,5 @@ pub use model::{
     AuthorizedClient, ClientConfig, ClientSection, Limits, ServerConfig, ServerSection,
     TunnelConfig, TunnelProtocol,
 };
+pub use p2p::{ConfigWarning, ExportConfig, ForwardConfig, P2pConfig, PortRange};
 pub use validate::ValidationError;

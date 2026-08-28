@@ -4,7 +4,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use rustgo_protocol::{MAX_CLIENT_NAME_BYTES, MAX_TUNNEL_NAME_BYTES, MAX_TUNNELS};
 use thiserror::Error;
 
-use crate::{ClientConfig, ServerConfig};
+use crate::{ClientConfig, ConfigWarning, ServerConfig};
 
 const MAX_LIMIT: u32 = 1_000_000;
 const MAX_UDP_PAYLOAD_BYTES: u32 = 65_507;
@@ -102,7 +102,70 @@ pub(crate) fn validate_client(config: &ClientConfig) -> Result<(), ValidationErr
             )));
         }
     }
+    if let Some(p2p) = &config.p2p {
+        require_nonzero("p2p.direct_timeout_secs", p2p.direct_timeout_secs)?;
+        require_nonzero("p2p.reconnect_timeout_secs", p2p.reconnect_timeout_secs)?;
+    }
+
+    let mut export_names = HashSet::new();
+    for export in &config.exports {
+        validate_wire_string("exports.name", &export.name, MAX_TUNNEL_NAME_BYTES)?;
+        validate_host_address("exports.local_addr", &export.local_addr)?;
+        if !export_names.insert(&export.name) {
+            return Err(ValidationError::new(format!(
+                "duplicate export name `{}`",
+                export.name
+            )));
+        }
+        for peer in &export.allowed_peers {
+            validate_wire_string("exports.allowed_peers", peer, MAX_CLIENT_NAME_BYTES)?;
+        }
+    }
+
+    let mut forward_names = HashSet::new();
+    for forward in &config.forwards {
+        validate_wire_string("forwards.name", &forward.name, MAX_TUNNEL_NAME_BYTES)?;
+        validate_wire_string("forwards.peer", &forward.peer, MAX_CLIENT_NAME_BYTES)?;
+        validate_wire_string("forwards.export", &forward.export, MAX_TUNNEL_NAME_BYTES)?;
+        validate_host_address("forwards.listen_addr", &forward.listen_addr)?;
+        if forward.peer == config.client.name {
+            return Err(ValidationError::new(format!(
+                "forward `{}` must not target the local client",
+                forward.name
+            )));
+        }
+        if !forward_names.insert(&forward.name) {
+            return Err(ValidationError::new(format!(
+                "duplicate forward name `{}`",
+                forward.name
+            )));
+        }
+    }
     Ok(())
+}
+
+pub(crate) fn client_validation_warnings(config: &ClientConfig) -> Vec<ConfigWarning> {
+    let mut warnings = Vec::new();
+    for export in &config.exports {
+        if export.allowed_peers.is_empty() {
+            warnings.push(ConfigWarning::new(
+                "P2P_EXPORT_ALLOW_ALL",
+                format!("export `{}` permits every authenticated peer", export.name),
+            ));
+        }
+    }
+    for forward in &config.forwards {
+        if !is_loopback_listen_address(&forward.listen_addr) {
+            warnings.push(ConfigWarning::new(
+                "P2P_FORWARD_NON_LOOPBACK_LISTEN",
+                format!(
+                    "forward `{}` listens on a non-loopback address `{}`",
+                    forward.name, forward.listen_addr
+                ),
+            ));
+        }
+    }
+    warnings
 }
 
 fn validate_limits(limits: &crate::Limits) -> Result<(), ValidationError> {
@@ -195,6 +258,13 @@ fn validate_host_address(field: &str, value: &str) -> Result<(), ValidationError
         return Err(ValidationError::new(format!("{field} has an invalid port")));
     }
     Ok(())
+}
+
+fn is_loopback_listen_address(value: &str) -> bool {
+    value
+        .parse::<SocketAddr>()
+        .is_ok_and(|address| address.ip().is_loopback())
+        || value.starts_with("localhost:")
 }
 
 fn validate_public_key(value: &str) -> Result<(), ValidationError> {

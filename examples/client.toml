@@ -6,6 +6,15 @@ certificate_authority_file = "${RUSTGO_CERTIFICATE_AUTHORITY_FILE}"
 private_key_file = "${RUSTGO_DEVICE_PRIVATE_KEY_FILE}"
 heartbeat_interval_secs = 20
 
+[p2p]
+enabled = true
+prefer_direct = true
+direct_timeout_secs = 8
+reconnect_timeout_secs = 3
+allow_relay_fallback = true
+udp_port_range = "7400-7499"
+tcp_port_range = "7400-7499"
+
 [[tunnels]]
 name = "ssh"
 protocol = "tcp"
@@ -17,3 +26,15 @@ name = "game"
 protocol = "udp"
 local_addr = "127.0.0.1:27015"
 remote_port = 27015
+
+[[exports]]
+name = "ssh"
+protocol = "tcp"
+local_addr = "127.0.0.1:22"
+allowed_peers = ["laptop"]
+
+[[forwards]]
+name = "office-ssh"
+peer = "office-pc"
+export = "ssh"
+listen_addr = "127.0.0.1:2222"

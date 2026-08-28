@@ -84,6 +84,11 @@ remote_port = 2222
     .to_owned()
 }
 
+fn load_client_fixture(contents: &str) -> ClientConfig {
+    let dir = TempDir::new();
+    load_client_text(&dir, contents).unwrap()
+}
+
 fn load_server_text(
     dir: &TempDir,
     contents: &str,
@@ -329,6 +334,171 @@ fn protocol_deserializes_to_public_enum() {
     let loaded = load_client_text(&dir, &valid_client()).unwrap();
 
     assert_eq!(loaded.tunnels[0].protocol, TunnelProtocol::Tcp);
+}
+
+#[test]
+fn p2p_missing_allowed_peers_means_allow_all() {
+    let config = load_client_fixture(
+        r#"
+        [client]
+        name = "home-pc"
+        server_addr = "127.0.0.1:7443"
+        server_name = "localhost"
+        certificate_authority_file = "ca.crt"
+        private_key_file = "device.key"
+        heartbeat_interval_secs = 20
+
+        [[exports]]
+        name = "ssh"
+        protocol = "tcp"
+        local_addr = "127.0.0.1:22"
+    "#,
+    );
+
+    assert!(config.exports[0].allows_peer("laptop"));
+    assert!(
+        config
+            .validation_warnings()
+            .iter()
+            .any(|warning| warning.code() == "P2P_EXPORT_ALLOW_ALL")
+    );
+}
+
+#[test]
+fn p2p_empty_allowed_peers_means_allow_all() {
+    let config = load_client_fixture(
+        r#"
+        [client]
+        name = "home-pc"
+        server_addr = "127.0.0.1:7443"
+        server_name = "localhost"
+        certificate_authority_file = "ca.crt"
+        private_key_file = "device.key"
+        heartbeat_interval_secs = 20
+
+        [[exports]]
+        name = "ssh"
+        protocol = "tcp"
+        local_addr = "127.0.0.1:22"
+        allowed_peers = []
+    "#,
+    );
+
+    assert!(config.exports[0].allows_peer("laptop"));
+    assert!(
+        config
+            .validation_warnings()
+            .iter()
+            .any(|warning| warning.code() == "P2P_EXPORT_ALLOW_ALL")
+    );
+}
+
+#[test]
+fn p2p_named_allowed_peers_deny_an_absent_peer() {
+    let config = load_client_fixture(
+        r#"
+        [client]
+        name = "home-pc"
+        server_addr = "127.0.0.1:7443"
+        server_name = "localhost"
+        certificate_authority_file = "ca.crt"
+        private_key_file = "device.key"
+        heartbeat_interval_secs = 20
+
+        [[exports]]
+        name = "ssh"
+        protocol = "tcp"
+        local_addr = "127.0.0.1:22"
+        allowed_peers = ["laptop"]
+    "#,
+    );
+
+    assert!(config.exports[0].allows_peer("laptop"));
+    assert!(!config.exports[0].allows_peer("tablet"));
+}
+
+#[test]
+fn p2p_rejects_unknown_fields() {
+    let dir = TempDir::new();
+    let config = format!(
+        "{}\n\n[p2p]\nenabled = true\nprefer_direct = true\ndirect_timeout_secs = 8\nreconnect_timeout_secs = 3\nallow_relay_fallback = true\nudp_port_range = \"7400-7499\"\ntcp_port_range = \"7400-7499\"\nunexpected = true\n",
+        valid_client()
+    );
+
+    assert!(load_client_text(&dir, &config).is_err());
+}
+
+#[test]
+fn p2p_rejects_invalid_reversed_and_oversized_port_ranges() {
+    let dir = TempDir::new();
+    let p2p = "\n[p2p]\nenabled = true\nprefer_direct = true\ndirect_timeout_secs = 8\nreconnect_timeout_secs = 3\nallow_relay_fallback = true\nudp_port_range = \"7400-7499\"\ntcp_port_range = \"7400-7499\"\n";
+
+    for invalid in ["0-7499", "7499-7400", "7400-8424"] {
+        let config = format!(
+            "{}{}",
+            valid_client(),
+            p2p.replace(
+                "udp_port_range = \"7400-7499\"",
+                &format!("udp_port_range = \"{invalid}\""),
+            )
+        );
+        assert!(load_client_text(&dir, &config).is_err(), "{invalid}");
+    }
+}
+
+#[test]
+fn p2p_rejects_duplicate_export_and_forward_names() {
+    let dir = TempDir::new();
+    let duplicate_export = format!(
+        "{}\n\n[[exports]]\nname = \"ssh\"\nprotocol = \"tcp\"\nlocal_addr = \"127.0.0.1:22\"\n\n[[exports]]\nname = \"ssh\"\nprotocol = \"udp\"\nlocal_addr = \"127.0.0.1:53\"\n",
+        valid_client()
+    );
+    let duplicate_forward = format!(
+        "{}\n\n[[forwards]]\nname = \"office-ssh\"\npeer = \"office-pc\"\nexport = \"ssh\"\nlisten_addr = \"127.0.0.1:2222\"\n\n[[forwards]]\nname = \"office-ssh\"\npeer = \"laptop\"\nexport = \"ssh\"\nlisten_addr = \"127.0.0.1:2223\"\n",
+        valid_client()
+    );
+
+    assert!(load_client_text(&dir, &duplicate_export).is_err());
+    assert!(load_client_text(&dir, &duplicate_forward).is_err());
+}
+
+#[test]
+fn p2p_rejects_a_forward_to_the_local_client() {
+    let dir = TempDir::new();
+    let config = format!(
+        "{}\n\n[[forwards]]\nname = \"self-ssh\"\npeer = \"home-pc\"\nexport = \"ssh\"\nlisten_addr = \"127.0.0.1:2222\"\n",
+        valid_client()
+    );
+
+    assert!(load_client_text(&dir, &config).is_err());
+}
+
+#[test]
+fn p2p_warns_when_a_forward_listens_on_wildcard_address() {
+    let config = load_client_fixture(
+        r#"
+        [client]
+        name = "home-pc"
+        server_addr = "127.0.0.1:7443"
+        server_name = "localhost"
+        certificate_authority_file = "ca.crt"
+        private_key_file = "device.key"
+        heartbeat_interval_secs = 20
+
+        [[forwards]]
+        name = "office-ssh"
+        peer = "office-pc"
+        export = "ssh"
+        listen_addr = "0.0.0.0:2222"
+    "#,
+    );
+
+    assert!(
+        config
+            .validation_warnings()
+            .iter()
+            .any(|warning| warning.code() == "P2P_FORWARD_NON_LOOPBACK_LISTEN")
+    );
 }
 
 #[allow(dead_code)]
