@@ -317,6 +317,12 @@ struct BucketAdmission {
     maintenance_steps: usize,
 }
 
+struct PreparedBucketSlot<K> {
+    eviction: Option<BucketExpiry<K>>,
+    maintenance_steps: usize,
+    available: bool,
+}
+
 impl<K: Eq + Hash + Clone> BucketTable<K> {
     fn allow(
         &mut self,
@@ -336,7 +342,80 @@ impl<K: Eq + Hash + Clone> BucketTable<K> {
         let stale_after = refill_interval
             .checked_mul(capacity)
             .unwrap_or(Duration::MAX);
+        let prepared = self.prepare_slot(maximum_entries, now, stale_after);
+        if !prepared.available {
+            return BucketAdmission {
+                allowed: false,
+                maintenance_steps: prepared.maintenance_steps,
+            };
+        }
+        self.commit_slot(prepared.eviction);
+
+        self.insert_bucket(
+            key,
+            capacity,
+            refill_interval,
+            now,
+            stale_after,
+            prepared.maintenance_steps,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn allow_new_source(
+        &mut self,
+        key: K,
+        maximum_entries: usize,
+        capacity: u32,
+        refill_interval: Duration,
+        now: Instant,
+        global_admission: &mut TokenBucket,
+        global_capacity: u32,
+    ) -> BucketAdmission {
+        if let Some(entry) = self.entries.get_mut(&key) {
+            return BucketAdmission {
+                allowed: entry.bucket.take(capacity, refill_interval, now),
+                maintenance_steps: 0,
+            };
+        }
+
+        let stale_after = refill_interval
+            .checked_mul(capacity)
+            .unwrap_or(Duration::MAX);
+        let prepared = self.prepare_slot(maximum_entries, now, stale_after);
+        if !prepared.available {
+            return BucketAdmission {
+                allowed: false,
+                maintenance_steps: prepared.maintenance_steps,
+            };
+        }
+        if !global_admission.take(global_capacity, refill_interval, now) {
+            self.restore_slot(prepared.eviction);
+            return BucketAdmission {
+                allowed: false,
+                maintenance_steps: prepared.maintenance_steps,
+            };
+        }
+        self.commit_slot(prepared.eviction);
+
+        self.insert_bucket(
+            key,
+            capacity,
+            refill_interval,
+            now,
+            stale_after,
+            prepared.maintenance_steps,
+        )
+    }
+
+    fn prepare_slot(
+        &mut self,
+        maximum_entries: usize,
+        now: Instant,
+        stale_after: Duration,
+    ) -> PreparedBucketSlot<K> {
         let mut maintenance_steps = self.sweep_expired(now, stale_after);
+        let mut eviction = None;
         if self.entries.len() >= maximum_entries {
             while maintenance_steps < MAX_BUCKET_MAINTENANCE_STEPS_PER_PACKET {
                 let Some(expiry) = self.expirations.pop_front() else {
@@ -348,18 +427,39 @@ impl<K: Eq + Hash + Clone> BucketTable<K> {
                     .get(&expiry.key)
                     .is_some_and(|entry| entry.generation == expiry.generation)
                 {
-                    self.entries.remove(&expiry.key);
+                    eviction = Some(expiry);
                     break;
                 }
             }
         }
-        if self.entries.len() >= maximum_entries {
-            return BucketAdmission {
-                allowed: false,
-                maintenance_steps,
-            };
+        PreparedBucketSlot {
+            available: self.entries.len() < maximum_entries || eviction.is_some(),
+            eviction,
+            maintenance_steps,
         }
+    }
 
+    fn commit_slot(&mut self, eviction: Option<BucketExpiry<K>>) {
+        if let Some(expiry) = eviction {
+            self.entries.remove(&expiry.key);
+        }
+    }
+
+    fn restore_slot(&mut self, eviction: Option<BucketExpiry<K>>) {
+        if let Some(expiry) = eviction {
+            self.expirations.push_front(expiry);
+        }
+    }
+
+    fn insert_bucket(
+        &mut self,
+        key: K,
+        capacity: u32,
+        refill_interval: Duration,
+        now: Instant,
+        stale_after: Duration,
+        maintenance_steps: usize,
+    ) -> BucketAdmission {
         let generation = self.next_generation;
         self.next_generation = self.next_generation.wrapping_add(1).max(1);
         let mut bucket = TokenBucket::new(capacity, now);
@@ -484,19 +584,20 @@ fn authorize_probe(
     let now = Instant::now();
     let pending = {
         let mut state = state.lock().ok()?;
-        if !state.global_ip_admission.take(
-            u32::try_from(limits.max_tracked_ips).ok()?,
-            limits.refill_interval,
-            now,
-        ) {
-            return None;
-        }
-        let admission = state.ip_buckets.allow(
+        let global_capacity = u32::try_from(limits.max_tracked_ips).ok()?;
+        let ObservationState {
+            global_ip_admission,
+            ip_buckets,
+            ..
+        } = &mut *state;
+        let admission = ip_buckets.allow_new_source(
             canonical_ip(source_ip),
             limits.max_tracked_ips,
             limits.per_ip_burst,
             limits.refill_interval,
             now,
+            global_ip_admission,
+            global_capacity,
         );
         debug_assert!(admission.maintenance_steps <= MAX_BUCKET_MAINTENANCE_STEPS_PER_PACKET);
         if !admission.allowed {
@@ -974,5 +1075,114 @@ mod tests {
         assert_eq!(state.ip_buckets.len(), constrained.max_tracked_ips);
         assert!(state.ip_buckets.queue_len() <= constrained.max_tracked_ips);
         assert_eq!(state.global_ip_admission.remaining(), 0);
+    }
+
+    #[test]
+    fn global_admission_only_charges_new_source_ips() -> Result<(), Box<dyn Error>> {
+        let constrained = ObservationRuntimeLimits {
+            max_tracked_ips: 2,
+            per_ip_burst: 2,
+            ..limits()
+        };
+        let service = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(ObservationService::bind(
+                loopback(1),
+                loopback(1),
+                constrained.clone(),
+            ))?;
+        let (registry, guard) = active_client()?;
+        let issuer = service.token_issuer(registry);
+        let first = issuer.issue(guard.identity())?;
+        let second = issuer.issue(guard.identity())?;
+        let rate_limited = issuer.issue(guard.identity())?;
+        let tracked_ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 10));
+
+        assert!(
+            super::authorize_probe(
+                &issuer.state,
+                &constrained,
+                &ObservationProbe::new(
+                    first.primary_token().clone(),
+                    ObservationNonce::from([11; 16]),
+                ),
+                ObservationEndpoint::Primary,
+                tracked_ip,
+            )
+            .is_some()
+        );
+        assert!(
+            super::authorize_probe(
+                &issuer.state,
+                &constrained,
+                &ObservationProbe::new(
+                    rustgo_rendezvous::ObservationToken::from([0xAB; 32]),
+                    ObservationNonce::from([12; 16]),
+                ),
+                ObservationEndpoint::Primary,
+                std::net::IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 20)),
+            )
+            .is_none()
+        );
+        assert_eq!(
+            issuer.state.lock().unwrap().global_ip_admission.remaining(),
+            0
+        );
+
+        assert!(
+            super::authorize_probe(
+                &issuer.state,
+                &constrained,
+                &ObservationProbe::new(
+                    second.primary_token().clone(),
+                    ObservationNonce::from([13; 16]),
+                ),
+                ObservationEndpoint::Primary,
+                tracked_ip,
+            )
+            .is_some(),
+            "a tracked IP must bypass exhausted new-source admission"
+        );
+        assert!(
+            super::authorize_probe(
+                &issuer.state,
+                &constrained,
+                &ObservationProbe::new(
+                    rustgo_rendezvous::ObservationToken::from([0xCD; 32]),
+                    ObservationNonce::from([14; 16]),
+                ),
+                ObservationEndpoint::Primary,
+                std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 30)),
+            )
+            .is_none(),
+            "an untracked IP must be denied after global admission is exhausted"
+        );
+
+        let rate_limited_key = *rate_limited.primary_token().as_bytes();
+        assert!(
+            super::authorize_probe(
+                &issuer.state,
+                &constrained,
+                &ObservationProbe::new(
+                    rate_limited.primary_token().clone(),
+                    ObservationNonce::from([15; 16]),
+                ),
+                ObservationEndpoint::Primary,
+                tracked_ip,
+            )
+            .is_none(),
+            "the tracked IP must still obey its own burst limit"
+        );
+        assert!(
+            issuer
+                .state
+                .lock()
+                .unwrap()
+                .pending
+                .contains_key(&rate_limited_key),
+            "per-IP denial must happen before consuming the one-use token"
+        );
+        Ok(())
     }
 }
