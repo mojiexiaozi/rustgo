@@ -8,8 +8,8 @@ use std::{
 use async_trait::async_trait;
 use rand::{TryRngCore as _, rngs::OsRng};
 use rustgo_crypto::{
-    EphemeralPeerKey, PEER_HANDSHAKE_TAG_BYTES, PEER_TRANSPORT_BINDING_BYTES, PeerCryptoError,
-    PeerFrameOpener, PeerFrameSealer, PeerRole, PeerSessionKeys, PeerTranscript,
+    EphemeralPeerKey, PEER_CANDIDATE_CONFIRMATION_BYTES, PEER_TRANSPORT_BINDING_BYTES,
+    PeerCryptoError, PeerFrameOpener, PeerFrameSealer, PeerRole, PeerSessionKeys, PeerTranscript,
 };
 use rustgo_nat::{TcpPunchMode, TcpPuncher};
 use rustgo_path::{PathAttempt, PathError, PathKind, SelectedPath};
@@ -27,7 +27,7 @@ use tokio_util::sync::CancellationToken;
 const AUTH_MAGIC: &[u8; 8] = b"RGOTCP01";
 const CHALLENGE_BYTES: usize = 32;
 const HELLO_RECORD_BYTES: usize = 8 + 1 + CHALLENGE_BYTES;
-const PROOF_RECORD_BYTES: usize = 8 + 1 + PEER_HANDSHAKE_TAG_BYTES;
+const PROOF_RECORD_BYTES: usize = 8 + 1 + PEER_CANDIDATE_CONFIRMATION_BYTES;
 const AUTH_INITIATOR: u8 = 1;
 const AUTH_RESPONDER: u8 = 2;
 const MAX_WIRE_FRAME_BYTES: usize = 70 * 1024;
@@ -79,21 +79,21 @@ impl PeerTcpAuthentication {
     fn handshake_tag(
         &self,
         binding: &[u8; PEER_TRANSPORT_BINDING_BYTES],
-    ) -> Result<[u8; PEER_HANDSHAKE_TAG_BYTES], PeerTcpError> {
+    ) -> Result<[u8; PEER_CANDIDATE_CONFIRMATION_BYTES], PeerTcpError> {
         let guard = self
             .keys
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard
             .as_ref()
-            .map(|keys| keys.handshake_tag(binding))
+            .map(|keys| keys.candidate_confirmation(binding))
             .ok_or(PeerTcpError::AuthenticationMaterialUnavailable)
     }
 
     fn verify_handshake_tag(
         &self,
         binding: &[u8; PEER_TRANSPORT_BINDING_BYTES],
-        tag: &[u8; PEER_HANDSHAKE_TAG_BYTES],
+        tag: &[u8; PEER_CANDIDATE_CONFIRMATION_BYTES],
     ) -> Result<(), PeerTcpError> {
         let guard = self
             .keys
@@ -102,7 +102,7 @@ impl PeerTcpAuthentication {
         guard
             .as_ref()
             .ok_or(PeerTcpError::AuthenticationMaterialUnavailable)?
-            .verify_handshake_tag(binding, tag)?;
+            .verify_candidate_confirmation(binding, tag)?;
         Ok(())
     }
 
@@ -377,7 +377,10 @@ fn hello_record(role: PeerRole, challenge: [u8; CHALLENGE_BYTES]) -> [u8; HELLO_
     record
 }
 
-fn proof_record(role: PeerRole, tag: [u8; PEER_HANDSHAKE_TAG_BYTES]) -> [u8; PROOF_RECORD_BYTES] {
+fn proof_record(
+    role: PeerRole,
+    tag: [u8; PEER_CANDIDATE_CONFIRMATION_BYTES],
+) -> [u8; PROOF_RECORD_BYTES] {
     let mut record = [0_u8; PROOF_RECORD_BYTES];
     record[..8].copy_from_slice(AUTH_MAGIC);
     record[8] = match role {
@@ -431,7 +434,7 @@ fn verify_proof(
     if &proof[..8] != AUTH_MAGIC || proof[8] != expected_role {
         return Err(PeerTcpError::AuthenticationFailed);
     }
-    let tag: [u8; PEER_HANDSHAKE_TAG_BYTES] = proof[9..]
+    let tag: [u8; PEER_CANDIDATE_CONFIRMATION_BYTES] = proof[9..]
         .try_into()
         .map_err(|_| PeerTcpError::AuthenticationFailed)?;
     authentication.verify_handshake_tag(binding, &tag)?;
@@ -503,15 +506,15 @@ mod tests {
         let (initiator, responder) = key_pair();
         let old_binding = live_binding(PeerRole::Initiator, &[1; 32], &[2; 32]);
         let new_binding = live_binding(PeerRole::Initiator, &[3; 32], &[4; 32]);
-        let captured = responder.handshake_tag(&old_binding);
+        let captured = responder.candidate_confirmation(&old_binding);
         assert!(
             initiator
-                .verify_handshake_tag(&old_binding, &captured)
+                .verify_candidate_confirmation(&old_binding, &captured)
                 .is_ok()
         );
         assert!(
             initiator
-                .verify_handshake_tag(&new_binding, &captured)
+                .verify_candidate_confirmation(&new_binding, &captured)
                 .is_err()
         );
     }
@@ -520,9 +523,13 @@ mod tests {
     fn tampered_live_proof_is_rejected() {
         let (initiator, responder) = key_pair();
         let binding = live_binding(PeerRole::Initiator, &[5; 32], &[6; 32]);
-        let mut proof = responder.handshake_tag(&binding);
+        let mut proof = responder.candidate_confirmation(&binding);
         proof[0] ^= 0x80;
-        assert!(initiator.verify_handshake_tag(&binding, &proof).is_err());
+        assert!(
+            initiator
+                .verify_candidate_confirmation(&binding, &proof)
+                .is_err()
+        );
     }
 
     #[test]

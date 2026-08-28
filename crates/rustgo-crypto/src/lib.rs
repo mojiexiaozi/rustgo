@@ -12,8 +12,8 @@ pub use identity::{
 };
 pub use keyfile::generate_key_file;
 pub use peer::{
-    EphemeralPeerKey, PEER_HANDSHAKE_TAG_BYTES, PEER_TRANSPORT_BINDING_BYTES, PeerCryptoError,
-    PeerFrameOpener, PeerFrameSealer, PeerRole, PeerSessionKeys, PeerTranscript,
-    sign_peer_envelope, verify_peer_envelope,
+    EphemeralPeerKey, PEER_CANDIDATE_CONFIRMATION_BYTES, PEER_HANDSHAKE_TAG_BYTES,
+    PEER_TRANSPORT_BINDING_BYTES, PeerCryptoError, PeerFrameOpener, PeerFrameSealer, PeerRole,
+    PeerSessionKeys, PeerTranscript, sign_peer_envelope, verify_peer_envelope,
 };
 pub use transcript::AuthTranscript;

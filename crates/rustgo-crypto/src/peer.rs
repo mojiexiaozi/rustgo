@@ -3,6 +3,7 @@ use std::{collections::HashSet, fmt};
 use chacha20poly1305::aead::{Aead, AeadInPlace, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, Tag};
 use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
 use rand::{TryRngCore as _, rngs::OsRng};
 use rustgo_protocol::{BoundedBytes, BoundedString, ProtocolVersion, SocketAddress};
 use rustgo_rendezvous::{
@@ -23,6 +24,7 @@ const FRAME_DOMAIN: &[u8] = b"rustgo-peer-frame-v1";
 const FRAME_KEY_DOMAIN: &[u8] = b"rustgo-peer-frame-key-v1";
 const HANDSHAKE_DOMAIN: &[u8] = b"rustgo-peer-handshake-confirmation-v1";
 pub const PEER_HANDSHAKE_TAG_BYTES: usize = 16;
+pub const PEER_CANDIDATE_CONFIRMATION_BYTES: usize = 32;
 pub const PEER_TRANSPORT_BINDING_BYTES: usize = 32;
 const AEAD_TAG_BYTES: usize = 16;
 const REPLAY_WINDOW_BITS: u64 = 64;
@@ -310,6 +312,36 @@ impl PeerSessionKeys {
             .map_err(|_| PeerCryptoError::HandshakeAuthenticationFailed)
     }
 
+    /// Produces a repeatable, connection-scoped confirmation without AEAD nonce reuse.
+    /// HMAC is a PRF under the directional handshake key and safely supports distinct live
+    /// challenge bindings from concurrent candidates.
+    #[must_use]
+    pub fn candidate_confirmation(
+        &self,
+        transport_binding: &[u8; PEER_TRANSPORT_BINDING_BYTES],
+    ) -> [u8; PEER_CANDIDATE_CONFIRMATION_BYTES] {
+        candidate_hmac(
+            &self.outgoing_handshake_key().0,
+            &self.context_hash,
+            transport_binding,
+        )
+    }
+
+    pub fn verify_candidate_confirmation(
+        &self,
+        transport_binding: &[u8; PEER_TRANSPORT_BINDING_BYTES],
+        confirmation: &[u8; PEER_CANDIDATE_CONFIRMATION_BYTES],
+    ) -> Result<(), PeerCryptoError> {
+        let mut mac =
+            <Hmac<Sha256> as Mac>::new_from_slice(self.incoming_handshake_key().0.0.as_ref())
+                .expect("HMAC-SHA256 accepts a 32-byte key");
+        mac.update(b"rustgo-peer-candidate-confirmation-v1");
+        mac.update(&self.context_hash);
+        mac.update(transport_binding);
+        mac.verify_slice(confirmation)
+            .map_err(|_| PeerCryptoError::HandshakeAuthenticationFailed)
+    }
+
     pub fn stream_sealer(&mut self, channel_id: u64) -> Result<PeerFrameSealer, PeerCryptoError> {
         let domain = self.issue_sealer(FrameMode::Ordered, channel_id)?;
         PeerFrameSealer::new(
@@ -450,6 +482,19 @@ impl PeerSessionKeys {
             PeerRole::Responder => &self.datagram_initiator_to_responder,
         }
     }
+}
+
+fn candidate_hmac(
+    key: &SecretKey,
+    context_hash: &[u8; 32],
+    transport_binding: &[u8; PEER_TRANSPORT_BINDING_BYTES],
+) -> [u8; PEER_CANDIDATE_CONFIRMATION_BYTES] {
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key.0.as_ref())
+        .expect("HMAC-SHA256 accepts a 32-byte key");
+    mac.update(b"rustgo-peer-candidate-confirmation-v1");
+    mac.update(context_hash);
+    mac.update(transport_binding);
+    mac.finalize().into_bytes().into()
 }
 
 impl fmt::Debug for PeerSessionKeys {

@@ -155,6 +155,35 @@ fn handshake_confirmation_rejects_cross_connection_exporter_substitution() {
 }
 
 #[test]
+fn candidate_confirmations_are_repeatable_mac_domains_not_fixed_nonce_aead() {
+    let fixture = PeerFixture::new();
+    let (initiator, responder) = fixture.keys("ssh");
+    let first_binding = [0x41; 32];
+    let second_binding = [0x42; 32];
+    let first = initiator.candidate_confirmation(&first_binding);
+    let second = initiator.candidate_confirmation(&second_binding);
+    assert_ne!(first, second);
+    responder
+        .verify_candidate_confirmation(&first_binding, &first)
+        .unwrap();
+    responder
+        .verify_candidate_confirmation(&second_binding, &second)
+        .unwrap();
+    assert!(
+        responder
+            .verify_candidate_confirmation(&second_binding, &first)
+            .is_err()
+    );
+    let mut tampered = second;
+    tampered[7] ^= 1;
+    assert!(
+        responder
+            .verify_candidate_confirmation(&second_binding, &tampered)
+            .is_err()
+    );
+}
+
+#[test]
 fn local_ephemeral_key_must_match_its_claimed_role() {
     let derive: fn(
         PeerRole,

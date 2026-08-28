@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 //! Pure, bounded candidate discovery inputs and NAT mapping evidence.
 
