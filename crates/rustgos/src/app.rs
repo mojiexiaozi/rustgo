@@ -185,6 +185,10 @@ impl ServerApp {
             .await?,
         );
         let listener_ip = tls_server.local_addr()?.ip();
+        let udp_listener_ip = config
+            .server
+            .udp_bind_ip
+            .or_else(|| (!listener_ip.is_unspecified()).then_some(listener_ip));
         let per_tunnel_bindings = u64::from(config.limits.max_tcp_connections_per_tunnel)
             .saturating_add(u64::from(config.limits.max_udp_sessions_per_tunnel));
         let configured_binding_capacity = u64::try_from(max_tunnels)
@@ -210,6 +214,7 @@ impl ServerApp {
             max_udp_sessions,
             max_udp_payload,
             listener_ip,
+            udp_listener_ip,
             binding_capacity,
             runtime_limits.binding_token_ttl,
             UdpRuntimeLimits {

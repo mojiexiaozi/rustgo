@@ -2,6 +2,7 @@
 
 use std::{
     fs,
+    net::{IpAddr, Ipv4Addr},
     path::{Path, PathBuf},
     sync::atomic::{AtomicUsize, Ordering},
 };
@@ -106,6 +107,29 @@ fn server_rejects_unknown_fields() {
     );
 
     assert!(load_server_text(&dir, &config).is_err());
+}
+
+#[test]
+fn server_accepts_only_a_unicast_udp_bind_ip() {
+    let dir = TempDir::new();
+    let explicit = valid_server().replace(
+        "bind_addr = \"0.0.0.0:7000\"",
+        "bind_addr = \"0.0.0.0:7000\"\nudp_bind_ip = \"192.0.2.10\"",
+    );
+    let loaded = load_server_text(&dir, &explicit).unwrap();
+    assert_eq!(
+        loaded.server.udp_bind_ip,
+        Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)))
+    );
+
+    for unspecified in ["0.0.0.0", "::"] {
+        let invalid = valid_server().replace(
+            "bind_addr = \"0.0.0.0:7000\"",
+            &format!("bind_addr = \"0.0.0.0:7000\"\nudp_bind_ip = \"{unspecified}\""),
+        );
+        let error = load_server_text(&dir, &invalid).unwrap_err();
+        assert!(error.to_string().contains("udp_bind_ip"), "{error}");
+    }
 }
 
 #[test]

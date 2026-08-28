@@ -270,6 +270,11 @@ fn decode_payload(message: MessageId, payload: &[u8]) -> Result<Message, FrameEr
 }
 
 fn encode_udp(datagram: &UdpDatagram) -> Result<Vec<u8>, FrameError> {
+    if datagram.tunnel_id == 0 || datagram.session_id == 0 {
+        return Err(FrameError::MalformedPayload {
+            message: MessageId::UDP_DATAGRAM,
+        });
+    }
     let mut payload = Vec::with_capacity(UDP_METADATA_LEN + datagram.payload.as_slice().len());
     payload.put_u32(datagram.tunnel_id);
     payload.put_u64(datagram.session_id);
@@ -305,6 +310,9 @@ fn decode_udp(message: MessageId, payload: &[u8]) -> Result<UdpDatagram, FrameEr
 
     let tunnel_id = u32::from_be_bytes(payload[0..4].try_into().expect("fixed metadata width"));
     let session_id = u64::from_be_bytes(payload[4..12].try_into().expect("fixed metadata width"));
+    if tunnel_id == 0 || session_id == 0 {
+        return Err(FrameError::MalformedPayload { message });
+    }
     let address: [u8; 16] = payload[13..29].try_into().expect("fixed metadata width");
     let port = u16::from_be_bytes(payload[29..31].try_into().expect("fixed metadata width"));
     let source = match payload[12] {

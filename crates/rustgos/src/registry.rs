@@ -11,7 +11,9 @@ use rustgo_protocol::{
     MAX_TUNNELS, Message, OpenUdpChannel, ProtocolErrorCode, ProtocolVersion, RegisterTunnels,
     TunnelProtocol, TunnelResult, TunnelResults,
 };
-use rustgo_transport::{BindingError, ChannelBinding, ChannelBindingStore, ChannelKind};
+use rustgo_transport::{
+    BindingError, ChannelBinding, ChannelBindingStore, ChannelKind, safe_display,
+};
 use thiserror::Error;
 use tokio::{
     net::{TcpListener, TcpStream, UdpSocket},
@@ -37,7 +39,8 @@ pub struct ClientRegistry {
     max_tcp_connections_per_tunnel: usize,
     max_udp_sessions_per_tunnel: usize,
     max_udp_payload_bytes: usize,
-    listener_ip: IpAddr,
+    tcp_listener_ip: IpAddr,
+    udp_listener_ip: Option<IpAddr>,
     binding_capacity: usize,
     binding_ttl: Duration,
     udp_runtime_limits: UdpRuntimeLimits,
@@ -69,7 +72,8 @@ impl std::fmt::Debug for ClientRegistry {
                 &self.max_udp_sessions_per_tunnel,
             )
             .field("max_udp_payload_bytes", &self.max_udp_payload_bytes)
-            .field("listener_ip", &self.listener_ip)
+            .field("tcp_listener_ip", &self.tcp_listener_ip)
+            .field("udp_listener_ip", &self.udp_listener_ip)
             .finish_non_exhaustive()
     }
 }
@@ -109,6 +113,7 @@ impl ClientRegistry {
             1,
             rustgo_protocol::MAX_UDP_PAYLOAD_BYTES,
             listener_ip,
+            (!listener_ip.is_unspecified()).then_some(listener_ip),
             binding_capacity,
             binding_ttl,
             UdpRuntimeLimits::default(),
@@ -122,7 +127,8 @@ impl ClientRegistry {
         max_tcp_connections_per_tunnel: usize,
         max_udp_sessions_per_tunnel: usize,
         max_udp_payload_bytes: usize,
-        listener_ip: IpAddr,
+        tcp_listener_ip: IpAddr,
+        udp_listener_ip: Option<IpAddr>,
         binding_capacity: usize,
         binding_ttl: Duration,
         udp_runtime_limits: UdpRuntimeLimits,
@@ -146,7 +152,8 @@ impl ClientRegistry {
             max_tcp_connections_per_tunnel,
             max_udp_sessions_per_tunnel,
             max_udp_payload_bytes,
-            listener_ip,
+            tcp_listener_ip,
+            udp_listener_ip,
             binding_capacity,
             binding_ttl,
             udp_runtime_limits,
@@ -605,13 +612,14 @@ impl ControlSessionGuard {
     pub async fn register_tunnels(&mut self, request: RegisterTunnels) -> TunnelResults {
         let mut results = Vec::with_capacity(request.tunnels.as_slice().len());
         for tunnel in request.tunnels.into_vec() {
-            let accepted = if self.listeners.len() >= self.registry.max_tunnels_per_client
+            let binding = if self.listeners.len() >= self.registry.max_tunnels_per_client
+                || tunnel.tunnel_id == 0
                 || tunnel.remote_port == 0
                 || tunnel.name.as_str().trim().is_empty()
                 || self.tunnel_ids.contains_key(&tunnel.tunnel_id)
                 || self.tunnel_names.contains(tunnel.name.as_str())
             {
-                false
+                Err(RegistryError::InvalidTunnelRegistration)
             } else {
                 self.bind_listener(
                     tunnel.tunnel_id,
@@ -620,17 +628,34 @@ impl ControlSessionGuard {
                     tunnel.remote_port,
                 )
                 .await
-                .is_ok_and(|lease| {
+            };
+            let (accepted, error) = match binding {
+                Ok(lease) => {
                     self.tunnel_ids.insert(tunnel.tunnel_id, tunnel.protocol);
                     self.tunnel_names.insert(tunnel.name.as_str().to_owned());
                     self.listeners.push(lease);
-                    true
-                })
+                    (true, None)
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        client = %safe_display(self.identity.name()),
+                        tunnel = %safe_display(tunnel.name.as_str()),
+                        tunnel_id = tunnel.tunnel_id,
+                        error = %safe_display(&error),
+                        "event=tunnel_rejected server rejected tunnel registration"
+                    );
+                    let code = if matches!(error, RegistryError::UdpBindAddressRequired) {
+                        ProtocolErrorCode::UDP_BIND_ADDRESS_REQUIRED
+                    } else {
+                        ProtocolErrorCode::TUNNEL_REJECTED
+                    };
+                    (false, Some(code))
+                }
             };
             results.push(TunnelResult {
                 tunnel_id: tunnel.tunnel_id,
                 accepted,
-                error: (!accepted).then_some(ProtocolErrorCode::TUNNEL_REJECTED),
+                error,
             });
         }
         TunnelResults {
@@ -706,8 +731,8 @@ impl ControlSessionGuard {
         protocol: TunnelProtocol,
         port: u16,
     ) -> Result<ListenerLease, RegistryError> {
-        let address = SocketAddr::new(self.registry.listener_ip, port);
         if protocol == TunnelProtocol::TCP {
+            let address = SocketAddr::new(self.registry.tcp_listener_ip, port);
             let listener = TcpListener::bind(address).await?;
             Ok(ListenerLease::Tcp(TcpListenerTask::spawn(
                 listener,
@@ -717,6 +742,11 @@ impl ControlSessionGuard {
                 self.registry.max_tcp_connections_per_tunnel,
             )))
         } else {
+            let ip = self
+                .registry
+                .udp_listener_ip
+                .ok_or(RegistryError::UdpBindAddressRequired)?;
+            let address = SocketAddr::new(ip, port);
             let socket = UdpSocket::bind(address).await?;
             let pending = self.runtime.prepare_udp(tunnel_id)?;
             Ok(ListenerLease::Udp(UdpListenerTask::spawn(
@@ -814,6 +844,12 @@ pub enum RegistryError {
     CapacityReached,
     #[error("unknown tunnel")]
     UnknownTunnel,
+    #[error("invalid tunnel registration")]
+    InvalidTunnelRegistration,
+    #[error(
+        "UDP public bind requires a specific server.udp_bind_ip when server.bind_addr is unspecified"
+    )]
+    UdpBindAddressRequired,
     #[error("channel binding failed: {0}")]
     Binding(#[from] BindingError),
     #[error("listener I/O failed: {0}")]

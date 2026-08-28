@@ -1,5 +1,8 @@
 [server]
 bind_addr = "0.0.0.0:7000"
+# Required for UDP tunnels when bind_addr uses 0.0.0.0 or ::. Set this to a
+# specific address assigned to the server interface that receives public UDP.
+udp_bind_ip = "${RUSTGO_SERVER_UDP_BIND_IP}"
 certificate_file = "${RUSTGO_SERVER_CERTIFICATE_FILE}"
 private_key_file = "${RUSTGO_SERVER_PRIVATE_KEY_FILE}"
 heartbeat_timeout_secs = 60

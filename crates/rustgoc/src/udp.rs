@@ -65,16 +65,32 @@ impl TryFrom<&OpenUdpChannel> for NegotiatedUdpLimits {
         let queue_capacity = usize::try_from(request.queue_capacity)
             .map_err(|_| UdpClientError::InvalidNegotiatedLimits)?;
         let idle_timeout = Duration::from_millis(u64::from(request.idle_timeout_millis));
+        let sweep_interval = idle_timeout.min(Duration::from_secs(1));
+        let sweep_batch = minimum_sweep_batch(max_sessions, idle_timeout, sweep_interval)
+            .ok_or(UdpClientError::InvalidNegotiatedLimits)?;
         Ok(Self {
             max_sessions,
             idle_timeout,
             max_payload,
             queue_capacity,
             session_queue_capacity: queue_capacity.min(64),
-            sweep_interval: idle_timeout.min(Duration::from_secs(1)),
-            sweep_batch: max_sessions.min(64),
+            sweep_interval,
+            sweep_batch,
         })
     }
+}
+
+fn minimum_sweep_batch(
+    capacity: usize,
+    idle_timeout: Duration,
+    sweep_interval: Duration,
+) -> Option<usize> {
+    let sweeps_before_timeout = idle_timeout
+        .as_nanos()
+        .checked_div(sweep_interval.as_nanos())?
+        .max(1);
+    let capacity = u128::try_from(capacity).ok()?;
+    usize::try_from(capacity.div_ceil(sweeps_before_timeout)).ok()
 }
 
 pub(crate) struct RelaySessionSupervisor {
@@ -969,6 +985,7 @@ mod tests {
     use std::{
         net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
         sync::{Arc, Mutex},
+        time::Duration,
     };
 
     use rustgo_protocol::{
@@ -1003,6 +1020,14 @@ mod tests {
 
         for invalid in [
             OpenUdpChannel {
+                tunnel_id: 0,
+                ..valid.clone()
+            },
+            OpenUdpChannel {
+                channel_id: 0,
+                ..valid.clone()
+            },
+            OpenUdpChannel {
                 max_sessions: 0,
                 ..valid.clone()
             },
@@ -1033,6 +1058,18 @@ mod tests {
         ] {
             assert!(NegotiatedUdpLimits::try_from(&invalid).is_err());
         }
+    }
+
+    #[test]
+    fn million_session_sweep_completes_within_the_idle_timeout() {
+        let request = OpenUdpChannel {
+            max_sessions: MAX_UDP_SESSIONS_PER_TUNNEL,
+            idle_timeout_millis: 60_000,
+            ..negotiated_request()
+        };
+        let limits = NegotiatedUdpLimits::try_from(&request).unwrap();
+        assert_eq!(limits.sweep_interval, Duration::from_secs(1));
+        assert_eq!(limits.sweep_batch, 16_667);
     }
 
     #[test]

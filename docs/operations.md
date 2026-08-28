@@ -81,6 +81,7 @@ credentials:
 | --- | --- | --- |
 | `RUSTGO_SERVER_CERTIFICATE_FILE` | server | absolute path to `server.crt` |
 | `RUSTGO_SERVER_PRIVATE_KEY_FILE` | server | absolute path to `server.key` |
+| `RUSTGO_SERVER_UDP_BIND_IP` | server | specific local interface IP used for public UDP tunnel listeners |
 | `RUSTGO_DEVICE_PUBLIC_KEY` | server | complete contents of `device.pub` |
 | `RUSTGO_CERTIFICATE_AUTHORITY_FILE` | client | absolute path to `ca.crt` |
 | `RUSTGO_DEVICE_PRIVATE_KEY_FILE` | client | absolute path to `device.key` |
@@ -108,6 +109,17 @@ protocol = "udp"
 local_addr = "127.0.0.1:27015"
 remote_port = 27015
 ```
+
+The control/data TLS listener may use `bind_addr = "0.0.0.0:7000"`. UDP flow
+identity, however, requires a real destination address. When `bind_addr` uses
+`0.0.0.0` or `::`, set `server.udp_bind_ip` to one specific address assigned to
+the server interface that receives the forwarded UDP traffic. Behind NAT, use
+the address actually assigned to the host, not an external NAT address that the
+host cannot bind. `0.0.0.0` and `::` are rejected as `udp_bind_ip`. If this field
+is omitted with a wildcard control bind, UDP tunnel registrations are rejected
+individually with `UDP_BIND_ADDRESS_REQUIRED`; TCP tunnels remain available.
+When `bind_addr` already names a specific IP, `udp_bind_ip` may be omitted and
+that IP is used for UDP listeners.
 
 `check` uses the same strict parser, validation, path resolution, and
 production credential loaders as startup. `rustgos check` parses every DER

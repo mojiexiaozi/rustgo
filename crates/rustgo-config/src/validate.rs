@@ -25,6 +25,15 @@ impl ValidationError {
 
 pub(crate) fn validate_server(config: &ServerConfig) -> Result<(), ValidationError> {
     validate_bind_address(&config.server.bind_addr)?;
+    if config.server.udp_bind_ip.is_some_and(|ip| {
+        ip.is_unspecified()
+            || ip.is_multicast()
+            || matches!(ip, std::net::IpAddr::V4(ip) if ip.is_broadcast())
+    }) {
+        return Err(ValidationError::new(
+            "server.udp_bind_ip must be a specific unicast or local interface address",
+        ));
+    }
     require_nonzero(
         "server.heartbeat_timeout_secs",
         config.server.heartbeat_timeout_secs,

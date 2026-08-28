@@ -183,32 +183,64 @@ fn udp_channel_limits_and_retirement_round_trip_as_bounded_explicit_messages() {
 #[test]
 fn udp_negotiation_and_retirement_reject_invalid_numeric_metadata_on_decode() {
     let codec = FrameCodec::new(4096);
-    let invalid_open = Message::OpenUdpChannel(OpenUdpChannel {
-        max_sessions: 0,
-        ..OpenUdpChannel {
-            tunnel_id: 7,
-            channel_id: 9,
-            binding_token: bytes(&[0xA5; MAX_BINDING_TOKEN_BYTES]),
-            max_sessions: 1,
-            idle_timeout_millis: 150,
-            max_payload_bytes: 16,
-            queue_capacity: 1,
-        }
-    });
+    let valid_open = OpenUdpChannel {
+        tunnel_id: 7,
+        channel_id: 9,
+        binding_token: bytes(&[0xA5; MAX_BINDING_TOKEN_BYTES]),
+        max_sessions: 1,
+        idle_timeout_millis: 150,
+        max_payload_bytes: 16,
+        queue_capacity: 1,
+    };
     let invalid_retirement = Message::UdpSessionRetired(UdpSessionRetired {
         tunnel_id: 7,
         session_id: 0,
     });
 
-    for (message, message_id) in [
-        (invalid_open, MessageId::OPEN_UDP_CHANNEL),
-        (invalid_retirement, MessageId::UDP_SESSION_RETIRED),
-    ] {
+    let invalid_messages = [
+        Message::OpenUdpChannel(OpenUdpChannel {
+            tunnel_id: 0,
+            ..valid_open.clone()
+        }),
+        Message::OpenUdpChannel(OpenUdpChannel {
+            channel_id: 0,
+            ..valid_open.clone()
+        }),
+        Message::OpenUdpChannel(OpenUdpChannel {
+            max_sessions: 0,
+            ..valid_open
+        }),
+        invalid_retirement,
+    ];
+    for message in invalid_messages {
+        let message_id = message.id();
         let encoded = codec.encode(VERSION, 0, &message).unwrap();
         assert_eq!(
             codec.decode_exact(&encoded),
             Err(FrameError::MalformedPayload {
                 message: message_id
+            })
+        );
+    }
+}
+
+#[test]
+fn udp_datagrams_reject_zero_tunnel_and_session_ids_on_encode() {
+    let codec = FrameCodec::new(4096);
+    for (tunnel_id, session_id) in [(0, 1), (1, 0)] {
+        let message = Message::UdpDatagram(UdpDatagram {
+            tunnel_id,
+            session_id,
+            source: SocketAddress::V4 {
+                octets: [127, 0, 0, 1],
+                port: 53,
+            },
+            payload: bytes(&[1]),
+        });
+        assert_eq!(
+            codec.encode(VERSION, 0, &message),
+            Err(FrameError::MalformedPayload {
+                message: MessageId::UDP_DATAGRAM
             })
         );
     }

@@ -93,6 +93,7 @@ fn server_config(pki: &TestPki, clients: Vec<AuthorizedClient>) -> ServerConfig 
     ServerConfig {
         server: ServerSection {
             bind_addr: "127.0.0.1:0".to_owned(),
+            udp_bind_ip: None,
             certificate_file: pki.certificate_file.clone(),
             private_key_file: pki.private_key_file.clone(),
             heartbeat_timeout_secs: 2,
@@ -212,6 +213,11 @@ fn unused_tcp_port() -> Result<u16, Box<dyn Error>> {
     Ok(listener.local_addr()?.port())
 }
 
+fn unused_udp_port() -> Result<u16, Box<dyn Error>> {
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0")?;
+    Ok(socket.local_addr()?.port())
+}
+
 async fn wait_for_active_count(
     registry: &rustgos::ClientRegistry,
     expected: usize,
@@ -265,6 +271,49 @@ async fn valid_authentication_uses_tls_frames_and_accepts_heartbeats() -> Result
     client
         .send(VERSION, Message::Heartbeat(Heartbeat { sequence: 1 }))
         .await?;
+
+    drop(client);
+    shutdown.cancel();
+    server_task.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn wildcard_control_rejects_udp_with_specific_error_but_accepts_tcp()
+-> Result<(), Box<dyn Error>> {
+    let pki = TestPki::generate()?;
+    let key = DeviceKeypair::from_secret_bytes([0x31; 32]);
+    let mut config = server_config(&pki, vec![authorized("home-pc", &key, true)]);
+    config.server.bind_addr = "0.0.0.0:0".to_owned();
+    config.server.udp_bind_ip = None;
+    let app = ServerApp::bind(config).await?;
+    let bound = app.local_addr()?;
+    let address = std::net::SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), bound.port());
+    let shutdown = CancellationToken::new();
+    let server_task = tokio::spawn(app.run_until(shutdown.clone()));
+
+    let mut client = FramedClient::connect(&pki, address).await?;
+    assert!(authenticate(&mut client, "home-pc", &key).await?.accepted);
+    let results = register_tunnels(
+        &mut client,
+        vec![
+            tcp_tunnel(1, "tcp", unused_tcp_port()?),
+            TunnelRegistration {
+                tunnel_id: 2,
+                name: text("udp"),
+                protocol: TunnelProtocol::UDP,
+                remote_port: unused_udp_port()?,
+            },
+        ],
+    )
+    .await?;
+    assert!(results.results.as_slice()[0].accepted);
+    assert_eq!(results.results.as_slice()[0].error, None);
+    assert!(!results.results.as_slice()[1].accepted);
+    assert_eq!(
+        results.results.as_slice()[1].error,
+        Some(ProtocolErrorCode::UDP_BIND_ADDRESS_REQUIRED)
+    );
 
     drop(client);
     shutdown.cancel();
@@ -842,6 +891,12 @@ async fn invalid_and_over_limit_tunnels_are_rejected_individually() -> Result<()
     let results = register_tunnels(
         &mut client,
         vec![
+            TunnelRegistration {
+                tunnel_id: 0,
+                name: text("zero-udp-id"),
+                protocol: TunnelProtocol::UDP,
+                remote_port: unused_udp_port()?,
+            },
             tcp_tunnel(1, "", healthy_port),
             tcp_tunnel(2, "zero", 0),
             tcp_tunnel(3, "healthy", healthy_port),
@@ -850,11 +905,12 @@ async fn invalid_and_over_limit_tunnels_are_rejected_individually() -> Result<()
     )
     .await?;
     let results = results.results.as_slice();
-    assert_eq!(results.len(), 4);
+    assert_eq!(results.len(), 5);
     assert!(!results[0].accepted);
     assert!(!results[1].accepted);
-    assert!(results[2].accepted);
-    assert!(!results[3].accepted);
+    assert!(!results[2].accepted);
+    assert!(results[3].accepted);
+    assert!(!results[4].accepted);
 
     drop(client);
     wait_for_active_count(&registry, 0).await?;

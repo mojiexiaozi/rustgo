@@ -328,6 +328,7 @@ impl ProtocolErrorCode {
     pub const UNKNOWN_SESSION: Self = Self(7);
     pub const TUNNEL_REJECTED: Self = Self(8);
     pub const INCOMPATIBLE_HEARTBEAT: Self = Self(9);
+    pub const UDP_BIND_ADDRESS_REQUIRED: Self = Self(10);
     pub const INTERNAL: Self = Self(255);
 
     pub const fn as_u16(self) -> u16 {
@@ -351,7 +352,7 @@ impl<'de> Deserialize<'de> for ProtocolErrorCode {
     {
         let value = u16::deserialize(deserializer)?;
         match value {
-            1..=9 | 255 => Ok(Self(value)),
+            1..=10 | 255 => Ok(Self(value)),
             _ => Err(de::Error::custom("unknown protocol error code")),
         }
     }
@@ -502,7 +503,9 @@ pub struct OpenUdpChannel {
 
 impl OpenUdpChannel {
     pub const fn has_valid_limits(&self) -> bool {
-        self.max_sessions > 0
+        self.tunnel_id > 0
+            && self.channel_id > 0
+            && self.max_sessions > 0
             && self.max_sessions <= MAX_UDP_SESSIONS_PER_TUNNEL
             && self.idle_timeout_millis > 0
             && self.max_payload_bytes > 0

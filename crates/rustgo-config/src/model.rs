@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{net::IpAddr, path::PathBuf};
 
 use serde::Deserialize;
 
@@ -17,6 +17,8 @@ pub struct ServerConfig {
 #[serde(deny_unknown_fields)]
 pub struct ServerSection {
     pub bind_addr: String,
+    #[serde(default)]
+    pub udp_bind_ip: Option<IpAddr>,
     pub certificate_file: PathBuf,
     pub private_key_file: PathBuf,
     pub heartbeat_timeout_secs: u64,

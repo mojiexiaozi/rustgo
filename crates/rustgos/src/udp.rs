@@ -96,6 +96,25 @@ impl UdpRuntimeLimits {
             .then_some(request)
             .ok_or(UdpRelayError::InvalidLimits)
     }
+
+    fn effective_sweep_batch(self, capacity: usize) -> Result<usize, UdpRelayError> {
+        minimum_sweep_batch(capacity, self.idle_timeout, self.sweep_interval)
+            .map(|minimum| self.sweep_batch.max(minimum))
+            .ok_or(UdpRelayError::InvalidLimits)
+    }
+}
+
+fn minimum_sweep_batch(
+    capacity: usize,
+    idle_timeout: Duration,
+    sweep_interval: Duration,
+) -> Option<usize> {
+    let sweeps_before_timeout = idle_timeout
+        .as_nanos()
+        .checked_div(sweep_interval.as_nanos())?
+        .max(1);
+    let capacity = u128::try_from(capacity).ok()?;
+    usize::try_from(capacity.div_ceil(sweeps_before_timeout)).ok()
 }
 
 pub(crate) struct UdpListenerTask {
@@ -589,6 +608,7 @@ async fn relay_datagrams(
     let mut flows = FlowTable::new(max_sessions);
     let mut forwarded_replies = 0_u64;
     let mut receive_buffer = vec![0_u8; max_payload.saturating_add(1)];
+    let sweep_batch = limits.effective_sweep_batch(max_sessions)?;
     let first_sweep = tokio::time::Instant::now()
         .checked_add(limits.sweep_interval)
         .ok_or(UdpRelayError::InvalidLimits)?;
@@ -610,7 +630,7 @@ async fn relay_datagrams(
                 let expired = flows.sweep_expired(
                     tokio::time::Instant::now(),
                     limits.idle_timeout,
-                    limits.sweep_batch,
+                    sweep_batch,
                 ).map_err(|_| UdpRelayError::SessionAllocation)?;
                 if !expired.is_empty() {
                     metrics.set_sessions(flows.len());
@@ -893,7 +913,11 @@ pub(crate) async fn serve_data_connection(
     version: ProtocolVersion,
     request: rustgo_protocol::DataChannelBind,
 ) -> Result<(), UdpDataError> {
-    if request.kind != DataChannelKind::UDP || !framed.is_buffer_empty() {
+    if request.kind != DataChannelKind::UDP
+        || request.tunnel_id == 0
+        || request.target_id == 0
+        || !framed.is_buffer_empty()
+    {
         return Err(UdpDataError::InvalidFirstFrame);
     }
     let stream = framed.into_stream().map_err(UdpDataError::Control)?;
@@ -994,7 +1018,13 @@ mod tests {
         time::Duration,
     };
 
-    use super::{FlowError, FlowKey, FlowTable, canonical_socket_addr};
+    use super::{FlowError, FlowKey, FlowTable, UdpRuntimeLimits, canonical_socket_addr};
+
+    #[test]
+    fn million_session_sweep_completes_within_the_idle_timeout() {
+        let limits = UdpRuntimeLimits::default();
+        assert_eq!(limits.effective_sweep_batch(1_000_000).unwrap(), 16_667);
+    }
 
     #[test]
     fn rolled_back_sessions_do_not_grow_the_bounded_sweep_ring() {
