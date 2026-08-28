@@ -145,7 +145,7 @@ fn future_expiry() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs()
-        + 60
+        + 20
 }
 
 struct Client(ScriptedProtocolClient);
@@ -241,12 +241,17 @@ async fn start_server(
 }
 
 async fn expect_error(client: &mut Client, code: RendezvousErrorCode) -> Result<(), AnyError> {
-    let response = client.receive_envelope().await?;
-    let RendezvousPayload::Error(error) = response.payload else {
-        return Err("expected rendezvous error".into());
-    };
-    assert_eq!(error.code, code.as_u16());
+    let notice = receive_notice(client).await?;
+    assert_eq!(notice.code, code.as_u16());
     Ok(())
+}
+
+async fn receive_notice(client: &mut Client) -> Result<rustgo_protocol::ServerNotice, AnyError> {
+    let frame = timeout(Duration::from_secs(2), client.receive()).await??;
+    let Message::ServerNotice(notice) = frame.message else {
+        return Err("expected a distinct server notice".into());
+    };
+    Ok(notice)
 }
 
 #[tokio::test]
@@ -446,9 +451,12 @@ async fn provider_decision_is_authoritative_and_disconnect_removes_only_owned_se
     })
     .await?;
     assert!(coordinator.session(SessionId::from([31; 32])).is_some());
-    let disconnected = b.receive_envelope().await?;
-    assert_eq!(disconnected.session_id, SessionId::from([30; 32]));
-    assert!(matches!(disconnected.payload, RendezvousPayload::Error(_)));
+    let disconnected = receive_notice(&mut b).await?;
+    assert_eq!(disconnected.session_id, [30; 32]);
+    assert_eq!(
+        disconnected.code,
+        RendezvousErrorCode::PEER_DISCONNECTED.as_u16()
+    );
 
     let rejected = envelope(
         31,
@@ -588,13 +596,10 @@ async fn expiry_removes_the_session_and_notifies_both_authenticated_peers() -> R
     a.send_envelope(&request).await?;
     assert_eq!(b.receive_envelope().await?, request);
 
-    let a_notice = timeout(Duration::from_secs(3), a.receive_envelope()).await??;
-    let b_notice = timeout(Duration::from_secs(3), b.receive_envelope()).await??;
+    let a_notice = timeout(Duration::from_secs(3), receive_notice(&mut a)).await??;
+    let b_notice = timeout(Duration::from_secs(3), receive_notice(&mut b)).await??;
     for notice in [a_notice, b_notice] {
-        let RendezvousPayload::Error(error) = notice.payload else {
-            return Err("expiry notification was not a rendezvous error".into());
-        };
-        assert_eq!(error.code, RendezvousErrorCode::EXPIRED.as_u16());
+        assert_eq!(notice.code, RendezvousErrorCode::EXPIRED.as_u16());
     }
     assert!(coordinator.session(SessionId::from([40; 32])).is_none());
 
@@ -708,7 +713,7 @@ async fn closed_session_ids_reject_replay_after_reject_close_and_disconnect() ->
         }
     })
     .await?;
-    let _ = b.receive_envelope().await?;
+    let _ = receive_notice(&mut b).await?;
     let replay_from_another_authenticated_device = envelope(
         52,
         "a",
@@ -737,7 +742,7 @@ async fn tombstones_consume_capacity_until_fixed_expiry_maintenance_reclaims_the
     let limits = ServerRuntimeLimits {
         max_rendezvous_sessions: 1,
         max_rendezvous_sessions_per_device: 1,
-        rendezvous_session_ttl: Duration::from_secs(1),
+        rendezvous_session_ttl: Duration::from_secs(2),
         ..ServerRuntimeLimits::default()
     };
     let (address, _coordinator, shutdown, server) = start_server(
@@ -748,12 +753,16 @@ async fn tombstones_consume_capacity_until_fixed_expiry_maintenance_reclaims_the
     .await?;
     let mut a = Client::connect(&pki, address, "a", &a_key, V02, Vec::new()).await?;
     let mut b = Client::connect(&pki, address, "b", &b_key, V02, Vec::new()).await?;
+    let first_expiry = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs()
+        + 2;
     let first = envelope(
         60,
         "a",
         "b",
         1,
-        future_expiry(),
+        first_expiry,
         RendezvousPayload::Request(RendezvousRequest {
             export: text("first"),
         }),
@@ -765,7 +774,7 @@ async fn tombstones_consume_capacity_until_fixed_expiry_maintenance_reclaims_the
         "b",
         "a",
         2,
-        future_expiry(),
+        first_expiry,
         RendezvousPayload::ProviderDecision(ProviderDecision::rejected(None)),
     );
     b.send_envelope(&rejection).await?;
@@ -776,16 +785,128 @@ async fn tombstones_consume_capacity_until_fixed_expiry_maintenance_reclaims_the
         "a",
         "b",
         1,
-        future_expiry(),
+        first_expiry,
         RendezvousPayload::Request(RendezvousRequest {
             export: text("after-expiry"),
         }),
     );
     a.send_envelope(&after_expiry).await?;
     expect_error(&mut a, RendezvousErrorCode::CAPACITY_REACHED).await?;
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let after_expiry = envelope(
+        61,
+        "a",
+        "b",
+        1,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs()
+            + 2,
+        RendezvousPayload::Request(RendezvousRequest {
+            export: text("after-expiry"),
+        }),
+    );
     a.send_envelope(&after_expiry).await?;
     assert_eq!(b.receive_envelope().await?, after_expiry);
+
+    shutdown.cancel();
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn signed_expiry_is_rejected_above_the_horizon_and_reserved_exactly_until_expiry()
+-> Result<(), AnyError> {
+    let pki = TestPki::generate()?;
+    let a_key = DeviceKeypair::from_secret_bytes([61; 32]);
+    let b_key = DeviceKeypair::from_secret_bytes([62; 32]);
+    let limits = ServerRuntimeLimits {
+        rendezvous_session_ttl: Duration::from_secs(2),
+        ..ServerRuntimeLimits::default()
+    };
+    let (address, coordinator, shutdown, server) = start_server(
+        &pki,
+        vec![authorized("a", &a_key, true), authorized("b", &b_key, true)],
+        limits,
+    )
+    .await?;
+    let mut a = Client::connect(&pki, address, "a", &a_key, V02, Vec::new()).await?;
+    let mut b = Client::connect(&pki, address, "b", &b_key, V02, Vec::new()).await?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    let overlong = envelope(
+        70,
+        "a",
+        "b",
+        1,
+        now + 10,
+        RendezvousPayload::Request(RendezvousRequest {
+            export: text("too-long"),
+        }),
+    );
+    a.send_envelope(&overlong).await?;
+    expect_error(&mut a, RendezvousErrorCode::INVALID_EXPIRY).await?;
+
+    let signed_expiry = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs()
+        + 2;
+    let exact = envelope(
+        70,
+        "a",
+        "b",
+        1,
+        signed_expiry,
+        RendezvousPayload::Request(RendezvousRequest {
+            export: text("exact"),
+        }),
+    );
+    a.send_envelope(&exact).await?;
+    assert_eq!(b.receive_envelope().await?, exact);
+    assert_eq!(
+        coordinator
+            .session(SessionId::from([70; 32]))
+            .expect("exact-bound request is active")
+            .expires_unix_secs(),
+        signed_expiry
+    );
+    let rejection = envelope(
+        70,
+        "b",
+        "a",
+        2,
+        signed_expiry,
+        RendezvousPayload::ProviderDecision(ProviderDecision::rejected(None)),
+    );
+    b.send_envelope(&rejection).await?;
+    assert_eq!(a.receive_envelope().await?, rejection);
+    a.send_envelope(&exact).await?;
+    expect_error(&mut a, RendezvousErrorCode::DUPLICATE_SESSION).await?;
+
+    while std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs()
+        <= signed_expiry
+    {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let reusable = envelope(
+        70,
+        "a",
+        "b",
+        1,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs()
+            + 2,
+        RendezvousPayload::Request(RendezvousRequest {
+            export: text("reused-after-expiry"),
+        }),
+    );
+    a.send_envelope(&reusable).await?;
+    assert_eq!(b.receive_envelope().await?, reusable);
 
     shutdown.cancel();
     server.await??;

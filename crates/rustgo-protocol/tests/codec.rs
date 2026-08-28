@@ -5,7 +5,7 @@ use rustgo_protocol::{
     DataChannelBind, DataChannelKind, ErrorMessage, FrameCodec, FrameError, HEADER_LEN, Heartbeat,
     MAGIC, MAX_BINDING_TOKEN_BYTES, MAX_OBSERVATION_GRANT_BYTES, MAX_UDP_PAYLOAD_BYTES, Message,
     MessageId, ObservationGrantRequest, OpenTcpStream, OpenUdpChannel, ProtocolErrorCode,
-    ProtocolVersion, RegisterTunnels, ServerChallenge, SocketAddress, TcpStreamReady,
+    ProtocolVersion, RegisterTunnels, ServerChallenge, ServerNotice, SocketAddress, TcpStreamReady,
     TunnelProtocol, TunnelRegistration, TunnelResult, TunnelResults, UDP_METADATA_LEN, UdpDatagram,
     UdpSessionRetired,
 };
@@ -107,6 +107,12 @@ fn messages() -> Vec<Message> {
         }),
         Message::ObservationGrantRequest(ObservationGrantRequest {}),
         Message::ObservationGrant(bytes::<MAX_OBSERVATION_GRANT_BYTES>(&[0xaa; 72])),
+        Message::ServerNotice(ServerNotice {
+            session_id: [0xbb; 32],
+            code: 13,
+            detail: text("peer disconnected"),
+            peer: Some(text("laptop")),
+        }),
     ]
 }
 
@@ -168,6 +174,7 @@ fn message_ids_are_explicit_and_stable() {
     assert_eq!(MessageId::PEER_RELAY_FRAME.as_u16(), 22);
     assert_eq!(MessageId::OBSERVATION_GRANT_REQUEST.as_u16(), 23);
     assert_eq!(MessageId::OBSERVATION_GRANT.as_u16(), 24);
+    assert_eq!(MessageId::SERVER_NOTICE.as_u16(), 25);
 }
 
 #[test]

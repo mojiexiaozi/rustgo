@@ -21,6 +21,7 @@ pub const MAX_ERROR_DETAIL_BYTES: usize = 512;
 pub const MAX_RENDEZVOUS_ENVELOPE_BYTES: usize = 16 * 1024;
 pub const MAX_PEER_RELAY_FRAME_BYTES: usize = 65_600;
 pub const MAX_OBSERVATION_GRANT_BYTES: usize = 96;
+pub const MAX_SERVER_NOTICE_BYTES: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[error("value length {actual} exceeds bound {max}")]
@@ -291,6 +292,7 @@ impl MessageId {
     pub const PEER_RELAY_FRAME: Self = Self(22);
     pub const OBSERVATION_GRANT_REQUEST: Self = Self(23);
     pub const OBSERVATION_GRANT: Self = Self(24);
+    pub const SERVER_NOTICE: Self = Self(25);
 
     pub const fn as_u16(self) -> u16 {
         self.0
@@ -316,6 +318,7 @@ impl MessageId {
             22 => MAX_PEER_RELAY_FRAME_BYTES,
             23 => 0,
             24 => MAX_OBSERVATION_GRANT_BYTES,
+            25 => MAX_SERVER_NOTICE_BYTES,
             _ => 0,
         }
     }
@@ -326,7 +329,7 @@ impl TryFrom<u16> for MessageId {
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
         match value {
-            1..=24 => Ok(Self(value)),
+            1..=25 => Ok(Self(value)),
             _ => Err(value),
         }
     }
@@ -630,6 +633,14 @@ pub struct ErrorMessage {
     pub detail: BoundedString<MAX_ERROR_DETAIL_BYTES>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerNotice {
+    pub session_id: [u8; 32],
+    pub code: u16,
+    pub detail: BoundedString<MAX_ERROR_DETAIL_BYTES>,
+    pub peer: Option<BoundedString<MAX_CLIENT_NAME_BYTES>>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObservationGrantRequest {}
 
@@ -663,6 +674,7 @@ pub enum Message {
     PeerRelayFrame(OpaquePeerRelayFrame),
     ObservationGrantRequest(ObservationGrantRequest),
     ObservationGrant(OpaqueObservationGrant),
+    ServerNotice(ServerNotice),
 }
 
 impl Message {
@@ -692,6 +704,7 @@ impl Message {
             Self::PeerRelayFrame(_) => MessageId::PEER_RELAY_FRAME,
             Self::ObservationGrantRequest(_) => MessageId::OBSERVATION_GRANT_REQUEST,
             Self::ObservationGrant(_) => MessageId::OBSERVATION_GRANT,
+            Self::ServerNotice(_) => MessageId::SERVER_NOTICE,
         }
     }
 }

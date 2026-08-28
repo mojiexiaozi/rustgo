@@ -6,10 +6,9 @@ use std::{
 };
 
 use rustgo_config::AuthorizedClient;
-use rustgo_protocol::{BoundedBytes, BoundedString, Message, ProtocolVersion, TunnelProtocol};
+use rustgo_protocol::{BoundedString, Message, ProtocolVersion, ServerNotice, TunnelProtocol};
 use rustgo_rendezvous::{
-    CandidateGeneration, MAX_DEVICE_NAME_BYTES, MAX_ERROR_DETAIL_BYTES, RendezvousEnvelope,
-    RendezvousError, RendezvousPayload, RendezvousState, SessionId,
+    MAX_ERROR_DETAIL_BYTES, RendezvousEnvelope, RendezvousPayload, RendezvousState, SessionId,
 };
 use thiserror::Error;
 use tokio::sync::mpsc::error::TrySendError;
@@ -19,7 +18,6 @@ use crate::{
     registry::{ClientRegistry, ControlSessionGuard},
 };
 
-const SERVER_EVENT_SENDER: &str = "rustgos";
 const EXPIRY_MAINTENANCE_BATCH: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -40,6 +38,7 @@ impl RendezvousErrorCode {
     pub const DELIVERY_UNAVAILABLE: Self = Self(12);
     pub const PEER_DISCONNECTED: Self = Self(13);
     pub const UNSUPPORTED_PEER_VERSION: Self = Self(14);
+    pub const INVALID_EXPIRY: Self = Self(15);
 
     pub const fn as_u16(self) -> u16 {
         self.0
@@ -61,6 +60,7 @@ impl RendezvousErrorCode {
             12 => "rendezvous delivery unavailable",
             13 => "peer control session disconnected",
             14 => "peer does not support rendezvous",
+            15 => "rendezvous expiry is outside the server horizon",
             _ => "rendezvous rejected",
         }
     }
@@ -314,9 +314,13 @@ impl RendezvousCoordinator {
         if envelope.expires_unix_secs <= now {
             return Err(RendezvousErrorCode::EXPIRED.into());
         }
-        let authoritative_expiry = envelope
-            .expires_unix_secs
-            .min(now.saturating_add(self.limits.session_ttl.as_secs()));
+        let max_expiry = now
+            .checked_add(self.limits.session_ttl.as_secs())
+            .ok_or(RendezvousErrorCode::INVALID_EXPIRY)?;
+        if envelope.expires_unix_secs > max_expiry {
+            return Err(RendezvousErrorCode::INVALID_EXPIRY.into());
+        }
+        let authoritative_expiry = envelope.expires_unix_secs;
         let mut rendezvous_state = RendezvousState::new(envelope.session_id);
         rendezvous_state
             .request(envelope.step, envelope.generation)
@@ -349,10 +353,7 @@ impl RendezvousCoordinator {
         {
             return Err(RendezvousErrorCode::CAPACITY_REACHED.into());
         }
-        provider
-            .outbound()
-            .try_send(message)
-            .map_err(map_delivery_error)?;
+        let permit = self.reserve_to(&provider_owner)?;
         increment_device_count(&mut state.device_counts, &consumer_owner.name);
         increment_device_count(&mut state.device_counts, &provider_owner.name);
         state.expiry.push(Reverse(ExpiryEntry {
@@ -375,6 +376,8 @@ impl RendezvousCoordinator {
                 state: rendezvous_state,
             })),
         );
+        drop(state);
+        permit.send(message);
         Ok(envelope.session_id)
     }
 
@@ -394,35 +397,44 @@ impl RendezvousCoordinator {
             .state
             .lock()
             .map_err(|_| RendezvousErrorCode::DELIVERY_UNAVAILABLE)?;
-        let record = state
+        let (consumer, next_session_state) = {
+            let record = state
+                .sessions
+                .get(&envelope.session_id)
+                .ok_or(RendezvousErrorCode::UNKNOWN_SESSION)?;
+            let session = record
+                .active()
+                .ok_or(RendezvousErrorCode::UNKNOWN_SESSION)?;
+            if session.metadata.expires_unix_secs <= now_unix_secs() {
+                return Err(RendezvousErrorCode::EXPIRED.into());
+            }
+            if !session.provider.matches(authenticated.identity()) {
+                return Err(RendezvousErrorCode::NOT_PARTICIPANT.into());
+            }
+            if envelope.target.as_str() != session.consumer.name {
+                return Err(RendezvousErrorCode::IDENTITY_MISMATCH.into());
+            }
+            let mut next = session.state.clone();
+            next.provider_decision(envelope.step, envelope.generation, decision.is_accepted())
+                .map_err(|_| RendezvousErrorCode::INVALID_STATE)?;
+            (session.consumer.clone(), next)
+        };
+        let permit = self.reserve_to(&consumer)?;
+        let session = state
             .sessions
             .get_mut(&envelope.session_id)
-            .ok_or(RendezvousErrorCode::UNKNOWN_SESSION)?;
-        let session = record
-            .active_mut()
-            .ok_or(RendezvousErrorCode::UNKNOWN_SESSION)?;
-        if session.metadata.expires_unix_secs <= now_unix_secs() {
-            return Err(RendezvousErrorCode::EXPIRED.into());
-        }
-        if !session.provider.matches(authenticated.identity()) {
-            return Err(RendezvousErrorCode::NOT_PARTICIPANT.into());
-        }
-        if envelope.target.as_str() != session.consumer.name {
-            return Err(RendezvousErrorCode::IDENTITY_MISMATCH.into());
-        }
-        session
-            .state
-            .provider_decision(envelope.step, envelope.generation, decision.is_accepted())
-            .map_err(|_| RendezvousErrorCode::INVALID_STATE)?;
-        let consumer = session.consumer.clone();
+            .and_then(SessionRecord::active_mut)
+            .expect("coordinator lock serializes the validated session");
+        session.state = next_session_state;
         if decision.is_accepted() {
             session.metadata.protocol = decision.protocol();
         }
-        let delivery = self.route_to(&consumer, message);
         if !decision.is_accepted() {
             tombstone_session(&mut state, envelope.session_id);
         }
-        delivery
+        drop(state);
+        permit.send(message);
+        Ok(())
     }
 
     pub async fn forward_envelope(
@@ -447,24 +459,25 @@ impl RendezvousCoordinator {
             .state
             .lock()
             .map_err(|_| RendezvousErrorCode::DELIVERY_UNAVAILABLE)?;
-        let record = state
-            .sessions
-            .get_mut(&envelope.session_id)
-            .ok_or(RendezvousErrorCode::UNKNOWN_SESSION)?;
-        let session = record
-            .active_mut()
-            .ok_or(RendezvousErrorCode::UNKNOWN_SESSION)?;
-        if session.metadata.expires_unix_secs <= now_unix_secs() {
-            return Err(RendezvousErrorCode::EXPIRED.into());
-        }
-        if session.metadata.protocol.is_none() {
-            return Err(RendezvousErrorCode::INVALID_STATE.into());
-        }
-        let target =
-            other_participant(session, authenticated.identity(), envelope.target.as_str())?.clone();
-        session
-            .state
-            .accept_metadata(
+        let (target, next_session_state) = {
+            let record = state
+                .sessions
+                .get(&envelope.session_id)
+                .ok_or(RendezvousErrorCode::UNKNOWN_SESSION)?;
+            let session = record
+                .active()
+                .ok_or(RendezvousErrorCode::UNKNOWN_SESSION)?;
+            if session.metadata.expires_unix_secs <= now_unix_secs() {
+                return Err(RendezvousErrorCode::EXPIRED.into());
+            }
+            if session.metadata.protocol.is_none() {
+                return Err(RendezvousErrorCode::INVALID_STATE.into());
+            }
+            let target =
+                other_participant(session, authenticated.identity(), envelope.target.as_str())?
+                    .clone();
+            let mut next = session.state.clone();
+            next.accept_metadata(
                 &envelope.session_id,
                 envelope.step,
                 envelope.generation,
@@ -472,7 +485,18 @@ impl RendezvousCoordinator {
                 now_unix_secs(),
             )
             .map_err(|_| RendezvousErrorCode::INVALID_STATE)?;
-        self.route_to(&target, message)
+            (target, next)
+        };
+        let permit = self.reserve_to(&target)?;
+        state
+            .sessions
+            .get_mut(&envelope.session_id)
+            .and_then(SessionRecord::active_mut)
+            .expect("coordinator lock serializes the validated session")
+            .state = next_session_state;
+        drop(state);
+        permit.send(message);
+        Ok(())
     }
 
     pub async fn close_session(
@@ -494,21 +518,22 @@ impl RendezvousCoordinator {
             .state
             .lock()
             .map_err(|_| RendezvousErrorCode::DELIVERY_UNAVAILABLE)?;
-        let record = state
-            .sessions
-            .get_mut(&envelope.session_id)
-            .ok_or(RendezvousErrorCode::UNKNOWN_SESSION)?;
-        let session = record
-            .active_mut()
-            .ok_or(RendezvousErrorCode::UNKNOWN_SESSION)?;
-        if session.metadata.expires_unix_secs <= now_unix_secs() {
-            return Err(RendezvousErrorCode::EXPIRED.into());
-        }
-        let target =
-            other_participant(session, authenticated.identity(), envelope.target.as_str())?.clone();
-        session
-            .state
-            .accept_metadata(
+        let (target, next_session_state) = {
+            let record = state
+                .sessions
+                .get(&envelope.session_id)
+                .ok_or(RendezvousErrorCode::UNKNOWN_SESSION)?;
+            let session = record
+                .active()
+                .ok_or(RendezvousErrorCode::UNKNOWN_SESSION)?;
+            if session.metadata.expires_unix_secs <= now_unix_secs() {
+                return Err(RendezvousErrorCode::EXPIRED.into());
+            }
+            let target =
+                other_participant(session, authenticated.identity(), envelope.target.as_str())?
+                    .clone();
+            let mut next = session.state.clone();
+            next.accept_metadata(
                 &envelope.session_id,
                 envelope.step,
                 envelope.generation,
@@ -516,9 +541,19 @@ impl RendezvousCoordinator {
                 now_unix_secs(),
             )
             .map_err(|_| RendezvousErrorCode::INVALID_STATE)?;
-        let delivery = self.route_to(&target, message);
+            (target, next)
+        };
+        let permit = self.reserve_to(&target)?;
+        state
+            .sessions
+            .get_mut(&envelope.session_id)
+            .and_then(SessionRecord::active_mut)
+            .expect("coordinator lock serializes the validated session")
+            .state = next_session_state;
         tombstone_session(&mut state, envelope.session_id);
-        delivery
+        drop(state);
+        permit.send(message);
+        Ok(())
     }
 
     pub async fn remove_device(&self, authenticated: &AuthenticatedClient) {
@@ -555,16 +590,12 @@ impl RendezvousCoordinator {
     pub(crate) fn error_response(
         &self,
         request: &RendezvousEnvelope,
-        target: &str,
         error: RendezvousCoordinatorError,
     ) -> Message {
         server_notice(
             request.session_id,
-            target,
-            request.step,
-            request.generation,
-            request.expires_unix_secs,
             error.code,
+            Some(request.target.as_str()),
         )
     }
 
@@ -603,6 +634,24 @@ impl RendezvousCoordinator {
         active
             .outbound()
             .try_send(message)
+            .map_err(map_delivery_error)
+    }
+
+    fn reserve_to(
+        &self,
+        owner: &SessionOwner,
+    ) -> Result<tokio::sync::mpsc::OwnedPermit<Message>, RendezvousCoordinatorError> {
+        let active = self
+            .registry
+            .active_control_session(&owner.name)
+            .ok_or(RendezvousErrorCode::PEER_OFFLINE)?;
+        if !owner.matches(active.identity()) {
+            return Err(RendezvousErrorCode::PEER_OFFLINE.into());
+        }
+        active
+            .outbound()
+            .clone()
+            .try_reserve_owned()
             .map_err(map_delivery_error)
     }
 
@@ -647,14 +696,12 @@ impl RendezvousCoordinator {
     ) {
         let message = server_notice(
             session.metadata.session_id,
-            &target.name,
-            session.state.last_step().saturating_add(1),
-            session.state.generation(),
-            session
-                .metadata
-                .expires_unix_secs
-                .max(now_unix_secs().saturating_add(1)),
             code,
+            Some(if session.consumer == *target {
+                &session.provider.name
+            } else {
+                &session.consumer.name
+            }),
         );
         let _ = self.route_to(target, message);
     }
@@ -718,7 +765,7 @@ fn supports_v02(version: ProtocolVersion) -> bool {
     version.major == ProtocolVersion::V0_2.major && version.minor >= ProtocolVersion::V0_2.minor
 }
 
-fn map_delivery_error(error: TrySendError<Message>) -> RendezvousCoordinatorError {
+fn map_delivery_error<T>(error: TrySendError<T>) -> RendezvousCoordinatorError {
     match error {
         TrySendError::Closed(_) | TrySendError::Full(_) => {
             RendezvousErrorCode::DELIVERY_UNAVAILABLE.into()
@@ -726,37 +773,383 @@ fn map_delivery_error(error: TrySendError<Message>) -> RendezvousCoordinatorErro
     }
 }
 
-fn server_notice(
-    session_id: SessionId,
-    target: &str,
-    step: u64,
-    generation: CandidateGeneration,
-    expires_unix_secs: u64,
-    code: RendezvousErrorCode,
-) -> Message {
-    RendezvousEnvelope {
-        version: ProtocolVersion::V0_2,
-        session_id,
-        sender: BoundedString::<MAX_DEVICE_NAME_BYTES>::try_from(SERVER_EVENT_SENDER)
-            .expect("server event sender is bounded"),
-        target: BoundedString::<MAX_DEVICE_NAME_BYTES>::try_from(target)
-            .expect("authenticated device names are bounded"),
-        step,
-        generation,
-        expires_unix_secs,
-        payload: RendezvousPayload::Error(RendezvousError {
-            code: code.as_u16(),
-            detail: BoundedString::<MAX_ERROR_DETAIL_BYTES>::try_from(code.detail())
-                .expect("static rendezvous error detail is bounded"),
+fn server_notice(session_id: SessionId, code: RendezvousErrorCode, peer: Option<&str>) -> Message {
+    Message::ServerNotice(ServerNotice {
+        session_id: *session_id.as_bytes(),
+        code: code.as_u16(),
+        detail: BoundedString::<MAX_ERROR_DETAIL_BYTES>::try_from(code.detail())
+            .expect("static rendezvous error detail is bounded"),
+        peer: peer.map(|name| {
+            BoundedString::try_from(name).expect("authenticated device names are bounded")
         }),
-        signature: BoundedBytes::try_from(Vec::new()).expect("empty server signature is bounded"),
-    }
-    .to_protocol_message()
-    .expect("bounded server notice is a valid rendezvous message")
+    })
 }
 
 fn now_unix_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{net::Ipv4Addr, sync::Arc, time::Duration};
+
+    use rustgo_config::AuthorizedClient;
+    use rustgo_protocol::{
+        BoundedBytes, BoundedString, Heartbeat, Message, ProtocolVersion, TunnelProtocol,
+    };
+    use rustgo_rendezvous::{
+        CandidateGeneration, ConnectivityResult, ProviderDecision, RendezvousClose,
+        RendezvousEnvelope, RendezvousPayload, RendezvousRequest, SessionId,
+    };
+    use tokio::sync::{Barrier, mpsc};
+
+    use super::{RendezvousCoordinator, RendezvousErrorCode, RendezvousLimits, now_unix_secs};
+    use crate::{AuthenticatedClient, ClientRegistry, ControlSessionGuard};
+
+    fn test_registry() -> ClientRegistry {
+        ClientRegistry::new(8, 1, Ipv4Addr::LOCALHOST.into(), 8, Duration::from_secs(30)).unwrap()
+    }
+
+    fn identity(name: &str, marker: u8) -> AuthenticatedClient {
+        AuthenticatedClient::verified(
+            name.to_owned(),
+            format!("fingerprint-{marker}"),
+            vec![marker; 32],
+        )
+    }
+
+    fn claim(
+        registry: &ClientRegistry,
+        name: &str,
+        marker: u8,
+        capacity: usize,
+    ) -> (
+        ControlSessionGuard,
+        mpsc::Sender<Message>,
+        mpsc::Receiver<Message>,
+    ) {
+        let (outbound, receiver) = mpsc::channel(capacity);
+        let guard = registry
+            .claim_with_outbound(
+                identity(name, marker),
+                outbound.clone(),
+                ProtocolVersion::V0_2,
+            )
+            .unwrap();
+        (guard, outbound, receiver)
+    }
+
+    fn test_coordinator(registry: ClientRegistry) -> RendezvousCoordinator {
+        let clients = ["a", "b", "c"]
+            .into_iter()
+            .map(|name| AuthorizedClient {
+                name: name.to_owned(),
+                public_key: "unused-by-coordinator".to_owned(),
+                enabled: true,
+            })
+            .collect::<Vec<_>>();
+        RendezvousCoordinator::new(
+            registry,
+            &clients,
+            RendezvousLimits {
+                max_sessions: 8,
+                max_sessions_per_device: 8,
+                session_ttl: Duration::from_secs(60),
+            },
+        )
+    }
+
+    fn request(session: u8, sender: &str, target: &str) -> RendezvousEnvelope {
+        envelope(
+            session,
+            sender,
+            target,
+            1,
+            RendezvousPayload::Request(RendezvousRequest {
+                export: BoundedString::try_from("ssh").unwrap(),
+            }),
+        )
+    }
+
+    fn envelope(
+        session: u8,
+        sender: &str,
+        target: &str,
+        step: u64,
+        payload: RendezvousPayload,
+    ) -> RendezvousEnvelope {
+        RendezvousEnvelope {
+            version: ProtocolVersion::V0_2,
+            session_id: SessionId::from([session; 32]),
+            sender: BoundedString::try_from(sender).unwrap(),
+            target: BoundedString::try_from(target).unwrap(),
+            step,
+            generation: CandidateGeneration::INITIAL,
+            expires_unix_secs: now_unix_secs() + 30,
+            payload,
+            signature: BoundedBytes::try_from([marker_for(session); 64].as_slice()).unwrap(),
+        }
+    }
+
+    const fn marker_for(session: u8) -> u8 {
+        session.wrapping_add(1)
+    }
+
+    #[tokio::test]
+    async fn unavailable_generation_blocks_racing_admission_before_exact_cleanup() {
+        let registry = test_registry();
+        let coordinator = test_coordinator(registry.clone());
+        let (mut a, _a_sender, mut a_outbound) = claim(&registry, "a", 1, 4);
+        let (b, _b_sender, _b_outbound) = claim(&registry, "b", 2, 4);
+        let (c, _c_sender, _c_outbound) = claim(&registry, "c", 3, 4);
+        coordinator.request(&b, request(1, "b", "a")).await.unwrap();
+        assert!(a_outbound.recv().await.is_some());
+
+        let identity = a.identity().clone();
+        let start = Arc::new(Barrier::new(2));
+        let racing = tokio::spawn({
+            let coordinator = coordinator.clone();
+            let start = start.clone();
+            async move {
+                start.wait().await;
+                coordinator.request(&c, request(2, "c", "a")).await
+            }
+        });
+        a.mark_unavailable();
+        start.wait().await;
+        coordinator.remove_device(&identity).await;
+
+        let error = racing.await.unwrap().unwrap_err();
+        assert_eq!(error.code(), RendezvousErrorCode::PEER_OFFLINE);
+        assert!(coordinator.session(SessionId::from([1; 32])).is_none());
+        assert!(coordinator.session(SessionId::from([2; 32])).is_none());
+    }
+
+    #[tokio::test]
+    async fn saturated_routes_leave_decision_forward_and_close_retryable() {
+        let registry = test_registry();
+        let coordinator = test_coordinator(registry.clone());
+        let (a, a_sender, mut a_outbound) = claim(&registry, "a", 11, 1);
+        let (b, b_sender, mut b_outbound) = claim(&registry, "b", 12, 1);
+        coordinator
+            .request(&a, request(10, "a", "b"))
+            .await
+            .unwrap();
+        assert!(b_outbound.recv().await.is_some());
+
+        a_sender
+            .try_send(Message::Heartbeat(Heartbeat { sequence: 1 }))
+            .unwrap();
+        let decision = envelope(
+            10,
+            "b",
+            "a",
+            2,
+            RendezvousPayload::ProviderDecision(ProviderDecision::accepted(TunnelProtocol::TCP)),
+        );
+        assert_eq!(
+            coordinator
+                .provider_decision(&b, decision.clone())
+                .await
+                .unwrap_err()
+                .code(),
+            RendezvousErrorCode::DELIVERY_UNAVAILABLE
+        );
+        assert_eq!(
+            a_outbound.recv().await,
+            Some(Message::Heartbeat(Heartbeat { sequence: 1 }))
+        );
+        coordinator
+            .provider_decision(&b, decision)
+            .await
+            .expect("decision remains retryable after queue capacity returns");
+        assert!(a_outbound.recv().await.is_some());
+
+        b_sender
+            .try_send(Message::Heartbeat(Heartbeat { sequence: 2 }))
+            .unwrap();
+        let forwarded = envelope(
+            10,
+            "a",
+            "b",
+            3,
+            RendezvousPayload::ConnectivityResult(ConnectivityResult {
+                connected: false,
+                transport: None,
+                detail: None,
+            }),
+        );
+        assert_eq!(
+            coordinator
+                .forward_envelope(&a, forwarded.clone())
+                .await
+                .unwrap_err()
+                .code(),
+            RendezvousErrorCode::DELIVERY_UNAVAILABLE
+        );
+        assert_eq!(
+            b_outbound.recv().await,
+            Some(Message::Heartbeat(Heartbeat { sequence: 2 }))
+        );
+        coordinator
+            .forward_envelope(&a, forwarded)
+            .await
+            .expect("forward remains retryable after queue capacity returns");
+        assert!(b_outbound.recv().await.is_some());
+
+        a_sender
+            .try_send(Message::Heartbeat(Heartbeat { sequence: 3 }))
+            .unwrap();
+        let close = envelope(
+            10,
+            "b",
+            "a",
+            4,
+            RendezvousPayload::Close(RendezvousClose { detail: None }),
+        );
+        assert_eq!(
+            coordinator
+                .close_session(&b, close.clone())
+                .await
+                .unwrap_err()
+                .code(),
+            RendezvousErrorCode::DELIVERY_UNAVAILABLE
+        );
+        assert_eq!(
+            a_outbound.recv().await,
+            Some(Message::Heartbeat(Heartbeat { sequence: 3 }))
+        );
+        coordinator
+            .close_session(&b, close)
+            .await
+            .expect("close remains retryable after queue capacity returns");
+        assert!(a_outbound.recv().await.is_some());
+        assert!(coordinator.session(SessionId::from([10; 32])).is_none());
+    }
+
+    #[tokio::test]
+    async fn closed_routes_leave_decision_forward_and_close_state_unchanged() {
+        let registry = test_registry();
+        let coordinator = test_coordinator(registry.clone());
+        let (a, _a_sender, a_outbound) = claim(&registry, "a", 21, 1);
+        let (b, _b_sender, mut b_outbound) = claim(&registry, "b", 22, 1);
+        coordinator
+            .request(&a, request(20, "a", "b"))
+            .await
+            .unwrap();
+        assert!(b_outbound.recv().await.is_some());
+        drop(a_outbound);
+        let decision = envelope(
+            20,
+            "b",
+            "a",
+            2,
+            RendezvousPayload::ProviderDecision(ProviderDecision::accepted(TunnelProtocol::TCP)),
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                coordinator
+                    .provider_decision(&b, decision.clone())
+                    .await
+                    .unwrap_err()
+                    .code(),
+                RendezvousErrorCode::DELIVERY_UNAVAILABLE
+            );
+        }
+
+        let registry = test_registry();
+        let coordinator = test_coordinator(registry.clone());
+        let (a, _a_sender, mut a_outbound) = claim(&registry, "a", 31, 1);
+        let (b, _b_sender, mut b_outbound) = claim(&registry, "b", 32, 1);
+        coordinator
+            .request(&a, request(30, "a", "b"))
+            .await
+            .unwrap();
+        assert!(b_outbound.recv().await.is_some());
+        coordinator
+            .provider_decision(
+                &b,
+                envelope(
+                    30,
+                    "b",
+                    "a",
+                    2,
+                    RendezvousPayload::ProviderDecision(ProviderDecision::accepted(
+                        TunnelProtocol::TCP,
+                    )),
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(a_outbound.recv().await.is_some());
+        drop(b_outbound);
+        let forwarded = envelope(
+            30,
+            "a",
+            "b",
+            3,
+            RendezvousPayload::ConnectivityResult(ConnectivityResult {
+                connected: false,
+                transport: None,
+                detail: None,
+            }),
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                coordinator
+                    .forward_envelope(&a, forwarded.clone())
+                    .await
+                    .unwrap_err()
+                    .code(),
+                RendezvousErrorCode::DELIVERY_UNAVAILABLE
+            );
+        }
+
+        let registry = test_registry();
+        let coordinator = test_coordinator(registry.clone());
+        let (a, _a_sender, mut a_outbound) = claim(&registry, "a", 41, 1);
+        let (b, _b_sender, mut b_outbound) = claim(&registry, "b", 42, 1);
+        coordinator
+            .request(&a, request(40, "a", "b"))
+            .await
+            .unwrap();
+        assert!(b_outbound.recv().await.is_some());
+        coordinator
+            .provider_decision(
+                &b,
+                envelope(
+                    40,
+                    "b",
+                    "a",
+                    2,
+                    RendezvousPayload::ProviderDecision(ProviderDecision::accepted(
+                        TunnelProtocol::TCP,
+                    )),
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(a_outbound.recv().await.is_some());
+        drop(a_outbound);
+        let close = envelope(
+            40,
+            "b",
+            "a",
+            3,
+            RendezvousPayload::Close(RendezvousClose { detail: None }),
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                coordinator
+                    .close_session(&b, close.clone())
+                    .await
+                    .unwrap_err()
+                    .code(),
+                RendezvousErrorCode::DELIVERY_UNAVAILABLE
+            );
+        }
+        assert!(coordinator.session(SessionId::from([40; 32])).is_some());
+    }
 }

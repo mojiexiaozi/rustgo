@@ -2,7 +2,7 @@ use rustgo_protocol::{
     AuthResult, BoundedBytes, BoundedString, BoundedVec, ClientAuthenticate, ClientHandshakeState,
     ClientHello, Heartbeat, MAX_BINDING_TOKEN_BYTES, MAX_OBSERVATION_GRANT_BYTES, Message,
     ObservationGrantRequest, OpenTcpStream, OpenUdpChannel, ProtocolErrorCode, ProtocolVersion,
-    RegisterTunnels, ServerChallenge, SocketAddress, StateError, TunnelProtocol,
+    RegisterTunnels, ServerChallenge, ServerNotice, SocketAddress, StateError, TunnelProtocol,
     TunnelRegistration,
 };
 
@@ -240,6 +240,12 @@ fn active_state_accepts_v02_control_events_only_after_registration() {
         }),
         Message::ObservationGrantRequest(ObservationGrantRequest {}),
         Message::ObservationGrant(bytes::<MAX_OBSERVATION_GRANT_BYTES>(&[7; 72])),
+        Message::ServerNotice(ServerNotice {
+            session_id: [15; 32],
+            code: 13,
+            detail: text("peer disconnected"),
+            peer: Some(text("peer")),
+        }),
         Message::RendezvousRequest(bytes(&[8])),
         Message::RendezvousProviderDecision(bytes(&[9])),
         Message::RendezvousCandidateSet(bytes(&[10])),

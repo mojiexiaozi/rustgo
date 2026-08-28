@@ -285,7 +285,9 @@ where
                 &runtime,
             ) => result,
         };
-        runtime.rendezvous.remove_device(guard.identity()).await;
+        let identity = guard.identity().clone();
+        guard.mark_unavailable();
+        runtime.rendezvous.remove_device(&identity).await;
         guard.shutdown().await;
         result
     }
@@ -457,7 +459,6 @@ where
                                 negotiated,
                                 runtime.rendezvous.error_response(
                                     &envelope,
-                                    guard.identity().name(),
                                     error,
                                 ),
                                 &mut heartbeat_deadline,
@@ -465,7 +466,9 @@ where
                             .await?;
                         }
                     }
-                    Message::ObservationGrant(_) | Message::PeerRelayFrame(_) => {
+                    Message::ObservationGrant(_)
+                    | Message::ServerNotice(_)
+                    | Message::PeerRelayFrame(_) => {
                         send_active_message(
                             framed,
                             state,
@@ -510,6 +513,7 @@ fn is_v02_control_message(message: &Message) -> bool {
         message,
         Message::ObservationGrantRequest(_)
             | Message::ObservationGrant(_)
+            | Message::ServerNotice(_)
             | Message::RendezvousRequest(_)
             | Message::RendezvousProviderDecision(_)
             | Message::RendezvousCandidateSet(_)

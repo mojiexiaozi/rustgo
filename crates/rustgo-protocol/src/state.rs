@@ -69,6 +69,7 @@ impl ClientHandshakeState {
                 | Message::Error(_)
                 | Message::ObservationGrantRequest(_)
                 | Message::ObservationGrant(_)
+                | Message::ServerNotice(_)
                 | Message::RendezvousRequest(_)
                 | Message::RendezvousProviderDecision(_)
                 | Message::RendezvousCandidateSet(_)

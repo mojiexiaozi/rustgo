@@ -249,6 +249,7 @@ impl ClientRegistry {
             tunnel_ids: HashMap::new(),
             tunnel_names: HashSet::new(),
             data_channels: Vec::new(),
+            unavailable: false,
             released: false,
         })
     }
@@ -631,6 +632,7 @@ pub struct ControlSessionGuard {
     tunnel_ids: HashMap<u32, TunnelProtocol>,
     tunnel_names: HashSet<String>,
     data_channels: Vec<AuthenticatedDataChannel>,
+    unavailable: bool,
     released: bool,
 }
 
@@ -659,6 +661,15 @@ impl ControlSessionGuard {
 
     pub(crate) fn protocol_version(&self) -> ProtocolVersion {
         self.runtime.protocol_version()
+    }
+
+    pub(crate) fn mark_unavailable(&mut self) {
+        if self.unavailable {
+            return;
+        }
+        self.runtime.cancel();
+        self.registry.release(&self.identity);
+        self.unavailable = true;
     }
 
     pub async fn register_tunnels(&mut self, request: RegisterTunnels) -> TunnelResults {
@@ -766,13 +777,12 @@ impl ControlSessionGuard {
         if self.released {
             return;
         }
-        self.runtime.cancel();
+        self.mark_unavailable();
         for listener in &mut self.listeners {
             listener.shutdown().await;
         }
         self.listeners.clear();
         self.data_channels.clear();
-        self.registry.release(&self.identity);
         self.released = true;
     }
 
@@ -820,10 +830,9 @@ impl Drop for ControlSessionGuard {
         if self.released {
             return;
         }
-        self.runtime.cancel();
+        self.mark_unavailable();
         self.data_channels.clear();
         self.listeners.clear();
-        self.registry.release(&self.identity);
         self.released = true;
     }
 }

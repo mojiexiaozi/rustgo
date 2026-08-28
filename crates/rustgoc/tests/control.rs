@@ -11,7 +11,10 @@ use rustgo_config::{
     AuthorizedClient, ClientConfig, ClientSection, Limits, ServerConfig, ServerSection,
     TunnelConfig, TunnelProtocol as ConfigProtocol,
 };
-use rustgo_crypto::{AuthTranscript, DeviceKeypair, generate_key_file, verify_auth};
+use rustgo_crypto::{
+    AuthTranscript, DeviceKeypair, generate_key_file, sign_peer_envelope, verify_auth,
+    verify_peer_envelope,
+};
 use rustgo_protocol::{
     AuthResult, BoundedBytes, BoundedString, BoundedVec, Frame, FrameCodec,
     MAX_BINDING_TOKEN_BYTES, Message, OpenTcpStream, OpenUdpChannel, ProtocolErrorCode,
@@ -1117,7 +1120,7 @@ async fn client_control_api_requests_grants_and_decodes_rendezvous_events() -> R
     };
     let _: ObservationGrant = grant;
 
-    let request = RendezvousEnvelope {
+    let mut request = RendezvousEnvelope {
         version: ProtocolVersion::V0_2,
         session_id: SessionId::from([0x91; 32]),
         sender: BoundedString::try_from("home-pc")?,
@@ -1128,14 +1131,20 @@ async fn client_control_api_requests_grants_and_decodes_rendezvous_events() -> R
         payload: RendezvousPayload::Request(RendezvousRequest {
             export: BoundedString::try_from("ssh")?,
         }),
-        signature: BoundedBytes::try_from([0x92; 64].as_slice())?,
+        signature: BoundedBytes::try_from(Vec::new())?,
     };
+    assert!(verify_peer_envelope(&key.public_key(), &request).is_err());
+    request.signature = sign_peer_envelope(&key, &request)?;
+    verify_peer_envelope(&key.public_key(), &request)?;
     session.send_rendezvous_envelope(&request).await?;
-    let ControlEvent::Rendezvous(response) = session.next_control_event().await? else {
-        return Err("client did not decode the rendezvous event".into());
+    let ControlEvent::ServerNotice(response) = session.next_control_event().await? else {
+        return Err("client did not decode the distinct server notice event".into());
     };
-    assert_eq!(response.session_id, request.session_id);
-    assert!(matches!(response.payload, RendezvousPayload::Error(_)));
+    assert_eq!(response.session_id, *request.session_id.as_bytes());
+    assert_eq!(
+        response.code,
+        rustgos::RendezvousErrorCode::SELF_TARGET.as_u16()
+    );
 
     server_shutdown.cancel();
     server_task.await??;

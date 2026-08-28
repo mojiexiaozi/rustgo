@@ -7,8 +7,8 @@ use crate::ProtocolVersion;
 use crate::message::{
     AuthResult, BoundedBytes, ClientAuthenticate, ClientHello, DataChannelBind, ErrorMessage,
     Heartbeat, MAX_UDP_PAYLOAD_BYTES, Message, MessageId, ObservationGrantRequest, OpenTcpStream,
-    OpenUdpChannel, RegisterTunnels, ServerChallenge, SocketAddress, TcpStreamReady, TunnelResults,
-    UDP_METADATA_LEN, UdpDatagram, UdpSessionRetired,
+    OpenUdpChannel, RegisterTunnels, ServerChallenge, ServerNotice, SocketAddress, TcpStreamReady,
+    TunnelResults, UDP_METADATA_LEN, UdpDatagram, UdpSessionRetired,
 };
 
 pub const MAGIC: [u8; 4] = *b"RSGO";
@@ -225,6 +225,7 @@ fn encode_payload(message: &Message) -> Result<Vec<u8>, FrameError> {
         Message::PeerRelayFrame(value) => Ok(value.as_slice().to_vec()),
         Message::ObservationGrantRequest(value) => serialize(value),
         Message::ObservationGrant(value) => Ok(value.as_slice().to_vec()),
+        Message::ServerNotice(value) => serialize(value),
     }
 }
 
@@ -296,6 +297,9 @@ fn decode_payload(message: MessageId, payload: &[u8]) -> Result<Message, FrameEr
                 .map(Message::ObservationGrantRequest)
         }
         MessageId::OBSERVATION_GRANT => decode_opaque(payload).map(Message::ObservationGrant),
+        MessageId::SERVER_NOTICE => {
+            deserialize::<ServerNotice>(message, payload).map(Message::ServerNotice)
+        }
         _ => unreachable!("MessageId values are validated before payload dispatch"),
     }
 }
