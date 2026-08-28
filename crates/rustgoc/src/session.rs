@@ -1,7 +1,7 @@
 use std::{future::Future, pin::Pin, sync::Arc};
 
 use rustgo_config::TunnelProtocol as ConfigTunnelProtocol;
-use rustgo_protocol::{Heartbeat, Message, OpenTcpStream, OpenUdpChannel};
+use rustgo_protocol::{Heartbeat, Message, OpenTcpStream, OpenUdpChannel, ProtocolVersion};
 use tokio::{sync::mpsc, task::JoinSet, time::MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 
@@ -36,6 +36,7 @@ pub struct ChildSessionContext {
     generation: SessionGeneration,
     session_id: Arc<[u8]>,
     control_outbound: mpsc::Sender<Message>,
+    protocol_version: ProtocolVersion,
 }
 
 impl ChildSessionContext {
@@ -45,6 +46,10 @@ impl ChildSessionContext {
 
     pub fn session_id(&self) -> &[u8] {
         &self.session_id
+    }
+
+    pub const fn protocol_version(&self) -> ProtocolVersion {
+        self.protocol_version
     }
 
     pub(crate) async fn send_control(&self, message: Message, shutdown: &CancellationToken) {
@@ -112,6 +117,7 @@ impl ControlSession {
             generation,
             session_id: Arc::from(self.session_id.clone()),
             control_outbound,
+            protocol_version: self.version,
         };
         let mut child_signals = ChildSignals {
             control: &mut child_control,

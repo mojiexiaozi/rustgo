@@ -138,6 +138,8 @@ impl ClientApp {
             match connected {
                 Ok(session) => {
                     let generation = SessionGeneration::next(self.last_generation)?;
+                    let protocol_version = session.protocol_version();
+                    let local_protocol_version = self.control.protocol_version();
                     self.last_generation = generation.get();
                     self.backoff.mark_connected();
                     self.status.send_replace(ClientStatus {
@@ -149,6 +151,9 @@ impl ClientApp {
                     tracing::info!(
                         client = %safe_display(&self.control.config().client.name),
                         generation = generation.get(),
+                        protocol_major = protocol_version.major,
+                        protocol_minor = protocol_version.minor,
+                        local_protocol_minor = local_protocol_version.minor,
                         event = %"registration_ready",
                         "client tunnel registration ready"
                     );

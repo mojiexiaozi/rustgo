@@ -16,7 +16,7 @@ use rustgo_config::TunnelProtocol as ConfigTunnelProtocol;
 use rustgo_protocol::{
     BoundedBytes, BoundedString, DataChannelBind, DataChannelKind, Frame, FrameCodec, FrameError,
     MAX_CLIENT_NAME_BYTES, MAX_SESSION_ID_BYTES, MAX_UDP_PAYLOAD_BYTES, Message, OpenUdpChannel,
-    SocketAddress, UDP_METADATA_LEN, UdpDatagram,
+    ProtocolVersion, SocketAddress, UDP_METADATA_LEN, UdpDatagram,
 };
 use rustgo_transport::{TlsClient, safe_display, short_id};
 use thiserror::Error;
@@ -191,10 +191,12 @@ impl ChildSessionSupervisor for UdpSessionSupervisor {
             let Some(target) = local_targets.get(&request.tunnel_id).cloned() else {
                 return;
             };
+            let protocol_version = context.protocol_version();
             let setup = setup_data_channel(
                 &client_name,
                 &server_addr,
                 &tls_client,
+                protocol_version,
                 context.session_id(),
                 &request,
             );
@@ -225,6 +227,7 @@ impl ChildSessionSupervisor for UdpSessionSupervisor {
             );
             if let Err(error) = relay_local_datagrams(
                 data,
+                protocol_version,
                 &client_name,
                 target,
                 request.tunnel_id,
@@ -250,6 +253,7 @@ async fn setup_data_channel(
     client_name: &str,
     server_addr: &str,
     tls_client: &TlsClient,
+    protocol_version: ProtocolVersion,
     session_id: &[u8],
     request: &OpenUdpChannel,
 ) -> Result<TlsStream<TcpStream>, UdpClientError> {
@@ -265,11 +269,11 @@ async fn setup_data_channel(
         binding_token: request.binding_token.clone(),
     });
     let codec = FrameCodec::new(1024);
-    let encoded = codec.encode(crate::CLIENT_VERSION, 0, &bind)?;
+    let encoded = codec.encode(protocol_version, 0, &bind)?;
     data.write_all(&encoded).await?;
 
     let acknowledgement = read_frame_exact(&mut data, codec).await?;
-    if acknowledgement.version != crate::CLIENT_VERSION {
+    if acknowledgement.version != protocol_version {
         return Err(UdpClientError::InvalidAcknowledgement);
     }
     let Message::OpenUdpChannel(ready) = acknowledgement.message else {
@@ -498,8 +502,10 @@ fn try_queue<T>(sender: &mpsc::Sender<T>, value: T, queued: &AtomicUsize) -> Que
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn relay_local_datagrams(
     data: TlsStream<TcpStream>,
+    protocol_version: ProtocolVersion,
     client_name: &str,
     target: UdpTunnelTarget,
     tunnel_id: u32,
@@ -521,6 +527,7 @@ async fn relay_local_datagrams(
         data_receiver,
         metrics.clone(),
         relay_shutdown.clone(),
+        protocol_version,
     ));
     let mut writer_finished = false;
     let mut sessions = ClientSessionTable::new();
@@ -570,7 +577,7 @@ async fn relay_local_datagrams(
                     Ok(frame) => frame,
                     Err(error) => break Err(error),
                 };
-                if frame.version != crate::CLIENT_VERSION {
+                if frame.version != protocol_version {
                     break Err(UdpClientError::InvalidFrame);
                 }
                 let datagram = match frame.message {
@@ -823,6 +830,7 @@ async fn write_frames<W>(
     mut receiver: mpsc::Receiver<Message>,
     metrics: Arc<UdpMetrics>,
     cancellation: CancellationToken,
+    protocol_version: ProtocolVersion,
 ) -> Result<(), UdpClientError>
 where
     W: AsyncWrite + Unpin,
@@ -838,7 +846,7 @@ where
             },
         };
         metrics.data_queued.fetch_sub(1, Ordering::AcqRel);
-        let encoded = codec.encode(crate::CLIENT_VERSION, 0, &message)?;
+        let encoded = codec.encode(protocol_version, 0, &message)?;
         let write = writer.write_all(&encoded);
         tokio::select! {
             biased;

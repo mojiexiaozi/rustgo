@@ -23,6 +23,7 @@ pub struct ControlClient {
     keypair: Arc<DeviceKeypair>,
     tls_client: TlsClient,
     heartbeat_interval: Duration,
+    version: ProtocolVersion,
 }
 
 impl ControlClient {
@@ -35,11 +36,13 @@ impl ControlClient {
     /// Builds every local security dependency before any network socket is opened.
     pub fn from_config(config: ClientConfig) -> Result<Self, ClientError> {
         let (keypair, tls_client, heartbeat_interval) = load_credentials(&config)?;
+        let version = internal_test_protocol_version()?;
         Ok(Self {
             config: Arc::new(config),
             keypair: Arc::new(keypair),
             tls_client,
             heartbeat_interval,
+            version,
         })
     }
 
@@ -49,6 +52,10 @@ impl ControlClient {
 
     pub(crate) fn tls_client(&self) -> TlsClient {
         self.tls_client.clone()
+    }
+
+    pub(crate) const fn protocol_version(&self) -> ProtocolVersion {
+        self.version
     }
 
     pub async fn connect(&self) -> Result<ControlSession, ClientError> {
@@ -81,10 +88,10 @@ impl ControlClient {
                 .map_err(|_| ClientError::InvalidConfiguration)?,
         });
         state = state.transition(&hello)?;
-        framed.send(CLIENT_VERSION, hello).await?;
+        framed.send(self.version, hello).await?;
 
         let challenge_frame = framed.receive().await?;
-        let negotiated = negotiated_version(challenge_frame.version)?;
+        let negotiated = negotiated_version(self.version, challenge_frame.version)?;
         let challenge = match challenge_frame.message {
             Message::ServerChallenge(challenge) => challenge,
             Message::Error(error) => return Err(ClientError::Protocol(error.code)),
@@ -172,14 +179,33 @@ fn load_credentials(
     ))
 }
 
-fn negotiated_version(server_version: ProtocolVersion) -> Result<ProtocolVersion, ClientError> {
-    let negotiated = CLIENT_VERSION
+fn negotiated_version(
+    local_version: ProtocolVersion,
+    server_version: ProtocolVersion,
+) -> Result<ProtocolVersion, ClientError> {
+    let negotiated = local_version
         .negotiate(server_version)
         .map_err(ClientError::Protocol)?;
     if negotiated != server_version {
         return Err(ClientError::InvalidState);
     }
     Ok(negotiated)
+}
+
+fn internal_test_protocol_version() -> Result<ProtocolVersion, ClientError> {
+    if std::env::var("RUSTGO_INTERNAL_TESTING").as_deref() != Ok("1") {
+        return Ok(CLIENT_VERSION);
+    }
+    let minor = std::env::var("RUSTGO_TEST_PROTOCOL_MINOR")
+        .ok()
+        .map(|value| {
+            value
+                .parse::<u16>()
+                .map_err(|_| ClientError::InvalidConfiguration)
+        })
+        .transpose()?
+        .unwrap_or(CLIENT_VERSION.minor);
+    Ok(ProtocolVersion::new(CLIENT_VERSION.major, minor))
 }
 
 fn require_version(
@@ -344,6 +370,10 @@ impl ControlSession {
 
     pub fn registered_tunnels(&self) -> &[RegisteredTunnel] {
         &self.registered_tunnels
+    }
+
+    pub const fn protocol_version(&self) -> ProtocolVersion {
+        self.version
     }
 
     pub(crate) fn registered_tunnels_shared(&self) -> Arc<[RegisteredTunnel]> {

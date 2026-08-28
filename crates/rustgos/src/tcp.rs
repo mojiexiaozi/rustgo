@@ -14,7 +14,7 @@ use tokio::{
 use tracing::Instrument;
 
 use crate::{
-    control::{ControlError, FramedControl, SERVER_VERSION},
+    control::{ControlError, FramedControl},
     registry::{ClientRegistry, RegistryError, SessionRuntime},
 };
 
@@ -208,14 +208,15 @@ pub(crate) async fn serve_data_connection(
     version: ProtocolVersion,
     request: rustgo_protocol::DataChannelBind,
 ) -> Result<(), TcpDataError> {
-    if version != SERVER_VERSION || !framed.is_buffer_empty() {
+    if request.kind != rustgo_protocol::DataChannelKind::TCP || !framed.is_buffer_empty() {
         return Err(TcpDataError::InvalidFirstFrame);
     }
     let stream = framed.into_stream().map_err(TcpDataError::Control)?;
     let connection_id = request.target_id;
-    let mut authenticated = registry.authenticate_data_channel(stream, &request)?;
+    let mut authenticated = registry.authenticate_data_channel(stream, &request, version)?;
+    let protocol_version = authenticated.protocol_version();
     let acknowledgement = FrameCodec::new(1024).encode(
-        SERVER_VERSION,
+        protocol_version,
         0,
         &Message::TcpStreamReady(TcpStreamReady {
             connection_id,

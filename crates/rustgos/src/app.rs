@@ -1,6 +1,7 @@
 use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 
 use rustgo_config::ServerConfig;
+use rustgo_protocol::ProtocolVersion;
 use rustgo_transport::{TlsError, TlsServer, safe_display};
 use thiserror::Error;
 use tokio::{sync::Semaphore, task::JoinSet};
@@ -136,6 +137,7 @@ pub struct ServerApp {
     limiter: FailedAuthLimiter,
     runtime_limits: ServerRuntimeLimits,
     heartbeat_timeout: Duration,
+    protocol_version: ProtocolVersion,
 }
 
 impl ServerApp {
@@ -161,6 +163,7 @@ impl ServerApp {
         runtime_limits: ServerRuntimeLimits,
     ) -> Result<Self, ServerError> {
         runtime_limits.validate()?;
+        let protocol_version = internal_test_protocol_version()?;
         let heartbeat_timeout = Duration::from_secs(config.server.heartbeat_timeout_secs);
         if tokio::time::Instant::now()
             .checked_add(heartbeat_timeout)
@@ -239,6 +242,7 @@ impl ServerApp {
             limiter,
             heartbeat_timeout,
             runtime_limits,
+            protocol_version,
         })
     }
 
@@ -277,13 +281,14 @@ impl ServerApp {
                     let limiter = self.limiter.clone();
                     let handshake_timeout = self.runtime_limits.handshake_timeout;
                     let heartbeat_timeout = self.heartbeat_timeout;
-                    let context = control::ControlContext::new(
+                    let context = control::ControlContext::new_with_version(
                         tls_server,
                         authenticator,
                         registry,
                         limiter,
                         handshake_timeout,
                         heartbeat_timeout,
+                        self.protocol_version,
                     );
                     let child_shutdown = session_shutdown.child_token();
                     sessions.spawn(async move {
@@ -308,6 +313,22 @@ impl ServerApp {
         while sessions.join_next().await.is_some() {}
         result
     }
+}
+
+fn internal_test_protocol_version() -> Result<ProtocolVersion, ServerError> {
+    if std::env::var("RUSTGO_INTERNAL_TESTING").as_deref() != Ok("1") {
+        return Ok(control::SERVER_VERSION);
+    }
+    let minor = std::env::var("RUSTGO_TEST_PROTOCOL_MINOR")
+        .ok()
+        .map(|value| {
+            value
+                .parse::<u16>()
+                .map_err(|_| ServerError::InvalidRuntimeLimits)
+        })
+        .transpose()?
+        .unwrap_or(control::SERVER_VERSION.minor);
+    Ok(ProtocolVersion::new(control::SERVER_VERSION.major, minor))
 }
 
 fn load_authenticator(config: &ServerConfig) -> Result<Authenticator, ServerError> {

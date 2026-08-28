@@ -37,16 +37,18 @@ pub(crate) struct ControlContext {
     limiter: FailedAuthLimiter,
     handshake_timeout: Duration,
     heartbeat_timeout: Duration,
+    version: ProtocolVersion,
 }
 
 impl ControlContext {
-    pub(crate) fn new(
+    pub(crate) fn new_with_version(
         tls_server: Arc<TlsServer>,
         authenticator: Authenticator,
         registry: ClientRegistry,
         limiter: FailedAuthLimiter,
         handshake_timeout: Duration,
         heartbeat_timeout: Duration,
+        version: ProtocolVersion,
     ) -> Self {
         Self {
             tls_server,
@@ -55,6 +57,7 @@ impl ControlContext {
             limiter,
             handshake_timeout,
             heartbeat_timeout,
+            version,
         }
     }
 }
@@ -129,11 +132,11 @@ pub(crate) async fn serve_connection(
         () = shutdown.cancelled() => return Ok(()),
         result = tokio::time::timeout_at(handshake_deadline, async {
             let mut state = ClientHandshakeState::new();
-            let negotiated = match SERVER_VERSION.negotiate(first_frame.version) {
+            let negotiated = match context.version.negotiate(first_frame.version) {
                 Ok(version) => version,
                 Err(code) => {
                     auth_attempt.fail();
-                    framed.send(SERVER_VERSION, protocol_error(code)).await?;
+                    framed.send(context.version, protocol_error(code)).await?;
                     return Ok(None);
                 }
             };
@@ -168,7 +171,7 @@ pub(crate) async fn serve_connection(
             let guard = identity.and_then(|identity| {
                 context
                     .registry
-                    .claim_with_outbound(identity, outbound.clone())
+                    .claim_with_outbound(identity, outbound.clone(), negotiated)
                     .ok()
             });
             let accepted = guard.is_some();
@@ -214,6 +217,7 @@ pub(crate) async fn serve_connection(
         framed,
         guard,
         state,
+        context.version,
         negotiated,
         context.heartbeat_timeout,
         outbound_rx,
@@ -222,10 +226,12 @@ pub(crate) async fn serve_connection(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_owned_control_session<S>(
     mut framed: FramedControl<S>,
     mut guard: ControlSessionGuard,
     mut state: ClientHandshakeState,
+    local_version: ProtocolVersion,
     negotiated: ProtocolVersion,
     heartbeat_timeout: Duration,
     mut outbound_rx: mpsc::Receiver<Message>,
@@ -248,6 +254,7 @@ where
                 &mut framed,
                 &mut guard,
                 &mut state,
+                local_version,
                 negotiated,
                 heartbeat_timeout,
                 &mut outbound_rx,
@@ -264,6 +271,7 @@ async fn run_control_session<S>(
     framed: &mut FramedControl<S>,
     guard: &mut ControlSessionGuard,
     state: &mut ClientHandshakeState,
+    local_version: ProtocolVersion,
     negotiated: ProtocolVersion,
     heartbeat_timeout: Duration,
     outbound_rx: &mut mpsc::Receiver<Message>,
@@ -286,7 +294,14 @@ where
         .send(negotiated, Message::TunnelResults(results))
         .await?;
 
-    tracing::info!(client = %safe_display(guard.identity().name()), listeners = guard.listener_count(), "event=registration_ready server tunnel registration ready");
+    tracing::info!(
+        client = %safe_display(guard.identity().name()),
+        listeners = guard.listener_count(),
+        protocol_major = negotiated.major,
+        protocol_minor = negotiated.minor,
+        local_protocol_minor = local_version.minor,
+        "event=registration_ready server tunnel registration ready"
+    );
     run_active_control(
         framed,
         guard,
@@ -580,7 +595,9 @@ mod tests {
             session_id.clone(),
         );
         let (outbound, outbound_rx) = mpsc::channel(1);
-        let guard = registry.claim_with_outbound(identity, outbound).unwrap();
+        let guard = registry
+            .claim_with_outbound(identity, outbound, SERVER_VERSION)
+            .unwrap();
         let registration = Message::RegisterTunnels(RegisterTunnels {
             tunnels: BoundedVec::try_from(vec![TunnelRegistration {
                 tunnel_id: 1,
@@ -604,6 +621,7 @@ mod tests {
             framed,
             guard,
             state,
+            SERVER_VERSION,
             SERVER_VERSION,
             Duration::from_secs(2),
             outbound_rx,

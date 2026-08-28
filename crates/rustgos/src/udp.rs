@@ -30,7 +30,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use crate::{
-    control::{ControlError, FramedControl, SERVER_VERSION},
+    control::{ControlError, FramedControl},
     registry::{ClientRegistry, PendingUdpOpen, RegistryError, SessionRuntime},
 };
 
@@ -300,6 +300,7 @@ async fn run_listener_inner(
     relay_datagrams(
         listener,
         data_channel,
+        runtime.protocol_version(),
         tunnel_id,
         tunnel_name,
         max_sessions,
@@ -562,6 +563,7 @@ fn try_enqueue(
 async fn relay_datagrams(
     public: &UdpSocket,
     data: TlsStream<TcpStream>,
+    protocol_version: ProtocolVersion,
     tunnel_id: u32,
     tunnel_name: &str,
     max_sessions: usize,
@@ -581,6 +583,7 @@ async fn relay_datagrams(
         metrics.clone(),
         relay_shutdown.clone(),
         limits.writer_delay,
+        protocol_version,
     ));
     let mut writer_finished = false;
     let mut flows = FlowTable::new(max_sessions);
@@ -699,7 +702,7 @@ async fn relay_datagrams(
                     Ok(frame) => frame,
                     Err(error) => break Err(error),
                 };
-                if frame.version != SERVER_VERSION {
+                if frame.version != protocol_version {
                     break Err(UdpRelayError::InvalidFrame);
                 }
                 let Message::UdpDatagram(datagram) = frame.message else {
@@ -773,6 +776,7 @@ async fn write_frames<W>(
     metrics: Arc<UdpMetrics>,
     cancellation: CancellationToken,
     writer_delay: Duration,
+    protocol_version: ProtocolVersion,
 ) -> Result<(), UdpRelayError>
 where
     W: AsyncWrite + Unpin,
@@ -788,7 +792,7 @@ where
             },
         };
         metrics.queued.fetch_sub(1, Ordering::AcqRel);
-        let encoded = codec.encode(SERVER_VERSION, 0, &message)?;
+        let encoded = codec.encode(protocol_version, 0, &message)?;
         if !writer_delay.is_zero() {
             tokio::select! {
                 biased;
@@ -889,10 +893,7 @@ pub(crate) async fn serve_data_connection(
     version: ProtocolVersion,
     request: rustgo_protocol::DataChannelBind,
 ) -> Result<(), UdpDataError> {
-    if version != SERVER_VERSION
-        || request.kind != DataChannelKind::UDP
-        || !framed.is_buffer_empty()
-    {
+    if request.kind != DataChannelKind::UDP || !framed.is_buffer_empty() {
         return Err(UdpDataError::InvalidFirstFrame);
     }
     let stream = framed.into_stream().map_err(UdpDataError::Control)?;
@@ -901,9 +902,10 @@ pub(crate) async fn serve_data_connection(
         request.target_id,
         request.binding_token.clone(),
     )?;
-    let mut authenticated = registry.authenticate_data_channel(stream, &request)?;
+    let mut authenticated = registry.authenticate_data_channel(stream, &request, version)?;
+    let protocol_version = authenticated.protocol_version();
     let acknowledgement = FrameCodec::new(1024).encode(
-        SERVER_VERSION,
+        protocol_version,
         0,
         &Message::OpenUdpChannel(acknowledgement),
     )?;

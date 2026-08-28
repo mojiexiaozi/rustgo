@@ -3,7 +3,8 @@ use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc, time::Durat
 use bytes::BytesMut;
 use rustgo_protocol::{
     BoundedBytes, BoundedString, DataChannelBind, DataChannelKind, Frame, FrameCodec, FrameError,
-    MAX_CLIENT_NAME_BYTES, MAX_SESSION_ID_BYTES, Message, ProtocolErrorCode, TcpStreamReady,
+    MAX_CLIENT_NAME_BYTES, MAX_SESSION_ID_BYTES, Message, ProtocolErrorCode, ProtocolVersion,
+    TcpStreamReady,
 };
 use rustgo_transport::{TlsClient, copy_bidirectional_bounded, safe_display, short_id};
 use thiserror::Error;
@@ -138,6 +139,7 @@ async fn run_tcp(
         return;
     };
     let local_address = target.local_address;
+    let protocol_version = context.protocol_version();
     let setup = setup_with_admission(
         local_connect_permits,
         handshake_permits,
@@ -147,6 +149,7 @@ async fn run_tcp(
                 &client_name,
                 &server_addr,
                 &tls_client,
+                protocol_version,
                 context.session_id(),
                 &request,
             )
@@ -227,6 +230,7 @@ async fn setup_data_channel(
     client_name: &str,
     server_addr: &str,
     tls_client: &TlsClient,
+    protocol_version: ProtocolVersion,
     session_id: &[u8],
     request: &rustgo_protocol::OpenTcpStream,
 ) -> Result<TlsStream<TcpStream>, TcpClientError> {
@@ -242,11 +246,11 @@ async fn setup_data_channel(
         binding_token: request.binding_token.clone(),
     });
     let codec = FrameCodec::new(DATA_FRAME_MAX);
-    let encoded = codec.encode(crate::CLIENT_VERSION, 0, &bind)?;
+    let encoded = codec.encode(protocol_version, 0, &bind)?;
     data.write_all(&encoded).await?;
 
     let acknowledgement = read_frame_exact(&mut data, codec).await?;
-    if acknowledgement.version != crate::CLIENT_VERSION {
+    if acknowledgement.version != protocol_version {
         return Err(TcpClientError::InvalidAcknowledgement);
     }
     let Message::TcpStreamReady(ready) = acknowledgement.message else {

@@ -8,8 +8,8 @@ use std::{
 use rand::{TryRngCore, rngs::OsRng};
 use rustgo_protocol::{
     BoundedBytes, BoundedVec, DataChannelBind, DataChannelKind, MAX_BINDING_TOKEN_BYTES,
-    MAX_TUNNELS, Message, OpenUdpChannel, ProtocolErrorCode, RegisterTunnels, TunnelProtocol,
-    TunnelResult, TunnelResults,
+    MAX_TUNNELS, Message, OpenUdpChannel, ProtocolErrorCode, ProtocolVersion, RegisterTunnels,
+    TunnelProtocol, TunnelResult, TunnelResults,
 };
 use rustgo_transport::{BindingError, ChannelBinding, ChannelBindingStore, ChannelKind};
 use thiserror::Error;
@@ -170,13 +170,14 @@ impl ClientRegistry {
     ) -> Result<ControlSessionGuard, RegistryError> {
         let (outbound, receiver) = mpsc::channel(1);
         drop(receiver);
-        self.claim_with_outbound(identity, outbound)
+        self.claim_with_outbound(identity, outbound, crate::control::SERVER_VERSION)
     }
 
     pub(crate) fn claim_with_outbound(
         &self,
         identity: AuthenticatedClient,
         outbound: mpsc::Sender<Message>,
+        protocol_version: ProtocolVersion,
     ) -> Result<ControlSessionGuard, RegistryError> {
         let binding_store = ChannelBindingStore::new(
             identity.name(),
@@ -194,6 +195,7 @@ impl ClientRegistry {
             outbound,
             cancellation: CancellationToken::new(),
             binding_ttl: self.binding_ttl,
+            protocol_version,
         });
         {
             let mut state = self.inner.lock().map_err(|_| RegistryError::Internal)?;
@@ -234,6 +236,7 @@ impl ClientRegistry {
         &self,
         stream: ServerDataStream,
         request: &DataChannelBind,
+        protocol_version: ProtocolVersion,
     ) -> Result<AuthenticatedDataChannel, RegistryError> {
         let runtimes = self
             .inner
@@ -244,13 +247,14 @@ impl ClientRegistry {
             .map(|active| active.runtime.clone())
             .collect::<Vec<_>>();
         for runtime in runtimes {
-            if let Some(result) = runtime.redeem_if_present(request) {
+            if let Some(result) = runtime.redeem_if_present(request, protocol_version) {
                 let (binding, destination) = result?;
                 return Ok(AuthenticatedDataChannel {
                     stream: Some(stream),
                     binding,
                     destination: Some(destination),
                     cancellation: runtime.cancellation(),
+                    protocol_version: runtime.protocol_version(),
                 });
             }
         }
@@ -326,6 +330,7 @@ pub(crate) struct SessionRuntime {
     outbound: mpsc::Sender<Message>,
     cancellation: CancellationToken,
     binding_ttl: Duration,
+    protocol_version: ProtocolVersion,
 }
 
 impl SessionRuntime {
@@ -343,6 +348,10 @@ impl SessionRuntime {
 
     pub(crate) fn outbound(&self) -> mpsc::Sender<Message> {
         self.outbound.clone()
+    }
+
+    pub(crate) const fn protocol_version(&self) -> ProtocolVersion {
+        self.protocol_version
     }
 
     pub(crate) fn prepare_tcp(&self, tunnel_id: u32) -> Result<PendingTcpOpen, RegistryError> {
@@ -442,6 +451,7 @@ impl SessionRuntime {
     fn redeem_if_present(
         &self,
         request: &DataChannelBind,
+        protocol_version: ProtocolVersion,
     ) -> Option<Result<(ChannelBinding, oneshot::Sender<ServerDataStream>), RegistryError>> {
         let channel_kind = if request.kind == DataChannelKind::TCP {
             ChannelKind::Tcp {
@@ -460,6 +470,9 @@ impl SessionRuntime {
         };
         if !bindings.store.recognizes(request.binding_token.as_slice()) {
             return None;
+        }
+        if protocol_version != self.protocol_version {
+            return Some(Err(RegistryError::Binding(BindingError::Rejected)));
         }
         let binding = match bindings.store.redeem(
             request.client_name.as_str(),
@@ -645,6 +658,7 @@ impl ControlSessionGuard {
             binding,
             destination: None,
             cancellation: self.runtime.cancellation(),
+            protocol_version: self.runtime.protocol_version(),
         });
         Ok(self
             .data_channels
@@ -741,6 +755,7 @@ pub struct AuthenticatedDataChannel {
     binding: ChannelBinding,
     destination: Option<oneshot::Sender<ServerDataStream>>,
     cancellation: CancellationToken,
+    protocol_version: ProtocolVersion,
 }
 
 impl AuthenticatedDataChannel {
@@ -754,6 +769,10 @@ impl AuthenticatedDataChannel {
 
     pub(crate) fn cancellation(&self) -> CancellationToken {
         self.cancellation.clone()
+    }
+
+    pub(crate) const fn protocol_version(&self) -> ProtocolVersion {
+        self.protocol_version
     }
 
     pub(crate) fn deliver(mut self) -> Result<(), RegistryError> {
@@ -803,7 +822,7 @@ mod tests {
     use tokio::io::AsyncReadExt;
 
     use super::ClientRegistry;
-    use crate::AuthenticatedClient;
+    use crate::{AuthenticatedClient, control::SERVER_VERSION};
 
     const SERVER_NAME: &str = "data.example.test";
 
@@ -1002,13 +1021,13 @@ mod tests {
                 tls_pair(&tls_server, &tls_client, address).await?;
             assert!(
                 registry
-                    .authenticate_data_channel(invalid_server, &invalid)
+                    .authenticate_data_channel(invalid_server, &invalid, SERVER_VERSION)
                     .is_err()
             );
             let (retry_server, _retry_client) = tls_pair(&tls_server, &tls_client, address).await?;
             assert!(
                 registry
-                    .authenticate_data_channel(retry_server, &correct)
+                    .authenticate_data_channel(retry_server, &correct, SERVER_VERSION)
                     .is_err()
             );
             guard.runtime.cancel_pending(pending.connection_id);
@@ -1024,12 +1043,13 @@ mod tests {
             pending.binding_token.as_slice(),
         );
         let (first_server, _first_client) = tls_pair(&tls_server, &tls_client, address).await?;
-        let authenticated = registry.authenticate_data_channel(first_server, &correct)?;
+        let authenticated =
+            registry.authenticate_data_channel(first_server, &correct, SERVER_VERSION)?;
         drop(authenticated);
         let (reused_server, _reused_client) = tls_pair(&tls_server, &tls_client, address).await?;
         assert!(
             registry
-                .authenticate_data_channel(reused_server, &correct)
+                .authenticate_data_channel(reused_server, &correct, SERVER_VERSION)
                 .is_err()
         );
 
@@ -1044,7 +1064,7 @@ mod tests {
         let (unknown_server, _unknown_client) = tls_pair(&tls_server, &tls_client, address).await?;
         assert!(
             registry
-                .authenticate_data_channel(unknown_server, &unknown)
+                .authenticate_data_channel(unknown_server, &unknown, SERVER_VERSION)
                 .is_err()
         );
         Ok(())
