@@ -2,21 +2,76 @@
 set -euo pipefail
 
 managed_pids=()
+managed_identities=()
 started_pid=
 started_stdout=
 started_stderr=
 process_sequence=0
 
+parse_proc_stat_starttime() {
+    local stat_line=$1
+    local stat_suffix
+    local starttime
+    local stat_fields=()
+
+    case "$stat_line" in
+        *') '*) ;;
+        *) return 1 ;;
+    esac
+    # comm is parenthesized and may itself contain spaces or right
+    # parentheses. Strip through the final ") "; the remaining tokens begin
+    # at field 3, so array index 19 is field 22 (starttime).
+    stat_suffix=${stat_line##*) }
+    read -r -a stat_fields <<<"$stat_suffix"
+    if [ "${#stat_fields[@]}" -lt 20 ]; then
+        return 1
+    fi
+    starttime=${stat_fields[19]}
+    case "$starttime" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    printf '%s\n' "$starttime"
+}
+
+read_process_identity() {
+    local pid=$1
+    local stat_line
+    local starttime
+    case "$pid" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    if ! IFS= read -r stat_line <"/proc/$pid/stat"; then
+        return 1
+    fi
+    case "$stat_line" in
+        "$pid ("*) ;;
+        *) return 1 ;;
+    esac
+    if ! starttime=$(parse_proc_stat_starttime "$stat_line"); then
+        return 1
+    fi
+    printf 'linux-proc-starttime:%s\n' "$starttime"
+}
+
 process_is_alive() {
-    kill -0 "$1" 2>/dev/null
+    local pid=$1
+    local expected_identity=$2
+    process_identity_matches "$pid" "$expected_identity" || return 1
+    kill -0 "$pid" 2>/dev/null
 }
 
 terminate_process() {
-    kill "$1"
+    local pid=$1
+    local expected_identity=$2
+    process_identity_matches "$pid" "$expected_identity" || return 1
+    kill "$pid"
 }
 
 wait_for_process() {
-    wait "$1"
+    local pid=$1
+    local expected_identity=$2
+    process_identity_matches "$pid" "$expected_identity" || return 1
+    wait "$pid"
 }
 
 remove_tree() {
@@ -36,35 +91,77 @@ is_managed_pid() {
 
 register_managed_pid() {
     local pid=$1
+    local identity=$2
     if is_managed_pid "$pid"; then
         echo "refusing duplicate managed PID registration: $pid" >&2
         return 1
     fi
+    if [ -z "$identity" ]; then
+        echo "refusing managed PID without process identity: $pid" >&2
+        return 1
+    fi
     managed_pids+=("$pid")
+    managed_identities+=("$identity")
+}
+
+managed_identity_for_pid() {
+    local target=$1
+    local index
+    for index in "${!managed_pids[@]}"; do
+        if [ "${managed_pids[$index]}" = "$target" ]; then
+            printf '%s\n' "${managed_identities[$index]}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+process_identity_matches() {
+    local pid=$1
+    local expected_identity=$2
+    local observed_identity
+    if ! observed_identity=$(read_process_identity "$pid"); then
+        return 1
+    fi
+    [ "$observed_identity" = "$expected_identity" ]
+}
+
+managed_process_is_alive() {
+    local pid=$1
+    local identity
+    if ! identity=$(managed_identity_for_pid "$pid"); then
+        return 1
+    fi
+    process_is_alive "$pid" "$identity"
 }
 
 unregister_managed_pid() {
     local target=$1
     local found=false
-    local owned
-    local remaining=()
-    for owned in "${managed_pids[@]}"; do
-        if [ "$owned" = "$target" ]; then
+    local index
+    local remaining_pids=()
+    local remaining_identities=()
+    for index in "${!managed_pids[@]}"; do
+        if [ "${managed_pids[$index]}" = "$target" ]; then
             found=true
         else
-            remaining+=("$owned")
+            remaining_pids+=("${managed_pids[$index]}")
+            remaining_identities+=("${managed_identities[$index]}")
         fi
     done
-    managed_pids=("${remaining[@]}")
+    managed_pids=("${remaining_pids[@]}")
+    managed_identities=("${remaining_identities[@]}")
     [ "$found" = true ]
 }
 
 wait_and_unregister_managed_pid() {
     local pid=$1
+    local expected_identity=$2
     local previous_int previous_term
     local deferred_signal=0
     local observed_signal=0
     local unregister_failed=0
+    local identity_lost=0
     previous_int=$(trap -p INT)
     previous_term=$(trap -p TERM)
 
@@ -75,7 +172,11 @@ wait_and_unregister_managed_pid() {
     trap 'deferred_signal=143; observed_signal=143' TERM
     while true; do
         deferred_signal=0
-        if wait_for_process "$pid"; then
+        if ! process_identity_matches "$pid" "$expected_identity"; then
+            identity_lost=1
+            break
+        fi
+        if wait_for_process "$pid" "$expected_identity"; then
             :
         else
             # A terminated child normally makes wait return its nonzero exit
@@ -109,23 +210,47 @@ wait_and_unregister_managed_pid() {
     if [ "$observed_signal" -ne 0 ]; then
         return "$observed_signal"
     fi
+    if [ "$identity_lost" -ne 0 ]; then
+        return 0
+    fi
     return 0
 }
 
 stop_managed() {
     local pid=$1
+    local identity
     local terminate_failed=0
     local reap_status=0
     if ! is_managed_pid "$pid"; then
         return 0
     fi
-    if process_is_alive "$pid"; then
-        if ! terminate_process "$pid" 2>/dev/null; then
+    if ! identity=$(managed_identity_for_pid "$pid"); then
+        echo "managed PID has no registered identity: $pid" >&2
+        return 1
+    fi
+    if ! process_identity_matches "$pid" "$identity"; then
+        unregister_managed_pid "$pid"
+        return 0
+    fi
+    if process_is_alive "$pid" "$identity"; then
+        if ! process_identity_matches "$pid" "$identity"; then
+            unregister_managed_pid "$pid"
+            return 0
+        fi
+        if ! terminate_process "$pid" "$identity" 2>/dev/null; then
+            if ! process_identity_matches "$pid" "$identity"; then
+                unregister_managed_pid "$pid"
+                return 0
+            fi
             echo "failed to terminate owned process: $pid" >&2
             terminate_failed=1
         fi
     fi
-    if wait_and_unregister_managed_pid "$pid"; then
+    if ! process_identity_matches "$pid" "$identity"; then
+        unregister_managed_pid "$pid"
+        return "$terminate_failed"
+    fi
+    if wait_and_unregister_managed_pid "$pid" "$identity"; then
         reap_status=0
     else
         reap_status=$?
@@ -148,6 +273,10 @@ cleanup_owned_children() {
     done
     if [ "${#managed_pids[@]}" -ne 0 ]; then
         echo "owned process registry is not empty after cleanup" >&2
+        failed=1
+    fi
+    if [ "${#managed_identities[@]}" -ne 0 ]; then
+        echo "owned process identity registry is not empty after cleanup" >&2
         failed=1
     fi
     [ "$failed" -eq 0 ]
@@ -227,7 +356,16 @@ start_managed() {
         exec "$binary" "$@"
     ) >"$started_stdout" 2>"$started_stderr" &
     started_pid=$!
-    register_managed_pid "$started_pid"
+    local started_identity
+    if ! started_identity=$(read_process_identity "$started_pid"); then
+        # Keep the PID registered with a value the Linux reader can never
+        # produce. EXIT cleanup will unregister it without signalling or
+        # waiting because ownership cannot be verified safely.
+        register_managed_pid "$started_pid" identity-unavailable
+        echo "cannot verify identity of started process $started_pid; refusing PID-only cleanup" >&2
+        return 1
+    fi
+    register_managed_pid "$started_pid" "$started_identity"
 }
 
 combined_output() {
@@ -248,7 +386,7 @@ wait_for_output() {
             { [ -f "$stderr_file" ] && grep -Fq -- "$pattern" "$stderr_file"; }; then
             return 0
         fi
-        if ! process_is_alive "$pid"; then
+        if ! managed_process_is_alive "$pid"; then
             echo "managed process $pid exited before readiness marker: $pattern" >&2
             combined_output "$stdout_file" "$stderr_file" >&2
             return 1
@@ -263,31 +401,97 @@ wait_for_output() {
 run_cleanup_self_test() (
     set -euo pipefail
 
-    # Simulate a child being reaped and its numeric PID immediately being
-    # reused by an unrelated process. The second cleanup pass must not call the
-    # termination wrapper for that number.
+    assert_file_contains() {
+        local file=$1
+        local expected=$2
+        local contents
+        contents=$(<"$file")
+        case "$contents" in
+            *"$expected"*) return 0 ;;
+            *)
+                echo "missing expected diagnostic in $file: $expected" >&2
+                return 1
+                ;;
+        esac
+    }
+
+    local parsed_starttime
+    if parsed_starttime=$(parse_proc_stat_starttime \
+        '4242 (worker ) with spaces) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 987654 20'); then
+        [ "$parsed_starttime" = 987654 ]
+    else
+        echo "failed to parse a valid proc stat starttime fixture" >&2
+        return 1
+    fi
+    if parse_proc_stat_starttime \
+        '4242 (truncated worker) S 1 2 3 4 5 6 7 8 9' >/dev/null; then
+        echo "accepted a truncated proc stat fixture" >&2
+        return 1
+    fi
+
+    # Simulate a naturally exited child whose numeric PID is immediately reused
+    # before an explicit wait. Cleanup must compare the registered process
+    # identity and never signal or wait for the unrelated replacement.
     managed_pids=()
+    managed_identities=()
+    local alive_calls=0
     local terminate_calls=0
     local wait_calls=0
+    local current_identity=identity-A
+    local identity_readable=true
+    read_process_identity() {
+        [ "$identity_readable" = true ] || return 1
+        printf '%s\n' "$current_identity"
+    }
     process_is_alive() {
+        [ "$1" = 4242 ]
+        [ "$2" = identity-A ]
+        alive_calls=$((alive_calls + 1))
         return 0
     }
     terminate_process() {
+        [ "$1" = 4242 ]
+        [ "$2" = identity-A ]
         terminate_calls=$((terminate_calls + 1))
         return 0
     }
     wait_for_process() {
+        [ "$1" = 4242 ]
+        [ "$2" = identity-A ]
         wait_calls=$((wait_calls + 1))
         return 0
     }
-    register_managed_pid 4242
-    stop_managed 4242
+    register_managed_pid 4242 identity-A
+    current_identity=identity-B
+    cleanup_owned_children
+    [ "$alive_calls" -eq 0 ]
+    [ "$terminate_calls" -eq 0 ]
+    [ "$wait_calls" -eq 0 ]
+    [ "${#managed_pids[@]}" -eq 0 ]
+    [ "${#managed_identities[@]}" -eq 0 ]
+
+    # An unreadable or missing /proc identity is also unverifiable and must
+    # take the same never-signal path.
+    identity_readable=false
+    register_managed_pid 4242 identity-A
+    cleanup_owned_children
+    [ "$alive_calls" -eq 0 ]
+    [ "$terminate_calls" -eq 0 ]
+    [ "$wait_calls" -eq 0 ]
+    [ "${#managed_pids[@]}" -eq 0 ]
+    [ "${#managed_identities[@]}" -eq 0 ]
+
+    # The matching identity remains an owned child and must follow the normal
+    # terminate, wait, and unregister lifecycle.
+    identity_readable=true
+    current_identity=identity-A
+    register_managed_pid 4242 identity-A
+    cleanup_owned_children
+    [ "$alive_calls" -eq 1 ]
     [ "$terminate_calls" -eq 1 ]
     [ "$wait_calls" -eq 1 ]
     [ "${#managed_pids[@]}" -eq 0 ]
-    cleanup_owned_children
-    [ "$terminate_calls" -eq 1 ]
-    [ "$wait_calls" -eq 1 ]
+    [ "${#managed_identities[@]}" -eq 0 ]
 
     # Simulate rm failure against a real, correctly scoped mktemp directory.
     # The helper must fail, retain the directory, and emit a clear diagnostic.
@@ -303,7 +507,7 @@ run_cleanup_self_test() (
         echo "cleanup_temporary_directory accepted a simulated remove failure" >&2
         return 1
     fi
-    grep -Fq "failed to remove owned temporary directory" "$cleanup_error"
+    assert_file_contains "$cleanup_error" "failed to remove owned temporary directory"
     [ -d "$test_directory" ]
     [ "$(select_cleanup_exit_status 0 1)" -eq 1 ]
     [ "$(select_cleanup_exit_status 23 1)" -eq 23 ]
@@ -318,7 +522,7 @@ run_cleanup_self_test() (
         cleanup_status=$?
     fi
     [ "$cleanup_status" -eq 1 ]
-    grep -Fq "cleanup failed; changing successful exit status to 1" "$cleanup_error"
+    assert_file_contains "$cleanup_error" "cleanup failed; changing successful exit status to 1"
     [ -d "$test_directory" ]
 
     preserved_error="$test_directory/cleanup-failure.stderr"
@@ -329,7 +533,7 @@ run_cleanup_self_test() (
         preserved_status=$?
     fi
     [ "$preserved_status" -eq 23 ]
-    grep -Fq "cleanup also failed; preserving original exit status 23" "$preserved_error"
+    assert_file_contains "$preserved_error" "cleanup also failed; preserving original exit status 23"
     [ -d "$test_directory" ]
     command rm -rf -- "$test_directory"
     trap - EXIT
@@ -366,6 +570,11 @@ if [ "$cleanup_self_test" = true ]; then
     run_cleanup_self_test
     echo "e2e bash cleanup self-test passed"
     exit 0
+fi
+
+if ! read_process_identity "$$" >/dev/null; then
+    echo "scripts/e2e.sh requires Linux /proc PID starttime identity support" >&2
+    exit 1
 fi
 
 temporary_directory=$(mktemp -d "$system_temp_base/rustgo-e2e.XXXXXXXX")

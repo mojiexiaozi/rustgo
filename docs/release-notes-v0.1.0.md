@@ -18,7 +18,8 @@ the clean release checkout immediately before distribution.
 - Windows release E2E: passed production credential `check`, managed default
   and explicit startup readiness, and TCP/UDP smoke transfers through release
   binaries
-- Linux release E2E: not run on this host; no Bash or installed WSL distribution
+- Linux release E2E: not run on this host; Git Bash self-tests are not a native
+  Linux run, and no WSL distribution is installed
 - 60-second fuzz smoke: not run; `cargo-fuzz` is absent and this Windows GNU host failed to compile `libfuzzer-sys`'s Windows shim
 
 Commands:

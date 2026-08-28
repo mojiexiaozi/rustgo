@@ -30,7 +30,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/e2e.ps1
 ```
 
 Each script creates one private temporary directory and removes only that
-directory. Credentials are never written into Cargo or CI cache paths.
+directory. Credentials are never written into Cargo or CI cache paths. The
+Bash entry point is Linux-only and requires readable `/proc/<pid>/stat`; it
+records each child process's starttime identity and will never signal a PID
+whose identity is missing or has changed.
 
 ## Start safely
 

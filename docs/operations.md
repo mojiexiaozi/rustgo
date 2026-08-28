@@ -245,8 +245,14 @@ cargo build --workspace --release
 cargo tree -d
 ```
 
-Run the matching platform E2E entry point. On a supported Linux/nightly
-libFuzzer host, install `cargo-fuzz` and run the bounded parser smoke:
+Run the matching platform E2E entry point. The Bash E2E entry point is
+Linux-only and requires readable
+`/proc/<pid>/stat`. It records each managed child's PID starttime before
+readiness polling and never signals or waits for a PID if that identity is
+missing or has changed.
+
+On a supported Linux/nightly libFuzzer host, install `cargo-fuzz` and run the
+bounded parser smoke:
 
 ```text
 cargo +nightly fuzz run frame_decode -- -max_total_time=60
