@@ -1,59 +1,218 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-startup_gate_only=false
-if [ "${1:-}" = "--startup-gate-only" ]; then
-    startup_gate_only=true
-    shift
-fi
-if [ "$#" -ne 0 ]; then
-    echo "usage: scripts/e2e.sh [--startup-gate-only]" >&2
-    exit 2
-fi
-
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
-workspace=$(CDPATH= cd -- "$script_dir/.." && pwd -P)
-system_temp_base=$(CDPATH= cd -- "${TMPDIR:-/tmp}" && pwd -P)
-temporary_directory=$(mktemp -d "$system_temp_base/rustgo-e2e.XXXXXXXX")
 managed_pids=()
-process_sequence=0
 started_pid=
 started_stdout=
 started_stderr=
+process_sequence=0
+
+process_is_alive() {
+    kill -0 "$1" 2>/dev/null
+}
+
+terminate_process() {
+    kill "$1"
+}
+
+wait_for_process() {
+    wait "$1"
+}
+
+remove_tree() {
+    rm -rf -- "$1"
+}
+
+is_managed_pid() {
+    local target=$1
+    local owned
+    for owned in "${managed_pids[@]}"; do
+        if [ "$owned" = "$target" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+register_managed_pid() {
+    local pid=$1
+    if is_managed_pid "$pid"; then
+        echo "refusing duplicate managed PID registration: $pid" >&2
+        return 1
+    fi
+    managed_pids+=("$pid")
+}
+
+unregister_managed_pid() {
+    local target=$1
+    local found=false
+    local owned
+    local remaining=()
+    for owned in "${managed_pids[@]}"; do
+        if [ "$owned" = "$target" ]; then
+            found=true
+        else
+            remaining+=("$owned")
+        fi
+    done
+    managed_pids=("${remaining[@]}")
+    [ "$found" = true ]
+}
+
+wait_and_unregister_managed_pid() {
+    local pid=$1
+    local previous_int previous_term
+    local deferred_signal=0
+    local observed_signal=0
+    local unregister_failed=0
+    previous_int=$(trap -p INT)
+    previous_term=$(trap -p TERM)
+
+    # Defer interrupt handling across wait plus unregister. Bash runs a pending
+    # trap between commands, so restoring the normal exit traps only after the
+    # registry update prevents a freshly reused PID from remaining owned.
+    trap 'deferred_signal=130; observed_signal=130' INT
+    trap 'deferred_signal=143; observed_signal=143' TERM
+    while true; do
+        deferred_signal=0
+        if wait_for_process "$pid"; then
+            :
+        else
+            # A terminated child normally makes wait return its nonzero exit
+            # status. The wait still reaped it; only a deferred signal requires
+            # another wait attempt before unregistering.
+            :
+        fi
+        if [ "$deferred_signal" -eq 0 ]; then
+            break
+        fi
+    done
+    if ! unregister_managed_pid "$pid"; then
+        unregister_failed=1
+    fi
+
+    if [ -n "$previous_int" ]; then
+        eval "$previous_int"
+    else
+        trap - INT
+    fi
+    if [ -n "$previous_term" ]; then
+        eval "$previous_term"
+    else
+        trap - TERM
+    fi
+
+    if [ "$unregister_failed" -ne 0 ]; then
+        echo "managed PID disappeared before unregister: $pid" >&2
+        return 1
+    fi
+    if [ "$observed_signal" -ne 0 ]; then
+        return "$observed_signal"
+    fi
+    return 0
+}
 
 stop_managed() {
     local pid=$1
-    if kill -0 "$pid" 2>/dev/null; then
-        kill "$pid" 2>/dev/null || true
+    local terminate_failed=0
+    local reap_status=0
+    if ! is_managed_pid "$pid"; then
+        return 0
     fi
-    wait "$pid" 2>/dev/null || true
+    if process_is_alive "$pid"; then
+        if ! terminate_process "$pid" 2>/dev/null; then
+            echo "failed to terminate owned process: $pid" >&2
+            terminate_failed=1
+        fi
+    fi
+    if wait_and_unregister_managed_pid "$pid"; then
+        reap_status=0
+    else
+        reap_status=$?
+    fi
+    if [ "$terminate_failed" -ne 0 ]; then
+        return 1
+    fi
+    return "$reap_status"
+}
+
+cleanup_owned_children() {
+    local failed=0
+    local pid
+    local pending=("${managed_pids[@]}")
+    for pid in "${pending[@]}"; do
+        if ! stop_managed "$pid"; then
+            echo "failed to clean up owned process: $pid" >&2
+            failed=1
+        fi
+    done
+    if [ "${#managed_pids[@]}" -ne 0 ]; then
+        echo "owned process registry is not empty after cleanup" >&2
+        failed=1
+    fi
+    [ "$failed" -eq 0 ]
+}
+
+cleanup_temporary_directory() {
+    if [ -z "${temporary_directory:-}" ]; then
+        return 0
+    fi
+    if [ ! -e "$temporary_directory" ] && [ ! -L "$temporary_directory" ]; then
+        return 0
+    fi
+
+    local cleanup_target
+    if ! cleanup_target=$(CDPATH= cd -- "$temporary_directory" && pwd -P); then
+        echo "failed to resolve owned temporary directory: $temporary_directory" >&2
+        return 1
+    fi
+    case "$cleanup_target" in
+        "$system_temp_base"/rustgo-e2e.*) ;;
+        *)
+            echo "refusing unsafe cleanup target: $cleanup_target" >&2
+            return 1
+            ;;
+    esac
+    if ! remove_tree "$cleanup_target"; then
+        echo "failed to remove owned temporary directory: $cleanup_target" >&2
+        return 1
+    fi
+    if [ -e "$cleanup_target" ] || [ -L "$cleanup_target" ]; then
+        echo "owned temporary directory remains after removal: $cleanup_target" >&2
+        return 1
+    fi
+    return 0
+}
+
+select_cleanup_exit_status() {
+    local original_status=$1
+    local cleanup_failed=$2
+    if [ "$original_status" -eq 0 ] && [ "$cleanup_failed" -ne 0 ]; then
+        echo 1
+    else
+        echo "$original_status"
+    fi
 }
 
 cleanup() {
-    local status=$?
+    local original_status=$?
+    local cleanup_failed=0
+    local final_status
     trap - EXIT INT TERM
     set +e
-    local pid
-    for pid in "${managed_pids[@]}"; do
-        stop_managed "$pid"
-    done
 
-    if [ -n "${temporary_directory:-}" ] && [ -d "$temporary_directory" ]; then
-        local cleanup_target
-        cleanup_target=$(CDPATH= cd -- "$temporary_directory" && pwd -P)
-        case "$cleanup_target" in
-            "$system_temp_base"/rustgo-e2e.*) rm -rf -- "$cleanup_target" ;;
-            *)
-                echo "refusing unsafe cleanup target: $cleanup_target" >&2
-                status=1
-                ;;
-        esac
+    cleanup_owned_children || cleanup_failed=1
+    cleanup_temporary_directory || cleanup_failed=1
+    if [ "$cleanup_failed" -ne 0 ]; then
+        if [ "$original_status" -eq 0 ]; then
+            echo "cleanup failed; changing successful exit status to 1" >&2
+        else
+            echo "cleanup also failed; preserving original exit status $original_status" >&2
+        fi
     fi
-    exit "$status"
+    final_status=$(select_cleanup_exit_status "$original_status" "$cleanup_failed")
+    exit "$final_status"
 }
-trap cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
 
 start_managed() {
     local name=$1
@@ -68,7 +227,7 @@ start_managed() {
         exec "$binary" "$@"
     ) >"$started_stdout" 2>"$started_stderr" &
     started_pid=$!
-    managed_pids+=("$started_pid")
+    register_managed_pid "$started_pid"
 }
 
 combined_output() {
@@ -89,7 +248,7 @@ wait_for_output() {
             { [ -f "$stderr_file" ] && grep -Fq -- "$pattern" "$stderr_file"; }; then
             return 0
         fi
-        if ! kill -0 "$pid" 2>/dev/null; then
+        if ! process_is_alive "$pid"; then
             echo "managed process $pid exited before readiness marker: $pattern" >&2
             combined_output "$stdout_file" "$stderr_file" >&2
             return 1
@@ -100,6 +259,119 @@ wait_for_output() {
     combined_output "$stdout_file" "$stderr_file" >&2
     return 1
 }
+
+run_cleanup_self_test() (
+    set -euo pipefail
+
+    # Simulate a child being reaped and its numeric PID immediately being
+    # reused by an unrelated process. The second cleanup pass must not call the
+    # termination wrapper for that number.
+    managed_pids=()
+    local terminate_calls=0
+    local wait_calls=0
+    process_is_alive() {
+        return 0
+    }
+    terminate_process() {
+        terminate_calls=$((terminate_calls + 1))
+        return 0
+    }
+    wait_for_process() {
+        wait_calls=$((wait_calls + 1))
+        return 0
+    }
+    register_managed_pid 4242
+    stop_managed 4242
+    [ "$terminate_calls" -eq 1 ]
+    [ "$wait_calls" -eq 1 ]
+    [ "${#managed_pids[@]}" -eq 0 ]
+    cleanup_owned_children
+    [ "$terminate_calls" -eq 1 ]
+    [ "$wait_calls" -eq 1 ]
+
+    # Simulate rm failure against a real, correctly scoped mktemp directory.
+    # The helper must fail, retain the directory, and emit a clear diagnostic.
+    local test_directory cleanup_error cleanup_status preserved_error preserved_status
+    test_directory=$(mktemp -d "$system_temp_base/rustgo-e2e.XXXXXXXX")
+    trap 'command rm -rf -- "$test_directory"' EXIT
+    temporary_directory=$test_directory
+    cleanup_error="$test_directory/cleanup.stderr"
+    remove_tree() {
+        return 1
+    }
+    if cleanup_temporary_directory 2>"$cleanup_error"; then
+        echo "cleanup_temporary_directory accepted a simulated remove failure" >&2
+        return 1
+    fi
+    grep -Fq "failed to remove owned temporary directory" "$cleanup_error"
+    [ -d "$test_directory" ]
+    [ "$(select_cleanup_exit_status 0 1)" -eq 1 ]
+    [ "$(select_cleanup_exit_status 23 1)" -eq 23 ]
+
+    # Exercise the actual EXIT cleanup path as well as its helpers. A cleanup
+    # failure must turn success into failure without hiding a prior failure.
+    cleanup_error="$test_directory/cleanup-success.stderr"
+    if (trap cleanup EXIT; exit 0) 2>"$cleanup_error"; then
+        echo "cleanup trap accepted a simulated remove failure" >&2
+        return 1
+    else
+        cleanup_status=$?
+    fi
+    [ "$cleanup_status" -eq 1 ]
+    grep -Fq "cleanup failed; changing successful exit status to 1" "$cleanup_error"
+    [ -d "$test_directory" ]
+
+    preserved_error="$test_directory/cleanup-failure.stderr"
+    if (trap cleanup EXIT; exit 23) 2>"$preserved_error"; then
+        echo "cleanup trap hid an original failure" >&2
+        return 1
+    else
+        preserved_status=$?
+    fi
+    [ "$preserved_status" -eq 23 ]
+    grep -Fq "cleanup also failed; preserving original exit status 23" "$preserved_error"
+    [ -d "$test_directory" ]
+    command rm -rf -- "$test_directory"
+    trap - EXIT
+)
+
+startup_gate_only=false
+cleanup_self_test=false
+case "${1:-}" in
+    --startup-gate-only)
+        startup_gate_only=true
+        shift
+        ;;
+    --self-test)
+        cleanup_self_test=true
+        shift
+        ;;
+    "")
+        ;;
+    *)
+        echo "usage: scripts/e2e.sh [--startup-gate-only | --self-test]" >&2
+        exit 2
+        ;;
+esac
+if [ "$#" -ne 0 ]; then
+    echo "usage: scripts/e2e.sh [--startup-gate-only | --self-test]" >&2
+    exit 2
+fi
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+workspace=$(CDPATH= cd -- "$script_dir/.." && pwd -P)
+system_temp_base=$(CDPATH= cd -- "${TMPDIR:-/tmp}" && pwd -P)
+
+if [ "$cleanup_self_test" = true ]; then
+    run_cleanup_self_test
+    echo "e2e bash cleanup self-test passed"
+    exit 0
+fi
+
+temporary_directory=$(mktemp -d "$system_temp_base/rustgo-e2e.XXXXXXXX")
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 export TMPDIR="$temporary_directory"
 export RUST_LOG=info
