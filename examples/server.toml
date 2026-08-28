@@ -1,5 +1,8 @@
 [server]
 bind_addr = "0.0.0.0:7000"
+# Optional P2P NAT observation service. Configure both fields together.
+p2p_observation_bind = "0.0.0.0:7443"
+p2p_observation_alternate_bind = "0.0.0.0:7444"
 # Required for UDP tunnels when bind_addr uses 0.0.0.0 or ::. Set this to a
 # specific address assigned to the server interface that receives public UDP.
 udp_bind_ip = "${RUSTGO_SERVER_UDP_BIND_IP}"

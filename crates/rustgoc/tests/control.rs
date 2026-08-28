@@ -206,6 +206,8 @@ fn real_server_config(
         server: ServerSection {
             bind_addr: "127.0.0.1:0".to_owned(),
             udp_bind_ip: None,
+            p2p_observation_bind: None,
+            p2p_observation_alternate_bind: None,
             certificate_file: pki.certificate_file.clone(),
             private_key_file: pki.private_key_file.clone(),
             heartbeat_timeout_secs,

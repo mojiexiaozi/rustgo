@@ -25,6 +25,27 @@ impl ValidationError {
 
 pub(crate) fn validate_server(config: &ServerConfig) -> Result<(), ValidationError> {
     validate_bind_address(&config.server.bind_addr)?;
+    match (
+        config.server.p2p_observation_bind.as_deref(),
+        config.server.p2p_observation_alternate_bind.as_deref(),
+    ) {
+        (None, None) => {}
+        (Some(primary), Some(alternate)) => {
+            let primary = validate_server_socket_address("server.p2p_observation_bind", primary)?;
+            let alternate =
+                validate_server_socket_address("server.p2p_observation_alternate_bind", alternate)?;
+            if primary.port() == alternate.port() {
+                return Err(ValidationError::new(
+                    "server observation bind addresses must use distinct ports",
+                ));
+            }
+        }
+        _ => {
+            return Err(ValidationError::new(
+                "server.p2p_observation_bind and server.p2p_observation_alternate_bind must be configured together",
+            ));
+        }
+    }
     if config.server.udp_bind_ip.is_some_and(|ip| {
         ip.is_unspecified()
             || ip.is_multicast()
@@ -238,6 +259,18 @@ fn validate_bind_address(value: &str) -> Result<(), ValidationError> {
         ));
     }
     Ok(())
+}
+
+fn validate_server_socket_address(field: &str, value: &str) -> Result<SocketAddr, ValidationError> {
+    let address = value
+        .parse::<SocketAddr>()
+        .map_err(|_| ValidationError::new(format!("{field} must be an IP address with a port")))?;
+    if address.port() == 0 {
+        return Err(ValidationError::new(format!(
+            "{field} must use a port between 1 and 65535"
+        )));
+    }
+    Ok(address)
 }
 
 fn validate_host_address(field: &str, value: &str) -> Result<(), ValidationError> {

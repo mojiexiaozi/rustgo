@@ -17,6 +17,179 @@ pub const MAX_EPHEMERAL_PUBLIC_KEY_BYTES: usize = 64;
 pub const MAX_SIGNATURE_BYTES: usize = 128;
 pub const MAX_ERROR_DETAIL_BYTES: usize = 512;
 pub const MAX_PEER_RELAY_CIPHERTEXT_BYTES: usize = 65_536;
+pub const OBSERVATION_TOKEN_BYTES: usize = 32;
+pub const OBSERVATION_NONCE_BYTES: usize = 16;
+
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ObservationToken([u8; OBSERVATION_TOKEN_BYTES]);
+
+impl ObservationToken {
+    pub const fn as_bytes(&self) -> &[u8; OBSERVATION_TOKEN_BYTES] {
+        &self.0
+    }
+}
+
+impl From<[u8; OBSERVATION_TOKEN_BYTES]> for ObservationToken {
+    fn from(value: [u8; OBSERVATION_TOKEN_BYTES]) -> Self {
+        Self(value)
+    }
+}
+
+impl std::fmt::Debug for ObservationToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ObservationToken([REDACTED])")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ObservationNonce([u8; OBSERVATION_NONCE_BYTES]);
+
+impl From<[u8; OBSERVATION_NONCE_BYTES]> for ObservationNonce {
+    fn from(value: [u8; OBSERVATION_NONCE_BYTES]) -> Self {
+        Self(value)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ObservationEndpoint {
+    Primary,
+    Alternate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservationGrant {
+    primary_token: ObservationToken,
+    alternate_token: ObservationToken,
+    expires_unix_secs: u64,
+}
+
+impl ObservationGrant {
+    pub const fn new(
+        primary_token: ObservationToken,
+        alternate_token: ObservationToken,
+        expires_unix_secs: u64,
+    ) -> Self {
+        Self {
+            primary_token,
+            alternate_token,
+            expires_unix_secs,
+        }
+    }
+
+    pub const fn primary_token(&self) -> &ObservationToken {
+        &self.primary_token
+    }
+
+    pub const fn alternate_token(&self) -> &ObservationToken {
+        &self.alternate_token
+    }
+
+    pub const fn expires_unix_secs(&self) -> u64 {
+        self.expires_unix_secs
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservationProbe {
+    token: ObservationToken,
+    nonce: ObservationNonce,
+}
+
+impl ObservationProbe {
+    pub const MAX_WIRE_BYTES: usize = OBSERVATION_TOKEN_BYTES + OBSERVATION_NONCE_BYTES;
+
+    pub const fn new(token: ObservationToken, nonce: ObservationNonce) -> Self {
+        Self { token, nonce }
+    }
+
+    pub const fn token(&self) -> &ObservationToken {
+        &self.token
+    }
+
+    pub const fn nonce(&self) -> ObservationNonce {
+        self.nonce
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, ObservationWireError> {
+        encode_bounded(self, Self::MAX_WIRE_BYTES)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, ObservationWireError> {
+        decode_bounded(bytes, Self::MAX_WIRE_BYTES)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservationReply {
+    nonce: ObservationNonce,
+    observed_source: SocketAddress,
+    endpoint: ObservationEndpoint,
+}
+
+impl ObservationReply {
+    pub const MAX_WIRE_BYTES: usize = OBSERVATION_NONCE_BYTES + 1 + 16 + 2 + 1;
+
+    pub const fn new(
+        nonce: ObservationNonce,
+        observed_source: SocketAddress,
+        endpoint: ObservationEndpoint,
+    ) -> Self {
+        Self {
+            nonce,
+            observed_source,
+            endpoint,
+        }
+    }
+
+    pub const fn nonce(&self) -> ObservationNonce {
+        self.nonce
+    }
+
+    pub const fn observed_source(&self) -> &SocketAddress {
+        &self.observed_source
+    }
+
+    pub const fn endpoint(&self) -> ObservationEndpoint {
+        self.endpoint
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, ObservationWireError> {
+        encode_bounded(self, Self::MAX_WIRE_BYTES)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, ObservationWireError> {
+        decode_bounded(bytes, Self::MAX_WIRE_BYTES)
+    }
+}
+
+fn encode_bounded<T: Serialize>(
+    value: &T,
+    maximum: usize,
+) -> Result<Vec<u8>, ObservationWireError> {
+    let encoded = postcard::to_allocvec(value).map_err(ObservationWireError::Codec)?;
+    if encoded.len() > maximum {
+        return Err(ObservationWireError::TooLarge);
+    }
+    Ok(encoded)
+}
+
+fn decode_bounded<'de, T: Deserialize<'de>>(
+    bytes: &'de [u8],
+    maximum: usize,
+) -> Result<T, ObservationWireError> {
+    if bytes.len() > maximum {
+        return Err(ObservationWireError::TooLarge);
+    }
+    postcard::from_bytes(bytes).map_err(ObservationWireError::Codec)
+}
+
+#[derive(Debug, Error)]
+pub enum ObservationWireError {
+    #[error("observation packet exceeds its fixed wire bound")]
+    TooLarge,
+    #[error("invalid observation packet: {0}")]
+    Codec(postcard::Error),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SessionId([u8; 32]);

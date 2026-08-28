@@ -138,6 +138,59 @@ fn server_accepts_only_a_unicast_udp_bind_ip() {
 }
 
 #[test]
+fn server_observation_binds_are_optional_but_must_be_configured_as_a_pair() {
+    let dir = TempDir::new();
+    let relay_only = load_server_text(&dir, &valid_server()).unwrap();
+    assert_eq!(relay_only.server.p2p_observation_bind, None);
+    assert_eq!(relay_only.server.p2p_observation_alternate_bind, None);
+
+    let paired = valid_server().replace(
+        "bind_addr = \"0.0.0.0:7000\"",
+        "bind_addr = \"0.0.0.0:7000\"\np2p_observation_bind = \"0.0.0.0:7443\"\np2p_observation_alternate_bind = \"0.0.0.0:7444\"",
+    );
+    let loaded = load_server_text(&dir, &paired).unwrap();
+    assert_eq!(
+        loaded.server.p2p_observation_bind.as_deref(),
+        Some("0.0.0.0:7443")
+    );
+    assert_eq!(
+        loaded.server.p2p_observation_alternate_bind.as_deref(),
+        Some("0.0.0.0:7444")
+    );
+
+    for lone_field in [
+        "p2p_observation_bind = \"0.0.0.0:7443\"",
+        "p2p_observation_alternate_bind = \"0.0.0.0:7444\"",
+    ] {
+        let invalid = valid_server().replace(
+            "bind_addr = \"0.0.0.0:7000\"",
+            &format!("bind_addr = \"0.0.0.0:7000\"\n{lone_field}"),
+        );
+        let error = load_server_text(&dir, &invalid).unwrap_err();
+        assert!(error.to_string().contains("configured together"), "{error}");
+    }
+}
+
+#[test]
+fn server_observation_binds_require_distinct_nonzero_socket_addresses() {
+    let dir = TempDir::new();
+    for (primary, alternate) in [
+        ("127.0.0.1:0", "127.0.0.1:7444"),
+        ("127.0.0.1:7443", "not-an-address"),
+        ("127.0.0.1:7443", "127.0.0.1:7443"),
+        ("127.0.0.1:7443", "127.0.0.2:7443"),
+    ] {
+        let invalid = valid_server().replace(
+            "bind_addr = \"0.0.0.0:7000\"",
+            &format!(
+                "bind_addr = \"0.0.0.0:7000\"\np2p_observation_bind = \"{primary}\"\np2p_observation_alternate_bind = \"{alternate}\""
+            ),
+        );
+        assert!(load_server_text(&dir, &invalid).is_err());
+    }
+}
+
+#[test]
 fn client_rejects_unknown_fields() {
     let dir = TempDir::new();
     let config = valid_client().replace(

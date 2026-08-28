@@ -170,6 +170,17 @@ impl ClientRegistry {
             .is_ok_and(|state| state.active.contains_key(fingerprint))
     }
 
+    pub(crate) fn is_active_session(&self, identity: &AuthenticatedClient) -> bool {
+        self.inner.lock().is_ok_and(|state| {
+            state
+                .active
+                .get(identity.fingerprint())
+                .is_some_and(|active| {
+                    active.name == identity.name() && active.session_id == identity.session_id()
+                })
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn claim(
         &self,

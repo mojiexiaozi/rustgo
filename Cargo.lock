@@ -1352,6 +1352,7 @@ dependencies = [
  "rustgo-crypto",
  "rustgo-e2e",
  "rustgo-protocol",
+ "rustgo-rendezvous",
  "rustgo-transport",
  "tempfile",
  "thiserror",

@@ -10,6 +10,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     auth::{Authenticator, FailedAuthLimiter, TlsHandshakeLimiter},
     control,
+    observation::{ObservationRuntimeLimits, ObservationService, ObservationTokenIssuer},
     registry::{ClientRegistry, RegistryError},
     udp::UdpRuntimeLimits,
 };
@@ -138,6 +139,8 @@ pub struct ServerApp {
     runtime_limits: ServerRuntimeLimits,
     heartbeat_timeout: Duration,
     protocol_version: ProtocolVersion,
+    observation: Option<ObservationService>,
+    observation_token_issuer: Option<ObservationTokenIssuer>,
 }
 
 impl ServerApp {
@@ -226,6 +229,32 @@ impl ServerApp {
                 test_disconnect_after_replies: runtime_limits.udp_test_disconnect_after_replies,
             },
         )?;
+        let observation = match (
+            config.server.p2p_observation_bind.as_deref(),
+            config.server.p2p_observation_alternate_bind.as_deref(),
+        ) {
+            (None, None) => None,
+            (Some(primary), Some(alternate)) => {
+                let primary = primary
+                    .parse::<SocketAddr>()
+                    .map_err(|_| ServerError::InvalidObservationConfiguration)?;
+                let alternate = alternate
+                    .parse::<SocketAddr>()
+                    .map_err(|_| ServerError::InvalidObservationConfiguration)?;
+                Some(
+                    ObservationService::bind(
+                        primary,
+                        alternate,
+                        ObservationRuntimeLimits::default(),
+                    )
+                    .await?,
+                )
+            }
+            _ => return Err(ServerError::InvalidObservationConfiguration),
+        };
+        let observation_token_issuer = observation
+            .as_ref()
+            .map(|service| service.token_issuer(registry.clone()));
         let limiter = FailedAuthLimiter::new_with_attempt_budget(
             runtime_limits.max_failed_auth_attempts_per_peer,
             runtime_limits.failed_auth_window,
@@ -248,6 +277,8 @@ impl ServerApp {
             heartbeat_timeout,
             runtime_limits,
             protocol_version,
+            observation,
+            observation_token_issuer,
         })
     }
 
@@ -259,16 +290,41 @@ impl ServerApp {
         self.registry.clone()
     }
 
+    pub fn observation_local_addrs(&self) -> io::Result<Option<(SocketAddr, SocketAddr)>> {
+        self.observation
+            .as_ref()
+            .map(ObservationService::local_addrs)
+            .transpose()
+    }
+
+    pub fn observation_token_issuer(&self) -> Option<ObservationTokenIssuer> {
+        self.observation_token_issuer.clone()
+    }
+
     pub async fn run(self) -> Result<(), ServerError> {
         self.run_until(CancellationToken::new()).await
     }
 
     pub async fn run_until(self, shutdown: CancellationToken) -> Result<(), ServerError> {
         let session_shutdown = CancellationToken::new();
+        let mut observation = self
+            .observation
+            .map(|service| Box::pin(service.run(session_shutdown.child_token())));
         let mut sessions = JoinSet::new();
         let result = loop {
             tokio::select! {
                 () = shutdown.cancelled() => break Ok(()),
+                observation_result = async {
+                    match observation.as_mut() {
+                        Some(service) => Some(service.await),
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    observation = None;
+                    break observation_result
+                        .expect("the absent observation future cannot complete")
+                        .map_err(ServerError::from);
+                }
                 accepted = self.tls_server.accept_tcp() => {
                     let (socket, peer) = match accepted {
                         Ok(accepted) => accepted,
@@ -315,6 +371,9 @@ impl ServerApp {
             while sessions.try_join_next().is_some() {}
         };
         session_shutdown.cancel();
+        if let Some(observation) = observation {
+            observation.await?;
+        }
         while sessions.join_next().await.is_some() {}
         result
     }
@@ -407,6 +466,8 @@ pub enum ServerError {
     Registry(#[from] RegistryError),
     #[error("invalid server runtime limits")]
     InvalidRuntimeLimits,
+    #[error("invalid paired observation bind configuration")]
+    InvalidObservationConfiguration,
 }
 
 #[cfg(test)]

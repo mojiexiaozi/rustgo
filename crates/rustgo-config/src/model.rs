@@ -19,6 +19,10 @@ pub struct ServerSection {
     pub bind_addr: String,
     #[serde(default)]
     pub udp_bind_ip: Option<IpAddr>,
+    #[serde(default)]
+    pub p2p_observation_bind: Option<String>,
+    #[serde(default)]
+    pub p2p_observation_alternate_bind: Option<String>,
     pub certificate_file: PathBuf,
     pub private_key_file: PathBuf,
     pub heartbeat_timeout_secs: u64,
