@@ -36,6 +36,7 @@ use crate::{
 
 const MAX_SESSION_ID_ATTEMPTS: usize = 16;
 const DATA_ACKNOWLEDGEMENT_TIMEOUT: Duration = Duration::from_secs(10);
+const UDP_TUNNEL_RESTART_DELAY: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct UdpRuntimeLimits {
@@ -169,7 +170,7 @@ impl Drop for UdpListenerTask {
 #[allow(clippy::too_many_arguments)]
 async fn run_listener(
     listener: UdpSocket,
-    pending: PendingUdpOpen,
+    mut pending: PendingUdpOpen,
     tunnel_id: u32,
     tunnel_name: String,
     runtime: Arc<SessionRuntime>,
@@ -178,34 +179,68 @@ async fn run_listener(
     limits: UdpRuntimeLimits,
 ) {
     let cancellation = runtime.cancellation();
-    let result = run_listener_inner(
-        listener,
-        pending,
-        tunnel_id,
-        &tunnel_name,
-        runtime.clone(),
-        max_sessions,
-        max_payload,
-        limits,
-        cancellation.clone(),
-    )
-    .await;
-    if let Err(error) = result {
+    loop {
+        let result = run_listener_inner(
+            &listener,
+            pending,
+            tunnel_id,
+            &tunnel_name,
+            runtime.clone(),
+            max_sessions,
+            max_payload,
+            limits,
+            cancellation.clone(),
+        )
+        .await;
+        if cancellation.is_cancelled() || result.is_ok() {
+            return;
+        }
+        let error = result.expect_err("an unsuccessful UDP relay has an error");
+        if matches!(error, UdpRelayError::ControlChannelClosed) {
+            tracing::warn!(
+                tunnel = %safe_display(&tunnel_name),
+                tunnel_id,
+                error = %safe_display(&error),
+                "event=udp_tunnel_stopped UDP tunnel control channel closed"
+            );
+            return;
+        }
+
         tracing::warn!(
             tunnel = %safe_display(&tunnel_name),
             tunnel_id,
             error = %safe_display(&error),
-            "event=udp_generation_fatal UDP listener ended its control generation"
+            "event=udp_tunnel_restarting UDP tunnel data path failed; retrying within the control generation"
         );
-        if !cancellation.is_cancelled() {
-            runtime.fail_generation();
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return,
+            () = tokio::time::sleep(UDP_TUNNEL_RESTART_DELAY) => {}
         }
+        pending = loop {
+            match runtime.prepare_udp(tunnel_id) {
+                Ok(pending) => break pending,
+                Err(error) => {
+                    tracing::warn!(
+                        tunnel = %safe_display(&tunnel_name),
+                        tunnel_id,
+                        error = %safe_display(&error),
+                        "event=udp_tunnel_reissue_failed UDP tunnel data-channel reissue failed"
+                    );
+                    tokio::select! {
+                        biased;
+                        () = cancellation.cancelled() => return,
+                        () = tokio::time::sleep(UDP_TUNNEL_RESTART_DELAY) => {}
+                    }
+                }
+            }
+        };
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn run_listener_inner(
-    listener: UdpSocket,
+    listener: &UdpSocket,
     pending: PendingUdpOpen,
     tunnel_id: u32,
     tunnel_name: &str,
@@ -216,13 +251,20 @@ async fn run_listener_inner(
     cancellation: CancellationToken,
 ) -> Result<(), UdpRelayError> {
     let channel_id = pending.channel_id;
-    let request = Message::OpenUdpChannel(limits.open_channel(
+    let open_channel = match limits.open_channel(
         tunnel_id,
         channel_id,
         pending.binding_token,
         max_sessions,
         max_payload,
-    )?);
+    ) {
+        Ok(request) => request,
+        Err(error) => {
+            runtime.cancel_pending_udp(channel_id);
+            return Err(error);
+        }
+    };
+    let request = Message::OpenUdpChannel(open_channel);
     let control_outbound = runtime.outbound();
     let sent = tokio::select! {
         biased;
@@ -235,12 +277,21 @@ async fn run_listener_inner(
     }
     let data_channel = tokio::select! {
         biased;
-        () = cancellation.cancelled() => return Ok(()),
+        () = cancellation.cancelled() => {
+            runtime.cancel_pending_udp(channel_id);
+            return Ok(());
+        },
         result = tokio::time::timeout(runtime.binding_ttl(), pending.data_channel) => {
             match result {
                 Ok(Ok(data_channel)) => data_channel,
-                Ok(Err(_)) => return Err(UdpRelayError::DataChannelClosed),
-                Err(_) => return Err(UdpRelayError::DataChannelSetupTimeout),
+                Ok(Err(_)) => {
+                    runtime.cancel_pending_udp(channel_id);
+                    return Err(UdpRelayError::DataChannelClosed);
+                }
+                Err(_) => {
+                    runtime.cancel_pending_udp(channel_id);
+                    return Err(UdpRelayError::DataChannelSetupTimeout);
+                }
             }
         }
     };
@@ -509,7 +560,7 @@ fn try_enqueue(
 
 #[allow(clippy::too_many_arguments)]
 async fn relay_datagrams(
-    public: UdpSocket,
+    public: &UdpSocket,
     data: TlsStream<TcpStream>,
     tunnel_id: u32,
     tunnel_name: &str,

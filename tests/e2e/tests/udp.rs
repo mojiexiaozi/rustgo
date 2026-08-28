@@ -1,6 +1,7 @@
 use std::{
-    io,
-    net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
+    fs,
+    io::{self, Read, Write},
+    net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -9,7 +10,9 @@ use std::{
     time::Duration,
 };
 
-use rustgo_e2e::{ManagedChild, ProcessFixture, TestResult, UdpEchoServer, UdpTunnelSpec};
+use rustgo_e2e::{
+    EchoServer, ManagedChild, ProcessFixture, TestResult, UdpEchoServer, UdpTunnelSpec,
+};
 
 const READY_TIMEOUT: Duration = Duration::from_secs(8);
 const DATAGRAM_TIMEOUT: Duration = Duration::from_secs(5);
@@ -53,6 +56,57 @@ fn expect_no_datagram(socket: &UdpSocket) -> TestResult {
         }
         Err(error) => Err(error.into()),
     }
+}
+
+fn append_tcp_sentinel(
+    fixture: &ProcessFixture,
+    local_address: SocketAddr,
+    existing_tunnel_count: usize,
+) -> TestResult<(TcpListener, SocketAddr)> {
+    let reservation = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))?;
+    let public_address = reservation.local_addr()?;
+    let server_path = fixture.server_config_path();
+    let original_limit = format!("max_tunnels_per_client = {existing_tunnel_count}");
+    let updated_limit = format!("max_tunnels_per_client = {}", existing_tunnel_count + 1);
+    let server_toml = fs::read_to_string(server_path)?;
+    if !server_toml.contains(&original_limit) {
+        return Err("server fixture tunnel limit was not found".into());
+    }
+    fs::write(
+        server_path,
+        server_toml.replacen(&original_limit, &updated_limit, 1),
+    )?;
+    let mut client_toml = fs::read_to_string(fixture.client_config_path())?;
+    client_toml.push_str(&format!(
+        "\n[[tunnels]]\nname = \"tcp-sentinel\"\nprotocol = \"tcp\"\nlocal_addr = \"{local_address}\"\nremote_port = {}\n",
+        public_address.port()
+    ));
+    fs::write(fixture.client_config_path(), client_toml)?;
+    Ok((reservation, public_address))
+}
+
+fn connect_tcp_sentinel(address: SocketAddr) -> TestResult<TcpStream> {
+    let stream = TcpStream::connect_timeout(&address, Duration::from_secs(2))?;
+    stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(3)))?;
+    Ok(stream)
+}
+
+fn assert_tcp_sentinel_echo(stream: &mut TcpStream, payload: &[u8]) -> TestResult {
+    stream.write_all(payload)?;
+    let mut echoed = vec![0_u8; payload.len()];
+    stream.read_exact(&mut echoed)?;
+    if echoed != payload {
+        return Err("TCP sentinel payload changed in transit".into());
+    }
+    Ok(())
+}
+
+fn lines_with_all(output: &str, required: &[&str]) -> usize {
+    output
+        .lines()
+        .filter(|line| required.iter().all(|needle| line.contains(needle)))
+        .count()
 }
 
 struct ReorderingUdpServer {
@@ -557,21 +611,36 @@ fn negotiated_limits_retire_idle_client_flow_before_capacity_reuse() -> TestResu
 }
 
 #[test]
-fn retirement_queue_full_tears_down_generation_before_a_delayed_old_reply_can_renew_it()
--> TestResult {
+fn retirement_queue_pressure_recovers_only_its_udp_tunnel() -> TestResult {
     let service = DelayedMarkedReplyUdpServer::start(Duration::from_millis(900))?;
-    let fixture = ProcessFixture::single_udp(service.address(), 3, 64)?
-        .with_server_env("RUSTGO_INTERNAL_TESTING", "1")
-        .with_server_env("RUSTGO_TEST_UDP_QUEUE_CAPACITY", "1")
-        .with_server_env("RUSTGO_TEST_UDP_IDLE_TIMEOUT_MS", "800")
-        .with_server_env("RUSTGO_TEST_UDP_SWEEP_INTERVAL_MS", "20")
-        .with_server_env("RUSTGO_TEST_UDP_WRITE_DELAY_MS", "500");
+    let sibling_service = UdpEchoServer::start()?;
+    let tcp_service = EchoServer::start()?;
+    let fixture = ProcessFixture::udp_tunnels(
+        vec![
+            UdpTunnelSpec::available("unstable", service.address()),
+            UdpTunnelSpec::available("sibling", sibling_service.address()),
+        ],
+        3,
+        64,
+    )?
+    .with_server_env("RUSTGO_INTERNAL_TESTING", "1")
+    .with_server_env("RUSTGO_TEST_UDP_QUEUE_CAPACITY", "1")
+    .with_server_env("RUSTGO_TEST_UDP_IDLE_TIMEOUT_MS", "800")
+    .with_server_env("RUSTGO_TEST_UDP_SWEEP_INTERVAL_MS", "20")
+    .with_server_env("RUSTGO_TEST_UDP_WRITE_DELAY_MS", "500");
+    let (tcp_reservation, tcp_public) = append_tcp_sentinel(&fixture, tcp_service.address(), 2)?;
+    drop(tcp_reservation);
     let (fixture, mut server, mut client) = launch(fixture)?;
     client.wait_for_line("event=udp_channel_ready", READY_TIMEOUT)?;
-    let public = fixture.public_address();
+    client.wait_for_line("event=udp_channel_ready", READY_TIMEOUT)?;
+    let public = fixture.public_address_at(0);
+    let sibling_public = fixture.public_address_at(1);
     let delayed = public_socket()?;
     let blocker = public_socket()?;
     let queued = public_socket()?;
+    let sibling = public_socket()?;
+    let mut tcp = connect_tcp_sentinel(tcp_public)?;
+    assert_tcp_sentinel_echo(&mut tcp, b"tcp before retirement pressure")?;
 
     delayed.send_to(b"\xD1late", public)?;
     service.wait_for_received(1, Duration::from_secs(2))?;
@@ -588,10 +657,28 @@ fn retirement_queue_full_tears_down_generation_before_a_delayed_old_reply_can_re
     assert!(cleanup.contains("sessions=0"), "{cleanup}");
     assert!(cleanup.contains("queue=0"), "{cleanup}");
     assert!(cleanup.contains("local_queue=0"), "{cleanup}");
-    client.wait_for_line("event=registration_ready", Duration::from_secs(12))?;
-    client.wait_for_line("event=udp_channel_ready", READY_TIMEOUT)?;
+    let recovered = client.wait_for_line("event=udp_channel_ready", READY_TIMEOUT)?;
+    assert!(recovered.contains("tunnel_id=1"), "{recovered}");
+    assert!(recovered.contains("generation=1"), "{recovered}");
+    assert_eq!(
+        client.output().matches("event=registration_ready").count(),
+        1,
+        "UDP tunnel recovery must not reconnect control:\n{}",
+        client.output()
+    );
+    assert_eq!(
+        lines_with_all(
+            &client.output(),
+            &["event=udp_channel_ready", "tunnel_id=2"]
+        ),
+        1,
+        "sibling UDP channel must not restart:\n{}",
+        client.output()
+    );
+    assert_tcp_sentinel_echo(&mut tcp, b"same tcp after retirement pressure")?;
+    assert_datagram_echo(&sibling, sibling_public, b"sibling remains healthy")?;
     service.wait_for_delayed_reply(Duration::from_secs(2))?;
-    if let Err(error) = assert_datagram_echo(&delayed, public, b"generation two remains healthy") {
+    if let Err(error) = assert_datagram_echo(&delayed, public, b"failed tunnel recovered") {
         return Err(format!(
             "restored UDP mapping did not echo: {error}\nclient output:\n{}\nserver output:\n{}",
             client.output(),
@@ -797,22 +884,57 @@ fn server_restart_cleans_stale_generation_and_restores_mapping() -> TestResult {
 }
 
 #[test]
-fn udp_data_channel_failure_reconnects_generation_and_restores_mapping() -> TestResult {
-    let echo = UdpEchoServer::start()?;
-    let fixture = ProcessFixture::single_udp(echo.address(), 8, 1024)?
-        .with_server_env("RUSTGO_INTERNAL_TESTING", "1")
-        .with_server_env("RUSTGO_TEST_UDP_DISCONNECT_AFTER_REPLIES", "1");
+fn udp_data_channel_failure_recovers_only_its_tunnel() -> TestResult {
+    let failing_echo = UdpEchoServer::start()?;
+    let sibling_echo = UdpEchoServer::start()?;
+    let tcp_echo = EchoServer::start()?;
+    let fixture = ProcessFixture::udp_tunnels(
+        vec![
+            UdpTunnelSpec::available("unstable", failing_echo.address()),
+            UdpTunnelSpec::available("sibling", sibling_echo.address()),
+        ],
+        8,
+        1024,
+    )?
+    .with_server_env("RUSTGO_INTERNAL_TESTING", "1")
+    .with_server_env("RUSTGO_TEST_UDP_DISCONNECT_AFTER_REPLIES", "1");
+    let (tcp_reservation, tcp_public) = append_tcp_sentinel(&fixture, tcp_echo.address(), 2)?;
+    drop(tcp_reservation);
     let (fixture, mut server, mut client) = launch(fixture)?;
-    let public = fixture.public_address();
+    client.wait_for_line("event=udp_channel_ready", READY_TIMEOUT)?;
+    client.wait_for_line("event=udp_channel_ready", READY_TIMEOUT)?;
+    let public = fixture.public_address_at(0);
+    let sibling_public = fixture.public_address_at(1);
     let socket = public_socket()?;
+    let sibling = public_socket()?;
+    let mut tcp = connect_tcp_sentinel(tcp_public)?;
+    assert_tcp_sentinel_echo(&mut tcp, b"tcp before UDP data failure")?;
 
-    assert_datagram_echo(&socket, public, b"generation one")?;
+    assert_datagram_echo(&socket, public, b"first UDP channel")?;
     server.wait_for_line("event=udp_test_data_disconnect", Duration::from_secs(3))?;
     let cleanup = client.wait_for_line("event=udp_cleanup", Duration::from_secs(5))?;
     assert!(cleanup.contains("generation=1"), "{cleanup}");
-    client.wait_for_line("event=registration_ready", Duration::from_secs(12))?;
-    client.wait_for_line("event=udp_channel_ready", READY_TIMEOUT)?;
-    assert_datagram_echo(&socket, public, b"generation two")?;
+    let recovered = client.wait_for_line("event=udp_channel_ready", READY_TIMEOUT)?;
+    assert!(recovered.contains("tunnel_id=1"), "{recovered}");
+    assert!(recovered.contains("generation=1"), "{recovered}");
+    assert_eq!(
+        client.output().matches("event=registration_ready").count(),
+        1,
+        "UDP tunnel recovery must not reconnect control:\n{}",
+        client.output()
+    );
+    assert_eq!(
+        lines_with_all(
+            &client.output(),
+            &["event=udp_channel_ready", "tunnel_id=2"]
+        ),
+        1,
+        "sibling UDP channel must remain on its first data channel:\n{}",
+        client.output()
+    );
+    assert_tcp_sentinel_echo(&mut tcp, b"same tcp after UDP data failure")?;
+    assert_datagram_echo(&sibling, sibling_public, b"sibling UDP remains healthy")?;
+    assert_datagram_echo(&socket, public, b"failed UDP tunnel recovered")?;
 
     client.terminate()?;
     server.terminate()?;

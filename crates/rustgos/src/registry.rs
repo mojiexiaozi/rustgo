@@ -345,10 +345,6 @@ impl SessionRuntime {
         self.outbound.clone()
     }
 
-    pub(crate) fn fail_generation(&self) {
-        self.cancel();
-    }
-
     pub(crate) fn prepare_tcp(&self, tunnel_id: u32) -> Result<PendingTcpOpen, RegistryError> {
         for _ in 0..MAX_CONNECTION_ID_ATTEMPTS {
             let connection_id = OsRng

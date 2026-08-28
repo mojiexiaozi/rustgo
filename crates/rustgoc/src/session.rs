@@ -36,7 +36,6 @@ pub struct ChildSessionContext {
     generation: SessionGeneration,
     session_id: Arc<[u8]>,
     control_outbound: mpsc::Sender<Message>,
-    generation_fatal: mpsc::Sender<()>,
 }
 
 impl ChildSessionContext {
@@ -55,31 +54,10 @@ impl ChildSessionContext {
             _ = self.control_outbound.send(message) => {}
         }
     }
-
-    pub(crate) fn fatal_on_exit(&self, shutdown: CancellationToken) -> GenerationFatalGuard {
-        GenerationFatalGuard {
-            generation_fatal: self.generation_fatal.clone(),
-            shutdown,
-        }
-    }
-}
-
-pub(crate) struct GenerationFatalGuard {
-    generation_fatal: mpsc::Sender<()>,
-    shutdown: CancellationToken,
 }
 
 struct ChildSignals<'a> {
     control: &'a mut mpsc::Receiver<Message>,
-    fatal: &'a mut mpsc::Receiver<()>,
-}
-
-impl Drop for GenerationFatalGuard {
-    fn drop(&mut self) {
-        if !self.shutdown.is_cancelled() {
-            let _ = self.generation_fatal.try_send(());
-        }
-    }
 }
 
 impl std::fmt::Debug for ChildSessionContext {
@@ -130,16 +108,13 @@ impl ControlSession {
         let child_shutdown = CancellationToken::new();
         let mut children = JoinSet::new();
         let (control_outbound, mut child_control) = mpsc::channel(CHILD_CONTROL_CAPACITY);
-        let (generation_fatal, mut generation_failures) = mpsc::channel(1);
         let child_context = ChildSessionContext {
             generation,
             session_id: Arc::from(self.session_id.clone()),
             control_outbound,
-            generation_fatal,
         };
         let mut child_signals = ChildSignals {
             control: &mut child_control,
-            fatal: &mut generation_failures,
         };
         let result = self
             .run_control_loop(
@@ -228,12 +203,6 @@ impl ControlSession {
                     if joined.is_some_and(|result| result.is_err()) {
                         return Err(ClientError::TaskJoin);
                     }
-                }
-                fatal = child_signals.fatal.recv() => {
-                    if fatal.is_some() {
-                        return Err(ClientError::DataSessionTerminated);
-                    }
-                    return Err(ClientError::InvalidState);
                 }
                 child_message = child_signals.control.recv() => {
                     let Some(message) = child_message else {
@@ -373,15 +342,11 @@ mod tests {
     impl ChildSessionSupervisor for TerminatingUdpSupervisor {
         fn run_child(
             &self,
-            context: ChildSessionContext,
-            request: ChildSessionRequest,
-            shutdown: CancellationToken,
+            _context: ChildSessionContext,
+            _request: ChildSessionRequest,
+            _shutdown: CancellationToken,
         ) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
-            Box::pin(async move {
-                if matches!(request, ChildSessionRequest::Udp(_)) {
-                    let _fatal_on_exit = context.fatal_on_exit(shutdown);
-                }
-            })
+            Box::pin(async {})
         }
     }
 
@@ -438,7 +403,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persistent_udp_child_exit_marks_the_generation_inactive() {
+    async fn udp_child_exit_keeps_the_control_generation_active() {
         let (client_stream, server_stream) = duplex(16 * 1024);
         let mut peer = FramedControl::new(server_stream);
         let session = ControlSession::new(
@@ -453,9 +418,10 @@ mod tests {
         );
         let inactive = Arc::new(AtomicBool::new(false));
         let inactive_callback = inactive.clone();
+        let shutdown = CancellationToken::new();
         let runtime = tokio::spawn(session.run_generation(
             SessionGeneration(1),
-            CancellationToken::new(),
+            shutdown.clone(),
             Arc::new(TerminatingUdpSupervisor),
             move || inactive_callback.store(true, Ordering::SeqCst),
         ));
@@ -475,11 +441,16 @@ mod tests {
         .await
         .unwrap();
 
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!runtime.is_finished());
+        assert!(!inactive.load(Ordering::SeqCst));
+
+        shutdown.cancel();
         let result = tokio::time::timeout(Duration::from_millis(100), runtime)
             .await
-            .expect("a dead persistent UDP child must end its generation")
+            .expect("shutdown must end the control generation")
             .unwrap();
-        assert!(matches!(result, Err(ClientError::DataSessionTerminated)));
+        assert!(result.is_ok());
         assert!(inactive.load(Ordering::SeqCst));
     }
 

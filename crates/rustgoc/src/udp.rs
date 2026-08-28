@@ -174,7 +174,6 @@ impl ChildSessionSupervisor for UdpSessionSupervisor {
             let ChildSessionRequest::Udp(request) = request else {
                 return;
             };
-            let _fatal_on_exit = context.fatal_on_exit(shutdown.clone());
             let limits = match NegotiatedUdpLimits::try_from(&request) {
                 Ok(limits) => limits,
                 Err(error) => {
