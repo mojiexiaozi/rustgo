@@ -1,7 +1,7 @@
 use proptest::prelude::*;
 use rustgo_crypto::{
-    DeviceKeypair, EphemeralPeerKey, PeerCryptoError, PeerRole, PeerSessionKeys, PeerTranscript,
-    sign_peer_envelope, verify_peer_envelope,
+    DeviceKeypair, EphemeralPeerKey, PeerCryptoError, PeerFrameSealer, PeerRole, PeerSessionKeys,
+    PeerTranscript, sign_peer_envelope, verify_peer_envelope,
 };
 use rustgo_protocol::{
     BoundedBytes, BoundedString, BoundedVec, ProtocolVersion, SocketAddress, TunnelProtocol,
@@ -23,8 +23,6 @@ type CandidateMutation = Box<dyn Fn(&mut Candidate)>;
 struct PeerFixture {
     initiator_identity: DeviceKeypair,
     responder_identity: DeviceKeypair,
-    initiator_ephemeral: EphemeralPeerKey,
-    responder_ephemeral: EphemeralPeerKey,
 }
 
 impl PeerFixture {
@@ -32,8 +30,6 @@ impl PeerFixture {
         Self {
             initiator_identity: DeviceKeypair::from_secret_bytes(INITIATOR_IDENTITY_SECRET),
             responder_identity: DeviceKeypair::from_secret_bytes(RESPONDER_IDENTITY_SECRET),
-            initiator_ephemeral: EphemeralPeerKey::from_secret_bytes(INITIATOR_EPHEMERAL_SECRET),
-            responder_ephemeral: EphemeralPeerKey::from_secret_bytes(RESPONDER_EPHEMERAL_SECRET),
         }
     }
 
@@ -43,8 +39,8 @@ impl PeerFixture {
             CandidateGeneration::new(3).unwrap(),
             self.initiator_identity.public_key(),
             self.responder_identity.public_key(),
-            self.initiator_ephemeral.public_key(),
-            self.responder_ephemeral.public_key(),
+            initiator_ephemeral().public_key(),
+            responder_ephemeral().public_key(),
             BoundedString::try_from(export).unwrap(),
             ProtocolVersion::V0_2,
             [0x66; 32],
@@ -54,13 +50,21 @@ impl PeerFixture {
     fn keys(&self, export: &str) -> (PeerSessionKeys, PeerSessionKeys) {
         let transcript = self.transcript(export);
         let initiator =
-            PeerSessionKeys::derive(PeerRole::Initiator, &self.initiator_ephemeral, &transcript)
+            PeerSessionKeys::derive(PeerRole::Initiator, initiator_ephemeral(), &transcript)
                 .unwrap();
         let responder =
-            PeerSessionKeys::derive(PeerRole::Responder, &self.responder_ephemeral, &transcript)
+            PeerSessionKeys::derive(PeerRole::Responder, responder_ephemeral(), &transcript)
                 .unwrap();
         (initiator, responder)
     }
+}
+
+fn initiator_ephemeral() -> EphemeralPeerKey {
+    EphemeralPeerKey::from_secret_bytes(INITIATOR_EPHEMERAL_SECRET)
+}
+
+fn responder_ephemeral() -> EphemeralPeerKey {
+    EphemeralPeerKey::from_secret_bytes(RESPONDER_EPHEMERAL_SECRET)
 }
 
 fn session_id(byte: u8) -> SessionId {
@@ -106,44 +110,83 @@ fn signed(mut envelope: RendezvousEnvelope, signer: &DeviceKeypair) -> Rendezvou
 #[test]
 fn both_role_orderings_derive_matching_directional_keys() {
     let fixture = PeerFixture::new();
-    let (initiator, responder) = fixture.keys("ssh");
+    let (mut initiator, mut responder) = fixture.keys("ssh");
 
     let initiator_tag = initiator.handshake_tag();
     responder.verify_handshake_tag(&initiator_tag).unwrap();
     let responder_tag = responder.handshake_tag();
     initiator.verify_handshake_tag(&responder_tag).unwrap();
 
-    let mut initiator_sealer = initiator
-        .stream_sealer(9, PeerRelayFlags::RELIABLE)
+    let mut initiator_sealer = initiator.stream_sealer(9).unwrap();
+    let mut responder_opener = responder.stream_opener(9).unwrap();
+    let frame = initiator_sealer
+        .seal(b"initiator payload", PeerRelayFlags::RELIABLE)
         .unwrap();
-    let mut responder_opener = responder
-        .stream_opener(9, PeerRelayFlags::RELIABLE)
-        .unwrap();
-    let frame = initiator_sealer.seal(7, b"initiator payload").unwrap();
     assert_eq!(responder_opener.open(&frame).unwrap(), b"initiator payload");
 
-    let mut responder_sealer = responder
-        .stream_sealer(10, PeerRelayFlags::RELIABLE)
+    let mut responder_sealer = responder.stream_sealer(10).unwrap();
+    let mut initiator_opener = initiator.stream_opener(10).unwrap();
+    let frame = responder_sealer
+        .seal(b"responder payload", PeerRelayFlags::RELIABLE)
         .unwrap();
-    let mut initiator_opener = initiator
-        .stream_opener(10, PeerRelayFlags::RELIABLE)
-        .unwrap();
-    let frame = responder_sealer.seal(12, b"responder payload").unwrap();
     assert_eq!(initiator_opener.open(&frame).unwrap(), b"responder payload");
 }
 
 #[test]
 fn local_ephemeral_key_must_match_its_claimed_role() {
+    let derive: fn(
+        PeerRole,
+        EphemeralPeerKey,
+        &PeerTranscript,
+    ) -> Result<PeerSessionKeys, PeerCryptoError> = PeerSessionKeys::derive;
     let fixture = PeerFixture::new();
     let transcript = fixture.transcript("ssh");
 
     assert!(matches!(
-        PeerSessionKeys::derive(
-            PeerRole::Responder,
-            &fixture.initiator_ephemeral,
-            &transcript,
-        ),
+        derive(PeerRole::Responder, initiator_ephemeral(), &transcript),
         Err(PeerCryptoError::LocalEphemeralKeyMismatch)
+    ));
+}
+
+#[test]
+fn initiator_ephemeral_slot_substitution_is_rejected() {
+    let fixture = PeerFixture::new();
+    let transcript = PeerTranscript::new(
+        session_id(0x42),
+        CandidateGeneration::new(3).unwrap(),
+        fixture.initiator_identity.public_key(),
+        fixture.responder_identity.public_key(),
+        EphemeralPeerKey::from_secret_bytes([0x77; 32]).public_key(),
+        responder_ephemeral().public_key(),
+        BoundedString::try_from("ssh").unwrap(),
+        ProtocolVersion::V0_2,
+        [0x66; 32],
+    );
+
+    assert!(matches!(
+        PeerSessionKeys::derive(PeerRole::Initiator, initiator_ephemeral(), &transcript),
+        Err(PeerCryptoError::LocalEphemeralKeyMismatch)
+    ));
+}
+
+#[test]
+fn all_zero_x25519_peer_input_is_rejected() {
+    let fixture = PeerFixture::new();
+    let transcript = PeerTranscript::new(
+        session_id(0x42),
+        CandidateGeneration::new(3).unwrap(),
+        fixture.initiator_identity.public_key(),
+        fixture.responder_identity.public_key(),
+        initiator_ephemeral().public_key(),
+        [0_u8; 32],
+        BoundedString::try_from("ssh").unwrap(),
+        ProtocolVersion::V0_2,
+        [0x66; 32],
+    );
+
+    assert!(matches!(
+        PeerSessionKeys::derive(PeerRole::Initiator, initiator_ephemeral(), &transcript),
+        Err(PeerCryptoError::InvalidPeerEphemeralKey)
     ));
 }
 
@@ -157,18 +200,20 @@ fn export_name_is_bound_into_session_keys() {
 }
 
 #[test]
-fn session_peer_generation_and_rendezvous_hash_are_bound_into_keys() {
+fn session_peer_generation_ephemeral_version_and_rendezvous_hash_are_bound_into_keys() {
     let fixture = PeerFixture::new();
     let base = fixture.transcript("ssh");
     let substitute = DeviceKeypair::from_secret_bytes(SUBSTITUTE_IDENTITY_SECRET);
+    let substitute_responder_ephemeral =
+        EphemeralPeerKey::from_secret_bytes([0x77; 32]).public_key();
     let variants = [
         PeerTranscript::new(
             session_id(0x43),
             CandidateGeneration::new(3).unwrap(),
             fixture.initiator_identity.public_key(),
             fixture.responder_identity.public_key(),
-            fixture.initiator_ephemeral.public_key(),
-            fixture.responder_ephemeral.public_key(),
+            initiator_ephemeral().public_key(),
+            responder_ephemeral().public_key(),
             BoundedString::try_from("ssh").unwrap(),
             ProtocolVersion::V0_2,
             [0x66; 32],
@@ -178,8 +223,8 @@ fn session_peer_generation_and_rendezvous_hash_are_bound_into_keys() {
             CandidateGeneration::new(4).unwrap(),
             fixture.initiator_identity.public_key(),
             fixture.responder_identity.public_key(),
-            fixture.initiator_ephemeral.public_key(),
-            fixture.responder_ephemeral.public_key(),
+            initiator_ephemeral().public_key(),
+            responder_ephemeral().public_key(),
             BoundedString::try_from("ssh").unwrap(),
             ProtocolVersion::V0_2,
             [0x66; 32],
@@ -189,8 +234,8 @@ fn session_peer_generation_and_rendezvous_hash_are_bound_into_keys() {
             CandidateGeneration::new(3).unwrap(),
             fixture.initiator_identity.public_key(),
             substitute.public_key(),
-            fixture.initiator_ephemeral.public_key(),
-            fixture.responder_ephemeral.public_key(),
+            initiator_ephemeral().public_key(),
+            responder_ephemeral().public_key(),
             BoundedString::try_from("ssh").unwrap(),
             ProtocolVersion::V0_2,
             [0x66; 32],
@@ -200,20 +245,41 @@ fn session_peer_generation_and_rendezvous_hash_are_bound_into_keys() {
             CandidateGeneration::new(3).unwrap(),
             fixture.initiator_identity.public_key(),
             fixture.responder_identity.public_key(),
-            fixture.initiator_ephemeral.public_key(),
-            fixture.responder_ephemeral.public_key(),
+            initiator_ephemeral().public_key(),
+            substitute_responder_ephemeral,
+            BoundedString::try_from("ssh").unwrap(),
+            ProtocolVersion::V0_2,
+            [0x66; 32],
+        ),
+        PeerTranscript::new(
+            session_id(0x42),
+            CandidateGeneration::new(3).unwrap(),
+            fixture.initiator_identity.public_key(),
+            fixture.responder_identity.public_key(),
+            initiator_ephemeral().public_key(),
+            responder_ephemeral().public_key(),
+            BoundedString::try_from("ssh").unwrap(),
+            ProtocolVersion::V0_1,
+            [0x66; 32],
+        ),
+        PeerTranscript::new(
+            session_id(0x42),
+            CandidateGeneration::new(3).unwrap(),
+            fixture.initiator_identity.public_key(),
+            fixture.responder_identity.public_key(),
+            initiator_ephemeral().public_key(),
+            responder_ephemeral().public_key(),
             BoundedString::try_from("ssh").unwrap(),
             ProtocolVersion::V0_2,
             [0x67; 32],
         ),
     ];
     let base_keys =
-        PeerSessionKeys::derive(PeerRole::Initiator, &fixture.initiator_ephemeral, &base).unwrap();
+        PeerSessionKeys::derive(PeerRole::Initiator, initiator_ephemeral(), &base).unwrap();
 
     for changed in &variants {
         let changed_keys =
-            PeerSessionKeys::derive(PeerRole::Initiator, &fixture.initiator_ephemeral, changed)
-                .unwrap();
+            PeerSessionKeys::derive(PeerRole::Initiator, initiator_ephemeral(), changed).unwrap();
         assert_ne!(base_keys.handshake_tag(), changed_keys.handshake_tag());
     }
 }
@@ -375,36 +441,38 @@ fn envelope_signature_binds_all_payload_variants() {
 #[test]
 fn handshake_stream_datagram_and_directions_use_separate_keys() {
     let fixture = PeerFixture::new();
-    let (initiator, responder) = fixture.keys("ssh");
+    let (mut initiator, mut responder) = fixture.keys("ssh");
     assert_ne!(initiator.handshake_tag(), responder.handshake_tag());
 
-    let mut stream = initiator
-        .stream_sealer(9, PeerRelayFlags::RELIABLE)
-        .unwrap();
+    let mut stream = initiator.stream_sealer(9).unwrap();
     let mut datagram = initiator.datagram_sealer(9).unwrap();
-    let stream_frame = stream.seal(7, b"same payload").unwrap();
-    let datagram_frame = datagram.seal(7, b"same payload").unwrap();
+    let stream_frame = stream
+        .seal(b"same payload", PeerRelayFlags::RELIABLE)
+        .unwrap();
+    let datagram_frame = datagram
+        .seal(b"same payload", PeerRelayFlags::DATAGRAM)
+        .unwrap();
     assert_ne!(stream_frame.ciphertext(), datagram_frame.ciphertext());
 
-    let mut reverse = responder
-        .stream_sealer(9, PeerRelayFlags::RELIABLE)
+    let mut reverse = responder.stream_sealer(9).unwrap();
+    let reverse_frame = reverse
+        .seal(b"same payload", PeerRelayFlags::RELIABLE)
         .unwrap();
-    let reverse_frame = reverse.seal(7, b"same payload").unwrap();
     assert_ne!(stream_frame.ciphertext(), reverse_frame.ciphertext());
 }
 
 #[test]
 fn stream_channels_do_not_reuse_the_same_key_and_nonce_pair() {
     let fixture = PeerFixture::new();
-    let (initiator, _) = fixture.keys("ssh");
-    let mut channel_9 = initiator
-        .stream_sealer(9, PeerRelayFlags::RELIABLE)
+    let (mut initiator, _) = fixture.keys("ssh");
+    let mut channel_9 = initiator.stream_sealer(9).unwrap();
+    let mut channel_10 = initiator.stream_sealer(10).unwrap();
+    let frame_9 = channel_9
+        .seal(b"same payload", PeerRelayFlags::RELIABLE)
         .unwrap();
-    let mut channel_10 = initiator
-        .stream_sealer(10, PeerRelayFlags::RELIABLE)
+    let frame_10 = channel_10
+        .seal(b"same payload", PeerRelayFlags::RELIABLE)
         .unwrap();
-    let frame_9 = channel_9.seal(7, b"same payload").unwrap();
-    let frame_10 = channel_10.seal(7, b"same payload").unwrap();
 
     assert_ne!(
         &frame_9.ciphertext()[..b"same payload".len()],
@@ -413,90 +481,213 @@ fn stream_channels_do_not_reuse_the_same_key_and_nonce_pair() {
 }
 
 #[test]
-fn opener_rejects_replayed_sequence_and_ordered_gaps() {
+fn duplicate_sealer_and_opener_domain_issuance_is_rejected() {
     let fixture = PeerFixture::new();
-    let (initiator, responder) = fixture.keys("ssh");
-    let mut sealer = initiator
-        .stream_sealer(9, PeerRelayFlags::RELIABLE)
-        .unwrap();
-    let mut opener = responder
-        .stream_opener(9, PeerRelayFlags::RELIABLE)
-        .unwrap();
-    let frame_7 = sealer.seal(7, b"payload").unwrap();
-    let frame_8 = sealer.seal(8, b"next").unwrap();
+    let (mut initiator, mut responder) = fixture.keys("ssh");
 
-    assert_eq!(opener.open(&frame_7).unwrap(), b"payload");
-    assert_eq!(opener.open(&frame_7), Err(PeerCryptoError::Replay));
-    let skipped = PeerRelayFrame::new(
-        frame_8.session_id,
-        frame_8.channel_id,
-        9,
-        frame_8.flags,
-        frame_8.ciphertext().to_vec(),
-    )
-    .unwrap();
-    assert_eq!(
-        opener.open(&skipped),
-        Err(PeerCryptoError::UnexpectedSequence)
-    );
-    assert_eq!(opener.open(&frame_8).unwrap(), b"next");
+    assert!(initiator.stream_sealer(9).is_ok());
+    assert!(matches!(
+        initiator.stream_sealer(9),
+        Err(PeerCryptoError::DomainAlreadyIssued)
+    ));
+    assert!(initiator.datagram_sealer(9).is_ok());
+    assert!(matches!(
+        initiator.datagram_sealer(9),
+        Err(PeerCryptoError::DomainAlreadyIssued)
+    ));
+    assert!(responder.stream_opener(9).is_ok());
+    assert!(matches!(
+        responder.stream_opener(9),
+        Err(PeerCryptoError::DomainAlreadyIssued)
+    ));
+    assert!(responder.datagram_opener(9).is_ok());
+    assert!(matches!(
+        responder.datagram_opener(9),
+        Err(PeerCryptoError::DomainAlreadyIssued)
+    ));
 }
 
 #[test]
-fn sealer_rejects_nonce_reuse_and_sequence_exhaustion() {
+fn sealer_allocates_sequences_without_a_caller_sequence_parameter() {
+    let seal: fn(
+        &mut PeerFrameSealer,
+        &[u8],
+        PeerRelayFlags,
+    ) -> Result<PeerRelayFrame, PeerCryptoError> = PeerFrameSealer::seal;
     let fixture = PeerFixture::new();
-    let (initiator, _) = fixture.keys("ssh");
-    let mut stream = initiator
-        .stream_sealer(9, PeerRelayFlags::RELIABLE)
+    let (mut initiator, _) = fixture.keys("ssh");
+    let mut sealer = initiator.stream_sealer(9).unwrap();
+
+    let first = seal(&mut sealer, b"first", PeerRelayFlags::RELIABLE).unwrap();
+    let second = seal(&mut sealer, b"second", PeerRelayFlags::RELIABLE).unwrap();
+
+    assert_eq!(first.sequence, 0);
+    assert_eq!(second.sequence, 1);
+}
+
+#[test]
+fn ordered_stream_accepts_reliable_then_reliable_fin_and_rejects_after_fin() {
+    let fixture = PeerFixture::new();
+    let (mut initiator, mut responder) = fixture.keys("ssh");
+    let mut sealer = initiator.stream_sealer(9).unwrap();
+    let mut opener = responder.stream_opener(9).unwrap();
+    let reliable = sealer.seal(b"payload", PeerRelayFlags::RELIABLE).unwrap();
+    let fin = sealer
+        .seal(b"last", PeerRelayFlags::RELIABLE | PeerRelayFlags::FIN)
         .unwrap();
-    stream.seal(7, b"payload").unwrap();
-    assert_eq!(stream.seal(7, b"again"), Err(PeerCryptoError::Replay));
+
+    assert_eq!(opener.open(&reliable).unwrap(), b"payload");
+    assert_eq!(opener.open(&fin).unwrap(), b"last");
     assert_eq!(
-        stream.seal(9, b"gap"),
+        sealer.seal(b"after fin", PeerRelayFlags::RELIABLE),
+        Err(PeerCryptoError::InvalidFlagTransition)
+    );
+}
+
+#[test]
+fn ordered_opener_rejects_out_of_order_replay_and_authenticated_flag_tampering() {
+    let fixture = PeerFixture::new();
+    let (mut initiator, mut responder) = fixture.keys("ssh");
+    let mut sealer = initiator.stream_sealer(9).unwrap();
+    let frame_0 = sealer.seal(b"zero", PeerRelayFlags::RELIABLE).unwrap();
+    let frame_1 = sealer
+        .seal(b"one", PeerRelayFlags::RELIABLE | PeerRelayFlags::FIN)
+        .unwrap();
+    let mut opener = responder.stream_opener(9).unwrap();
+
+    assert_eq!(
+        opener.open(&frame_1),
         Err(PeerCryptoError::UnexpectedSequence)
     );
-
-    let mut exhausted = initiator.datagram_sealer(10).unwrap();
-    exhausted.seal(u64::MAX, b"last").unwrap();
+    let tampered_flags = PeerRelayFrame::new(
+        frame_0.session_id,
+        frame_0.channel_id,
+        frame_0.sequence,
+        PeerRelayFlags::RELIABLE | PeerRelayFlags::FIN,
+        frame_0.ciphertext().to_vec(),
+    )
+    .unwrap();
     assert_eq!(
-        exhausted.seal(u64::MAX, b"reuse"),
-        Err(PeerCryptoError::Replay)
+        opener.open(&tampered_flags),
+        Err(PeerCryptoError::FrameAuthenticationFailed)
+    );
+    assert_eq!(opener.open(&frame_0).unwrap(), b"zero");
+    assert_eq!(opener.open(&frame_0), Err(PeerCryptoError::Replay));
+    assert_eq!(opener.open(&frame_1).unwrap(), b"one");
+}
+
+#[test]
+fn modes_reject_invalid_flags_without_consuming_sequence() {
+    let fixture = PeerFixture::new();
+    let (mut initiator, _) = fixture.keys("ssh");
+    let mut stream = initiator.stream_sealer(9).unwrap();
+    assert_eq!(
+        stream.seal(b"invalid", PeerRelayFlags::DATAGRAM),
+        Err(PeerCryptoError::InvalidFrameContext)
     );
     assert_eq!(
-        exhausted.seal(0, b"wrapped"),
-        Err(PeerCryptoError::SequenceExhausted)
+        stream
+            .seal(b"valid", PeerRelayFlags::RELIABLE)
+            .unwrap()
+            .sequence,
+        0
+    );
+
+    let mut datagram = initiator.datagram_sealer(10).unwrap();
+    assert_eq!(
+        datagram.seal(b"invalid", PeerRelayFlags::DATAGRAM | PeerRelayFlags::FIN),
+        Err(PeerCryptoError::InvalidFrameContext)
+    );
+    assert_eq!(
+        datagram
+            .seal(b"valid", PeerRelayFlags::DATAGRAM)
+            .unwrap()
+            .sequence,
+        0
     );
 }
 
 #[test]
 fn datagram_opener_accepts_reordering_but_rejects_duplicate_and_too_old_frames() {
     let fixture = PeerFixture::new();
-    let (initiator, responder) = fixture.keys("ssh");
+    let (mut initiator, mut responder) = fixture.keys("ssh");
     let mut sealer = initiator.datagram_sealer(9).unwrap();
-    let frame_0 = sealer.seal(0, b"zero").unwrap();
-    let frame_1 = sealer.seal(1, b"one").unwrap();
-    let frame_2 = sealer.seal(2, b"two").unwrap();
-    let frame_64 = sealer.seal(64, b"sixty-four").unwrap();
+    let frames = (0..=64)
+        .map(|sequence| {
+            sealer
+                .seal(
+                    format!("payload-{sequence}").as_bytes(),
+                    PeerRelayFlags::DATAGRAM,
+                )
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
     let mut opener = responder.datagram_opener(9).unwrap();
 
-    assert_eq!(opener.open(&frame_2).unwrap(), b"two");
-    assert_eq!(opener.open(&frame_0).unwrap(), b"zero");
-    assert_eq!(opener.open(&frame_1).unwrap(), b"one");
-    assert_eq!(opener.open(&frame_1), Err(PeerCryptoError::Replay));
-    assert_eq!(opener.open(&frame_64).unwrap(), b"sixty-four");
-    assert_eq!(opener.open(&frame_0), Err(PeerCryptoError::Replay));
+    assert_eq!(opener.open(&frames[2]).unwrap(), b"payload-2");
+    assert_eq!(opener.open(&frames[0]).unwrap(), b"payload-0");
+    assert_eq!(opener.open(&frames[1]).unwrap(), b"payload-1");
+    assert_eq!(opener.open(&frames[1]), Err(PeerCryptoError::Replay));
+    assert_eq!(opener.open(&frames[64]).unwrap(), b"payload-64");
+    assert_eq!(opener.open(&frames[0]), Err(PeerCryptoError::Replay));
+}
+
+#[test]
+fn invalid_datagram_flag_tampering_is_rejected_without_consuming_window() {
+    let fixture = PeerFixture::new();
+    let (mut initiator, mut responder) = fixture.keys("ssh");
+    let mut sealer = initiator.datagram_sealer(9).unwrap();
+    let frame = sealer.seal(b"payload", PeerRelayFlags::DATAGRAM).unwrap();
+    let changed = PeerRelayFrame::new(
+        frame.session_id,
+        frame.channel_id,
+        frame.sequence,
+        PeerRelayFlags::DATAGRAM | PeerRelayFlags::FIN,
+        frame.ciphertext().to_vec(),
+    )
+    .unwrap();
+    let mut opener = responder.datagram_opener(9).unwrap();
+
+    assert_eq!(
+        opener.open(&changed),
+        Err(PeerCryptoError::InvalidFrameContext)
+    );
+    assert_eq!(opener.open(&frame).unwrap(), b"payload");
+}
+
+#[test]
+fn acceptable_datagram_sequence_tampering_is_authenticated_without_consuming_window() {
+    let fixture = PeerFixture::new();
+    let (mut initiator, mut responder) = fixture.keys("ssh");
+    let mut sealer = initiator.datagram_sealer(9).unwrap();
+    let frame = sealer.seal(b"payload", PeerRelayFlags::DATAGRAM).unwrap();
+    let changed = PeerRelayFrame::new(
+        frame.session_id,
+        frame.channel_id,
+        1,
+        frame.flags,
+        frame.ciphertext().to_vec(),
+    )
+    .unwrap();
+    let mut opener = responder.datagram_opener(9).unwrap();
+
+    assert_eq!(
+        opener.open(&changed),
+        Err(PeerCryptoError::FrameAuthenticationFailed)
+    );
+    assert_eq!(opener.open(&frame).unwrap(), b"payload");
 }
 
 #[test]
 fn bit_flipped_ciphertext_is_rejected_without_consuming_the_sequence() {
     let fixture = PeerFixture::new();
-    let (initiator, responder) = fixture.keys("ssh");
+    let (mut initiator, mut responder) = fixture.keys("ssh");
     let mut sealer = initiator.datagram_sealer(9).unwrap();
-    let frame = sealer.seal(7, b"payload").unwrap();
+    let frame = sealer.seal(b"payload", PeerRelayFlags::DATAGRAM).unwrap();
     let mut changed = frame.ciphertext().to_vec();
     changed[0] ^= 1;
     let changed =
-        PeerRelayFrame::new(session_id(0x42), 9, 7, PeerRelayFlags::DATAGRAM, changed).unwrap();
+        PeerRelayFrame::new(session_id(0x42), 9, 0, PeerRelayFlags::DATAGRAM, changed).unwrap();
     let mut opener = responder.datagram_opener(9).unwrap();
 
     assert_eq!(
@@ -509,13 +700,13 @@ fn bit_flipped_ciphertext_is_rejected_without_consuming_the_sequence() {
 #[test]
 fn frame_header_and_canonical_context_are_authenticated() {
     let fixture = PeerFixture::new();
-    let (initiator, responder) = fixture.keys("ssh");
+    let (mut initiator, mut responder) = fixture.keys("ssh");
     let mut sealer = initiator.datagram_sealer(9).unwrap();
-    let frame = sealer.seal(7, b"payload").unwrap();
+    let frame = sealer.seal(b"payload", PeerRelayFlags::DATAGRAM).unwrap();
     let altered_channel = PeerRelayFrame::new(
         session_id(0x42),
         10,
-        7,
+        0,
         PeerRelayFlags::DATAGRAM,
         frame.ciphertext().to_vec(),
     )
@@ -523,7 +714,7 @@ fn frame_header_and_canonical_context_are_authenticated() {
     let altered_session = PeerRelayFrame::new(
         session_id(0x43),
         9,
-        7,
+        0,
         PeerRelayFlags::DATAGRAM,
         frame.ciphertext().to_vec(),
     )
@@ -539,7 +730,7 @@ fn frame_header_and_canonical_context_are_authenticated() {
         Err(PeerCryptoError::FrameContextMismatch)
     );
 
-    let (_, wrong_responder) = fixture.keys("admin");
+    let (_, mut wrong_responder) = fixture.keys("admin");
     let mut wrong_context = wrong_responder.datagram_opener(9).unwrap();
     assert_eq!(
         wrong_context.open(&frame),
@@ -551,7 +742,7 @@ fn frame_header_and_canonical_context_are_authenticated() {
 fn secret_debug_and_errors_do_not_expose_key_or_payload_bytes() {
     let fixture = PeerFixture::new();
     let (keys, _) = fixture.keys("ssh");
-    let ephemeral_debug = format!("{:?}", fixture.initiator_ephemeral);
+    let ephemeral_debug = format!("{:?}", initiator_ephemeral());
     let keys_debug = format!("{keys:?}");
     let error = format!("{:?}", PeerCryptoError::FrameAuthenticationFailed);
 
@@ -570,16 +761,16 @@ proptest! {
         bit in 0_u8..8,
     ) {
         let fixture = PeerFixture::new();
-        let (initiator, responder) = fixture.keys("ssh");
+        let (mut initiator, mut responder) = fixture.keys("ssh");
         let mut sealer = initiator.datagram_sealer(9).unwrap();
-        let frame = sealer.seal(7, &payload).unwrap();
+        let frame = sealer.seal(&payload, PeerRelayFlags::DATAGRAM).unwrap();
         let mut ciphertext = frame.ciphertext().to_vec();
         let index = byte_offset % ciphertext.len();
         ciphertext[index] ^= 1 << bit;
         let corrupted = PeerRelayFrame::new(
             session_id(0x42),
             9,
-            7,
+            0,
             PeerRelayFlags::DATAGRAM,
             ciphertext,
         ).unwrap();

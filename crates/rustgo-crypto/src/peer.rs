@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{collections::HashSet, fmt};
 
 use chacha20poly1305::aead::{Aead, AeadInPlace, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, Tag};
@@ -58,6 +58,10 @@ pub enum PeerCryptoError {
     FrameContextMismatch,
     #[error("peer frame channel or flags are invalid for this cipher")]
     InvalidFrameContext,
+    #[error("peer frame cryptographic domain was already issued")]
+    DomainAlreadyIssued,
+    #[error("peer frame flags violate the ordered channel lifecycle")]
+    InvalidFlagTransition,
     #[error("peer frame sequence was already used or is outside the replay window")]
     Replay,
     #[error("ordered peer frame sequence is not the exact next value")]
@@ -183,10 +187,6 @@ impl fmt::Debug for PeerTranscript {
 struct SecretKey(Zeroizing<[u8; 32]>);
 
 impl SecretKey {
-    fn new(value: [u8; 32]) -> Self {
-        Self(Zeroizing::new(value))
-    }
-
     fn cipher(&self) -> ChaCha20Poly1305 {
         ChaCha20Poly1305::new(Key::from_slice(self.0.as_ref()))
     }
@@ -206,12 +206,14 @@ pub struct PeerSessionKeys {
     stream_responder_to_initiator: StreamKey,
     datagram_initiator_to_responder: DatagramKey,
     datagram_responder_to_initiator: DatagramKey,
+    issued_sealers: HashSet<FrameDomain>,
+    issued_openers: HashSet<FrameDomain>,
 }
 
 impl PeerSessionKeys {
     pub fn derive(
         role: PeerRole,
-        local_ephemeral: &EphemeralPeerKey,
+        local_ephemeral: EphemeralPeerKey,
         transcript: &PeerTranscript,
     ) -> Result<Self, PeerCryptoError> {
         if local_ephemeral.public_key() != *transcript.local_ephemeral(role) {
@@ -254,6 +256,8 @@ impl PeerSessionKeys {
                 &hkdf,
                 b"rustgo-peer-datagram-responder-to-initiator-v1",
             )?),
+            issued_sealers: HashSet::new(),
+            issued_openers: HashSet::new(),
         })
     }
 
@@ -284,84 +288,92 @@ impl PeerSessionKeys {
             .map_err(|_| PeerCryptoError::HandshakeAuthenticationFailed)
     }
 
-    pub fn stream_sealer(
-        &self,
-        channel_id: u64,
-        flags: PeerRelayFlags,
-    ) -> Result<PeerFrameSealer, PeerCryptoError> {
+    pub fn stream_sealer(&mut self, channel_id: u64) -> Result<PeerFrameSealer, PeerCryptoError> {
+        let domain = self.issue_sealer(FrameMode::Ordered, channel_id)?;
         PeerFrameSealer::new(
             self.session_id,
-            channel_id,
-            flags,
+            domain.channel_id,
             self.context_hash,
             derive_frame_key(
                 &self.outgoing_stream_key().0,
                 &self.context_hash,
                 &self.session_id,
-                channel_id,
-                flags,
+                domain.mode,
+                domain.channel_id,
             )?,
-            FrameMode::Ordered,
+            domain.mode,
             nonce_prefix(FrameMode::Ordered, self.outgoing_direction()),
         )
     }
 
-    pub fn stream_opener(
-        &self,
-        channel_id: u64,
-        flags: PeerRelayFlags,
-    ) -> Result<PeerFrameOpener, PeerCryptoError> {
+    pub fn stream_opener(&mut self, channel_id: u64) -> Result<PeerFrameOpener, PeerCryptoError> {
+        let domain = self.issue_opener(FrameMode::Ordered, channel_id)?;
         PeerFrameOpener::new(
             self.session_id,
-            channel_id,
-            flags,
+            domain.channel_id,
             self.context_hash,
             derive_frame_key(
                 &self.incoming_stream_key().0,
                 &self.context_hash,
                 &self.session_id,
-                channel_id,
-                flags,
+                domain.mode,
+                domain.channel_id,
             )?,
-            FrameMode::Ordered,
+            domain.mode,
             nonce_prefix(FrameMode::Ordered, self.incoming_direction()),
         )
     }
 
-    pub fn datagram_sealer(&self, channel_id: u64) -> Result<PeerFrameSealer, PeerCryptoError> {
+    pub fn datagram_sealer(&mut self, channel_id: u64) -> Result<PeerFrameSealer, PeerCryptoError> {
+        let domain = self.issue_sealer(FrameMode::Datagram, channel_id)?;
         PeerFrameSealer::new(
             self.session_id,
-            channel_id,
-            PeerRelayFlags::DATAGRAM,
+            domain.channel_id,
             self.context_hash,
             derive_frame_key(
                 &self.outgoing_datagram_key().0,
                 &self.context_hash,
                 &self.session_id,
-                channel_id,
-                PeerRelayFlags::DATAGRAM,
+                domain.mode,
+                domain.channel_id,
             )?,
-            FrameMode::Datagram,
+            domain.mode,
             nonce_prefix(FrameMode::Datagram, self.outgoing_direction()),
         )
     }
 
-    pub fn datagram_opener(&self, channel_id: u64) -> Result<PeerFrameOpener, PeerCryptoError> {
+    pub fn datagram_opener(&mut self, channel_id: u64) -> Result<PeerFrameOpener, PeerCryptoError> {
+        let domain = self.issue_opener(FrameMode::Datagram, channel_id)?;
         PeerFrameOpener::new(
             self.session_id,
-            channel_id,
-            PeerRelayFlags::DATAGRAM,
+            domain.channel_id,
             self.context_hash,
             derive_frame_key(
                 &self.incoming_datagram_key().0,
                 &self.context_hash,
                 &self.session_id,
-                channel_id,
-                PeerRelayFlags::DATAGRAM,
+                domain.mode,
+                domain.channel_id,
             )?,
-            FrameMode::Datagram,
+            domain.mode,
             nonce_prefix(FrameMode::Datagram, self.incoming_direction()),
         )
+    }
+
+    fn issue_sealer(
+        &mut self,
+        mode: FrameMode,
+        channel_id: u64,
+    ) -> Result<FrameDomain, PeerCryptoError> {
+        issue_domain(&mut self.issued_sealers, mode, channel_id)
+    }
+
+    fn issue_opener(
+        &mut self,
+        mode: FrameMode,
+        channel_id: u64,
+    ) -> Result<FrameDomain, PeerCryptoError> {
+        issue_domain(&mut self.issued_openers, mode, channel_id)
     }
 
     fn outgoing_direction(&self) -> PeerRole {
@@ -424,61 +436,73 @@ impl fmt::Debug for PeerSessionKeys {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum FrameMode {
     Ordered,
     Datagram,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct FrameDomain {
+    mode: FrameMode,
+    channel_id: u64,
+}
+
 pub struct PeerFrameSealer {
     session_id: SessionId,
     channel_id: u64,
-    flags: PeerRelayFlags,
     context_hash: [u8; 32],
     key: SecretKey,
     mode: FrameMode,
     nonce_prefix: [u8; 4],
-    last_sequence: Option<u64>,
+    next_sequence: u64,
+    exhausted: bool,
+    finished: bool,
 }
 
 impl PeerFrameSealer {
     fn new(
         session_id: SessionId,
         channel_id: u64,
-        flags: PeerRelayFlags,
         context_hash: [u8; 32],
         key: SecretKey,
         mode: FrameMode,
         nonce_prefix: [u8; 4],
     ) -> Result<Self, PeerCryptoError> {
-        validate_frame_context(channel_id, flags, mode)?;
+        validate_channel_id(channel_id)?;
         Ok(Self {
             session_id,
             channel_id,
-            flags,
             context_hash,
             key,
             mode,
             nonce_prefix,
-            last_sequence: None,
+            next_sequence: 0,
+            exhausted: false,
+            finished: false,
         })
     }
 
     pub fn seal(
         &mut self,
-        sequence: u64,
         plaintext: &[u8],
+        flags: PeerRelayFlags,
     ) -> Result<PeerRelayFrame, PeerCryptoError> {
         if plaintext.len() > MAX_PEER_RELAY_CIPHERTEXT_BYTES.saturating_sub(AEAD_TAG_BYTES) {
             return Err(PeerCryptoError::FrameTooLarge);
         }
-        check_send_sequence(self.mode, self.last_sequence, sequence)?;
+        validate_frame_flags(self.mode, flags)?;
+        validate_flag_transition(self.mode, self.finished)?;
+        if self.exhausted {
+            return Err(PeerCryptoError::SequenceExhausted);
+        }
+        let sequence = self.next_sequence;
         let nonce = frame_nonce(self.nonce_prefix, sequence);
         let aad = frame_aad(
             &self.context_hash,
             &self.session_id,
             self.channel_id,
-            self.flags,
+            flags,
             sequence,
         );
         let ciphertext = self
@@ -496,11 +520,15 @@ impl PeerFrameSealer {
             self.session_id,
             self.channel_id,
             sequence,
-            self.flags,
+            flags,
             ciphertext,
         )
         .map_err(|_| PeerCryptoError::FrameTooLarge)?;
-        self.last_sequence = Some(sequence);
+        match sequence.checked_add(1) {
+            Some(next) => self.next_sequence = next,
+            None => self.exhausted = true,
+        }
+        self.finished = self.finished || has_fin(flags);
         Ok(frame)
     }
 }
@@ -513,7 +541,7 @@ impl fmt::Debug for PeerFrameSealer {
 
 #[derive(Clone, Copy)]
 enum ReceiveState {
-    Ordered(Option<u64>),
+    Ordered { expected: u64, exhausted: bool },
     Datagram(ReplayWindow),
 }
 
@@ -526,26 +554,29 @@ struct ReplayWindow {
 pub struct PeerFrameOpener {
     session_id: SessionId,
     channel_id: u64,
-    flags: PeerRelayFlags,
     context_hash: [u8; 32],
     key: SecretKey,
+    mode: FrameMode,
     nonce_prefix: [u8; 4],
     state: ReceiveState,
+    finished: bool,
 }
 
 impl PeerFrameOpener {
     fn new(
         session_id: SessionId,
         channel_id: u64,
-        flags: PeerRelayFlags,
         context_hash: [u8; 32],
         key: SecretKey,
         mode: FrameMode,
         nonce_prefix: [u8; 4],
     ) -> Result<Self, PeerCryptoError> {
-        validate_frame_context(channel_id, flags, mode)?;
+        validate_channel_id(channel_id)?;
         let state = match mode {
-            FrameMode::Ordered => ReceiveState::Ordered(None),
+            FrameMode::Ordered => ReceiveState::Ordered {
+                expected: 0,
+                exhausted: false,
+            },
             FrameMode::Datagram => ReceiveState::Datagram(ReplayWindow {
                 highest: None,
                 bitmap: 0,
@@ -554,22 +585,22 @@ impl PeerFrameOpener {
         Ok(Self {
             session_id,
             channel_id,
-            flags,
             context_hash,
             key,
+            mode,
             nonce_prefix,
             state,
+            finished: false,
         })
     }
 
     pub fn open(&mut self, frame: &PeerRelayFrame) -> Result<Vec<u8>, PeerCryptoError> {
-        if frame.session_id != self.session_id
-            || frame.channel_id != self.channel_id
-            || frame.flags != self.flags
-        {
+        if frame.session_id != self.session_id || frame.channel_id != self.channel_id {
             return Err(PeerCryptoError::FrameContextMismatch);
         }
+        validate_frame_flags(self.mode, frame.flags)?;
         let next_state = receive_sequence(self.state, frame.sequence)?;
+        validate_flag_transition(self.mode, self.finished)?;
         let nonce = frame_nonce(self.nonce_prefix, frame.sequence);
         let aad = frame_aad(
             &self.context_hash,
@@ -590,6 +621,7 @@ impl PeerFrameOpener {
             )
             .map_err(|_| PeerCryptoError::FrameAuthenticationFailed)?;
         self.state = next_state;
+        self.finished = self.finished || has_fin(frame.flags);
         Ok(plaintext)
     }
 }
@@ -631,18 +663,18 @@ fn append_role(
 }
 
 fn expand_key(hkdf: &Hkdf<Sha256>, label: &[u8]) -> Result<SecretKey, PeerCryptoError> {
-    let mut bytes = [0_u8; 32];
-    hkdf.expand(label, &mut bytes)
+    let mut bytes = Zeroizing::new([0_u8; 32]);
+    hkdf.expand(label, bytes.as_mut())
         .map_err(|_| PeerCryptoError::KeyDerivationFailed)?;
-    Ok(SecretKey::new(bytes))
+    Ok(SecretKey(bytes))
 }
 
 fn derive_frame_key(
     base_key: &SecretKey,
     context_hash: &[u8; 32],
     session_id: &SessionId,
+    mode: FrameMode,
     channel_id: u64,
-    flags: PeerRelayFlags,
 ) -> Result<SecretKey, PeerCryptoError> {
     let hkdf = Hkdf::<Sha256>::from_prk(base_key.0.as_ref())
         .map_err(|_| PeerCryptoError::KeyDerivationFailed)?;
@@ -650,8 +682,8 @@ fn derive_frame_key(
     info.extend_from_slice(FRAME_KEY_DOMAIN);
     append_bytes(&mut info, context_hash);
     append_bytes(&mut info, session_id.as_bytes());
+    info.push(frame_mode_tag(mode));
     append_u64(&mut info, channel_id);
-    info.push(flags.bits());
     expand_key(&hkdf, &info)
 }
 
@@ -662,18 +694,32 @@ fn handshake_aad(context_hash: &[u8; 32]) -> Vec<u8> {
     aad
 }
 
-fn validate_frame_context(
-    channel_id: u64,
-    flags: PeerRelayFlags,
+fn issue_domain(
+    issued: &mut HashSet<FrameDomain>,
     mode: FrameMode,
-) -> Result<(), PeerCryptoError> {
+    channel_id: u64,
+) -> Result<FrameDomain, PeerCryptoError> {
+    validate_channel_id(channel_id)?;
+    let domain = FrameDomain { mode, channel_id };
+    if issued.insert(domain) {
+        Ok(domain)
+    } else {
+        Err(PeerCryptoError::DomainAlreadyIssued)
+    }
+}
+
+fn validate_channel_id(channel_id: u64) -> Result<(), PeerCryptoError> {
     if channel_id == 0 {
         return Err(PeerCryptoError::InvalidFrameContext);
     }
+    Ok(())
+}
+
+fn validate_frame_flags(mode: FrameMode, flags: PeerRelayFlags) -> Result<(), PeerCryptoError> {
     let valid = match mode {
         FrameMode::Ordered => {
-            flags.bits() & PeerRelayFlags::RELIABLE.bits() != 0
-                && flags.bits() & PeerRelayFlags::DATAGRAM.bits() == 0
+            flags == PeerRelayFlags::RELIABLE
+                || flags == (PeerRelayFlags::RELIABLE | PeerRelayFlags::FIN)
         }
         FrameMode::Datagram => flags == PeerRelayFlags::DATAGRAM,
     };
@@ -684,45 +730,47 @@ fn validate_frame_context(
     }
 }
 
-fn check_send_sequence(
-    mode: FrameMode,
-    last: Option<u64>,
-    sequence: u64,
-) -> Result<(), PeerCryptoError> {
-    let Some(last) = last else {
-        return Ok(());
-    };
-    if last == u64::MAX {
-        return if sequence == last {
-            Err(PeerCryptoError::Replay)
-        } else {
-            Err(PeerCryptoError::SequenceExhausted)
-        };
+fn validate_flag_transition(mode: FrameMode, finished: bool) -> Result<(), PeerCryptoError> {
+    if matches!(mode, FrameMode::Ordered) && finished {
+        Err(PeerCryptoError::InvalidFlagTransition)
+    } else {
+        Ok(())
     }
-    if sequence <= last {
-        return Err(PeerCryptoError::Replay);
-    }
-    if matches!(mode, FrameMode::Ordered) && sequence != last + 1 {
-        return Err(PeerCryptoError::UnexpectedSequence);
-    }
-    Ok(())
 }
 
 fn receive_sequence(state: ReceiveState, sequence: u64) -> Result<ReceiveState, PeerCryptoError> {
     match state {
-        ReceiveState::Ordered(None) => Ok(ReceiveState::Ordered(Some(sequence))),
-        ReceiveState::Ordered(Some(last)) if last == u64::MAX => {
-            if sequence == last {
+        ReceiveState::Ordered {
+            expected: _,
+            exhausted: true,
+        } => {
+            if sequence == u64::MAX {
                 Err(PeerCryptoError::Replay)
             } else {
                 Err(PeerCryptoError::SequenceExhausted)
             }
         }
-        ReceiveState::Ordered(Some(last)) if sequence <= last => Err(PeerCryptoError::Replay),
-        ReceiveState::Ordered(Some(last)) if sequence == last + 1 => {
-            Ok(ReceiveState::Ordered(Some(sequence)))
+        ReceiveState::Ordered {
+            expected,
+            exhausted: false,
+        } if sequence < expected => Err(PeerCryptoError::Replay),
+        ReceiveState::Ordered {
+            expected,
+            exhausted: false,
+        } if sequence > expected => Err(PeerCryptoError::UnexpectedSequence),
+        ReceiveState::Ordered {
+            expected,
+            exhausted: false,
+        } => {
+            let (expected, exhausted) = match expected.checked_add(1) {
+                Some(next) => (next, false),
+                None => (expected, true),
+            };
+            Ok(ReceiveState::Ordered {
+                expected,
+                exhausted,
+            })
         }
-        ReceiveState::Ordered(Some(_)) => Err(PeerCryptoError::UnexpectedSequence),
         ReceiveState::Datagram(window) => {
             replay_window_accept(window, sequence).map(ReceiveState::Datagram)
         }
@@ -763,11 +811,19 @@ fn replay_window_accept(
 }
 
 fn nonce_prefix(mode: FrameMode, direction: PeerRole) -> [u8; 4] {
-    let purpose = match mode {
+    let purpose = frame_mode_tag(mode);
+    [purpose, direction.tag(), 0, 0]
+}
+
+fn frame_mode_tag(mode: FrameMode) -> u8 {
+    match mode {
         FrameMode::Ordered => 1,
         FrameMode::Datagram => 2,
-    };
-    [purpose, direction.tag(), 0, 0]
+    }
+}
+
+fn has_fin(flags: PeerRelayFlags) -> bool {
+    flags.bits() & PeerRelayFlags::FIN.bits() != 0
 }
 
 fn frame_nonce(prefix: [u8; 4], sequence: u64) -> [u8; 12] {
@@ -927,4 +983,31 @@ fn append_u32(encoded: &mut Vec<u8>, value: u32) {
 
 fn append_u64(encoded: &mut Vec<u8>, value: u64) {
     encoded.extend_from_slice(&value.to_be_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sealer_reports_exhaustion_after_allocating_the_last_internal_sequence() {
+        let mut sealer = PeerFrameSealer {
+            session_id: SessionId::from([0x42; 32]),
+            channel_id: 9,
+            context_hash: [0x66; 32],
+            key: SecretKey(Zeroizing::new([0x77; 32])),
+            mode: FrameMode::Datagram,
+            nonce_prefix: [2, 1, 0, 0],
+            next_sequence: u64::MAX,
+            exhausted: false,
+            finished: false,
+        };
+
+        let final_frame = sealer.seal(b"last", PeerRelayFlags::DATAGRAM).unwrap();
+        assert_eq!(final_frame.sequence, u64::MAX);
+        assert_eq!(
+            sealer.seal(b"wrapped", PeerRelayFlags::DATAGRAM),
+            Err(PeerCryptoError::SequenceExhausted)
+        );
+    }
 }
