@@ -175,6 +175,7 @@ fn client_fixture(pki: &TestPki, server_addr: String) -> Result<Fixture, AnyErro
                 private_key_file,
                 heartbeat_interval_secs: 1,
             },
+            p2p: None,
             tunnels: vec![
                 TunnelConfig {
                     name: "ssh".to_owned(),
@@ -189,6 +190,8 @@ fn client_fixture(pki: &TestPki, server_addr: String) -> Result<Fixture, AnyErro
                     remote_port: 27015,
                 },
             ],
+            exports: Vec::new(),
+            forwards: Vec::new(),
         },
         verification_key,
     })
@@ -1038,7 +1041,10 @@ async fn real_server_heartbeat_echo_keeps_one_generation_active() -> Result<(), 
             private_key_file: keys.path().join("device.key"),
             heartbeat_interval_secs: 1,
         },
+        p2p: None,
         tunnels: Vec::new(),
+        exports: Vec::new(),
+        forwards: Vec::new(),
     };
     let control = ControlClient::from_config(config)?;
     let app = ClientApp::with_runtime(
