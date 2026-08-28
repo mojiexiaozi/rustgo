@@ -55,6 +55,12 @@ rustgos check -c ./server.toml
 rustgoc check -c ./client.toml
 ```
 
+`check` uses the production credential loaders. The server parses every
+certificate in its TLS chain, validates the TLS private-key encoding and
+leaf/key match, and rejects malformed or weak Ed25519 authorization keys. The
+client parses every explicit CA certificate and its Rustgo device private key.
+These checks perform no bind or connect operation.
+
 With conventional filenames in the current directory, no-argument startup is
 equivalent to explicit `-c`:
 

@@ -51,12 +51,17 @@ async fn execute(cli: Cli) -> Result<(), CommandError> {
     check_server_references(&cli.config, &config)?;
 
     match action {
-        Action::Run => ServerApp::bind(config)
-            .await?
-            .run()
-            .await
-            .map_err(Into::into),
-        Action::Check => Ok(()),
+        Action::Run => {
+            let server = ServerApp::bind(config).await?;
+            let address = server.local_addr().map_err(ServerError::from)?;
+            tracing::info!(
+                address = %safe_display(address),
+                event = %"server_listening",
+                "server TLS listener ready"
+            );
+            server.run().await.map_err(Into::into)
+        }
+        Action::Check => ServerApp::validate_credentials(&config).map_err(Into::into),
     }
 }
 

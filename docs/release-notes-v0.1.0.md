@@ -15,7 +15,9 @@ the clean release checkout immediately before distribution.
 - `rustc -Vv`: `rustc 1.98.0 (88d9e12ae 2026-08-18)`, host `x86_64-pc-windows-gnu`, LLVM 22.1.8
 - `cargo -V`: `cargo 1.98.0 (797e8a9bc 2026-08-05)`
 - installed target triples: `x86_64-pc-windows-gnu`
-- Windows release E2E: passed TCP and UDP smoke transfers through release binaries
+- Windows release E2E: passed production credential `check`, managed default
+  and explicit startup readiness, and TCP/UDP smoke transfers through release
+  binaries
 - Linux release E2E: not run on this host; no Bash or installed WSL distribution
 - 60-second fuzz smoke: not run; `cargo-fuzz` is absent and this Windows GNU host failed to compile `libfuzzer-sys`'s Windows shim
 
@@ -32,11 +34,16 @@ bash scripts/e2e.sh
 cargo +nightly fuzz run frame_decode -- -max_total_time=60
 ```
 
+The platform scripts generate a real ephemeral CA, server certificate chain,
+TLS private key, and device key pair outside cache paths. Default and explicit
+startup gates keep owned PIDs, enforce readiness deadlines, drain both output
+streams independently, and reap only those recorded processes.
+
 ## Artifact SHA-256
 
 ```text
-2a18dc451a41d899df9ca4da792dbbca2be4432f7d1430839b652ae8d9a14e1c  rustgos.exe
-2962cb9abcb928c24e1e6bef644e43cb8882af1e98741254c122f156d2c83c5f  rustgoc.exe
+efa50d6386301148d0ce913a18ac2b84e88dbda5d5083191cc53d6c1ae555dcd  rustgos.exe
+c39ae01aff364015b5bf4a9a14e2289f2ff5db75b100d76c80689b54a4eb86d1  rustgoc.exe
 NOT_BUILT_ON_THIS_HOST  rustgos
 NOT_BUILT_ON_THIS_HOST  rustgoc
 ```

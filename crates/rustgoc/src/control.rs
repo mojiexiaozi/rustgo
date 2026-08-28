@@ -26,26 +26,20 @@ pub struct ControlClient {
 }
 
 impl ControlClient {
+    /// Loads every local credential used by the production client without
+    /// creating or connecting a network socket.
+    pub fn validate_credentials(config: &ClientConfig) -> Result<(), ClientError> {
+        load_credentials(config).map(drop)
+    }
+
     /// Builds every local security dependency before any network socket is opened.
     pub fn from_config(config: ClientConfig) -> Result<Self, ClientError> {
-        config
-            .validate()
-            .map_err(|_| ClientError::InvalidConfiguration)?;
-        let heartbeat_interval_secs = u32::try_from(config.client.heartbeat_interval_secs)
-            .map_err(|_| ClientError::InvalidConfiguration)?;
-        if heartbeat_interval_secs == 0 {
-            return Err(ClientError::InvalidConfiguration);
-        }
-        let keypair = DeviceKeypair::load_private_file(&config.client.private_key_file)?;
-        let tls_client = TlsClient::from_ca_file(
-            &config.client.certificate_authority_file,
-            &config.client.server_name,
-        )?;
+        let (keypair, tls_client, heartbeat_interval) = load_credentials(&config)?;
         Ok(Self {
             config: Arc::new(config),
             keypair: Arc::new(keypair),
             tls_client,
-            heartbeat_interval: Duration::from_secs(u64::from(heartbeat_interval_secs)),
+            heartbeat_interval,
         })
     }
 
@@ -153,6 +147,29 @@ impl ControlClient {
             registered_tunnels,
         ))
     }
+}
+
+fn load_credentials(
+    config: &ClientConfig,
+) -> Result<(DeviceKeypair, TlsClient, Duration), ClientError> {
+    config
+        .validate()
+        .map_err(|_| ClientError::InvalidConfiguration)?;
+    let heartbeat_interval_secs = u32::try_from(config.client.heartbeat_interval_secs)
+        .map_err(|_| ClientError::InvalidConfiguration)?;
+    if heartbeat_interval_secs == 0 {
+        return Err(ClientError::InvalidConfiguration);
+    }
+    let keypair = DeviceKeypair::load_private_file(&config.client.private_key_file)?;
+    let tls_client = TlsClient::from_ca_file(
+        &config.client.certificate_authority_file,
+        &config.client.server_name,
+    )?;
+    Ok((
+        keypair,
+        tls_client,
+        Duration::from_secs(u64::from(heartbeat_interval_secs)),
+    ))
 }
 
 fn negotiated_version(server_version: ProtocolVersion) -> Result<ProtocolVersion, ClientError> {

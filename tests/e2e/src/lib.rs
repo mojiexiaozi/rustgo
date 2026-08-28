@@ -267,14 +267,10 @@ impl ProcessFixture {
             return Err("process fixture requires at least one TCP tunnel".into());
         }
         let directory = tempfile::tempdir()?;
-        let ca_file = directory.path().join("ca.pem");
-        let certificate_file = directory.path().join("server.pem");
-        let private_key_file = directory.path().join("server.key");
-        let (ca_pem, issuer) = certificate_authority()?;
-        let (server_pem, server_key_pem) = server_certificate(&issuer)?;
-        fs::write(&ca_file, ca_pem)?;
-        fs::write(&certificate_file, server_pem)?;
-        fs::write(&private_key_file, server_key_pem)?;
+        let pki = generate_ephemeral_pki(directory.path(), SERVER_NAME)?;
+        let ca_file = pki.certificate_authority_file;
+        let certificate_file = pki.certificate_file;
+        let private_key_file = pki.private_key_file;
 
         let key_directory = directory.path().join("device");
         generate_key_file(&key_directory)?;
@@ -359,14 +355,10 @@ impl ProcessFixture {
             return Err("process fixture requires at least one UDP tunnel".into());
         }
         let directory = tempfile::tempdir()?;
-        let ca_file = directory.path().join("ca.pem");
-        let certificate_file = directory.path().join("server.pem");
-        let private_key_file = directory.path().join("server.key");
-        let (ca_pem, issuer) = certificate_authority()?;
-        let (server_pem, server_key_pem) = server_certificate(&issuer)?;
-        fs::write(&ca_file, ca_pem)?;
-        fs::write(&certificate_file, server_pem)?;
-        fs::write(&private_key_file, server_key_pem)?;
+        let pki = generate_ephemeral_pki(directory.path(), SERVER_NAME)?;
+        let ca_file = pki.certificate_authority_file;
+        let certificate_file = pki.certificate_file;
+        let private_key_file = pki.private_key_file;
 
         let key_directory = directory.path().join("device");
         generate_key_file(&key_directory)?;
@@ -553,6 +545,47 @@ fn toml_basic_string(value: &str) -> String {
     rendered
 }
 
+/// Files generated for script and process E2E only.
+pub struct EphemeralPki {
+    pub certificate_authority_file: PathBuf,
+    pub certificate_file: PathBuf,
+    pub private_key_file: PathBuf,
+}
+
+/// Generates an isolated CA plus a server leaf/key pair. The server file
+/// contains the leaf followed by its CA so the production loader checks every
+/// certificate in a non-empty chain.
+pub fn generate_ephemeral_pki(directory: &Path, server_name: &str) -> TestResult<EphemeralPki> {
+    fs::create_dir_all(directory)?;
+    let certificate_authority_file = directory.join("ca.crt");
+    let certificate_file = directory.join("server.crt");
+    let private_key_file = directory.join("server.key");
+    let (ca_pem, issuer) = certificate_authority()?;
+    let (server_pem, server_key_pem) = server_certificate(server_name, &issuer)?;
+    write_new(&certificate_authority_file, ca_pem.as_bytes())?;
+    write_new(
+        &certificate_file,
+        format!("{server_pem}{ca_pem}").as_bytes(),
+    )?;
+    write_new(&private_key_file, server_key_pem.as_bytes())?;
+    Ok(EphemeralPki {
+        certificate_authority_file,
+        certificate_file,
+        private_key_file,
+    })
+}
+
+fn write_new(path: &Path, contents: &[u8]) -> TestResult {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(contents)?;
+    file.flush()?;
+    file.sync_all()?;
+    Ok(())
+}
+
 fn certificate_authority() -> TestResult<(String, Issuer<'static, KeyPair>)> {
     let mut parameters = CertificateParams::new(Vec::<String>::new())?;
     parameters.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
@@ -569,11 +602,14 @@ fn certificate_authority() -> TestResult<(String, Issuer<'static, KeyPair>)> {
     Ok((certificate.pem(), Issuer::new(parameters, key)))
 }
 
-fn server_certificate(issuer: &Issuer<'static, KeyPair>) -> TestResult<(String, String)> {
-    let mut parameters = CertificateParams::new(vec![SERVER_NAME.to_owned()])?;
+fn server_certificate(
+    server_name: &str,
+    issuer: &Issuer<'static, KeyPair>,
+) -> TestResult<(String, String)> {
+    let mut parameters = CertificateParams::new(vec![server_name.to_owned()])?;
     parameters
         .distinguished_name
-        .push(rcgen::DnType::CommonName, SERVER_NAME);
+        .push(rcgen::DnType::CommonName, server_name);
     parameters.key_usages = vec![KeyUsagePurpose::DigitalSignature];
     parameters.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
     let key = KeyPair::generate()?;

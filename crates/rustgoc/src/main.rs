@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 use rustgo_config::{ClientConfig, check_client_references, load_client};
 use rustgo_crypto::generate_key_file;
 use rustgo_transport::{init_logging, safe_display};
-use rustgoc::ClientApp;
+use rustgoc::{ClientApp, ControlClient};
 
 /// Rustgo private-network client.
 #[derive(Debug, Parser)]
@@ -91,7 +91,9 @@ fn execute<H: CommandHandler>(cli: Cli, handler: &H) -> Result<(), String> {
     check_client_references(&cli.config, &config).map_err(|error| error.to_string())?;
     match action {
         Action::Run => handler.run(config),
-        Action::Check => Ok(()),
+        Action::Check => {
+            ControlClient::validate_credentials(&config).map_err(|error| error.to_string())
+        }
         Action::Keygen { .. } => unreachable!("keygen actions return before configuration loading"),
     }
 }

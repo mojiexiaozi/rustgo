@@ -206,18 +206,23 @@ impl std::fmt::Debug for TlsServer {
 }
 
 impl TlsServer {
+    /// Parses a complete certificate chain and private key, then verifies that
+    /// the leaf certificate and key form a usable TLS 1.3 server identity.
+    /// No socket is created or bound.
+    pub fn validate_identity(
+        certificate_file: impl AsRef<Path>,
+        private_key_file: impl AsRef<Path>,
+    ) -> Result<(), TlsError> {
+        load_server_config(certificate_file.as_ref(), private_key_file.as_ref()).map(drop)
+    }
+
     /// Loads and validates all TLS material before binding the socket.
     pub async fn bind<A: ToSocketAddrs>(
         address: A,
         certificate_file: impl AsRef<Path>,
         private_key_file: impl AsRef<Path>,
     ) -> Result<Self, TlsError> {
-        let certificates = load_certificates(certificate_file.as_ref())?;
-        let private_key = load_private_key(private_key_file.as_ref())?;
-        let config = ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-            .with_no_client_auth()
-            .with_single_cert(certificates, private_key)
-            .map_err(|_| TlsError::InvalidTlsIdentity)?;
+        let config = load_server_config(certificate_file.as_ref(), private_key_file.as_ref())?;
         let acceptor = TlsAcceptor::from(Arc::new(config));
 
         let listener = TcpListener::bind(address)
@@ -248,6 +253,18 @@ impl TlsServer {
             .await
             .map_err(|_| TlsError::HandshakeFailed)
     }
+}
+
+fn load_server_config(
+    certificate_file: &Path,
+    private_key_file: &Path,
+) -> Result<ServerConfig, TlsError> {
+    let certificates = load_certificates(certificate_file)?;
+    let private_key = load_private_key(private_key_file)?;
+    ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+        .with_no_client_auth()
+        .with_single_cert(certificates, private_key)
+        .map_err(|_| TlsError::InvalidTlsIdentity)
 }
 
 /// A TLS 1.3-only client that verifies an explicit CA file and server name.

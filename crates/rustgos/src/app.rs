@@ -139,6 +139,17 @@ pub struct ServerApp {
 }
 
 impl ServerApp {
+    /// Loads every local credential used by the production server without
+    /// creating or binding a network socket.
+    pub fn validate_credentials(config: &ServerConfig) -> Result<(), ServerError> {
+        load_authenticator(config)?;
+        TlsServer::validate_identity(
+            &config.server.certificate_file,
+            &config.server.private_key_file,
+        )?;
+        Ok(())
+    }
+
     pub async fn bind(config: ServerConfig) -> Result<Self, ServerError> {
         let mut runtime_limits = ServerRuntimeLimits::default();
         runtime_limits.apply_internal_test_overrides()?;
@@ -161,8 +172,7 @@ impl ServerApp {
             .map_err(|_| ServerError::InvalidRuntimeLimits)?;
         let max_tunnels = usize::try_from(config.limits.max_tunnels_per_client)
             .map_err(|_| ServerError::InvalidRuntimeLimits)?;
-        let authenticator =
-            Authenticator::new(&config.clients).map_err(|_| ServerError::AuthenticationSetup)?;
+        let authenticator = load_authenticator(&config)?;
         let tls_server = Arc::new(
             TlsServer::bind(
                 &config.server.bind_addr,
@@ -298,6 +308,10 @@ impl ServerApp {
         while sessions.join_next().await.is_some() {}
         result
     }
+}
+
+fn load_authenticator(config: &ServerConfig) -> Result<Authenticator, ServerError> {
+    Authenticator::new(&config.clients).map_err(|_| ServerError::AuthenticationSetup)
 }
 
 impl ServerRuntimeLimits {

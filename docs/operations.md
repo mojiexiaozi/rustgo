@@ -110,8 +110,12 @@ remote_port = 27015
 ```
 
 `check` uses the same strict parser, validation, path resolution, and
-referenced-file checks as startup, but it does not bind sockets or contact the
-server:
+production credential loaders as startup. `rustgos check` parses every DER
+certificate in the configured TLS chain, validates the TLS private-key format
+and leaf/key match, and parses every authorized Ed25519 public key (including
+weak-key rejection). `rustgoc check` parses every certificate in the explicit
+CA chain and loads the Rustgo device private key. It does not bind a listener,
+open a socket, resolve the peer, or contact the server:
 
 ```text
 rustgos check -c C:\rustgo\server.toml
@@ -219,7 +223,8 @@ client and restore the old public/private references as one coordinated change.
 | --- | --- |
 | `cannot read configuration` | Confirm the current directory for no-argument startup, or pass the exact file with `-c`. |
 | missing referenced file | Remember relative paths are based on the TOML directory; verify service-account permissions as well as existence. |
-| TLS certificate or server-name failure | Verify DNS, the certificate SAN, validity dates, and that the explicit CA file signed the server certificate. |
+| `check` reports a TLS certificate/key error | Verify every PEM certificate decodes to complete DER, the server leaf matches its private key, and the client CA file contains only intended trust roots. |
+| TLS certificate or server-name failure at startup | Verify DNS, the certificate SAN, validity dates, and that the explicit CA file signed the server certificate. |
 | authentication rejected | Confirm name, enabled status, public key on the server, and matching private key on the client. Do not rotate one side alone. |
 | heartbeat incompatibility or reconnect loop | Keep `heartbeat_interval_secs` strictly below server `heartbeat_timeout_secs`; inspect both logs and clocks. |
 | tunnel rejected with port conflict | Find the process or another Rustgo tunnel already owning that TCP/UDP port; one failed tunnel does not invalidate unrelated tunnels. |
