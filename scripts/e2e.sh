@@ -7,6 +7,9 @@ started_pid=
 started_stdout=
 started_stderr=
 process_sequence=0
+cleanup_deadline=0
+managed_term_grace_seconds=2
+managed_kill_reap_seconds=2
 
 parse_proc_stat_starttime() {
     local stat_line=$1
@@ -64,14 +67,27 @@ terminate_process() {
     local pid=$1
     local expected_identity=$2
     process_identity_matches "$pid" "$expected_identity" || return 1
-    kill "$pid"
+    kill -TERM "$pid"
 }
 
-wait_for_process() {
+kill_process() {
     local pid=$1
     local expected_identity=$2
     process_identity_matches "$pid" "$expected_identity" || return 1
-    wait "$pid"
+    kill -KILL "$pid"
+}
+
+begin_cleanup_deadline() {
+    local timeout_seconds=$1
+    cleanup_deadline=$((SECONDS + timeout_seconds))
+}
+
+cleanup_deadline_expired() {
+    [ "$SECONDS" -ge "$cleanup_deadline" ]
+}
+
+cleanup_poll_pause() {
+    sleep 0.1
 }
 
 remove_tree() {
@@ -154,73 +170,45 @@ unregister_managed_pid() {
     [ "$found" = true ]
 }
 
-wait_and_unregister_managed_pid() {
+wait_for_managed_identity_release() {
     local pid=$1
     local expected_identity=$2
-    local previous_int previous_term
-    local deferred_signal=0
-    local observed_signal=0
-    local unregister_failed=0
-    local identity_lost=0
-    previous_int=$(trap -p INT)
-    previous_term=$(trap -p TERM)
+    local timeout_seconds=$3
 
-    # Defer interrupt handling across wait plus unregister. Bash runs a pending
-    # trap between commands, so restoring the normal exit traps only after the
-    # registry update prevents a freshly reused PID from remaining owned.
-    trap 'deferred_signal=130; observed_signal=130' INT
-    trap 'deferred_signal=143; observed_signal=143' TERM
+    begin_cleanup_deadline "$timeout_seconds"
     while true; do
-        deferred_signal=0
         if ! process_identity_matches "$pid" "$expected_identity"; then
-            identity_lost=1
-            break
+            if ! unregister_managed_pid "$pid"; then
+                echo "managed PID disappeared before unregister: $pid" >&2
+                return 1
+            fi
+            return 0
         fi
-        if wait_for_process "$pid" "$expected_identity"; then
-            :
-        else
-            # A terminated child normally makes wait return its nonzero exit
-            # status. The wait still reaped it; only a deferred signal requires
-            # another wait attempt before unregistering.
-            :
+        if cleanup_deadline_expired; then
+            return 1
         fi
-        if [ "$deferred_signal" -eq 0 ]; then
-            break
+        if ! process_is_alive "$pid" "$expected_identity"; then
+            # A child may exit between the identity read and signal-0 probe.
+            # Continue only while the same identity remains readable; Bash
+            # reaps asynchronous children and /proc then releases the identity.
+            if ! process_identity_matches "$pid" "$expected_identity"; then
+                if ! unregister_managed_pid "$pid"; then
+                    echo "managed PID disappeared before unregister: $pid" >&2
+                    return 1
+                fi
+                return 0
+            fi
         fi
+        cleanup_poll_pause
     done
-    if ! unregister_managed_pid "$pid"; then
-        unregister_failed=1
-    fi
-
-    if [ -n "$previous_int" ]; then
-        eval "$previous_int"
-    else
-        trap - INT
-    fi
-    if [ -n "$previous_term" ]; then
-        eval "$previous_term"
-    else
-        trap - TERM
-    fi
-
-    if [ "$unregister_failed" -ne 0 ]; then
-        echo "managed PID disappeared before unregister: $pid" >&2
-        return 1
-    fi
-    if [ "$observed_signal" -ne 0 ]; then
-        return "$observed_signal"
-    fi
-    if [ "$identity_lost" -ne 0 ]; then
-        return 0
-    fi
-    return 0
 }
 
 stop_managed() {
     local pid=$1
     local identity
     local terminate_failed=0
-    local reap_status=0
+    local kill_failed=0
+    local kill_sent=0
     if ! is_managed_pid "$pid"; then
         return 0
     fi
@@ -246,19 +234,65 @@ stop_managed() {
             terminate_failed=1
         fi
     fi
+
+    if wait_for_managed_identity_release \
+        "$pid" "$identity" "$managed_term_grace_seconds"; then
+        return "$terminate_failed"
+    fi
+
+    # The TERM grace period expired while the original identity was still
+    # present. Re-check both identity and liveness, then check identity again at
+    # the KILL wrapper so a recycled numeric PID is never signalled.
     if ! process_identity_matches "$pid" "$identity"; then
         unregister_managed_pid "$pid"
         return "$terminate_failed"
     fi
-    if wait_and_unregister_managed_pid "$pid" "$identity"; then
-        reap_status=0
+    if process_is_alive "$pid" "$identity"; then
+        if ! process_identity_matches "$pid" "$identity"; then
+            unregister_managed_pid "$pid"
+            return "$terminate_failed"
+        fi
+        if kill_process "$pid" "$identity" 2>/dev/null; then
+            kill_sent=1
+        else
+            if ! process_identity_matches "$pid" "$identity"; then
+                unregister_managed_pid "$pid"
+                return "$terminate_failed"
+            fi
+            echo "failed to KILL owned process: $pid" >&2
+            kill_failed=1
+        fi
     else
-        reap_status=$?
+        if ! process_identity_matches "$pid" "$identity"; then
+            unregister_managed_pid "$pid"
+            return "$terminate_failed"
+        fi
     fi
-    if [ "$terminate_failed" -ne 0 ]; then
-        return 1
+
+    if wait_for_managed_identity_release \
+        "$pid" "$identity" "$managed_kill_reap_seconds"; then
+        if [ "$terminate_failed" -ne 0 ] || [ "$kill_failed" -ne 0 ]; then
+            return 1
+        fi
+        return 0
     fi
-    return "$reap_status"
+
+    if ! process_identity_matches "$pid" "$identity"; then
+        unregister_managed_pid "$pid"
+        if [ "$terminate_failed" -ne 0 ] || [ "$kill_failed" -ne 0 ]; then
+            return 1
+        fi
+        return 0
+    fi
+    if [ "$kill_sent" -ne 0 ]; then
+        echo "owned process did not exit after KILL before cleanup deadline: $pid" >&2
+    else
+        echo "owned process could not be reaped before cleanup deadline: $pid" >&2
+    fi
+    if ! unregister_managed_pid "$pid"; then
+        echo "managed PID disappeared before unregister: $pid" >&2
+    fi
+    return 1
 }
 
 cleanup_owned_children() {
@@ -429,69 +463,188 @@ run_cleanup_self_test() (
         return 1
     fi
 
-    # Simulate a naturally exited child whose numeric PID is immediately reused
-    # before an explicit wait. Cleanup must compare the registered process
-    # identity and never signal or wait for the unrelated replacement.
-    managed_pids=()
-    managed_identities=()
-    local alive_calls=0
-    local terminate_calls=0
-    local wait_calls=0
-    local current_identity=identity-A
-    local identity_readable=true
-    read_process_identity() {
-        [ "$identity_readable" = true ] || return 1
-        printf '%s\n' "$current_identity"
-    }
-    process_is_alive() {
-        [ "$1" = 4242 ]
-        [ "$2" = identity-A ]
-        alive_calls=$((alive_calls + 1))
-        return 0
-    }
-    terminate_process() {
-        [ "$1" = 4242 ]
-        [ "$2" = identity-A ]
-        terminate_calls=$((terminate_calls + 1))
-        return 0
-    }
-    wait_for_process() {
-        [ "$1" = 4242 ]
-        [ "$2" = identity-A ]
-        wait_calls=$((wait_calls + 1))
-        return 0
-    }
-    register_managed_pid 4242 identity-A
-    current_identity=identity-B
-    cleanup_owned_children
-    [ "$alive_calls" -eq 0 ]
-    [ "$terminate_calls" -eq 0 ]
-    [ "$wait_calls" -eq 0 ]
-    [ "${#managed_pids[@]}" -eq 0 ]
-    [ "${#managed_identities[@]}" -eq 0 ]
+    install_managed_child_simulation() {
+        local behavior=$1
+        managed_pids=()
+        managed_identities=()
+        simulated_behavior=$behavior
+        simulated_alive=true
+        simulated_identity=identity-A
+        simulated_identity_readable=true
+        alive_calls=0
+        terminate_calls=0
+        kill_calls=0
+        wait_calls=0
+        deadline_starts=0
+        deadline_checks=0
+        total_deadline_checks=0
+        poll_pause_calls=0
 
-    # An unreadable or missing /proc identity is also unverifiable and must
-    # take the same never-signal path.
-    identity_readable=false
-    register_managed_pid 4242 identity-A
-    cleanup_owned_children
-    [ "$alive_calls" -eq 0 ]
-    [ "$terminate_calls" -eq 0 ]
-    [ "$wait_calls" -eq 0 ]
-    [ "${#managed_pids[@]}" -eq 0 ]
-    [ "${#managed_identities[@]}" -eq 0 ]
+        if [ "$behavior" = missing-identity ]; then
+            simulated_identity_readable=false
+        fi
 
-    # The matching identity remains an owned child and must follow the normal
-    # terminate, wait, and unregister lifecycle.
-    identity_readable=true
-    current_identity=identity-A
-    register_managed_pid 4242 identity-A
-    cleanup_owned_children
-    [ "$alive_calls" -eq 1 ]
-    [ "$terminate_calls" -eq 1 ]
-    [ "$wait_calls" -eq 1 ]
-    [ "${#managed_pids[@]}" -eq 0 ]
-    [ "${#managed_identities[@]}" -eq 0 ]
+        read_process_identity() {
+            [ "$1" = 4242 ]
+            [ "$simulated_identity_readable" = true ] || return 1
+            printf '%s\n' "$simulated_identity"
+        }
+        process_is_alive() {
+            [ "$1" = 4242 ]
+            [ "$2" = identity-A ]
+            alive_calls=$((alive_calls + 1))
+            if [ "$simulated_behavior" = term-identity-changes ] &&
+                [ "$terminate_calls" -eq 1 ] && [ "$alive_calls" -eq 3 ]; then
+                # Change identity after the TERM deadline, in the race window
+                # between escalation liveness and the final pre-KILL check.
+                simulated_identity=identity-B
+            fi
+            [ "$simulated_alive" = true ]
+        }
+        terminate_process() {
+            [ "$1" = 4242 ]
+            [ "$2" = identity-A ]
+            terminate_calls=$((terminate_calls + 1))
+            case "$simulated_behavior" in
+                term-exits)
+                    simulated_alive=false
+                    simulated_identity_readable=false
+                    ;;
+            esac
+        }
+        kill_process() {
+            [ "$1" = 4242 ]
+            [ "$2" = identity-A ]
+            kill_calls=$((kill_calls + 1))
+            if [ "$simulated_behavior" = term-ignored-kill-exits ]; then
+                simulated_alive=false
+                simulated_identity_readable=false
+            fi
+        }
+        wait_for_process() {
+            [ "$1" = 4242 ]
+            [ "$2" = identity-A ]
+            wait_calls=$((wait_calls + 1))
+            return 0
+        }
+        begin_cleanup_deadline() {
+            deadline_starts=$((deadline_starts + 1))
+            deadline_checks=0
+        }
+        cleanup_deadline_expired() {
+            deadline_checks=$((deadline_checks + 1))
+            total_deadline_checks=$((total_deadline_checks + 1))
+            [ "$deadline_checks" -ge 2 ]
+        }
+        cleanup_poll_pause() {
+            poll_pause_calls=$((poll_pause_calls + 1))
+        }
+    }
+
+    assert_managed_child_scenario() (
+        local behavior=$1
+        local expected_status=$2
+        local expected_term_calls=$3
+        local expected_kill_calls=$4
+        local expected_deadline_starts=$5
+        local minimum_deadline_checks=$6
+        install_managed_child_simulation "$behavior"
+        register_managed_pid 4242 identity-A
+
+        local observed_status=0
+        local scenario_error
+        scenario_error=$(mktemp "$system_temp_base/rustgo-e2e-self-test.XXXXXXXX")
+        trap 'command rm -f -- "$scenario_error"' EXIT
+        if cleanup_owned_children 2>"$scenario_error"; then
+            observed_status=0
+        else
+            observed_status=$?
+        fi
+        if [ "$observed_status" -ne "$expected_status" ]; then
+            echo "$behavior cleanup status: expected $expected_status, got $observed_status" >&2
+            return 1
+        fi
+        if [ "$terminate_calls" -ne "$expected_term_calls" ]; then
+            echo "$behavior TERM calls: expected $expected_term_calls, got $terminate_calls" >&2
+            return 1
+        fi
+        if [ "$kill_calls" -ne "$expected_kill_calls" ]; then
+            echo "$behavior KILL calls: expected $expected_kill_calls, got $kill_calls" >&2
+            return 1
+        fi
+        if [ "$deadline_starts" -ne "$expected_deadline_starts" ]; then
+            echo "$behavior deadline starts: expected $expected_deadline_starts, got $deadline_starts" >&2
+            return 1
+        fi
+        if [ "$total_deadline_checks" -lt "$minimum_deadline_checks" ]; then
+            echo "$behavior deadline checks: expected at least $minimum_deadline_checks, got $total_deadline_checks" >&2
+            return 1
+        fi
+        [ "$wait_calls" -eq 0 ]
+        [ "$total_deadline_checks" -le 8 ]
+        [ "$poll_pause_calls" -le 4 ]
+        [ "${#managed_pids[@]}" -eq 0 ]
+        [ "${#managed_identities[@]}" -eq 0 ]
+        if [ "$expected_status" -eq 0 ]; then
+            [ ! -s "$scenario_error" ]
+        else
+            assert_file_contains "$scenario_error" \
+                "owned process did not exit after KILL before cleanup deadline"
+        fi
+        command rm -f -- "$scenario_error"
+        trap - EXIT
+    )
+
+    # These scenarios exercise the real cleanup state machine with deterministic
+    # process primitives: cooperative TERM, TERM escalation, identity loss,
+    # missing identity, and a child that remains present even after KILL.
+    assert_managed_child_scenario term-exits 0 1 0 1 0
+    assert_managed_child_scenario term-ignored-kill-exits 0 1 1 2 2
+    assert_managed_child_scenario term-identity-changes 0 1 0 1 2
+    assert_managed_child_scenario missing-identity 0 0 0 0 0
+    assert_managed_child_scenario kill-stuck 1 1 1 2 4
+
+    run_kill_stuck_cleanup() (
+        local original_status=$1
+        install_managed_child_simulation kill-stuck
+        cleanup_temporary_directory() {
+            return 0
+        }
+        register_managed_pid 4242 identity-A
+        trap cleanup EXIT
+        exit "$original_status"
+    )
+
+    local kill_stuck_output kill_stuck_status
+    if kill_stuck_output=$(run_kill_stuck_cleanup 0 2>&1); then
+        echo "cleanup accepted a managed child that remained alive after KILL" >&2
+        return 1
+    else
+        kill_stuck_status=$?
+    fi
+    [ "$kill_stuck_status" -eq 1 ]
+    case "$kill_stuck_output" in
+        *"cleanup failed; changing successful exit status to 1"*) ;;
+        *)
+            echo "missing cleanup-success propagation diagnostic" >&2
+            return 1
+            ;;
+    esac
+
+    if kill_stuck_output=$(run_kill_stuck_cleanup 23 2>&1); then
+        echo "cleanup hid an original failure while KILL did not converge" >&2
+        return 1
+    else
+        kill_stuck_status=$?
+    fi
+    [ "$kill_stuck_status" -eq 23 ]
+    case "$kill_stuck_output" in
+        *"cleanup also failed; preserving original exit status 23"*) ;;
+        *)
+            echo "missing original-failure preservation diagnostic" >&2
+            return 1
+            ;;
+    esac
 
     # Simulate rm failure against a real, correctly scoped mktemp directory.
     # The helper must fail, retain the directory, and emit a clear diagnostic.
