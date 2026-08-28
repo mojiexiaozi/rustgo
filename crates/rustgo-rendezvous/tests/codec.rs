@@ -4,9 +4,10 @@ use rustgo_protocol::{
 };
 use rustgo_rendezvous::{
     Candidate, CandidateGeneration, CandidateSet, CandidateTransport, ConnectivityResult,
-    MAX_CANDIDATES, MAX_DEVICE_NAME_BYTES, MAX_PEER_RELAY_CIPHERTEXT_BYTES, PeerRelayFlags,
-    PeerRelayFrame, ProviderDecision, RelayRequest, RendezvousClose, RendezvousEnvelope,
-    RendezvousError, RendezvousPayload, RendezvousRequest, SessionId, WireError,
+    MAX_CANDIDATES, MAX_DEVICE_NAME_BYTES, MAX_EPHEMERAL_PUBLIC_KEY_BYTES, MAX_ERROR_DETAIL_BYTES,
+    MAX_PEER_RELAY_CIPHERTEXT_BYTES, PeerRelayFlags, PeerRelayFrame, ProviderDecision,
+    RelayRequest, RendezvousClose, RendezvousEnvelope, RendezvousError, RendezvousPayload,
+    RendezvousRequest, SessionId, WireError,
 };
 use serde::Serialize;
 
@@ -40,7 +41,6 @@ fn request_envelope() -> RendezvousEnvelope {
         expires_unix_secs: 2_000,
         payload: RendezvousPayload::Request(RendezvousRequest {
             export: BoundedString::try_from("ssh").unwrap(),
-            protocol: TunnelProtocol::TCP,
         }),
         signature: BoundedBytes::try_from(vec![0x5a; 64]).unwrap(),
     }
@@ -91,12 +91,8 @@ fn every_rendezvous_payload_uses_its_stable_outer_id_and_round_trips() {
     let payloads = [
         RendezvousPayload::Request(RendezvousRequest {
             export: BoundedString::try_from("ssh").unwrap(),
-            protocol: TunnelProtocol::TCP,
         }),
-        RendezvousPayload::ProviderDecision(ProviderDecision {
-            accepted: true,
-            detail: None,
-        }),
+        RendezvousPayload::ProviderDecision(ProviderDecision::accepted(TunnelProtocol::TCP)),
         RendezvousPayload::CandidateSet(CandidateSet {
             ephemeral_public_key: BoundedBytes::try_from(vec![3; 32]).unwrap(),
             candidates: BoundedVec::try_from(vec![candidate()]).unwrap(),
@@ -134,6 +130,73 @@ fn every_rendezvous_payload_uses_its_stable_outer_id_and_round_trips() {
             envelope
         );
     }
+}
+
+#[test]
+fn provider_decision_round_trip_preserves_the_authoritative_protocol() {
+    let accepted = ProviderDecision::accepted(TunnelProtocol::UDP);
+    let encoded = postcard::to_allocvec(&accepted).unwrap();
+    let decoded: ProviderDecision = postcard::from_bytes(&encoded).unwrap();
+
+    assert!(decoded.is_accepted());
+    assert_eq!(decoded.protocol(), Some(TunnelProtocol::UDP));
+    assert_eq!(decoded.detail(), None);
+
+    let rejected = ProviderDecision::rejected(Some(
+        BoundedString::try_from("export is unavailable").unwrap(),
+    ));
+    let encoded = postcard::to_allocvec(&rejected).unwrap();
+    let decoded: ProviderDecision = postcard::from_bytes(&encoded).unwrap();
+
+    assert!(!decoded.is_accepted());
+    assert_eq!(decoded.protocol(), None);
+    assert_eq!(
+        decoded.detail().map(BoundedString::as_str),
+        Some("export is unavailable")
+    );
+}
+
+#[test]
+fn provider_decision_rejects_hostile_protocol_combinations_on_decode() {
+    #[derive(Serialize)]
+    struct InvalidDecisionWire {
+        accepted: bool,
+        protocol: Option<TunnelProtocol>,
+        detail: Option<BoundedString<MAX_ERROR_DETAIL_BYTES>>,
+    }
+
+    let accepted_without_protocol = postcard::to_allocvec(&InvalidDecisionWire {
+        accepted: true,
+        protocol: None,
+        detail: None,
+    })
+    .unwrap();
+    let rejected_with_protocol = postcard::to_allocvec(&InvalidDecisionWire {
+        accepted: false,
+        protocol: Some(TunnelProtocol::TCP),
+        detail: None,
+    })
+    .unwrap();
+
+    assert!(postcard::from_bytes::<ProviderDecision>(&accepted_without_protocol).is_err());
+    assert!(postcard::from_bytes::<ProviderDecision>(&rejected_with_protocol).is_err());
+}
+
+#[test]
+fn hostile_candidate_set_with_thirty_three_entries_is_rejected_during_decode() {
+    #[derive(Serialize)]
+    struct UnboundedCandidateSet {
+        ephemeral_public_key: BoundedBytes<MAX_EPHEMERAL_PUBLIC_KEY_BYTES>,
+        candidates: Vec<Candidate>,
+    }
+
+    let hostile = postcard::to_allocvec(&UnboundedCandidateSet {
+        ephemeral_public_key: BoundedBytes::try_from(vec![0x24; 32]).unwrap(),
+        candidates: vec![candidate(); MAX_CANDIDATES + 1],
+    })
+    .unwrap();
+
+    assert!(postcard::from_bytes::<CandidateSet>(&hostile).is_err());
 }
 
 #[test]

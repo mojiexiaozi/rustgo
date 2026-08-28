@@ -79,13 +79,87 @@ pub struct Candidate {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RendezvousRequest {
     pub export: BoundedString<MAX_EXPORT_NAME_BYTES>,
-    pub protocol: TunnelProtocol,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderDecision {
-    pub accepted: bool,
-    pub detail: Option<BoundedString<MAX_ERROR_DETAIL_BYTES>>,
+    accepted: bool,
+    protocol: Option<TunnelProtocol>,
+    detail: Option<BoundedString<MAX_ERROR_DETAIL_BYTES>>,
+}
+
+impl ProviderDecision {
+    pub const fn accepted(protocol: TunnelProtocol) -> Self {
+        Self {
+            accepted: true,
+            protocol: Some(protocol),
+            detail: None,
+        }
+    }
+
+    pub const fn rejected(detail: Option<BoundedString<MAX_ERROR_DETAIL_BYTES>>) -> Self {
+        Self {
+            accepted: false,
+            protocol: None,
+            detail,
+        }
+    }
+
+    pub const fn is_accepted(&self) -> bool {
+        self.accepted
+    }
+
+    pub const fn protocol(&self) -> Option<TunnelProtocol> {
+        self.protocol
+    }
+
+    pub const fn detail(&self) -> Option<&BoundedString<MAX_ERROR_DETAIL_BYTES>> {
+        self.detail.as_ref()
+    }
+}
+
+impl Serialize for ProviderDecision {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        #[derive(Serialize)]
+        struct Wire<'a> {
+            accepted: bool,
+            protocol: Option<TunnelProtocol>,
+            detail: Option<&'a BoundedString<MAX_ERROR_DETAIL_BYTES>>,
+        }
+
+        Wire {
+            accepted: self.accepted,
+            protocol: self.protocol,
+            detail: self.detail.as_ref(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ProviderDecision {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Wire {
+            accepted: bool,
+            protocol: Option<TunnelProtocol>,
+            detail: Option<BoundedString<MAX_ERROR_DETAIL_BYTES>>,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        match (wire.accepted, wire.protocol, wire.detail) {
+            (true, Some(protocol), None) => Ok(Self::accepted(protocol)),
+            (false, None, detail) => Ok(Self::rejected(detail)),
+            _ => Err(de::Error::custom(
+                "invalid provider decision protocol fields",
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

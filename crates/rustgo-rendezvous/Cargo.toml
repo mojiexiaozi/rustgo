@@ -9,4 +9,3 @@ postcard.workspace = true
 rustgo-protocol = { path = "../rustgo-protocol" }
 serde.workspace = true
 thiserror.workspace = true
-
