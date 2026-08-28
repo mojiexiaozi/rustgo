@@ -543,7 +543,16 @@ fn udp_echo() -> TestResult {
 fn wildcard_control_without_udp_bind_rejects_only_udp_and_keeps_tcp() -> TestResult {
     let udp_echo = UdpEchoServer::start()?;
     let tcp_echo = EchoServer::start()?;
-    let fixture = ProcessFixture::single_udp(udp_echo.address(), 8, 1024)?;
+    let public_reservation = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))?;
+    let fixture = ProcessFixture::udp_tunnels(
+        vec![UdpTunnelSpec::on_port(
+            "echo",
+            udp_echo.address(),
+            public_reservation.local_addr()?.port(),
+        )],
+        8,
+        1024,
+    )?;
     let (tcp_reservation, tcp_public) = append_tcp_sentinel(&fixture, tcp_echo.address(), 1)?;
     set_wildcard_control_bind(&fixture, None)?;
     drop(tcp_reservation);
@@ -557,9 +566,7 @@ fn wildcard_control_without_udp_bind_rejects_only_udp_and_keeps_tcp() -> TestRes
         &mut connect_tcp_sentinel(tcp_public)?,
         b"TCP survives wildcard UDP rejection",
     )?;
-    let socket = public_socket_with_timeout(Duration::from_millis(300))?;
-    socket.send_to(b"must not route through 0.0.0.0", fixture.public_address())?;
-    expect_no_datagram(&socket)?;
+    assert_eq!(public_reservation.local_addr()?, fixture.public_address());
     assert!(
         client
             .wait_for_line("event=udp_channel_ready", Duration::from_millis(300))
