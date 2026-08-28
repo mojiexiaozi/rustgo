@@ -645,6 +645,7 @@ device_private_key="$client_key_directory/device.key"
 RUSTGO_DEVICE_PUBLIC_KEY=$(tr -d '\r\n' < "$server_authorized_directory/device.pub")
 export RUSTGO_SERVER_CERTIFICATE_FILE="$server_certificate"
 export RUSTGO_SERVER_PRIVATE_KEY_FILE="$server_private_key"
+export RUSTGO_SERVER_UDP_BIND_IP=127.0.0.1
 export RUSTGO_CERTIFICATE_AUTHORITY_FILE="$certificate_authority"
 export RUSTGO_DEVICE_PRIVATE_KEY_FILE="$device_private_key"
 export RUSTGO_DEVICE_PUBLIC_KEY

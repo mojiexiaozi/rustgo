@@ -167,6 +167,7 @@ $savedEnvironment = @{}
 $environmentNames = @(
     "RUST_LOG",
     "RUSTGO_E2E_BIN_PROFILE",
+    "RUSTGO_SERVER_UDP_BIND_IP",
     "RUSTGO_SERVER_CERTIFICATE_FILE",
     "RUSTGO_SERVER_PRIVATE_KEY_FILE",
     "RUSTGO_CERTIFICATE_AUTHORITY_FILE",
@@ -219,6 +220,7 @@ try {
 
     $env:RUSTGO_SERVER_CERTIFICATE_FILE = $serverCertificate.Replace('\', '/')
     $env:RUSTGO_SERVER_PRIVATE_KEY_FILE = $serverPrivateKey.Replace('\', '/')
+    $env:RUSTGO_SERVER_UDP_BIND_IP = "127.0.0.1"
     $env:RUSTGO_CERTIFICATE_AUTHORITY_FILE = $certificateAuthority.Replace('\', '/')
     $env:RUSTGO_DEVICE_PRIVATE_KEY_FILE = $devicePrivateKey.Replace('\', '/')
     $env:RUSTGO_DEVICE_PUBLIC_KEY = $devicePublicKey
