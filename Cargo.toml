@@ -9,6 +9,7 @@ version = "0.1.0"
 
 [workspace.dependencies]
 anyhow = "1.0.100"
+async-trait = "0.1.89"
 base64 = "0.22.1"
 bytes = "1.10.1"
 chacha20poly1305 = "0.10.1"
@@ -24,6 +25,7 @@ serde = { version = "1.0.219", features = ["derive"] }
 sha2 = "0.10.9"
 thiserror = "2.0.16"
 tokio = { version = "1.47.1", features = ["full"] }
+tokio-util = { version = "0.7.19", features = ["rt"] }
 tokio-rustls = "0.26.2"
 toml = "0.9.5"
 tracing = "0.1.41"
