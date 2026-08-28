@@ -162,7 +162,9 @@ fn candidate_confirmations_are_repeatable_mac_domains_not_fixed_nonce_aead() {
     let second_binding = [0x42; 32];
     let first = initiator.candidate_confirmation(&first_binding);
     let second = initiator.candidate_confirmation(&second_binding);
+    let quic_handshake_tag = initiator.handshake_tag(&first_binding);
     assert_ne!(first, second);
+    assert_ne!(&first[..quic_handshake_tag.len()], &quic_handshake_tag);
     responder
         .verify_candidate_confirmation(&first_binding, &first)
         .unwrap();

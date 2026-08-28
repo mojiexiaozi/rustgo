@@ -210,6 +210,7 @@ impl SecretKey {
 }
 
 struct HandshakeKey(SecretKey);
+struct CandidateMacKey(SecretKey);
 struct StreamKey(SecretKey);
 struct DatagramKey(SecretKey);
 
@@ -219,6 +220,8 @@ pub struct PeerSessionKeys {
     context_hash: [u8; 32],
     handshake_initiator_to_responder: HandshakeKey,
     handshake_responder_to_initiator: HandshakeKey,
+    candidate_mac_initiator_to_responder: CandidateMacKey,
+    candidate_mac_responder_to_initiator: CandidateMacKey,
     stream_initiator_to_responder: StreamKey,
     stream_responder_to_initiator: StreamKey,
     datagram_initiator_to_responder: DatagramKey,
@@ -256,6 +259,14 @@ impl PeerSessionKeys {
             handshake_responder_to_initiator: HandshakeKey(expand_key(
                 &hkdf,
                 b"rustgo-peer-handshake-responder-to-initiator-v1",
+            )?),
+            candidate_mac_initiator_to_responder: CandidateMacKey(expand_key(
+                &hkdf,
+                b"rustgo-peer-tcp-candidate-mac-initiator-to-responder-v1",
+            )?),
+            candidate_mac_responder_to_initiator: CandidateMacKey(expand_key(
+                &hkdf,
+                b"rustgo-peer-tcp-candidate-mac-responder-to-initiator-v1",
             )?),
             stream_initiator_to_responder: StreamKey(expand_key(
                 &hkdf,
@@ -313,7 +324,7 @@ impl PeerSessionKeys {
     }
 
     /// Produces a repeatable, connection-scoped confirmation without AEAD nonce reuse.
-    /// HMAC is a PRF under the directional handshake key and safely supports distinct live
+    /// HMAC is a PRF under a dedicated directional candidate key and safely supports distinct live
     /// challenge bindings from concurrent candidates.
     #[must_use]
     pub fn candidate_confirmation(
@@ -321,7 +332,7 @@ impl PeerSessionKeys {
         transport_binding: &[u8; PEER_TRANSPORT_BINDING_BYTES],
     ) -> [u8; PEER_CANDIDATE_CONFIRMATION_BYTES] {
         candidate_hmac(
-            &self.outgoing_handshake_key().0,
+            &self.outgoing_candidate_mac_key().0,
             &self.context_hash,
             transport_binding,
         )
@@ -333,7 +344,7 @@ impl PeerSessionKeys {
         confirmation: &[u8; PEER_CANDIDATE_CONFIRMATION_BYTES],
     ) -> Result<(), PeerCryptoError> {
         let mut mac =
-            <Hmac<Sha256> as Mac>::new_from_slice(self.incoming_handshake_key().0.0.as_ref())
+            <Hmac<Sha256> as Mac>::new_from_slice(self.incoming_candidate_mac_key().0.0.as_ref())
                 .expect("HMAC-SHA256 accepts a 32-byte key");
         mac.update(b"rustgo-peer-candidate-confirmation-v1");
         mac.update(&self.context_hash);
@@ -452,6 +463,20 @@ impl PeerSessionKeys {
         match self.role {
             PeerRole::Initiator => &self.handshake_responder_to_initiator,
             PeerRole::Responder => &self.handshake_initiator_to_responder,
+        }
+    }
+
+    fn outgoing_candidate_mac_key(&self) -> &CandidateMacKey {
+        match self.role {
+            PeerRole::Initiator => &self.candidate_mac_initiator_to_responder,
+            PeerRole::Responder => &self.candidate_mac_responder_to_initiator,
+        }
+    }
+
+    fn incoming_candidate_mac_key(&self) -> &CandidateMacKey {
+        match self.role {
+            PeerRole::Initiator => &self.candidate_mac_responder_to_initiator,
+            PeerRole::Responder => &self.candidate_mac_initiator_to_responder,
         }
     }
 

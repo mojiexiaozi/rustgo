@@ -292,28 +292,9 @@ fn configure_outbound_sharing(socket: &Socket) -> io::Result<()> {
     socket.set_reuse_address(true)
 }
 #[cfg(windows)]
-#[allow(unsafe_code)]
-fn configure_listener_ownership(socket: &Socket) -> io::Result<()> {
-    use std::os::windows::io::AsRawSocket;
-    use windows_sys::Win32::Networking::WinSock::{
-        SO_EXCLUSIVEADDRUSE, SOCKET_ERROR, SOL_SOCKET, WSAGetLastError, setsockopt,
-    };
-    let enabled: i32 = 1;
-    // SAFETY: the socket handle is live for the call, `enabled` points to an initialized i32,
-    // its exact byte length is supplied, and Winsock copies the option before returning.
-    let result = unsafe {
-        setsockopt(
-            socket.as_raw_socket() as usize,
-            SOL_SOCKET,
-            SO_EXCLUSIVEADDRUSE,
-            (&enabled as *const i32).cast(),
-            std::mem::size_of::<i32>() as i32,
-        )
-    };
-    if result == SOCKET_ERROR {
-        // SAFETY: WSAGetLastError has no pointer preconditions and reads thread-local state.
-        return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
-    }
+fn configure_listener_ownership(_socket: &Socket) -> io::Result<()> {
+    // The supported Windows role-split never enables SO_REUSEADDR on the listener. Safe Rust's
+    // default Winsock bind is validated below by a hostile SO_REUSEADDR contender test.
     Ok(())
 }
 #[cfg(windows)]
