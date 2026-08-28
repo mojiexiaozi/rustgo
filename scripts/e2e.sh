@@ -9,6 +9,8 @@ started_stderr=
 process_sequence=0
 managed_term_grace_seconds=2
 managed_kill_reap_seconds=2
+pidfd_supervisor_wall_seconds=6
+pidfd_supervisor_kill_after_seconds=1
 
 parse_proc_stat_starttime() {
     local stat_line=$1
@@ -135,6 +137,24 @@ unregister_managed_pid() {
     [ "$found" = true ]
 }
 
+run_pidfd_supervisor() {
+    local supervisor_status
+    if timeout --foreground --signal=TERM \
+        --kill-after="${pidfd_supervisor_kill_after_seconds}s" \
+        "${pidfd_supervisor_wall_seconds}s" \
+        "$pidfd_python" "$pidfd_helper" "$@"; then
+        return 0
+    else
+        supervisor_status=$?
+    fi
+    case "$supervisor_status" in
+        124|137)
+            echo "pidfd supervisor exceeded its ${pidfd_supervisor_wall_seconds}s hard wall deadline" >&2
+            ;;
+    esac
+    return "$supervisor_status"
+}
+
 stop_managed() {
     local pid=$1
     local identity
@@ -154,7 +174,7 @@ stop_managed() {
             supervisor_status=1
             ;;
         *)
-            "$pidfd_python" "$pidfd_helper" terminate \
+            run_pidfd_supervisor terminate \
                 --pid "$pid" \
                 --expected-starttime "$identity" \
                 --term-grace-seconds "$managed_term_grace_seconds" \
@@ -236,11 +256,11 @@ select_cleanup_exit_status() {
 }
 
 cleanup() {
-    local original_status=$?
+    trap '' INT TERM
+    local original_status=$1
     local cleanup_failed=0
     local final_status
     trap - EXIT
-    trap '' INT TERM
     set +e
 
     cleanup_owned_children || cleanup_failed=1
@@ -359,19 +379,22 @@ run_cleanup_self_test() (
         trap 'command rm -f -- "$helper_calls"' EXIT
         managed_pids=()
         managed_identities=()
-        pidfd_python=pidfd_supervisor_fixture
         pidfd_helper=/expected/pidfd-supervisor.py
-        pidfd_supervisor_fixture() {
-            [ "$1" = "$pidfd_helper" ]
-            [ "$2" = terminate ]
-            [ "$3" = --pid ]
-            [ "$4" = 4242 ]
-            [ "$5" = --expected-starttime ]
-            [ "$6" = 987654 ]
-            [ "$7" = --term-grace-seconds ]
-            [ "$8" = "$managed_term_grace_seconds" ]
-            [ "$9" = --kill-grace-seconds ]
-            [ "${10}" = "$managed_kill_reap_seconds" ]
+        pidfd_python=unexpected_pidfd_python
+        unexpected_pidfd_python() {
+            echo "stop_managed bypassed the pidfd watchdog" >&2
+            return 99
+        }
+        run_pidfd_supervisor() {
+            [ "$1" = terminate ]
+            [ "$2" = --pid ]
+            [ "$3" = 4242 ]
+            [ "$4" = --expected-starttime ]
+            [ "$5" = 987654 ]
+            [ "$6" = --term-grace-seconds ]
+            [ "$7" = "$managed_term_grace_seconds" ]
+            [ "$8" = --kill-grace-seconds ]
+            [ "$9" = "$managed_kill_reap_seconds" ]
             printf 'called\n' >>"$helper_calls"
         }
         # A regression to local /proc checks would take this branch instead of
@@ -390,7 +413,75 @@ run_cleanup_self_test() (
         [ "${#managed_identities[@]}" -eq 0 ]
     )
     assert_stop_managed_uses_pidfd_helper
+
+    assert_hung_pidfd_helper_is_bounded() (
+        local hung_helper supervisor_status started_at elapsed
+        hung_helper=$(mktemp "$system_temp_base/rustgo-e2e-self-test.XXXXXXXX.py")
+        trap 'command rm -f -- "$hung_helper"' EXIT
+        printf 'import time\ntime.sleep(60)\n' >"$hung_helper"
+        pidfd_helper=$hung_helper
+        pidfd_supervisor_wall_seconds=0.2
+        pidfd_supervisor_kill_after_seconds=0.2
+        started_at=$(date +%s)
+        if run_pidfd_supervisor terminate --pid 4242 --expected-starttime 987654 \
+            --term-grace-seconds 2 --kill-grace-seconds 2; then
+            echo "hung pidfd supervisor unexpectedly succeeded" >&2
+            return 1
+        else
+            supervisor_status=$?
+        fi
+        if [ "$supervisor_status" -eq 127 ]; then
+            echo "pidfd supervisor watchdog is not implemented" >&2
+            return 1
+        fi
+        elapsed=$(($(date +%s) - started_at))
+        if [ "$elapsed" -ge 5 ]; then
+            echo "hung pidfd supervisor exceeded its hard wall deadline" >&2
+            return 1
+        fi
+    )
+    assert_hung_pidfd_helper_is_bounded
     "$pidfd_python" "$script_dir/pidfd_supervisor_test.py" --mock-only
+
+    run_entry_interrupted_cleanup() (
+        cleanup_temporary_directory() {
+            return 0
+        }
+        cleanup_marker=$1
+        cleanup_owned_children() {
+            printf 'completed\n' >"$cleanup_marker"
+        }
+        builtin trap 'cleanup $?' EXIT
+        entry_signal_pending=true
+        trap() {
+            builtin trap "$@"
+            if [ "$entry_signal_pending" = true ]; then
+                entry_signal_pending=false
+                kill -TERM "$BASHPID"
+            fi
+        }
+        exit 23
+    )
+
+    local entry_marker entry_status
+    entry_marker=$(mktemp "$system_temp_base/rustgo-e2e-self-test.XXXXXXXX")
+    trap 'command rm -f -- "$entry_marker"' EXIT
+    if run_entry_interrupted_cleanup "$entry_marker"; then
+        echo "cleanup hid the original failure after an entry TERM" >&2
+        return 1
+    else
+        entry_status=$?
+    fi
+    if [ "$entry_status" -ne 23 ]; then
+        echo "entry TERM changed cleanup status from 23 to $entry_status" >&2
+        return 1
+    fi
+    if [ "$(<"$entry_marker")" != completed ]; then
+        echo "cleanup did not finish after an entry TERM" >&2
+        return 1
+    fi
+    command rm -f -- "$entry_marker"
+    trap - EXIT
 
     run_term_interrupted_cleanup() (
         local completion_marker=$1
@@ -403,7 +494,7 @@ run_cleanup_self_test() (
         cleanup_temporary_directory() {
             return 0
         }
-        trap cleanup EXIT
+        trap 'cleanup $?' EXIT
         exit 23
     )
 
@@ -449,7 +540,7 @@ run_cleanup_self_test() (
     # Exercise the actual EXIT cleanup path as well as its helpers. A cleanup
     # failure must turn success into failure without hiding a prior failure.
     cleanup_error="$test_directory/cleanup-success.stderr"
-    if (trap cleanup EXIT; exit 0) 2>"$cleanup_error"; then
+    if (trap 'cleanup $?' EXIT; exit 0) 2>"$cleanup_error"; then
         echo "cleanup trap accepted a simulated remove failure" >&2
         return 1
     else
@@ -460,7 +551,7 @@ run_cleanup_self_test() (
     [ -d "$test_directory" ]
 
     preserved_error="$test_directory/cleanup-failure.stderr"
-    if (trap cleanup EXIT; exit 23) 2>"$preserved_error"; then
+    if (trap 'cleanup $?' EXIT; exit 23) 2>"$preserved_error"; then
         echo "cleanup trap hid an original failure" >&2
         return 1
     else
@@ -512,13 +603,13 @@ if ! read_process_identity "$$" >/dev/null; then
     echo "scripts/e2e.sh requires Linux /proc PID starttime identity support" >&2
     exit 1
 fi
-if ! "$pidfd_python" "$pidfd_helper" preflight; then
+if ! run_pidfd_supervisor preflight; then
     echo "scripts/e2e.sh requires Linux kernel pidfd support and Python pidfd APIs" >&2
     exit 1
 fi
 
 temporary_directory=$(mktemp -d "$system_temp_base/rustgo-e2e.XXXXXXXX")
-trap cleanup EXIT
+trap 'cleanup $?' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 

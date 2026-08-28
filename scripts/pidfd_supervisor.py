@@ -45,7 +45,6 @@ class CleanupResult:
     def ok(self) -> bool:
         return self.disposition in {
             CleanupDisposition.ALREADY_EXITED,
-            CleanupDisposition.IDENTITY_MISMATCH,
             CleanupDisposition.TERMINATED,
             CleanupDisposition.KILLED,
         }

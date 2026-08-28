@@ -98,7 +98,7 @@ class PidfdSupervisorStateMachineTests(unittest.TestCase):
 
         result = supervise_process(4242, 987654, 2.0, 2.0, operations)
 
-        self.assertTrue(result.ok, result.detail)
+        self.assertFalse(result.ok, result.detail)
         self.assertEqual(result.disposition, CleanupDisposition.IDENTITY_MISMATCH)
         self.assertEqual(operations.signals, [])
         self.assertEqual(
@@ -220,7 +220,7 @@ class LinuxPidfdIntegrationTests(unittest.TestCase):
                 self.operations,
             )
 
-            self.assertTrue(result.ok, result.detail)
+            self.assertFalse(result.ok, result.detail)
             self.assertEqual(result.disposition, CleanupDisposition.IDENTITY_MISMATCH)
             self.assertIsNone(process.poll())
         finally:
