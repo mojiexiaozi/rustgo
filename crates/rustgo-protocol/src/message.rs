@@ -20,6 +20,7 @@ pub const UDP_METADATA_LEN: usize = 31;
 pub const MAX_ERROR_DETAIL_BYTES: usize = 512;
 pub const MAX_RENDEZVOUS_ENVELOPE_BYTES: usize = 16 * 1024;
 pub const MAX_PEER_RELAY_FRAME_BYTES: usize = 65_600;
+pub const MAX_OBSERVATION_GRANT_BYTES: usize = 96;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[error("value length {actual} exceeds bound {max}")]
@@ -288,6 +289,8 @@ impl MessageId {
     pub const RENDEZVOUS_CLOSE: Self = Self(20);
     pub const RENDEZVOUS_ERROR: Self = Self(21);
     pub const PEER_RELAY_FRAME: Self = Self(22);
+    pub const OBSERVATION_GRANT_REQUEST: Self = Self(23);
+    pub const OBSERVATION_GRANT: Self = Self(24);
 
     pub const fn as_u16(self) -> u16 {
         self.0
@@ -311,6 +314,8 @@ impl MessageId {
             14 => 32,
             15..=21 => MAX_RENDEZVOUS_ENVELOPE_BYTES,
             22 => MAX_PEER_RELAY_FRAME_BYTES,
+            23 => 0,
+            24 => MAX_OBSERVATION_GRANT_BYTES,
             _ => 0,
         }
     }
@@ -321,7 +326,7 @@ impl TryFrom<u16> for MessageId {
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
         match value {
-            1..=22 => Ok(Self(value)),
+            1..=24 => Ok(Self(value)),
             _ => Err(value),
         }
     }
@@ -625,8 +630,12 @@ pub struct ErrorMessage {
     pub detail: BoundedString<MAX_ERROR_DETAIL_BYTES>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservationGrantRequest {}
+
 pub type OpaqueRendezvousMessage = BoundedBytes<MAX_RENDEZVOUS_ENVELOPE_BYTES>;
 pub type OpaquePeerRelayFrame = BoundedBytes<MAX_PEER_RELAY_FRAME_BYTES>;
+pub type OpaqueObservationGrant = BoundedBytes<MAX_OBSERVATION_GRANT_BYTES>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
@@ -652,6 +661,8 @@ pub enum Message {
     RendezvousClose(OpaqueRendezvousMessage),
     RendezvousError(OpaqueRendezvousMessage),
     PeerRelayFrame(OpaquePeerRelayFrame),
+    ObservationGrantRequest(ObservationGrantRequest),
+    ObservationGrant(OpaqueObservationGrant),
 }
 
 impl Message {
@@ -679,6 +690,8 @@ impl Message {
             Self::RendezvousClose(_) => MessageId::RENDEZVOUS_CLOSE,
             Self::RendezvousError(_) => MessageId::RENDEZVOUS_ERROR,
             Self::PeerRelayFrame(_) => MessageId::PEER_RELAY_FRAME,
+            Self::ObservationGrantRequest(_) => MessageId::OBSERVATION_GRANT_REQUEST,
+            Self::ObservationGrant(_) => MessageId::OBSERVATION_GRANT,
         }
     }
 }

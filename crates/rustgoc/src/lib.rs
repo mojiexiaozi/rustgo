@@ -9,7 +9,9 @@ mod tcp;
 mod udp;
 
 pub use app::{ActiveGeneration, ClientApp, ClientStatus, ReconnectBackoff};
-pub use control::{CLIENT_VERSION, ClientError, ControlClient, ControlSession, RegisteredTunnel};
+pub use control::{
+    CLIENT_VERSION, ClientError, ControlClient, ControlEvent, ControlSession, RegisteredTunnel,
+};
 pub use session::{
     ChildSessionContext, ChildSessionRequest, ChildSessionSupervisor, NoopChildSessionSupervisor,
     SessionGeneration,

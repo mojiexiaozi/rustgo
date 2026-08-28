@@ -3,10 +3,11 @@ use proptest::prelude::*;
 use rustgo_protocol::{
     AuthResult, BoundedBytes, BoundedString, BoundedVec, ClientAuthenticate, ClientHello,
     DataChannelBind, DataChannelKind, ErrorMessage, FrameCodec, FrameError, HEADER_LEN, Heartbeat,
-    MAGIC, MAX_BINDING_TOKEN_BYTES, MAX_UDP_PAYLOAD_BYTES, Message, MessageId, OpenTcpStream,
-    OpenUdpChannel, ProtocolErrorCode, ProtocolVersion, RegisterTunnels, ServerChallenge,
-    SocketAddress, TcpStreamReady, TunnelProtocol, TunnelRegistration, TunnelResult, TunnelResults,
-    UDP_METADATA_LEN, UdpDatagram, UdpSessionRetired,
+    MAGIC, MAX_BINDING_TOKEN_BYTES, MAX_OBSERVATION_GRANT_BYTES, MAX_UDP_PAYLOAD_BYTES, Message,
+    MessageId, ObservationGrantRequest, OpenTcpStream, OpenUdpChannel, ProtocolErrorCode,
+    ProtocolVersion, RegisterTunnels, ServerChallenge, SocketAddress, TcpStreamReady,
+    TunnelProtocol, TunnelRegistration, TunnelResult, TunnelResults, UDP_METADATA_LEN, UdpDatagram,
+    UdpSessionRetired,
 };
 
 const VERSION: ProtocolVersion = ProtocolVersion::new(1, 7);
@@ -104,6 +105,8 @@ fn messages() -> Vec<Message> {
             target_id: 9001,
             binding_token: bytes(&[0x99; MAX_BINDING_TOKEN_BYTES]),
         }),
+        Message::ObservationGrantRequest(ObservationGrantRequest {}),
+        Message::ObservationGrant(bytes::<MAX_OBSERVATION_GRANT_BYTES>(&[0xaa; 72])),
     ]
 }
 
@@ -163,6 +166,8 @@ fn message_ids_are_explicit_and_stable() {
     assert_eq!(MessageId::RENDEZVOUS_CLOSE.as_u16(), 20);
     assert_eq!(MessageId::RENDEZVOUS_ERROR.as_u16(), 21);
     assert_eq!(MessageId::PEER_RELAY_FRAME.as_u16(), 22);
+    assert_eq!(MessageId::OBSERVATION_GRANT_REQUEST.as_u16(), 23);
+    assert_eq!(MessageId::OBSERVATION_GRANT.as_u16(), 24);
 }
 
 #[test]

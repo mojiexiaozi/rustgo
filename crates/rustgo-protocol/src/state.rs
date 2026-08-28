@@ -63,7 +63,19 @@ impl ClientHandshakeState {
             (Self::Active { .. }, Message::Heartbeat(_)) => Ok(self.clone()),
             (
                 Self::Active { .. },
-                Message::OpenTcpStream(_) | Message::OpenUdpChannel(_) | Message::TcpStreamReady(_),
+                Message::OpenTcpStream(_)
+                | Message::OpenUdpChannel(_)
+                | Message::TcpStreamReady(_)
+                | Message::Error(_)
+                | Message::ObservationGrantRequest(_)
+                | Message::ObservationGrant(_)
+                | Message::RendezvousRequest(_)
+                | Message::RendezvousProviderDecision(_)
+                | Message::RendezvousCandidateSet(_)
+                | Message::RendezvousConnectivityResult(_)
+                | Message::RendezvousRelayRequest(_)
+                | Message::RendezvousClose(_)
+                | Message::RendezvousError(_),
             ) => Ok(self.clone()),
             _ => Err(StateError::invalid_state()),
         }

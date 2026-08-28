@@ -12,6 +12,7 @@ use crate::{
     control,
     observation::{ObservationRuntimeLimits, ObservationService, ObservationTokenIssuer},
     registry::{ClientRegistry, RegistryError},
+    rendezvous::{RendezvousCoordinator, RendezvousLimits},
     udp::UdpRuntimeLimits,
 };
 
@@ -25,6 +26,9 @@ const MAX_AUTH_ATTEMPTS_PER_WINDOW: usize = 65_536;
 const MAX_PENDING_DATA_CHANNEL_TOKENS_PER_CLIENT: usize = 65_536;
 const MAX_UDP_QUEUE_CAPACITY: usize = 65_536;
 const MAX_UDP_SWEEP_BATCH: usize = 65_536;
+const MAX_RENDEZVOUS_SESSIONS: usize = 65_536;
+const MAX_RENDEZVOUS_SESSIONS_PER_DEVICE: usize = 1_024;
+const MAX_RENDEZVOUS_SESSION_TTL: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone)]
 pub struct ServerRuntimeLimits {
@@ -43,6 +47,9 @@ pub struct ServerRuntimeLimits {
     pub udp_sweep_interval: Duration,
     pub udp_sweep_batch: usize,
     pub udp_writer_delay: Duration,
+    pub max_rendezvous_sessions: usize,
+    pub max_rendezvous_sessions_per_device: usize,
+    pub rendezvous_session_ttl: Duration,
     #[doc(hidden)]
     pub udp_test_disconnect_after_replies: Option<u64>,
 }
@@ -65,6 +72,9 @@ impl Default for ServerRuntimeLimits {
             udp_sweep_interval: Duration::from_secs(1),
             udp_sweep_batch: 64,
             udp_writer_delay: Duration::ZERO,
+            max_rendezvous_sessions: 4096,
+            max_rendezvous_sessions_per_device: 64,
+            rendezvous_session_ttl: Duration::from_secs(30),
             udp_test_disconnect_after_replies: None,
         }
     }
@@ -86,6 +96,9 @@ impl ServerRuntimeLimits {
             || self.udp_idle_timeout.is_zero()
             || self.udp_sweep_interval.is_zero()
             || self.udp_sweep_batch == 0
+            || self.max_rendezvous_sessions == 0
+            || self.max_rendezvous_sessions_per_device == 0
+            || self.rendezvous_session_ttl < Duration::from_secs(1)
             || self.max_unauthenticated_connections > MAX_UNAUTHENTICATED_CONNECTIONS
             || self.max_unauthenticated_connections_per_peer
                 > MAX_UNAUTHENTICATED_CONNECTIONS_PER_PEER
@@ -100,6 +113,10 @@ impl ServerRuntimeLimits {
                 > MAX_PENDING_DATA_CHANNEL_TOKENS_PER_CLIENT
             || self.udp_queue_capacity > MAX_UDP_QUEUE_CAPACITY
             || self.udp_sweep_batch > MAX_UDP_SWEEP_BATCH
+            || self.max_rendezvous_sessions > MAX_RENDEZVOUS_SESSIONS
+            || self.max_rendezvous_sessions_per_device > MAX_RENDEZVOUS_SESSIONS_PER_DEVICE
+            || self.max_rendezvous_sessions_per_device > self.max_rendezvous_sessions
+            || self.rendezvous_session_ttl > MAX_RENDEZVOUS_SESSION_TTL
             || self.udp_writer_delay > Duration::from_secs(60)
             || self.udp_test_disconnect_after_replies == Some(0)
             || self.max_failed_auth_attempts_per_peer > self.max_auth_attempt_records
@@ -122,6 +139,9 @@ impl ServerRuntimeLimits {
             || tokio::time::Instant::now()
                 .checked_add(self.udp_writer_delay)
                 .is_none()
+            || tokio::time::Instant::now()
+                .checked_add(self.rendezvous_session_ttl)
+                .is_none()
         {
             return Err(ServerError::InvalidRuntimeLimits);
         }
@@ -141,6 +161,7 @@ pub struct ServerApp {
     protocol_version: ProtocolVersion,
     observation: Option<ObservationService>,
     observation_token_issuer: Option<ObservationTokenIssuer>,
+    rendezvous: RendezvousCoordinator,
 }
 
 impl ServerApp {
@@ -255,6 +276,15 @@ impl ServerApp {
         let observation_token_issuer = observation
             .as_ref()
             .map(|service| service.token_issuer(registry.clone()));
+        let rendezvous = RendezvousCoordinator::new(
+            registry.clone(),
+            &config.clients,
+            RendezvousLimits {
+                max_sessions: runtime_limits.max_rendezvous_sessions,
+                max_sessions_per_device: runtime_limits.max_rendezvous_sessions_per_device,
+                session_ttl: runtime_limits.rendezvous_session_ttl,
+            },
+        );
         let limiter = FailedAuthLimiter::new_with_attempt_budget(
             runtime_limits.max_failed_auth_attempts_per_peer,
             runtime_limits.failed_auth_window,
@@ -279,6 +309,7 @@ impl ServerApp {
             protocol_version,
             observation,
             observation_token_issuer,
+            rendezvous,
         })
     }
 
@@ -301,12 +332,18 @@ impl ServerApp {
         self.observation_token_issuer.clone()
     }
 
+    pub fn rendezvous_coordinator(&self) -> RendezvousCoordinator {
+        self.rendezvous.clone()
+    }
+
     pub async fn run(self) -> Result<(), ServerError> {
         self.run_until(CancellationToken::new()).await
     }
 
     pub async fn run_until(self, shutdown: CancellationToken) -> Result<(), ServerError> {
         let session_shutdown = CancellationToken::new();
+        let mut rendezvous_expiry = tokio::time::interval(Duration::from_millis(250));
+        rendezvous_expiry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut observation = self
             .observation
             .map(|service| Box::pin(service.run(session_shutdown.child_token())));
@@ -314,6 +351,7 @@ impl ServerApp {
         let result = loop {
             tokio::select! {
                 () = shutdown.cancelled() => break Ok(()),
+                _ = rendezvous_expiry.tick() => self.rendezvous.expire_now(),
                 observation_result = async {
                     match observation.as_mut() {
                         Some(service) => Some(service.await),
@@ -342,14 +380,20 @@ impl ServerApp {
                     let limiter = self.limiter.clone();
                     let handshake_timeout = self.runtime_limits.handshake_timeout;
                     let heartbeat_timeout = self.heartbeat_timeout;
+                    let observation_token_issuer = self.observation_token_issuer.clone();
+                    let rendezvous = self.rendezvous.clone();
                     let context = control::ControlContext::new_with_version(
                         tls_server,
                         authenticator,
                         registry,
                         limiter,
-                        handshake_timeout,
-                        heartbeat_timeout,
-                        self.protocol_version,
+                        control::ControlRuntime::new(
+                            handshake_timeout,
+                            heartbeat_timeout,
+                            self.protocol_version,
+                            observation_token_issuer,
+                            rendezvous,
+                        ),
                     );
                     let child_shutdown = session_shutdown.child_token();
                     sessions.spawn(async move {
@@ -516,6 +560,14 @@ mod tests {
             change(&mut limits);
             assert_invalid(limits);
         }
+    }
+
+    #[test]
+    fn rendezvous_ttl_rejects_subsecond_values_that_wire_expiry_cannot_represent() {
+        assert_invalid(ServerRuntimeLimits {
+            rendezvous_session_ttl: std::time::Duration::from_millis(999),
+            ..ServerRuntimeLimits::default()
+        });
     }
 
     #[test]

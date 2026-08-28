@@ -9,11 +9,12 @@ use rustgo_protocol::{
     MAX_PUBLIC_KEY_BYTES, MAX_SIGNATURE_BYTES, MAX_TUNNEL_NAME_BYTES, Message, ProtocolErrorCode,
     ProtocolVersion, RegisterTunnels, TunnelProtocol, TunnelRegistration,
 };
+use rustgo_rendezvous::{ObservationGrant, RendezvousEnvelope};
 use rustgo_transport::{TlsClient, TlsError};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const CLIENT_VERSION: ProtocolVersion = ProtocolVersion::new(1, 0);
+pub const CLIENT_VERSION: ProtocolVersion = ProtocolVersion::SUPPORTED;
 const MAX_CONTROL_PAYLOAD: usize = 70 * 1024;
 const CONTROL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -351,6 +352,12 @@ pub struct ControlSession {
     registered_tunnels: Arc<[RegisteredTunnel]>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ControlEvent {
+    ObservationGrant(ObservationGrant),
+    Rendezvous(RendezvousEnvelope),
+}
+
 impl ControlSession {
     pub(crate) fn new(
         framed: FramedControl,
@@ -376,9 +383,78 @@ impl ControlSession {
         self.version
     }
 
+    pub async fn request_observation_grant(&mut self) -> Result<(), ClientError> {
+        self.require_v02()?;
+        self.framed
+            .send(
+                self.version,
+                Message::ObservationGrantRequest(rustgo_protocol::ObservationGrantRequest {}),
+            )
+            .await
+    }
+
+    pub async fn send_rendezvous_envelope(
+        &mut self,
+        envelope: &RendezvousEnvelope,
+    ) -> Result<(), ClientError> {
+        self.require_v02()?;
+        if envelope.version != self.version {
+            return Err(ClientError::InvalidState);
+        }
+        let message = envelope
+            .to_protocol_message()
+            .map_err(|_| ClientError::InvalidState)?;
+        self.framed.send(self.version, message).await
+    }
+
+    pub async fn next_control_event(&mut self) -> Result<ControlEvent, ClientError> {
+        self.require_v02()?;
+        let frame = self.framed.receive().await?;
+        require_version(frame.version, self.version)?;
+        match frame.message {
+            message @ Message::ObservationGrant(_) => {
+                ObservationGrant::from_protocol_message(message)
+                    .map(ControlEvent::ObservationGrant)
+                    .map_err(|_| ClientError::InvalidState)
+            }
+            message if is_rendezvous_message(&message) => {
+                RendezvousEnvelope::from_protocol_message(message)
+                    .map(ControlEvent::Rendezvous)
+                    .map_err(|_| ClientError::InvalidState)
+            }
+            Message::Error(error) => Err(ClientError::Protocol(error.code)),
+            _ => Err(ClientError::InvalidState),
+        }
+    }
+
+    fn require_v02(&self) -> Result<(), ClientError> {
+        if self.version.major == ProtocolVersion::V0_2.major
+            && self.version.minor >= ProtocolVersion::V0_2.minor
+        {
+            Ok(())
+        } else {
+            Err(ClientError::Protocol(
+                ProtocolErrorCode::UNSUPPORTED_VERSION,
+            ))
+        }
+    }
+
     pub(crate) fn registered_tunnels_shared(&self) -> Arc<[RegisteredTunnel]> {
         self.registered_tunnels.clone()
     }
+}
+
+fn is_rendezvous_message(message: &Message) -> bool {
+    matches!(
+        message,
+        Message::RendezvousRequest(_)
+            | Message::RendezvousProviderDecision(_)
+            | Message::RendezvousCandidateSet(_)
+            | Message::RendezvousConnectivityResult(_)
+            | Message::RendezvousRelayRequest(_)
+            | Message::RendezvousClose(_)
+            | Message::RendezvousError(_)
+    )
 }
 
 impl std::fmt::Debug for ControlSession {

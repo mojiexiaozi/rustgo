@@ -10,6 +10,7 @@ clap.workspace = true
 rustgo-config = { path = "../rustgo-config" }
 rustgo-crypto = { path = "../rustgo-crypto" }
 rustgo-protocol = { path = "../rustgo-protocol" }
+rustgo-rendezvous = { path = "../rustgo-rendezvous" }
 rustgo-transport = { path = "../rustgo-transport" }
 thiserror.workspace = true
 tokio.workspace = true

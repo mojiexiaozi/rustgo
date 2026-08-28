@@ -1,8 +1,9 @@
 use rustgo_protocol::{
     AuthResult, BoundedBytes, BoundedString, BoundedVec, ClientAuthenticate, ClientHandshakeState,
-    ClientHello, Heartbeat, MAX_BINDING_TOKEN_BYTES, Message, OpenTcpStream, OpenUdpChannel,
-    ProtocolErrorCode, ProtocolVersion, RegisterTunnels, ServerChallenge, SocketAddress,
-    StateError, TunnelProtocol, TunnelRegistration,
+    ClientHello, Heartbeat, MAX_BINDING_TOKEN_BYTES, MAX_OBSERVATION_GRANT_BYTES, Message,
+    ObservationGrantRequest, OpenTcpStream, OpenUdpChannel, ProtocolErrorCode, ProtocolVersion,
+    RegisterTunnels, ServerChallenge, SocketAddress, StateError, TunnelProtocol,
+    TunnelRegistration,
 };
 
 fn text<const MAX: usize>(value: &str) -> BoundedString<MAX> {
@@ -215,6 +216,44 @@ fn active_state_accepts_data_channel_control_notifications() {
     assert_eq!(state.transition(&udp), Ok(state));
     assert_eq!(
         ClientHandshakeState::new().transition(&tcp),
+        Err(StateError::invalid_state())
+    );
+}
+
+#[test]
+fn active_state_accepts_v02_control_events_only_after_registration() {
+    let state = ClientHandshakeState::new()
+        .transition(&hello())
+        .unwrap()
+        .transition(&challenge())
+        .unwrap()
+        .transition(&authenticate())
+        .unwrap()
+        .transition(&auth_result(true))
+        .unwrap()
+        .transition(&registration())
+        .unwrap();
+    let events = [
+        Message::Error(rustgo_protocol::ErrorMessage {
+            code: ProtocolErrorCode::UNSUPPORTED_VERSION,
+            detail: text("unsupported P2P operation"),
+        }),
+        Message::ObservationGrantRequest(ObservationGrantRequest {}),
+        Message::ObservationGrant(bytes::<MAX_OBSERVATION_GRANT_BYTES>(&[7; 72])),
+        Message::RendezvousRequest(bytes(&[8])),
+        Message::RendezvousProviderDecision(bytes(&[9])),
+        Message::RendezvousCandidateSet(bytes(&[10])),
+        Message::RendezvousConnectivityResult(bytes(&[11])),
+        Message::RendezvousRelayRequest(bytes(&[12])),
+        Message::RendezvousClose(bytes(&[13])),
+        Message::RendezvousError(bytes(&[14])),
+    ];
+
+    for event in &events {
+        assert_eq!(state.transition(event), Ok(state.clone()));
+    }
+    assert_eq!(
+        ClientHandshakeState::new().transition(&events[0]),
         Err(StateError::invalid_state())
     );
 }

@@ -1327,6 +1327,7 @@ dependencies = [
  "rustgo-config",
  "rustgo-crypto",
  "rustgo-protocol",
+ "rustgo-rendezvous",
  "rustgo-transport",
  "rustgos",
  "tempfile",

@@ -10,6 +10,7 @@ use rustgo_protocol::{
     AuthResult, BoundedString, ClientHandshakeState, ErrorMessage, Frame, FrameCodec, FrameError,
     MAX_ERROR_DETAIL_BYTES, Message, ProtocolErrorCode, ProtocolVersion,
 };
+use rustgo_rendezvous::{RendezvousEnvelope, RendezvousPayload};
 use rustgo_transport::{EventRateLimit, TlsServer, safe_display, short_fingerprint};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -20,11 +21,13 @@ use tracing::Instrument;
 
 use crate::{
     auth::{AuthAttemptReservation, Authenticator, FailedAuthLimiter, TlsHandshakePermit},
+    observation::ObservationTokenIssuer,
     registry::{ClientRegistry, ControlSessionGuard},
+    rendezvous::RendezvousCoordinator,
     tcp, udp,
 };
 
-pub(crate) const SERVER_VERSION: ProtocolVersion = ProtocolVersion::new(1, 0);
+pub(crate) const SERVER_VERSION: ProtocolVersion = ProtocolVersion::SUPPORTED;
 const MAX_CONTROL_PAYLOAD: usize = 70 * 1024;
 const CONTROL_COMMAND_CAPACITY: usize = 1024;
 const AUTH_FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(5);
@@ -35,9 +38,33 @@ pub(crate) struct ControlContext {
     authenticator: Authenticator,
     registry: ClientRegistry,
     limiter: FailedAuthLimiter,
+    runtime: ControlRuntime,
+}
+
+pub(crate) struct ControlRuntime {
     handshake_timeout: Duration,
     heartbeat_timeout: Duration,
     version: ProtocolVersion,
+    observation_token_issuer: Option<ObservationTokenIssuer>,
+    rendezvous: RendezvousCoordinator,
+}
+
+impl ControlRuntime {
+    pub(crate) fn new(
+        handshake_timeout: Duration,
+        heartbeat_timeout: Duration,
+        version: ProtocolVersion,
+        observation_token_issuer: Option<ObservationTokenIssuer>,
+        rendezvous: RendezvousCoordinator,
+    ) -> Self {
+        Self {
+            handshake_timeout,
+            heartbeat_timeout,
+            version,
+            observation_token_issuer,
+            rendezvous,
+        }
+    }
 }
 
 impl ControlContext {
@@ -46,18 +73,14 @@ impl ControlContext {
         authenticator: Authenticator,
         registry: ClientRegistry,
         limiter: FailedAuthLimiter,
-        handshake_timeout: Duration,
-        heartbeat_timeout: Duration,
-        version: ProtocolVersion,
+        runtime: ControlRuntime,
     ) -> Self {
         Self {
             tls_server,
             authenticator,
             registry,
             limiter,
-            handshake_timeout,
-            heartbeat_timeout,
-            version,
+            runtime,
         }
     }
 }
@@ -71,7 +94,7 @@ pub(crate) async fn serve_connection(
     shutdown: CancellationToken,
 ) -> Result<(), ControlError> {
     let handshake_deadline = tokio::time::Instant::now()
-        .checked_add(context.handshake_timeout)
+        .checked_add(context.runtime.handshake_timeout)
         .ok_or(ControlError::HandshakeTimeout)?;
     let stream = tokio::select! {
         biased;
@@ -135,16 +158,19 @@ pub(crate) async fn serve_connection(
         () = shutdown.cancelled() => return Ok(()),
         result = tokio::time::timeout_at(handshake_deadline, async {
             let mut state = ClientHandshakeState::new();
-            let negotiated = match context.version.negotiate(first_frame.version) {
+            let negotiated = match context.runtime.version.negotiate(first_frame.version) {
                 Ok(version) => version,
                 Err(code) => {
                     auth_attempt.fail();
-                    framed.send(context.version, protocol_error(code)).await?;
+                    framed
+                        .send(context.runtime.version, protocol_error(code))
+                        .await?;
                     return Ok(None);
                 }
             };
             if hello.heartbeat_interval_secs == 0
-                || u64::from(hello.heartbeat_interval_secs) >= context.heartbeat_timeout.as_secs()
+                || u64::from(hello.heartbeat_interval_secs)
+                    >= context.runtime.heartbeat_timeout.as_secs()
             {
                 auth_attempt.fail();
                 framed
@@ -220,24 +246,21 @@ pub(crate) async fn serve_connection(
         framed,
         guard,
         state,
-        context.version,
         negotiated,
-        context.heartbeat_timeout,
         outbound_rx,
+        context.runtime,
         shutdown,
     )
     .await
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_owned_control_session<S>(
     mut framed: FramedControl<S>,
     mut guard: ControlSessionGuard,
     mut state: ClientHandshakeState,
-    local_version: ProtocolVersion,
     negotiated: ProtocolVersion,
-    heartbeat_timeout: Duration,
     mut outbound_rx: mpsc::Receiver<Message>,
+    runtime: ControlRuntime,
     shutdown: CancellationToken,
 ) -> Result<(), ControlError>
 where
@@ -257,12 +280,12 @@ where
                 &mut framed,
                 &mut guard,
                 &mut state,
-                local_version,
                 negotiated,
-                heartbeat_timeout,
                 &mut outbound_rx,
+                &runtime,
             ) => result,
         };
+        runtime.rendezvous.remove_device(guard.identity()).await;
         guard.shutdown().await;
         result
     }
@@ -274,15 +297,14 @@ async fn run_control_session<S>(
     framed: &mut FramedControl<S>,
     guard: &mut ControlSessionGuard,
     state: &mut ClientHandshakeState,
-    local_version: ProtocolVersion,
     negotiated: ProtocolVersion,
-    heartbeat_timeout: Duration,
     outbound_rx: &mut mpsc::Receiver<Message>,
+    runtime: &ControlRuntime,
 ) -> Result<(), ControlError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let registration_frame = tokio::time::timeout(heartbeat_timeout, framed.receive())
+    let registration_frame = tokio::time::timeout(runtime.heartbeat_timeout, framed.receive())
         .await
         .map_err(|_| ControlError::HeartbeatTimeout)??;
     if registration_frame.version != negotiated {
@@ -302,18 +324,10 @@ where
         listeners = guard.listener_count(),
         protocol_major = negotiated.major,
         protocol_minor = negotiated.minor,
-        local_protocol_minor = local_version.minor,
+        local_protocol_minor = runtime.version.minor,
         "event=registration_ready server tunnel registration ready"
     );
-    run_active_control(
-        framed,
-        guard,
-        state,
-        negotiated,
-        heartbeat_timeout,
-        outbound_rx,
-    )
-    .await
+    run_active_control(framed, guard, state, negotiated, outbound_rx, runtime).await
 }
 
 async fn run_active_control<S>(
@@ -321,13 +335,13 @@ async fn run_active_control<S>(
     guard: &mut ControlSessionGuard,
     state: &mut ClientHandshakeState,
     negotiated: ProtocolVersion,
-    heartbeat_timeout: Duration,
     outbound: &mut mpsc::Receiver<Message>,
+    runtime: &ControlRuntime,
 ) -> Result<(), ControlError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let heartbeat_deadline = tokio::time::sleep(heartbeat_timeout);
+    let heartbeat_deadline = tokio::time::sleep(runtime.heartbeat_timeout);
     tokio::pin!(heartbeat_deadline);
     let generation_cancellation = guard.cancellation();
     loop {
@@ -354,6 +368,17 @@ where
                 if frame.version != negotiated {
                     return Err(ControlError::InvalidState);
                 }
+                if is_v02_control_message(&frame.message) && !supports_v02(negotiated) {
+                    send_active_message(
+                        framed,
+                        state,
+                        negotiated,
+                        protocol_error(ProtocolErrorCode::UNSUPPORTED_VERSION),
+                        &mut heartbeat_deadline,
+                    )
+                    .await?;
+                    continue;
+                }
                 match frame.message {
                     Message::Heartbeat(heartbeat) => {
                         let acknowledgement = Message::Heartbeat(heartbeat);
@@ -366,7 +391,7 @@ where
                         }
                         heartbeat_deadline.as_mut().reset(
                             tokio::time::Instant::now()
-                                .checked_add(heartbeat_timeout)
+                                .checked_add(runtime.heartbeat_timeout)
                                 .ok_or(ControlError::HeartbeatTimeout)?,
                         );
                     }
@@ -374,11 +399,139 @@ where
                         *state = state.transition(&Message::TcpStreamReady(ready.clone()))?;
                         guard.reject_tcp(ready.connection_id);
                     }
+                    Message::ObservationGrantRequest(request) => {
+                        *state = state.transition(&Message::ObservationGrantRequest(request))?;
+                        let response = runtime.observation_token_issuer.as_ref()
+                            .ok_or(ControlError::ObservationUnavailable)
+                            .and_then(|issuer| {
+                                issuer
+                                    .issue(guard.identity())
+                                    .map_err(|_| ControlError::ObservationUnavailable)
+                            })
+                            .and_then(|grant| {
+                                grant
+                                    .to_protocol_message()
+                                    .map_err(|_| ControlError::ObservationUnavailable)
+                            })
+                            .unwrap_or_else(|_| protocol_error(ProtocolErrorCode::UNKNOWN_SESSION));
+                        send_active_message(
+                            framed,
+                            state,
+                            negotiated,
+                            response,
+                            &mut heartbeat_deadline,
+                        )
+                        .await?;
+                    }
+                    message if is_rendezvous_message(&message) => {
+                        let envelope = match RendezvousEnvelope::from_protocol_message(message) {
+                            Ok(envelope) => envelope,
+                            Err(_) => {
+                                send_active_message(
+                                    framed,
+                                    state,
+                                    negotiated,
+                                    protocol_error(ProtocolErrorCode::INVALID_FRAME),
+                                    &mut heartbeat_deadline,
+                                )
+                                .await?;
+                                continue;
+                            }
+                        };
+                        let result = match &envelope.payload {
+                            RendezvousPayload::Request(_) => {
+                                runtime.rendezvous.request(guard, envelope.clone()).await.map(drop)
+                            }
+                            RendezvousPayload::ProviderDecision(_) => {
+                                runtime.rendezvous.provider_decision(guard, envelope.clone()).await
+                            }
+                            RendezvousPayload::Close(_) | RendezvousPayload::Error(_) => {
+                                runtime.rendezvous.close_session(guard, envelope.clone()).await
+                            }
+                            _ => runtime.rendezvous.forward_envelope(guard, envelope.clone()).await,
+                        };
+                        if let Err(error) = result {
+                            send_active_message(
+                                framed,
+                                state,
+                                negotiated,
+                                runtime.rendezvous.error_response(
+                                    &envelope,
+                                    guard.identity().name(),
+                                    error,
+                                ),
+                                &mut heartbeat_deadline,
+                            )
+                            .await?;
+                        }
+                    }
+                    Message::ObservationGrant(_) | Message::PeerRelayFrame(_) => {
+                        send_active_message(
+                            framed,
+                            state,
+                            negotiated,
+                            protocol_error(ProtocolErrorCode::UNKNOWN_MESSAGE),
+                            &mut heartbeat_deadline,
+                        )
+                        .await?;
+                    }
                     _ => return Err(ControlError::InvalidState),
                 }
             }
         }
     }
+}
+
+async fn send_active_message<S>(
+    framed: &mut FramedControl<S>,
+    state: &mut ClientHandshakeState,
+    negotiated: ProtocolVersion,
+    message: Message,
+    heartbeat_deadline: &mut std::pin::Pin<&mut tokio::time::Sleep>,
+) -> Result<(), ControlError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    *state = state.transition(&message)?;
+    let write = framed.send(negotiated, message);
+    tokio::select! {
+        biased;
+        () = heartbeat_deadline => Err(ControlError::HeartbeatTimeout),
+        result = write => result,
+    }
+}
+
+fn supports_v02(version: ProtocolVersion) -> bool {
+    version.major == ProtocolVersion::V0_2.major && version.minor >= ProtocolVersion::V0_2.minor
+}
+
+fn is_v02_control_message(message: &Message) -> bool {
+    matches!(
+        message,
+        Message::ObservationGrantRequest(_)
+            | Message::ObservationGrant(_)
+            | Message::RendezvousRequest(_)
+            | Message::RendezvousProviderDecision(_)
+            | Message::RendezvousCandidateSet(_)
+            | Message::RendezvousConnectivityResult(_)
+            | Message::RendezvousRelayRequest(_)
+            | Message::RendezvousClose(_)
+            | Message::RendezvousError(_)
+            | Message::PeerRelayFrame(_)
+    )
+}
+
+fn is_rendezvous_message(message: &Message) -> bool {
+    matches!(
+        message,
+        Message::RendezvousRequest(_)
+            | Message::RendezvousProviderDecision(_)
+            | Message::RendezvousCandidateSet(_)
+            | Message::RendezvousConnectivityResult(_)
+            | Message::RendezvousRelayRequest(_)
+            | Message::RendezvousClose(_)
+            | Message::RendezvousError(_)
+    )
 }
 
 fn protocol_error(code: ProtocolErrorCode) -> Message {
@@ -486,6 +639,8 @@ pub(crate) enum ControlError {
     InvalidState,
     #[error("a registered listener terminated its control generation")]
     ListenerGenerationTerminated,
+    #[error("authenticated observation grant is unavailable")]
+    ObservationUnavailable,
 }
 
 #[cfg(test)]
@@ -508,8 +663,15 @@ mod tests {
     };
     use tokio_util::sync::CancellationToken;
 
-    use super::{FramedControl, SERVER_VERSION, run_owned_control_session, send_auth_result};
-    use crate::{AuthenticatedClient, auth::FailedAuthLimiter, registry::ClientRegistry};
+    use super::{
+        ControlRuntime, FramedControl, SERVER_VERSION, run_owned_control_session, send_auth_result,
+    };
+    use crate::{
+        AuthenticatedClient,
+        auth::FailedAuthLimiter,
+        registry::ClientRegistry,
+        rendezvous::{RendezvousCoordinator, RendezvousLimits},
+    };
 
     struct RegistrationThenWriteFailure {
         input: std::io::Cursor<Vec<u8>>,
@@ -619,15 +781,29 @@ mod tests {
         let state = ClientHandshakeState::AwaitingTunnelRegistration {
             session_id: rustgo_protocol::BoundedBytes::try_from(session_id.as_slice()).unwrap(),
         };
+        let rendezvous = RendezvousCoordinator::new(
+            registry.clone(),
+            &[],
+            RendezvousLimits {
+                max_sessions: 1,
+                max_sessions_per_device: 1,
+                session_ttl: Duration::from_secs(1),
+            },
+        );
 
         let result = run_owned_control_session(
             framed,
             guard,
             state,
             SERVER_VERSION,
-            SERVER_VERSION,
-            Duration::from_secs(2),
             outbound_rx,
+            ControlRuntime::new(
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+                SERVER_VERSION,
+                None,
+                rendezvous,
+            ),
             CancellationToken::new(),
         )
         .await;

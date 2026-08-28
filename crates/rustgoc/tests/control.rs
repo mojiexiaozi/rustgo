@@ -13,14 +13,18 @@ use rustgo_config::{
 };
 use rustgo_crypto::{AuthTranscript, DeviceKeypair, generate_key_file, verify_auth};
 use rustgo_protocol::{
-    AuthResult, BoundedBytes, BoundedVec, Frame, FrameCodec, MAX_BINDING_TOKEN_BYTES, Message,
-    OpenTcpStream, OpenUdpChannel, ProtocolErrorCode, ProtocolVersion, ServerChallenge,
-    SocketAddress, TunnelResult, TunnelResults,
+    AuthResult, BoundedBytes, BoundedString, BoundedVec, Frame, FrameCodec,
+    MAX_BINDING_TOKEN_BYTES, Message, OpenTcpStream, OpenUdpChannel, ProtocolErrorCode,
+    ProtocolVersion, ServerChallenge, SocketAddress, TunnelResult, TunnelResults,
+};
+use rustgo_rendezvous::{
+    CandidateGeneration, ObservationGrant, RendezvousEnvelope, RendezvousPayload,
+    RendezvousRequest, SessionId,
 };
 use rustgo_transport::{Backoff, BackoffClock, BackoffConfig, JitterSource, TlsServer};
 use rustgoc::{
     ChildSessionContext, ChildSessionRequest, ChildSessionSupervisor, ClientApp, ClientError,
-    ClientStatus, ControlClient, NoopChildSessionSupervisor, SessionGeneration,
+    ClientStatus, ControlClient, ControlEvent, NoopChildSessionSupervisor, SessionGeneration,
 };
 use rustgos::ServerApp;
 use tempfile::TempDir;
@@ -399,7 +403,7 @@ async fn strict_tls_authentication_precedes_complete_per_tunnel_registration()
         let mut server = FramedServer::new(tls_server.handshake(socket).await?);
 
         let hello_frame = server.receive().await?;
-        assert_eq!(hello_frame.version, VERSION);
+        assert_eq!(hello_frame.version, rustgoc::CLIENT_VERSION);
         let Message::ClientHello(hello) = hello_frame.message else {
             return Err("first message was not ClientHello".into());
         };
@@ -1071,6 +1075,69 @@ async fn real_server_heartbeat_echo_keeps_one_generation_active() -> Result<(), 
     shutdown.cancel();
     server_shutdown.cancel();
     assert!(app_task.await?.is_ok());
+    server_task.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn client_control_api_requests_grants_and_decodes_rendezvous_events() -> Result<(), AnyError>
+{
+    let pki = TestPki::generate()?;
+    let keys = tempfile::tempdir()?;
+    generate_key_file(keys.path())?;
+    let key = DeviceKeypair::load_private_file(&keys.path().join("device.key"))?;
+    let mut server_config = real_server_config(&pki, &key, 2);
+    server_config.server.p2p_observation_bind = Some("127.0.0.1:0".to_owned());
+    server_config.server.p2p_observation_alternate_bind = Some("127.0.0.1:0".to_owned());
+    let server_app = ServerApp::bind(server_config).await?;
+    let server_addr = server_app.local_addr()?.to_string();
+    let server_shutdown = CancellationToken::new();
+    let server_task = tokio::spawn(server_app.run_until(server_shutdown.clone()));
+
+    let config = ClientConfig {
+        client: ClientSection {
+            name: "home-pc".to_owned(),
+            server_addr,
+            server_name: SERVER_NAME.to_owned(),
+            certificate_authority_file: pki.ca_file.clone(),
+            private_key_file: keys.path().join("device.key"),
+            heartbeat_interval_secs: 1,
+        },
+        p2p: None,
+        tunnels: Vec::new(),
+        exports: Vec::new(),
+        forwards: Vec::new(),
+    };
+    let mut session = ControlClient::from_config(config)?.connect().await?;
+    assert_eq!(session.protocol_version(), ProtocolVersion::V0_2);
+
+    session.request_observation_grant().await?;
+    let ControlEvent::ObservationGrant(grant) = session.next_control_event().await? else {
+        return Err("client did not decode the observation grant event".into());
+    };
+    let _: ObservationGrant = grant;
+
+    let request = RendezvousEnvelope {
+        version: ProtocolVersion::V0_2,
+        session_id: SessionId::from([0x91; 32]),
+        sender: BoundedString::try_from("home-pc")?,
+        target: BoundedString::try_from("home-pc")?,
+        step: 1,
+        generation: CandidateGeneration::INITIAL,
+        expires_unix_secs: u64::MAX,
+        payload: RendezvousPayload::Request(RendezvousRequest {
+            export: BoundedString::try_from("ssh")?,
+        }),
+        signature: BoundedBytes::try_from([0x92; 64].as_slice())?,
+    };
+    session.send_rendezvous_envelope(&request).await?;
+    let ControlEvent::Rendezvous(response) = session.next_control_event().await? else {
+        return Err("client did not decode the rendezvous event".into());
+    };
+    assert_eq!(response.session_id, request.session_id);
+    assert!(matches!(response.payload, RendezvousPayload::Error(_)));
+
+    server_shutdown.cancel();
     server_task.await??;
     Ok(())
 }

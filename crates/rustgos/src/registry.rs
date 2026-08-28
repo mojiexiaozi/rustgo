@@ -205,6 +205,7 @@ impl ClientRegistry {
         )?;
         let runtime = Arc::new(SessionRuntime {
             client: identity.name().to_owned(),
+            fingerprint: identity.fingerprint().to_owned(),
             session_id: identity.session_id().to_vec(),
             bindings: Mutex::new(SessionBindings {
                 store: binding_store,
@@ -298,6 +299,20 @@ impl ClientRegistry {
             .map_err(|_| RegistryError::InvalidConfiguration)
     }
 
+    pub(crate) fn active_control_session(&self, name: &str) -> Option<ActiveControlSession> {
+        let state = self.inner.lock().ok()?;
+        let runtime = state.by_name.get(name)?;
+        Some(ActiveControlSession {
+            identity: AuthenticatedClient::verified(
+                runtime.client.clone(),
+                runtime.fingerprint.clone(),
+                runtime.session_id.clone(),
+            ),
+            outbound: runtime.outbound(),
+            protocol_version: runtime.protocol_version(),
+        })
+    }
+
     fn release(&self, identity: &AuthenticatedClient) {
         let Ok(mut state) = self.inner.lock() else {
             return;
@@ -347,6 +362,7 @@ struct SessionBindings {
 
 pub(crate) struct SessionRuntime {
     client: String,
+    fingerprint: String,
     session_id: Vec<u8>,
     bindings: Mutex<SessionBindings>,
     outbound: mpsc::Sender<Message>,
@@ -355,6 +371,27 @@ pub(crate) struct SessionRuntime {
     protocol_version: ProtocolVersion,
     #[cfg(test)]
     redeem_attempts: std::sync::atomic::AtomicUsize,
+}
+
+#[derive(Clone)]
+pub(crate) struct ActiveControlSession {
+    identity: AuthenticatedClient,
+    outbound: mpsc::Sender<Message>,
+    protocol_version: ProtocolVersion,
+}
+
+impl ActiveControlSession {
+    pub(crate) fn identity(&self) -> &AuthenticatedClient {
+        &self.identity
+    }
+
+    pub(crate) fn outbound(&self) -> &mpsc::Sender<Message> {
+        &self.outbound
+    }
+
+    pub(crate) const fn protocol_version(&self) -> ProtocolVersion {
+        self.protocol_version
+    }
 }
 
 impl SessionRuntime {
@@ -618,6 +655,10 @@ impl ControlSessionGuard {
 
     pub(crate) fn cancellation(&self) -> CancellationToken {
         self.runtime.cancellation()
+    }
+
+    pub(crate) fn protocol_version(&self) -> ProtocolVersion {
+        self.runtime.protocol_version()
     }
 
     pub async fn register_tunnels(&mut self, request: RegisterTunnels) -> TunnelResults {

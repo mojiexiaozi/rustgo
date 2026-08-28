@@ -88,6 +88,23 @@ impl ObservationGrant {
     pub const fn expires_unix_secs(&self) -> u64 {
         self.expires_unix_secs
     }
+
+    pub fn to_protocol_message(&self) -> Result<Message, ObservationWireError> {
+        let encoded = encode_bounded(self, rustgo_protocol::MAX_OBSERVATION_GRANT_BYTES)?;
+        let opaque = rustgo_protocol::OpaqueObservationGrant::try_from(encoded)
+            .map_err(|_| ObservationWireError::TooLarge)?;
+        Ok(Message::ObservationGrant(opaque))
+    }
+
+    pub fn from_protocol_message(message: Message) -> Result<Self, ObservationWireError> {
+        let Message::ObservationGrant(opaque) = message else {
+            return Err(ObservationWireError::WrongControlMessage);
+        };
+        decode_bounded(
+            opaque.as_slice(),
+            rustgo_protocol::MAX_OBSERVATION_GRANT_BYTES,
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -190,6 +207,8 @@ pub enum ObservationWireError {
     TooLarge,
     #[error("invalid observation packet: {0}")]
     Codec(postcard::Error),
+    #[error("control message does not contain an observation grant")]
+    WrongControlMessage,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

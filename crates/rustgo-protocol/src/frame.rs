@@ -6,8 +6,8 @@ use thiserror::Error;
 use crate::ProtocolVersion;
 use crate::message::{
     AuthResult, BoundedBytes, ClientAuthenticate, ClientHello, DataChannelBind, ErrorMessage,
-    Heartbeat, MAX_UDP_PAYLOAD_BYTES, Message, MessageId, OpenTcpStream, OpenUdpChannel,
-    RegisterTunnels, ServerChallenge, SocketAddress, TcpStreamReady, TunnelResults,
+    Heartbeat, MAX_UDP_PAYLOAD_BYTES, Message, MessageId, ObservationGrantRequest, OpenTcpStream,
+    OpenUdpChannel, RegisterTunnels, ServerChallenge, SocketAddress, TcpStreamReady, TunnelResults,
     UDP_METADATA_LEN, UdpDatagram, UdpSessionRetired,
 };
 
@@ -223,6 +223,8 @@ fn encode_payload(message: &Message) -> Result<Vec<u8>, FrameError> {
         | Message::RendezvousClose(value)
         | Message::RendezvousError(value) => Ok(value.as_slice().to_vec()),
         Message::PeerRelayFrame(value) => Ok(value.as_slice().to_vec()),
+        Message::ObservationGrantRequest(value) => serialize(value),
+        Message::ObservationGrant(value) => Ok(value.as_slice().to_vec()),
     }
 }
 
@@ -289,6 +291,11 @@ fn decode_payload(message: MessageId, payload: &[u8]) -> Result<Message, FrameEr
         MessageId::RENDEZVOUS_CLOSE => decode_opaque(payload).map(Message::RendezvousClose),
         MessageId::RENDEZVOUS_ERROR => decode_opaque(payload).map(Message::RendezvousError),
         MessageId::PEER_RELAY_FRAME => decode_opaque(payload).map(Message::PeerRelayFrame),
+        MessageId::OBSERVATION_GRANT_REQUEST => {
+            deserialize::<ObservationGrantRequest>(message, payload)
+                .map(Message::ObservationGrantRequest)
+        }
+        MessageId::OBSERVATION_GRANT => decode_opaque(payload).map(Message::ObservationGrant),
         _ => unreachable!("MessageId values are validated before payload dispatch"),
     }
 }

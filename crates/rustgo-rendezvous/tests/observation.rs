@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use rustgo_protocol::SocketAddress;
+use rustgo_protocol::{Message, SocketAddress};
 use rustgo_rendezvous::{
     ObservationEndpoint, ObservationGrant, ObservationNonce, ObservationProbe, ObservationReply,
     ObservationToken,
@@ -15,6 +15,12 @@ fn observation_packets_round_trip_with_fixed_bounded_fields() {
     assert_eq!(grant.primary_token(), &primary);
     assert_eq!(grant.alternate_token(), &alternate);
     assert_eq!(grant.expires_unix_secs(), 42);
+    let grant_message = grant.to_protocol_message().unwrap();
+    assert!(matches!(grant_message, Message::ObservationGrant(_)));
+    assert_eq!(
+        ObservationGrant::from_protocol_message(grant_message).unwrap(),
+        grant
+    );
 
     let probe = ObservationProbe::new(primary, nonce);
     let encoded = probe.encode().unwrap();

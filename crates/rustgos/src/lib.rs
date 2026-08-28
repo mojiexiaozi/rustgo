@@ -7,6 +7,7 @@ mod auth;
 mod control;
 mod observation;
 mod registry;
+mod rendezvous;
 mod tcp;
 mod udp;
 
@@ -16,3 +17,7 @@ pub use observation::{
     ObservationIssueError, ObservationRuntimeLimits, ObservationService, ObservationTokenIssuer,
 };
 pub use registry::{AuthenticatedDataChannel, ClientRegistry, ControlSessionGuard, RegistryError};
+pub use rendezvous::{
+    RendezvousCoordinator, RendezvousCoordinatorError, RendezvousErrorCode,
+    RendezvousSessionMetadata,
+};
