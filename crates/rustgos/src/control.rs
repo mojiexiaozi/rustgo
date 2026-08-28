@@ -89,9 +89,7 @@ pub(crate) async fn serve_connection(
         }
     };
     if let Message::DataChannelBind(request) = first_frame.message {
-        drop(unauthenticated_permit);
-        drop(tls_peer_permit);
-        return if request.kind == rustgo_protocol::DataChannelKind::UDP {
+        let result = if request.kind == rustgo_protocol::DataChannelKind::UDP {
             tokio::select! {
                 biased;
                 () = shutdown.cancelled() => Ok(()),
@@ -114,6 +112,11 @@ pub(crate) async fn serve_connection(
                 ) => result.map_err(Into::into),
             }
         };
+        // Data-bind admission covers identity lookup, one-time token redemption,
+        // acknowledgement, and delivery to the owning control session.
+        drop(unauthenticated_permit);
+        drop(tls_peer_permit);
+        return result;
     }
     let Message::ClientHello(hello) = first_frame.message else {
         return Err(ControlError::InvalidState);

@@ -46,12 +46,12 @@ pub struct ClientRegistry {
 #[derive(Default)]
 struct RegistryState {
     active: HashMap<String, ActiveSession>,
+    by_name: HashMap<String, Arc<SessionRuntime>>,
 }
 
 struct ActiveSession {
     name: String,
     session_id: Vec<u8>,
-    runtime: Arc<SessionRuntime>,
 }
 
 impl std::fmt::Debug for ClientRegistry {
@@ -187,6 +187,7 @@ impl ClientRegistry {
         )?;
         let runtime = Arc::new(SessionRuntime {
             client: identity.name().to_owned(),
+            session_id: identity.session_id().to_vec(),
             bindings: Mutex::new(SessionBindings {
                 store: binding_store,
                 pending_tcp: HashMap::new(),
@@ -196,14 +197,13 @@ impl ClientRegistry {
             cancellation: CancellationToken::new(),
             binding_ttl: self.binding_ttl,
             protocol_version,
+            #[cfg(test)]
+            redeem_attempts: std::sync::atomic::AtomicUsize::new(0),
         });
         {
             let mut state = self.inner.lock().map_err(|_| RegistryError::Internal)?;
             if state.active.contains_key(identity.fingerprint())
-                || state
-                    .active
-                    .values()
-                    .any(|active| active.name == identity.name())
+                || state.by_name.contains_key(identity.name())
             {
                 return Err(RegistryError::AlreadyConnected);
             }
@@ -215,9 +215,11 @@ impl ClientRegistry {
                 ActiveSession {
                     name: identity.name().to_owned(),
                     session_id: identity.session_id().to_vec(),
-                    runtime: runtime.clone(),
                 },
             );
+            state
+                .by_name
+                .insert(identity.name().to_owned(), runtime.clone());
         }
 
         Ok(ControlSessionGuard {
@@ -238,27 +240,27 @@ impl ClientRegistry {
         request: &DataChannelBind,
         protocol_version: ProtocolVersion,
     ) -> Result<AuthenticatedDataChannel, RegistryError> {
-        let runtimes = self
+        let runtime = self
             .inner
             .lock()
             .map_err(|_| RegistryError::Internal)?
-            .active
-            .values()
-            .map(|active| active.runtime.clone())
-            .collect::<Vec<_>>();
-        for runtime in runtimes {
-            if let Some(result) = runtime.redeem_if_present(request, protocol_version) {
-                let (binding, destination) = result?;
-                return Ok(AuthenticatedDataChannel {
-                    stream: Some(stream),
-                    binding,
-                    destination: Some(destination),
-                    cancellation: runtime.cancellation(),
-                    protocol_version: runtime.protocol_version(),
-                });
-            }
+            .by_name
+            .get(request.client_name.as_str())
+            .cloned()
+            .ok_or(RegistryError::Binding(BindingError::Rejected))?;
+        if runtime.session_id() != request.session_id.as_slice() {
+            return Err(RegistryError::Binding(BindingError::Rejected));
         }
-        Err(RegistryError::Binding(BindingError::Rejected))
+        let (binding, destination) = runtime
+            .redeem_if_present(request, protocol_version)
+            .ok_or(RegistryError::Binding(BindingError::Rejected))??;
+        Ok(AuthenticatedDataChannel {
+            stream: Some(stream),
+            binding,
+            destination: Some(destination),
+            cancellation: runtime.cancellation(),
+            protocol_version: runtime.protocol_version(),
+        })
     }
 
     pub(crate) fn udp_open_channel(
@@ -290,6 +292,7 @@ impl ClientRegistry {
             });
         if owns_entry {
             state.active.remove(identity.fingerprint());
+            state.by_name.remove(identity.name());
         }
     }
 }
@@ -326,16 +329,23 @@ struct SessionBindings {
 
 pub(crate) struct SessionRuntime {
     client: String,
+    session_id: Vec<u8>,
     bindings: Mutex<SessionBindings>,
     outbound: mpsc::Sender<Message>,
     cancellation: CancellationToken,
     binding_ttl: Duration,
     protocol_version: ProtocolVersion,
+    #[cfg(test)]
+    redeem_attempts: std::sync::atomic::AtomicUsize,
 }
 
 impl SessionRuntime {
     pub(crate) fn client(&self) -> &str {
         &self.client
+    }
+
+    pub(crate) fn session_id(&self) -> &[u8] {
+        &self.session_id
     }
 
     pub(crate) fn cancellation(&self) -> CancellationToken {
@@ -352,6 +362,12 @@ impl SessionRuntime {
 
     pub(crate) const fn protocol_version(&self) -> ProtocolVersion {
         self.protocol_version
+    }
+
+    #[cfg(test)]
+    fn redeem_attempts(&self) -> usize {
+        self.redeem_attempts
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub(crate) fn prepare_tcp(&self, tunnel_id: u32) -> Result<PendingTcpOpen, RegistryError> {
@@ -453,6 +469,9 @@ impl SessionRuntime {
         request: &DataChannelBind,
         protocol_version: ProtocolVersion,
     ) -> Option<Result<(ChannelBinding, oneshot::Sender<ServerDataStream>), RegistryError>> {
+        #[cfg(test)]
+        self.redeem_attempts
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         let channel_kind = if request.kind == DataChannelKind::TCP {
             ChannelKind::Tcp {
                 tunnel_id: request.tunnel_id,
@@ -817,7 +836,7 @@ mod tests {
         BoundedBytes, BoundedString, DataChannelBind, DataChannelKind, MAX_BINDING_TOKEN_BYTES,
         MAX_CLIENT_NAME_BYTES, MAX_SESSION_ID_BYTES, TunnelProtocol,
     };
-    use rustgo_transport::{ChannelKind, TlsClient, TlsServer};
+    use rustgo_transport::{BindingError, ChannelKind, TlsClient, TlsServer};
     use tempfile::TempDir;
     use tokio::io::AsyncReadExt;
 
@@ -950,7 +969,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatcher_consumes_known_tokens_on_wrong_binding_fields_and_reuse()
+    async fn dispatcher_rejects_wrong_identity_without_consuming_the_target_binding()
     -> Result<(), Box<dyn Error>> {
         let pki = TestPki::generate()?;
         let session_id = vec![3; 32];
@@ -1025,11 +1044,18 @@ mod tests {
                     .is_err()
             );
             let (retry_server, _retry_client) = tls_pair(&tls_server, &tls_client, address).await?;
-            assert!(
-                registry
-                    .authenticate_data_channel(retry_server, &correct, SERVER_VERSION)
-                    .is_err()
-            );
+            let retry = registry.authenticate_data_channel(retry_server, &correct, SERVER_VERSION);
+            if case < 2 {
+                assert!(
+                    retry.is_ok(),
+                    "wrong identity must not consume the target token"
+                );
+            } else {
+                assert!(
+                    retry.is_err(),
+                    "a target identity's malformed binding must consume its known token"
+                );
+            }
             guard.runtime.cancel_pending(pending.connection_id);
         }
 
@@ -1067,6 +1093,104 @@ mod tests {
                 .authenticate_data_channel(unknown_server, &unknown, SERVER_VERSION)
                 .is_err()
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bind_dispatch_is_constant_time_by_client_and_session_identity()
+    -> Result<(), Box<dyn Error>> {
+        const ACTIVE_CLIENTS: usize = 512;
+        let pki = TestPki::generate()?;
+        let registry = ClientRegistry::new(
+            ACTIVE_CLIENTS,
+            1,
+            IpAddr::from([127, 0, 0, 1]),
+            2,
+            Duration::from_secs(30),
+        )?;
+        let mut guards = Vec::with_capacity(ACTIVE_CLIENTS);
+        for index in 0..ACTIVE_CLIENTS {
+            let mut session_id = vec![0_u8; 32];
+            session_id[..size_of::<usize>()].copy_from_slice(&index.to_le_bytes());
+            guards.push(registry.claim(AuthenticatedClient::verified(
+                format!("client-{index}"),
+                format!("sha256:{index:064x}"),
+                session_id,
+            ))?);
+        }
+        let tls_server =
+            TlsServer::bind("127.0.0.1:0", &pki.certificate_file, &pki.private_key_file).await?;
+        let address = tls_server.local_addr()?;
+        let tls_client = TlsClient::from_ca_file(&pki.ca_file, SERVER_NAME)?;
+
+        let unknown = bind_request(
+            "missing-client",
+            &[0xAA; 32],
+            DataChannelKind::TCP,
+            1,
+            7,
+            &[0x55; MAX_BINDING_TOKEN_BYTES],
+        );
+        let (unknown_server, _unknown_client) = tls_pair(&tls_server, &tls_client, address).await?;
+        assert!(matches!(
+            registry.authenticate_data_channel(unknown_server, &unknown, SERVER_VERSION),
+            Err(super::RegistryError::Binding(BindingError::Rejected))
+        ));
+        assert_eq!(
+            guards
+                .iter()
+                .map(|guard| guard.runtime.redeem_attempts())
+                .sum::<usize>(),
+            0,
+            "an unknown client must not probe active runtimes"
+        );
+
+        let target_index = ACTIVE_CLIENTS - 1;
+        let target = &guards[target_index];
+        let pending = target.runtime.prepare_tcp(1)?;
+        let wrong_session = bind_request(
+            &format!("client-{target_index}"),
+            &[0xBB; 32],
+            DataChannelKind::TCP,
+            1,
+            pending.connection_id,
+            pending.binding_token.as_slice(),
+        );
+        let (wrong_server, _wrong_client) = tls_pair(&tls_server, &tls_client, address).await?;
+        assert!(matches!(
+            registry.authenticate_data_channel(wrong_server, &wrong_session, SERVER_VERSION),
+            Err(super::RegistryError::Binding(BindingError::Rejected))
+        ));
+        assert_eq!(
+            guards
+                .iter()
+                .map(|guard| guard.runtime.redeem_attempts())
+                .sum::<usize>(),
+            0,
+            "a wrong session must be rejected before target redemption"
+        );
+
+        let correct = bind_request(
+            &format!("client-{target_index}"),
+            target.identity.session_id(),
+            DataChannelKind::TCP,
+            1,
+            pending.connection_id,
+            pending.binding_token.as_slice(),
+        );
+        let (correct_server, _correct_client) = tls_pair(&tls_server, &tls_client, address).await?;
+        let authenticated =
+            registry.authenticate_data_channel(correct_server, &correct, SERVER_VERSION)?;
+        drop(authenticated);
+        assert_eq!(
+            guards
+                .iter()
+                .map(|guard| guard.runtime.redeem_attempts())
+                .sum::<usize>(),
+            1,
+            "a valid bind must touch exactly its named runtime"
+        );
+        assert_eq!(target.runtime.redeem_attempts(), 1);
         Ok(())
     }
 
