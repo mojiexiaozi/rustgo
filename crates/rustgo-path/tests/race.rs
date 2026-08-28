@@ -17,6 +17,8 @@ use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
 enum Outcome {
+    SuccessImmediately,
+    SuccessAfterYields(usize),
     SuccessAfter(Duration),
     SuccessAsAfter(Duration, PathKind),
     FailAfter(Duration),
@@ -140,6 +142,13 @@ impl PathAttempt for FakeAttempt {
             .unwrap_or(Outcome::Hang);
         let attempt = async {
             match outcome {
+                Outcome::SuccessImmediately => Ok(self.selected(self.kind)),
+                Outcome::SuccessAfterYields(yields) => {
+                    for _ in 0..yields {
+                        yield_now().await;
+                    }
+                    Ok(self.selected(self.kind))
+                }
                 Outcome::SuccessAfter(delay) => {
                     tokio::time::sleep(delay).await;
                     Ok(self.selected(self.kind))
@@ -773,7 +782,9 @@ async fn concurrent_failure_reports_never_accumulate_recheck_loops() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn simultaneous_direct_completions_use_launch_priority_as_tie_breaker() {
+async fn zero_delay_completions_document_current_launch_order() {
+    // This documents deterministic spawn/event scheduling, not a winner-selection
+    // contract: the first successful completion observed by the race is authoritative.
     for _ in 0..64 {
         let v6 = FakeAttempt::new(PathKind::QuicV6, [Outcome::SuccessAfter(Duration::ZERO)]);
         let v4 = FakeAttempt::new(PathKind::QuicV4, [Outcome::SuccessAfter(Duration::ZERO)]);
@@ -800,6 +811,25 @@ async fn simultaneous_direct_completions_use_launch_priority_as_tie_breaker() {
         );
         manager.close().await.unwrap();
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn later_high_priority_authentication_cannot_replace_the_observed_winner() {
+    // The high-priority fake can complete only after yielding once. The removed
+    // ready-set expansion supplied that extra scheduling window after it had
+    // already observed the immediately successful lower-priority path.
+    let high = FakeAttempt::new(PathKind::QuicV6, [Outcome::SuccessAfterYields(1)]);
+    let low = FakeAttempt::new(PathKind::NativeTcp, [Outcome::SuccessImmediately]);
+    let manager = PathManager::new(config());
+
+    let selected = manager
+        .connect(vec![high.clone(), low], CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(selected.kind(), PathKind::NativeTcp);
+    assert!(high.token_is_cancelled());
+    assert_eq!(high.active.load(Ordering::SeqCst), 0);
+    manager.close().await.unwrap();
 }
 
 #[tokio::test(start_paused = true)]

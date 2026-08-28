@@ -118,17 +118,10 @@ pub(crate) async fn race_attempts(
                         decrement_active(kind, &mut direct_active, &mut relay_active);
                         match result {
                             Ok(path) if path.kind() == kind => {
-                                let winner = resolve_ready_ties(
-                                    id,
-                                    RaceWinner {
-                                        path,
-                                        cancellation: completed.cancellation,
-                                    },
-                                    &mut tasks,
-                                    &mut running,
-                                    &manager,
-                                )
-                                .await;
+                                let winner = RaceWinner {
+                                    path,
+                                    cancellation: completed.cancellation,
+                                };
                                 cleanup(&mut tasks, &running).await;
                                 return Ok(winner);
                             }
@@ -155,53 +148,6 @@ pub(crate) async fn race_attempts(
             }
         }
     }
-}
-
-async fn resolve_ready_ties(
-    mut winner_id: usize,
-    mut winner: RaceWinner,
-    tasks: &mut JoinSet<AttemptResult>,
-    running: &mut Vec<RunningAttempt>,
-    manager: &Arc<ManagerInner>,
-) -> RaceWinner {
-    tokio::task::yield_now().await;
-    while let Some(outcome) = tasks.try_join_next_with_id() {
-        match outcome {
-            Ok((_task_id, (id, kind, result))) => {
-                let Some(position) = running.iter().position(|entry| entry.id == id) else {
-                    continue;
-                };
-                let completed = running.swap_remove(position);
-                match result {
-                    Ok(path) if path.kind() == kind => {
-                        if id < winner_id {
-                            winner.cancellation.cancel();
-                            winner_id = id;
-                            winner = RaceWinner {
-                                path,
-                                cancellation: completed.cancellation,
-                            };
-                        } else {
-                            completed.cancellation.cancel();
-                        }
-                    }
-                    Ok(_) | Err(_) => {
-                        completed.cancellation.cancel();
-                        manager.record_event(PathEvent::AttemptFailed(kind));
-                    }
-                }
-            }
-            Err(error) => {
-                let task_id = error.id();
-                if let Some(position) = running.iter().position(|entry| entry.task_id == task_id) {
-                    let failed = running.swap_remove(position);
-                    failed.cancellation.cancel();
-                    manager.record_event(PathEvent::AttemptFailed(failed.kind));
-                }
-            }
-        }
-    }
-    winner
 }
 
 fn spawn_group(
