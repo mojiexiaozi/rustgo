@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     hash::Hash,
     io,
     net::{IpAddr, SocketAddr},
@@ -23,6 +23,7 @@ const MAX_PENDING_OBSERVATION_TOKENS: usize = 65_536;
 const MAX_TRACKED_OBSERVATION_SUBJECTS: usize = 65_536;
 const MAX_OBSERVATION_BURST: u32 = 65_536;
 const TOKEN_GENERATION_ATTEMPTS: usize = 16;
+const MAX_BUCKET_MAINTENANCE_STEPS_PER_PACKET: usize = 4;
 
 #[derive(Debug, Clone)]
 pub struct ObservationRuntimeLimits {
@@ -33,6 +34,8 @@ pub struct ObservationRuntimeLimits {
     pub per_ip_burst: u32,
     pub per_device_burst: u32,
     pub refill_interval: Duration,
+    #[doc(hidden)]
+    pub test_send_delay: Duration,
 }
 
 impl Default for ObservationRuntimeLimits {
@@ -45,6 +48,7 @@ impl Default for ObservationRuntimeLimits {
             per_ip_burst: 32,
             per_device_burst: 8,
             refill_interval: Duration::from_secs(1),
+            test_send_delay: Duration::ZERO,
         }
     }
 }
@@ -61,8 +65,10 @@ impl ObservationRuntimeLimits {
             && (1..=MAX_OBSERVATION_BURST).contains(&self.per_ip_burst)
             && (1..=MAX_OBSERVATION_BURST).contains(&self.per_device_burst)
             && !self.refill_interval.is_zero()
+            && self.test_send_delay <= Duration::from_secs(60)
             && Instant::now().checked_add(self.token_ttl).is_some()
             && Instant::now().checked_add(self.refill_interval).is_some()
+            && Instant::now().checked_add(self.test_send_delay).is_some()
             && SystemTime::now().checked_add(self.token_ttl).is_some()
     }
 }
@@ -213,11 +219,22 @@ pub enum ObservationIssueError {
     Internal,
 }
 
-#[derive(Default)]
 struct ObservationState {
     pending: HashMap<[u8; OBSERVATION_TOKEN_BYTES], PendingToken>,
-    ip_buckets: HashMap<IpAddr, TokenBucket>,
-    device_buckets: HashMap<String, TokenBucket>,
+    global_ip_admission: TokenBucket,
+    ip_buckets: BucketTable<IpAddr>,
+    device_buckets: BucketTable<String>,
+}
+
+impl Default for ObservationState {
+    fn default() -> Self {
+        Self {
+            pending: HashMap::new(),
+            global_ip_admission: TokenBucket::new(0, Instant::now()),
+            ip_buckets: BucketTable::default(),
+            device_buckets: BucketTable::default(),
+        }
+    }
 }
 
 struct PendingToken {
@@ -228,8 +245,186 @@ struct PendingToken {
 }
 
 struct TokenBucket {
+    capacity: u32,
     tokens: u32,
     last_refill: Instant,
+}
+
+impl TokenBucket {
+    fn new(capacity: u32, now: Instant) -> Self {
+        Self {
+            capacity,
+            tokens: capacity,
+            last_refill: now,
+        }
+    }
+
+    fn take(&mut self, capacity: u32, refill_interval: Duration, now: Instant) -> bool {
+        if self.capacity != capacity {
+            *self = Self::new(capacity, now);
+        }
+        let elapsed = now.duration_since(self.last_refill);
+        let refill = elapsed.as_nanos() / refill_interval.as_nanos();
+        if refill > 0 {
+            self.tokens = self
+                .tokens
+                .saturating_add(u32::try_from(refill).unwrap_or(u32::MAX))
+                .min(capacity);
+            self.last_refill = now;
+        }
+        if self.tokens == 0 {
+            return false;
+        }
+        self.tokens -= 1;
+        true
+    }
+
+    #[cfg(test)]
+    const fn remaining(&self) -> u32 {
+        self.tokens
+    }
+}
+
+struct BucketEntry {
+    bucket: TokenBucket,
+    generation: u64,
+}
+
+struct BucketExpiry<K> {
+    key: K,
+    generation: u64,
+    expires_at: Instant,
+}
+
+struct BucketTable<K> {
+    entries: HashMap<K, BucketEntry>,
+    expirations: VecDeque<BucketExpiry<K>>,
+    next_generation: u64,
+}
+
+impl<K> Default for BucketTable<K> {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            expirations: VecDeque::new(),
+            next_generation: 1,
+        }
+    }
+}
+
+struct BucketAdmission {
+    allowed: bool,
+    maintenance_steps: usize,
+}
+
+impl<K: Eq + Hash + Clone> BucketTable<K> {
+    fn allow(
+        &mut self,
+        key: K,
+        maximum_entries: usize,
+        capacity: u32,
+        refill_interval: Duration,
+        now: Instant,
+    ) -> BucketAdmission {
+        if let Some(entry) = self.entries.get_mut(&key) {
+            return BucketAdmission {
+                allowed: entry.bucket.take(capacity, refill_interval, now),
+                maintenance_steps: 0,
+            };
+        }
+
+        let stale_after = refill_interval
+            .checked_mul(capacity)
+            .unwrap_or(Duration::MAX);
+        let mut maintenance_steps = self.sweep_expired(now, stale_after);
+        if self.entries.len() >= maximum_entries {
+            while maintenance_steps < MAX_BUCKET_MAINTENANCE_STEPS_PER_PACKET {
+                let Some(expiry) = self.expirations.pop_front() else {
+                    break;
+                };
+                maintenance_steps += 1;
+                if self
+                    .entries
+                    .get(&expiry.key)
+                    .is_some_and(|entry| entry.generation == expiry.generation)
+                {
+                    self.entries.remove(&expiry.key);
+                    break;
+                }
+            }
+        }
+        if self.entries.len() >= maximum_entries {
+            return BucketAdmission {
+                allowed: false,
+                maintenance_steps,
+            };
+        }
+
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.wrapping_add(1).max(1);
+        let mut bucket = TokenBucket::new(capacity, now);
+        let allowed = bucket.take(capacity, refill_interval, now);
+        self.entries
+            .insert(key.clone(), BucketEntry { bucket, generation });
+        self.expirations.push_back(BucketExpiry {
+            key,
+            generation,
+            expires_at: expiration_from(now, stale_after, refill_interval),
+        });
+        BucketAdmission {
+            allowed,
+            maintenance_steps,
+        }
+    }
+
+    fn sweep_expired(&mut self, now: Instant, stale_after: Duration) -> usize {
+        let mut steps = 0;
+        while steps < MAX_BUCKET_MAINTENANCE_STEPS_PER_PACKET {
+            let Some(expiry) = self.expirations.front() else {
+                break;
+            };
+            if expiry.expires_at > now {
+                break;
+            }
+            let expiry = self
+                .expirations
+                .pop_front()
+                .expect("the expiry queue front exists");
+            steps += 1;
+            let Some(entry) = self.entries.get(&expiry.key) else {
+                continue;
+            };
+            if entry.generation != expiry.generation {
+                continue;
+            }
+            let expires_at = expiration_from(entry.bucket.last_refill, stale_after, Duration::ZERO);
+            if expires_at <= now {
+                self.entries.remove(&expiry.key);
+            } else {
+                self.expirations.push_back(BucketExpiry {
+                    expires_at,
+                    ..expiry
+                });
+            }
+        }
+        steps
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[cfg(test)]
+    fn queue_len(&self) -> usize {
+        self.expirations.len()
+    }
+}
+
+fn expiration_from(now: Instant, stale_after: Duration, fallback: Duration) -> Instant {
+    now.checked_add(stale_after)
+        .or_else(|| now.checked_add(fallback))
+        .unwrap_or(now)
 }
 
 async fn serve_socket(
@@ -257,6 +452,12 @@ async fn serve_socket(
         let Some(nonce) = authorize_probe(&state, &limits, &probe, endpoint, source.ip()) else {
             continue;
         };
+        if !limits.test_send_delay.is_zero() {
+            tokio::select! {
+                () = shutdown.cancelled() => return Ok(()),
+                () = tokio::time::sleep(limits.test_send_delay) => {}
+            }
+        }
         let reply = ObservationReply::new(nonce, wire_address(source), endpoint);
         let Ok(encoded) = reply.encode() else {
             continue;
@@ -264,7 +465,12 @@ async fn serve_socket(
         if encoded.len() > length {
             continue;
         }
-        socket.send_to(&encoded, source).await?;
+        tokio::select! {
+            () = shutdown.cancelled() => return Ok(()),
+            sent = socket.send_to(&encoded, source) => {
+                sent?;
+            }
+        }
     }
 }
 
@@ -278,14 +484,22 @@ fn authorize_probe(
     let now = Instant::now();
     let pending = {
         let mut state = state.lock().ok()?;
-        if !allow_bucket(
-            &mut state.ip_buckets,
+        if !state.global_ip_admission.take(
+            u32::try_from(limits.max_tracked_ips).ok()?,
+            limits.refill_interval,
+            now,
+        ) {
+            return None;
+        }
+        let admission = state.ip_buckets.allow(
             canonical_ip(source_ip),
             limits.max_tracked_ips,
             limits.per_ip_burst,
             limits.refill_interval,
             now,
-        ) {
+        );
+        debug_assert!(admission.maintenance_steps <= MAX_BUCKET_MAINTENANCE_STEPS_PER_PACKET);
+        if !admission.allowed {
             return None;
         }
         let key = *probe.token().as_bytes();
@@ -307,52 +521,15 @@ fn authorize_probe(
         return None;
     }
     let mut state = state.lock().ok()?;
-    allow_bucket(
-        &mut state.device_buckets,
+    let admission = state.device_buckets.allow(
         device_key,
         limits.max_tracked_devices,
         limits.per_device_burst,
         limits.refill_interval,
         now,
-    )
-    .then_some(probe.nonce())
-}
-
-fn allow_bucket<K: Eq + Hash + Clone>(
-    buckets: &mut HashMap<K, TokenBucket>,
-    key: K,
-    maximum_entries: usize,
-    capacity: u32,
-    refill_interval: Duration,
-    now: Instant,
-) -> bool {
-    if !buckets.contains_key(&key) && buckets.len() >= maximum_entries {
-        let stale_after = refill_interval
-            .checked_mul(capacity)
-            .unwrap_or(Duration::MAX);
-        buckets.retain(|_, bucket| now.duration_since(bucket.last_refill) < stale_after);
-        if buckets.len() >= maximum_entries {
-            return false;
-        }
-    }
-    let bucket = buckets.entry(key).or_insert(TokenBucket {
-        tokens: capacity,
-        last_refill: now,
-    });
-    let elapsed = now.duration_since(bucket.last_refill);
-    let refill = elapsed.as_nanos() / refill_interval.as_nanos();
-    if refill > 0 {
-        bucket.tokens = bucket
-            .tokens
-            .saturating_add(u32::try_from(refill).unwrap_or(u32::MAX))
-            .min(capacity);
-        bucket.last_refill = now;
-    }
-    if bucket.tokens == 0 {
-        return false;
-    }
-    bucket.tokens -= 1;
-    true
+    );
+    debug_assert!(admission.maintenance_steps <= MAX_BUCKET_MAINTENANCE_STEPS_PER_PACKET);
+    admission.allowed.then_some(probe.nonce())
 }
 
 fn issue_unique_token(
@@ -402,7 +579,11 @@ fn is_oversized_datagram(error: &io::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{error::Error, net::SocketAddr, time::Duration};
+    use std::{
+        error::Error,
+        net::{Ipv6Addr, SocketAddr},
+        time::Duration,
+    };
 
     use rustgo_rendezvous::{
         ObservationEndpoint, ObservationNonce, ObservationProbe, ObservationReply,
@@ -410,7 +591,10 @@ mod tests {
     use tokio::{net::UdpSocket, time::timeout};
     use tokio_util::sync::CancellationToken;
 
-    use super::{ObservationRuntimeLimits, ObservationService};
+    use super::{
+        BucketTable, MAX_BUCKET_MAINTENANCE_STEPS_PER_PACKET, ObservationRuntimeLimits,
+        ObservationService,
+    };
     use crate::{AuthenticatedClient, ClientRegistry};
 
     fn loopback(host: u8) -> SocketAddr {
@@ -426,6 +610,7 @@ mod tests {
             per_ip_burst: 8,
             per_device_burst: 8,
             refill_interval: Duration::from_secs(1),
+            test_send_delay: Duration::ZERO,
         }
     }
 
@@ -602,5 +787,192 @@ mod tests {
         shutdown.cancel();
         task.await??;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn ipv6_high_port_probe_receives_the_full_observed_source() -> Result<(), Box<dyn Error>>
+    {
+        let ipv6 = SocketAddr::from((Ipv6Addr::LOCALHOST, 0));
+        let service = match ObservationService::bind(ipv6, ipv6, limits()).await {
+            Ok(service) => service,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::AddrNotAvailable | std::io::ErrorKind::Unsupported
+                ) =>
+            {
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let addresses = service.local_addrs()?;
+        let (registry, guard) = active_client()?;
+        let issuer = service.token_issuer(registry);
+        let grant = issuer.issue(guard.identity())?;
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(service.run(shutdown.clone()));
+        let std_client = (40_000..40_100)
+            .find_map(|port| std::net::UdpSocket::bind((Ipv6Addr::LOCALHOST, port)).ok())
+            .ok_or("no high IPv6 loopback UDP port was available")?;
+        std_client.set_nonblocking(true)?;
+        let client = UdpSocket::from_std(std_client)?;
+        let nonce = ObservationNonce::from([8; 16]);
+
+        client
+            .send_to(
+                &ObservationProbe::new(grant.primary_token().clone(), nonce).encode()?,
+                addresses.0,
+            )
+            .await?;
+        let (reply, source) = receive_reply(&client).await?;
+        assert_eq!(source, addresses.0);
+        assert_eq!(reply.nonce(), nonce);
+        assert_eq!(reply.endpoint(), ObservationEndpoint::Primary);
+        assert_eq!(
+            reply.observed_source(),
+            &super::wire_address(client.local_addr()?)
+        );
+
+        shutdown.cancel();
+        task.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pending_token_capacity_is_hard_and_expiry_reclaims_it() -> Result<(), Box<dyn Error>> {
+        let constrained = ObservationRuntimeLimits {
+            token_ttl: Duration::from_millis(20),
+            max_pending_tokens: 2,
+            ..limits()
+        };
+        let service = ObservationService::bind(loopback(1), loopback(1), constrained).await?;
+        let (registry, guard) = active_client()?;
+        let issuer = service.token_issuer(registry);
+
+        issuer.issue(guard.identity())?;
+        assert!(matches!(
+            issuer.issue(guard.identity()),
+            Err(super::ObservationIssueError::CapacityReached)
+        ));
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        issuer.issue(guard.identity())?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_the_authenticated_reply_send_boundary()
+    -> Result<(), Box<dyn Error>> {
+        let constrained = ObservationRuntimeLimits {
+            test_send_delay: Duration::from_secs(60),
+            ..limits()
+        };
+        let service = ObservationService::bind(loopback(1), loopback(1), constrained).await?;
+        let primary = service.local_addrs()?.0;
+        let (registry, guard) = active_client()?;
+        let issuer = service.token_issuer(registry);
+        let grant = issuer.issue(guard.identity())?;
+        let primary_key = *grant.primary_token().as_bytes();
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(service.run(shutdown.clone()));
+        let client = UdpSocket::bind(loopback(1)).await?;
+        client
+            .send_to(
+                &ObservationProbe::new(
+                    grant.primary_token().clone(),
+                    ObservationNonce::from([10; 16]),
+                )
+                .encode()?,
+                primary,
+            )
+            .await?;
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if !issuer
+                    .state
+                    .lock()
+                    .unwrap()
+                    .pending
+                    .contains_key(&primary_key)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+
+        shutdown.cancel();
+        timeout(Duration::from_millis(500), task).await???;
+        Ok(())
+    }
+
+    #[test]
+    fn saturated_bucket_table_keeps_fixed_memory_and_maintenance_work() {
+        let capacity = 8;
+        let interval = Duration::from_secs(1);
+        let now = tokio::time::Instant::now();
+        let mut table = BucketTable::<u32>::default();
+
+        for key in 0..10_000 {
+            let admission = table.allow(key, capacity, 1, interval, now);
+            assert!(admission.allowed);
+            assert!(
+                admission.maintenance_steps <= MAX_BUCKET_MAINTENANCE_STEPS_PER_PACKET,
+                "one admission performed {} maintenance steps",
+                admission.maintenance_steps
+            );
+            assert!(table.len() <= capacity);
+            assert!(table.queue_len() <= capacity);
+        }
+    }
+
+    #[test]
+    fn expired_bucket_cleanup_is_bounded_per_admission() {
+        let capacity = 8;
+        let interval = Duration::from_secs(1);
+        let now = tokio::time::Instant::now();
+        let mut table = BucketTable::<u32>::default();
+        for key in 0..capacity as u32 {
+            assert!(table.allow(key, capacity, 1, interval, now).allowed);
+        }
+
+        let later = now + Duration::from_secs(2);
+        let admission = table.allow(99, capacity, 1, interval, later);
+        assert!(admission.allowed);
+        assert!(admission.maintenance_steps <= MAX_BUCKET_MAINTENANCE_STEPS_PER_PACKET);
+        assert!(table.len() <= capacity);
+        assert!(table.queue_len() <= capacity);
+    }
+
+    #[test]
+    fn invalid_token_flood_is_globally_bounded_before_per_source_state() {
+        let constrained = ObservationRuntimeLimits {
+            max_tracked_ips: 8,
+            per_ip_burst: 1,
+            ..limits()
+        };
+        let state = std::sync::Mutex::new(super::ObservationState::default());
+        let probe = ObservationProbe::new(
+            rustgo_rendezvous::ObservationToken::from([0xEE; 32]),
+            ObservationNonce::from([9; 16]),
+        );
+
+        for source in 1_u32..=10_000 {
+            assert!(
+                super::authorize_probe(
+                    &state,
+                    &constrained,
+                    &probe,
+                    ObservationEndpoint::Primary,
+                    std::net::Ipv4Addr::from(source).into(),
+                )
+                .is_none()
+            );
+        }
+
+        let state = state.into_inner().unwrap();
+        assert_eq!(state.ip_buckets.len(), constrained.max_tracked_ips);
+        assert!(state.ip_buckets.queue_len() <= constrained.max_tracked_ips);
+        assert_eq!(state.global_ip_admission.remaining(), 0);
     }
 }

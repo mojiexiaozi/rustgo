@@ -19,6 +19,7 @@ pub const MAX_ERROR_DETAIL_BYTES: usize = 512;
 pub const MAX_PEER_RELAY_CIPHERTEXT_BYTES: usize = 65_536;
 pub const OBSERVATION_TOKEN_BYTES: usize = 32;
 pub const OBSERVATION_NONCE_BYTES: usize = 16;
+const MAX_POSTCARD_U16_BYTES: usize = 3;
 
 #[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ObservationToken([u8; OBSERVATION_TOKEN_BYTES]);
@@ -127,7 +128,7 @@ pub struct ObservationReply {
 }
 
 impl ObservationReply {
-    pub const MAX_WIRE_BYTES: usize = OBSERVATION_NONCE_BYTES + 1 + 16 + 2 + 1;
+    pub const MAX_WIRE_BYTES: usize = OBSERVATION_NONCE_BYTES + 1 + 16 + MAX_POSTCARD_U16_BYTES + 1;
 
     pub const fn new(
         nonce: ObservationNonce,

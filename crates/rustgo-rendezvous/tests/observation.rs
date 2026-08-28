@@ -45,3 +45,20 @@ fn observation_packet_decoders_reject_trailing_and_oversized_input() {
     assert!(ObservationProbe::decode(&trailing).is_err());
     assert!(ObservationProbe::decode(&[0_u8; ObservationProbe::MAX_WIRE_BYTES + 1]).is_err());
 }
+
+#[test]
+fn ipv6_high_port_reply_fits_the_declared_wire_bound() {
+    let reply = ObservationReply::new(
+        ObservationNonce::from([0x66; 16]),
+        SocketAddress::V6 {
+            octets: [0xAB; 16],
+            port: u16::MAX,
+        },
+        ObservationEndpoint::Alternate,
+    );
+
+    let encoded = reply.encode().unwrap();
+    assert_eq!(encoded.len(), 37);
+    assert!(encoded.len() <= ObservationReply::MAX_WIRE_BYTES);
+    assert_eq!(ObservationReply::decode(&encoded).unwrap(), reply);
+}

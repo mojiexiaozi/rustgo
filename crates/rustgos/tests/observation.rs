@@ -147,6 +147,22 @@ async fn observation_service_requires_two_distinct_destination_ports() -> Result
 }
 
 #[tokio::test]
+async fn alternate_bind_failure_releases_the_primary_socket() -> Result<(), Box<dyn Error>> {
+    let primary_reservation = std::net::UdpSocket::bind(loopback_ephemeral())?;
+    let primary = primary_reservation.local_addr()?;
+    drop(primary_reservation);
+    let alternate_reservation = std::net::UdpSocket::bind(loopback_ephemeral())?;
+    let alternate = alternate_reservation.local_addr()?;
+
+    let result =
+        ObservationService::bind(primary, alternate, ObservationRuntimeLimits::default()).await;
+    assert!(result.is_err());
+    let rebound = UdpSocket::bind(primary).await?;
+    assert_eq!(rebound.local_addr()?, primary);
+    Ok(())
+}
+
+#[tokio::test]
 async fn server_app_owns_the_optional_paired_observation_sockets() -> Result<(), Box<dyn Error>> {
     let pki = TestPki::generate()?;
     let primary_reservation = std::net::UdpSocket::bind(loopback_ephemeral())?;
