@@ -1481,6 +1481,7 @@ dependencies = [
  "rustgo-rendezvous",
  "rustls",
  "rustls-pemfile",
+ "sha2",
  "tempfile",
  "thiserror",
  "time",

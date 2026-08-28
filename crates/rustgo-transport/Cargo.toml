@@ -16,6 +16,7 @@ rustgo-protocol = { path = "../rustgo-protocol" }
 rustgo-rendezvous = { path = "../rustgo-rendezvous" }
 rustgo-nat = { path = "../rustgo-nat" }
 postcard.workspace = true
+sha2.workspace = true
 rustls.workspace = true
 rustls-pemfile.workspace = true
 thiserror.workspace = true
