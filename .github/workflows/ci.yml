@@ -33,6 +33,10 @@ jobs:
           restore-keys: rustgo-${{ runner.os }}-
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Linux pidfd supervisor integration
+        run: |
+          python3 scripts/pidfd_supervisor.py preflight
+          python3 scripts/pidfd_supervisor_test.py --integration
       - name: Bash cleanup self-test
         run: |
           bash -n scripts/e2e.sh

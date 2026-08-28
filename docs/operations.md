@@ -246,10 +246,18 @@ cargo tree -d
 ```
 
 Run the matching platform E2E entry point. The Bash E2E entry point is
-Linux-only and requires readable
-`/proc/<pid>/stat`. It records each managed child's PID starttime before
-readiness polling and never signals or waits for a PID if that identity is
-missing or has changed.
+Linux-only and requires readable `/proc/<pid>/stat`, Linux kernel pidfd support,
+and Python 3.10+ with `os.pidfd_open` and `signal.pidfd_send_signal`. Its
+preflight opens a pidfd before any E2E child or temporary credential is
+created. Cleanup opens one pidfd for the recorded PID, validates the expected
+starttime after the open, and performs TERM, bounded polling, KILL escalation,
+and final bounded polling through that same pidfd. If the APIs, kernel support,
+or identity check are unavailable, cleanup sends no PID-only signal and the E2E
+gate exits nonzero.
+
+The Linux CI gate runs both the mockable pidfd state-machine suite and real
+pidfd integration cases for identity mismatch, cooperative TERM, and
+TERM-to-KILL escalation before the release E2E script.
 
 On a supported Linux/nightly libFuzzer host, install `cargo-fuzz` and run the
 bounded parser smoke:

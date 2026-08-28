@@ -31,9 +31,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/e2e.ps1
 
 Each script creates one private temporary directory and removes only that
 directory. Credentials are never written into Cargo or CI cache paths. The
-Bash entry point is Linux-only and requires readable `/proc/<pid>/stat`; it
-records each child process's starttime identity and will never signal a PID
-whose identity is missing or has changed.
+Bash entry point is Linux-only and requires readable `/proc/<pid>/stat`, a
+kernel with `pidfd_open`/`pidfd_send_signal`, and Python 3.10+ exposing
+`os.pidfd_open` and `signal.pidfd_send_signal`. It opens one pidfd per cleanup
+attempt, verifies the recorded starttime only after that open, and sends TERM
+and any bounded KILL escalation through that same process object. Missing
+support or an unreadable identity fails the E2E run without a PID-only signal.
 
 ## Start safely
 
