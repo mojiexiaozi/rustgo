@@ -120,6 +120,89 @@ fn candidate_input_strategy() -> BoxedStrategy<CandidateInput> {
     .boxed()
 }
 
+fn changed_v4_mapping_observations_strategy() -> BoxedStrategy<[Observation; 2]> {
+    (
+        any::<[u8; 3]>(),
+        1u16..=u16::MAX,
+        1u16..=u16::MAX,
+        1u16..=u16::MAX,
+        1u16..=u16::MAX,
+    )
+        .prop_map(
+            |(
+                tail,
+                first_destination_port,
+                second_destination_port,
+                first_mapped_port,
+                second_mapped_port,
+            )| {
+                let first_mapped_host = [8, tail[0], tail[1], tail[2]];
+                let mut second_mapped_host = first_mapped_host;
+                second_mapped_host[3] ^= 1;
+                [
+                    Observation::new(
+                        address([198, 51, 100, 10], first_destination_port),
+                        address(first_mapped_host, first_mapped_port),
+                    ),
+                    Observation::new(
+                        address([198, 51, 100, 10], second_destination_port),
+                        address(second_mapped_host, second_mapped_port),
+                    ),
+                ]
+            },
+        )
+        .boxed()
+}
+
+fn changed_v6_mapping_observations_strategy() -> BoxedStrategy<[Observation; 2]> {
+    (
+        any::<[u8; 14]>(),
+        1u16..=u16::MAX,
+        1u16..=u16::MAX,
+        1u16..=u16::MAX,
+        1u16..=u16::MAX,
+    )
+        .prop_map(
+            |(
+                tail,
+                first_destination_port,
+                second_destination_port,
+                first_mapped_port,
+                second_mapped_port,
+            )| {
+                let first_mapped_host = [
+                    0x20, 0x01, tail[0], tail[1], tail[2], tail[3], tail[4], tail[5], tail[6],
+                    tail[7], tail[8], tail[9], tail[10], tail[11], tail[12], tail[13],
+                ];
+                let mut second_mapped_host = first_mapped_host;
+                second_mapped_host[15] ^= 1;
+                [
+                    Observation::new(
+                        SocketAddress::V6 {
+                            octets: [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+                            port: first_destination_port,
+                        },
+                        SocketAddress::V6 {
+                            octets: first_mapped_host,
+                            port: first_mapped_port,
+                        },
+                    ),
+                    Observation::new(
+                        SocketAddress::V6 {
+                            octets: [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+                            port: second_destination_port,
+                        },
+                        SocketAddress::V6 {
+                            octets: second_mapped_host,
+                            port: second_mapped_port,
+                        },
+                    ),
+                ]
+            },
+        )
+        .boxed()
+}
+
 #[test]
 fn predicted_ports_reject_wraparound_and_zero() {
     let observations = [
@@ -141,7 +224,7 @@ fn predicted_ports_reject_wraparound_and_zero() {
 
 proptest! {
     #[test]
-    fn arbitrary_observations_have_bounded_unique_nonzero_predictions_and_no_cross_host_port_evidence(
+    fn arbitrary_observations_have_bounded_unique_nonzero_predictions(
         addresses in proptest::collection::vec((socket_address_strategy(), socket_address_strategy()), 0..80),
         requested_window in any::<usize>(),
     ) {
@@ -150,16 +233,24 @@ proptest! {
             .collect();
         let predicted = predicted_ports(&observations, PredictionPolicy { requested_window });
         let unique: HashSet<_> = predicted.iter().copied().collect();
-        let mapped_hosts_differ = observations.windows(2).any(|pair| {
-            !same_host(&pair[0].mapped_address, &pair[1].mapped_address)
-        });
 
         prop_assert!(predicted.len() <= 16);
         prop_assert!(predicted.iter().all(|port| *port != 0));
         prop_assert_eq!(predicted.len(), unique.len());
-        if mapped_hosts_differ {
-            prop_assert_ne!(analyze_mappings(&observations), MappingEvidence::DestinationPortDependent);
-        }
+    }
+
+    #[test]
+    fn changed_ipv4_mapping_hosts_are_exactly_uncertain(
+        observations in changed_v4_mapping_observations_strategy(),
+    ) {
+        prop_assert_eq!(analyze_mappings(&observations), MappingEvidence::Uncertain);
+    }
+
+    #[test]
+    fn changed_ipv6_mapping_hosts_are_exactly_uncertain(
+        observations in changed_v6_mapping_observations_strategy(),
+    ) {
+        prop_assert_eq!(analyze_mappings(&observations), MappingEvidence::Uncertain);
     }
 
     #[test]
@@ -183,18 +274,6 @@ proptest! {
         prop_assert!(candidates.len() <= 32);
         prop_assert!(all_unique);
         prop_assert!(all_usable);
-    }
-}
-
-fn same_host(left: &SocketAddress, right: &SocketAddress) -> bool {
-    match (left, right) {
-        (SocketAddress::V4 { octets: left, .. }, SocketAddress::V4 { octets: right, .. }) => {
-            left == right
-        }
-        (SocketAddress::V6 { octets: left, .. }, SocketAddress::V6 { octets: right, .. }) => {
-            left == right
-        }
-        _ => false,
     }
 }
 
