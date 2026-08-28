@@ -12,16 +12,20 @@ use rustgo_path::{
     PathAttempt, PathError, PathEvent, PathKind, PathManager, PathManagerConfig, PathState,
     SelectedPath,
 };
-use tokio::task::yield_now;
+use tokio::{sync::Barrier, task::yield_now};
 use tokio_util::sync::CancellationToken;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum Outcome {
     SuccessAfter(Duration),
     SuccessAsAfter(Duration, PathKind),
     FailAfter(Duration),
     Hang,
     Panic,
+    BarrierSuccess {
+        entered: Arc<Barrier>,
+        release: Arc<Barrier>,
+    },
 }
 
 struct FakeAttempt {
@@ -29,8 +33,11 @@ struct FakeAttempt {
     outcomes: Mutex<VecDeque<Outcome>>,
     starts: AtomicUsize,
     active: Arc<AtomicUsize>,
+    max_active: AtomicUsize,
     cancelled: AtomicBool,
+    cancellation: Mutex<Option<CancellationToken>>,
     dropped: Arc<AtomicUsize>,
+    handle_dropped: Option<Arc<AtomicUsize>>,
 }
 
 impl FakeAttempt {
@@ -40,13 +47,30 @@ impl FakeAttempt {
             outcomes: Mutex::new(outcomes.into_iter().collect()),
             starts: AtomicUsize::new(0),
             active: Arc::new(AtomicUsize::new(0)),
+            max_active: AtomicUsize::new(0),
             cancelled: AtomicBool::new(false),
+            cancellation: Mutex::new(None),
             dropped: Arc::new(AtomicUsize::new(0)),
+            handle_dropped: None,
         })
+    }
+
+    fn with_handle(
+        kind: PathKind,
+        outcomes: impl IntoIterator<Item = Outcome>,
+        handle_dropped: Arc<AtomicUsize>,
+    ) -> Arc<Self> {
+        let mut attempt = Arc::into_inner(Self::new(kind, outcomes)).unwrap();
+        attempt.handle_dropped = Some(handle_dropped);
+        Arc::new(attempt)
     }
 
     fn starts(&self) -> usize {
         self.starts.load(Ordering::SeqCst)
+    }
+
+    fn max_active(&self) -> usize {
+        self.max_active.load(Ordering::SeqCst)
     }
 
     fn is_cancelled(&self) -> bool {
@@ -55,6 +79,30 @@ impl FakeAttempt {
 
     fn drop_probe(&self) -> Arc<AtomicUsize> {
         self.dropped.clone()
+    }
+
+    fn token_is_cancelled(&self) -> bool {
+        self.cancellation
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+    }
+
+    fn selected(&self, kind: PathKind) -> SelectedPath {
+        if let Some(dropped) = &self.handle_dropped {
+            SelectedPath::authenticated_with(kind, Arc::new(DropHandle(dropped.clone())))
+        } else {
+            SelectedPath::authenticated(kind)
+        }
+    }
+}
+
+struct DropHandle(Arc<AtomicUsize>);
+
+impl Drop for DropHandle {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -79,8 +127,10 @@ impl PathAttempt for FakeAttempt {
     }
 
     async fn connect(&self, cancellation: CancellationToken) -> Result<SelectedPath, PathError> {
+        *self.cancellation.lock().unwrap() = Some(cancellation.clone());
         self.starts.fetch_add(1, Ordering::SeqCst);
-        self.active.fetch_add(1, Ordering::SeqCst);
+        let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_active.fetch_max(active, Ordering::SeqCst);
         let _active = ActiveGuard(self.active.clone());
         let outcome = self
             .outcomes
@@ -92,11 +142,11 @@ impl PathAttempt for FakeAttempt {
             match outcome {
                 Outcome::SuccessAfter(delay) => {
                     tokio::time::sleep(delay).await;
-                    Ok(SelectedPath::authenticated(self.kind))
+                    Ok(self.selected(self.kind))
                 }
                 Outcome::SuccessAsAfter(delay, kind) => {
                     tokio::time::sleep(delay).await;
-                    Ok(SelectedPath::authenticated(kind))
+                    Ok(self.selected(kind))
                 }
                 Outcome::FailAfter(delay) => {
                     tokio::time::sleep(delay).await;
@@ -104,6 +154,11 @@ impl PathAttempt for FakeAttempt {
                 }
                 Outcome::Hang => std::future::pending().await,
                 Outcome::Panic => panic!("fake attempt panic"),
+                Outcome::BarrierSuccess { entered, release } => {
+                    entered.wait().await;
+                    release.wait().await;
+                    Ok(self.selected(self.kind))
+                }
             }
         };
 
@@ -301,7 +356,189 @@ async fn caller_cancellation_stops_and_joins_every_attempt() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn panicking_attempt_still_cancels_and_joins_its_peers() {
+async fn failed_initial_connect_enters_the_terminal_closed_state() {
+    let manager = PathManager::new(config());
+
+    assert_eq!(
+        manager
+            .connect(Vec::new(), CancellationToken::new())
+            .await
+            .unwrap_err(),
+        PathError::NoViablePath
+    );
+    assert_eq!(manager.state(), PathState::Closed);
+    assert!(manager.events().contains(&PathEvent::StateChanged {
+        from: PathState::Checking,
+        to: PathState::Closed,
+    }));
+}
+
+#[tokio::test]
+async fn close_is_idempotent_from_discovering() {
+    let manager = PathManager::new(config());
+
+    manager.close().await.unwrap();
+    manager.close().await.unwrap();
+
+    assert_eq!(manager.state(), PathState::Closed);
+    assert_eq!(
+        manager
+            .events()
+            .iter()
+            .filter(|event| **event == PathEvent::Closed)
+            .count(),
+        1
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn close_cancels_the_winner_and_drops_the_manager_owned_handle() {
+    let handle_dropped = Arc::new(AtomicUsize::new(0));
+    let winner = FakeAttempt::with_handle(
+        PathKind::QuicV6,
+        [Outcome::SuccessAfter(Duration::ZERO)],
+        handle_dropped.clone(),
+    );
+    let manager = PathManager::new(config());
+
+    let selected = manager
+        .connect(vec![winner.clone()], CancellationToken::new())
+        .await
+        .unwrap();
+    drop(selected);
+    assert!(!winner.token_is_cancelled());
+    assert_eq!(handle_dropped.load(Ordering::SeqCst), 0);
+
+    manager.close().await.unwrap();
+
+    assert!(winner.token_is_cancelled());
+    assert_eq!(handle_dropped.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn selected_winner_independently_observes_late_caller_cancellation() {
+    let winner = FakeAttempt::new(PathKind::QuicV6, [Outcome::SuccessAfter(Duration::ZERO)]);
+    let caller = CancellationToken::new();
+    let manager = PathManager::new(config());
+    manager
+        .connect(vec![winner.clone()], caller.clone())
+        .await
+        .unwrap();
+    assert!(!winner.token_is_cancelled());
+
+    caller.cancel();
+    settle().await;
+
+    assert!(winner.token_is_cancelled());
+    manager.close().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn manager_drop_cancels_the_winner_and_drops_its_handle() {
+    let handle_dropped = Arc::new(AtomicUsize::new(0));
+    let winner = FakeAttempt::with_handle(
+        PathKind::QuicV6,
+        [Outcome::SuccessAfter(Duration::ZERO)],
+        handle_dropped.clone(),
+    );
+    let manager = PathManager::new(config());
+    let selected = manager
+        .connect(vec![winner.clone()], CancellationToken::new())
+        .await
+        .unwrap();
+    drop(selected);
+
+    drop(manager);
+    settle().await;
+
+    assert!(winner.token_is_cancelled());
+    assert_eq!(handle_dropped.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn close_wins_a_barrier_race_with_connect_publication() {
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let attempt = FakeAttempt::new(
+        PathKind::QuicV6,
+        [Outcome::BarrierSuccess {
+            entered: entered.clone(),
+            release,
+        }],
+    );
+    let manager = Arc::new(PathManager::new(config()));
+    let task_manager = manager.clone();
+    let task_attempt = attempt.clone();
+    let connect = tokio::spawn(async move {
+        task_manager
+            .connect(vec![task_attempt], CancellationToken::new())
+            .await
+    });
+    entered.wait().await;
+
+    manager.close().await.unwrap();
+    assert_eq!(connect.await.unwrap().unwrap_err(), PathError::Cancelled);
+
+    let events = manager.events();
+    let closed = events
+        .iter()
+        .position(|event| *event == PathEvent::Closed)
+        .unwrap();
+    assert!(
+        !events[closed + 1..]
+            .iter()
+            .any(|event| matches!(event, PathEvent::Selected(_)))
+    );
+    assert_eq!(manager.state(), PathState::Closed);
+    assert!(manager.selected().is_none());
+    assert!(attempt.token_is_cancelled());
+    assert_eq!(attempt.active.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn close_wins_a_barrier_race_with_background_promotion() {
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let direct = FakeAttempt::new(
+        PathKind::QuicV6,
+        [
+            Outcome::FailAfter(Duration::ZERO),
+            Outcome::BarrierSuccess {
+                entered: entered.clone(),
+                release,
+            },
+        ],
+    );
+    let relay = FakeAttempt::new(PathKind::Relay, [Outcome::SuccessAfter(Duration::ZERO)]);
+    let manager = PathManager::new(config());
+    manager
+        .connect(vec![direct.clone(), relay], CancellationToken::new())
+        .await
+        .unwrap();
+    settle().await;
+    tokio::time::advance(Duration::from_secs(30)).await;
+    entered.wait().await;
+
+    manager.close().await.unwrap();
+
+    let events = manager.events();
+    let closed = events
+        .iter()
+        .position(|event| *event == PathEvent::Closed)
+        .unwrap();
+    assert!(
+        !events[closed + 1..]
+            .iter()
+            .any(|event| matches!(event, PathEvent::Selected(_) | PathEvent::Promoted(_)))
+    );
+    assert_eq!(manager.state(), PathState::Closed);
+    assert!(manager.selected().is_none());
+    assert!(direct.token_is_cancelled());
+    assert_eq!(direct.active.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn panic_only_exhaustion_closes_after_cancelling_and_joining_peers() {
     let panic_attempt = FakeAttempt::new(PathKind::QuicV6, [Outcome::Panic]);
     let loser = FakeAttempt::new(PathKind::QuicV6, [Outcome::Hang]);
     let manager = PathManager::new(config());
@@ -311,9 +548,25 @@ async fn panicking_attempt_still_cancels_and_joins_its_peers() {
         .await
         .unwrap_err();
 
-    assert_eq!(error, PathError::AttemptTaskFailed);
-    assert!(loser.is_cancelled());
+    assert_eq!(error, PathError::NoViablePath);
+    assert!(loser.token_is_cancelled());
     assert_eq!(loser.active.load(Ordering::SeqCst), 0);
+    assert_eq!(manager.state(), PathState::Closed);
+}
+
+#[tokio::test(start_paused = true)]
+async fn panicking_direct_attempt_does_not_prevent_a_successful_relay() {
+    let panic_attempt = FakeAttempt::new(PathKind::QuicV6, [Outcome::Panic]);
+    let relay = FakeAttempt::new(PathKind::Relay, [Outcome::SuccessAfter(Duration::ZERO)]);
+    let manager = PathManager::new(config());
+
+    let selected = manager
+        .connect(vec![panic_attempt, relay], CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(selected.kind(), PathKind::Relay);
+    assert_eq!(manager.state(), PathState::Relay);
 }
 
 #[tokio::test(start_paused = true)]
@@ -432,6 +685,120 @@ async fn repeated_races_drop_every_attempt_and_background_recheck() {
 
         assert_eq!(direct_drop.load(Ordering::SeqCst), 1);
         assert_eq!(relay_drop.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn report_failed_replaces_and_joins_the_old_recheck_loop() {
+    let old_direct = FakeAttempt::new(PathKind::QuicV6, [Outcome::FailAfter(Duration::ZERO)]);
+    let old_drop = old_direct.drop_probe();
+    let initial_relay = FakeAttempt::new(PathKind::Relay, [Outcome::SuccessAfter(Duration::ZERO)]);
+    let manager = PathManager::new(config());
+    manager
+        .connect(
+            vec![old_direct.clone(), initial_relay],
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    settle().await;
+
+    let new_direct = FakeAttempt::new(
+        PathKind::QuicV6,
+        [Outcome::FailAfter(Duration::ZERO), Outcome::Hang],
+    );
+    let replacement_relay =
+        FakeAttempt::new(PathKind::Relay, [Outcome::SuccessAfter(Duration::ZERO)]);
+    manager
+        .report_failed(
+            vec![new_direct.clone(), replacement_relay],
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    drop(old_direct);
+    settle().await;
+
+    assert_eq!(old_drop.load(Ordering::SeqCst), 1);
+    tokio::time::advance(Duration::from_secs(30)).await;
+    settle().await;
+    assert_eq!(new_direct.starts(), 2);
+    assert_eq!(new_direct.max_active(), 1);
+
+    manager.close().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn concurrent_failure_reports_never_accumulate_recheck_loops() {
+    let initial_direct = FakeAttempt::new(PathKind::QuicV6, [Outcome::FailAfter(Duration::ZERO)]);
+    let initial_relay = FakeAttempt::new(PathKind::Relay, [Outcome::SuccessAfter(Duration::ZERO)]);
+    let manager = Arc::new(PathManager::new(config()));
+    manager
+        .connect(
+            vec![initial_direct, initial_relay],
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    settle().await;
+
+    let direct = FakeAttempt::new(
+        PathKind::QuicV6,
+        std::iter::repeat_n(Outcome::FailAfter(Duration::ZERO), 64),
+    );
+    let relay = FakeAttempt::new(
+        PathKind::Relay,
+        std::iter::repeat_n(Outcome::SuccessAfter(Duration::ZERO), 64),
+    );
+    let mut reports = Vec::new();
+    for _ in 0..16 {
+        let task_manager = manager.clone();
+        let task_direct = direct.clone();
+        let task_relay = relay.clone();
+        reports.push(tokio::spawn(async move {
+            task_manager
+                .report_failed(vec![task_direct, task_relay], CancellationToken::new())
+                .await
+        }));
+    }
+    for report in reports {
+        let _ = report.await.unwrap();
+    }
+    settle().await;
+    tokio::time::advance(Duration::from_secs(30)).await;
+    settle().await;
+
+    assert_eq!(direct.max_active(), 1);
+    manager.close().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn simultaneous_direct_completions_use_launch_priority_as_tie_breaker() {
+    for _ in 0..64 {
+        let v6 = FakeAttempt::new(PathKind::QuicV6, [Outcome::SuccessAfter(Duration::ZERO)]);
+        let v4 = FakeAttempt::new(PathKind::QuicV4, [Outcome::SuccessAfter(Duration::ZERO)]);
+        let tcp = FakeAttempt::new(PathKind::NativeTcp, [Outcome::SuccessAfter(Duration::ZERO)]);
+        let manager = PathManager::new(config());
+
+        let selected = manager
+            .connect(vec![tcp, v4, v6], CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(selected.kind(), PathKind::QuicV6);
+        let starts: Vec<_> = manager
+            .events()
+            .into_iter()
+            .filter_map(|event| match event {
+                PathEvent::AttemptStarted(kind) => Some(kind),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            starts,
+            [PathKind::QuicV6, PathKind::QuicV4, PathKind::NativeTcp]
+        );
+        manager.close().await.unwrap();
     }
 }
 

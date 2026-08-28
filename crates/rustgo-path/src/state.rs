@@ -35,18 +35,24 @@ impl PathStateMachine {
     }
 
     pub fn transition(&mut self, next: PathState) -> Result<(), PathError> {
+        // Discovering -> Closed and Checking -> Closed are terminal abort edges:
+        // they are used only when startup is cancelled or exhausts every viable
+        // authenticated path before one can be published.
         let legal = matches!(
             (self.current, next),
-            (PathState::Discovering, PathState::Checking)
-                | (PathState::Checking, PathState::Direct | PathState::Relay)
-                | (
-                    PathState::Direct | PathState::Relay,
-                    PathState::Rechecking | PathState::Closed
-                )
-                | (
-                    PathState::Rechecking,
-                    PathState::Direct | PathState::Relay | PathState::Closed
-                )
+            (
+                PathState::Discovering,
+                PathState::Checking | PathState::Closed
+            ) | (
+                PathState::Checking,
+                PathState::Direct | PathState::Relay | PathState::Closed
+            ) | (
+                PathState::Direct | PathState::Relay,
+                PathState::Rechecking | PathState::Closed
+            ) | (
+                PathState::Rechecking,
+                PathState::Direct | PathState::Relay | PathState::Closed
+            )
         );
         if !legal {
             return Err(PathError::IllegalTransition {

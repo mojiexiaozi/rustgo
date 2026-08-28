@@ -1,9 +1,9 @@
-use std::{sync::Weak, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    Attempt, ManagerInner, PathError, PathEvent, PathKind, PathState, race::race_attempts,
+    Attempt, ManagerInner, OwnedRecheck, PathError, PathState, install_winner, race::race_attempts,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,64 +54,98 @@ impl PathManagerConfig {
     }
 }
 
-pub(crate) fn spawn_rechecks(
-    manager: Weak<ManagerInner>,
-    config: PathManagerConfig,
+pub(crate) async fn start_recheck(
+    inner: Arc<ManagerInner>,
     direct_attempts: Vec<Attempt>,
     caller_cancellation: CancellationToken,
-    manager_cancellation: CancellationToken,
 ) {
     if direct_attempts.is_empty() {
         return;
     }
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                biased;
-                () = caller_cancellation.cancelled() => return,
-                () = manager_cancellation.cancelled() => return,
-                () = tokio::time::sleep(config.recheck_interval()) => {}
-            }
-
-            let Some(inner) = manager.upgrade() else {
-                return;
-            };
-            if inner.transition(PathState::Rechecking).is_err() {
+    loop {
+        let finished = {
+            let mut record = inner.record.lock().expect("path record mutex poisoned");
+            if record.state.current() != PathState::Relay {
                 return;
             }
-            inner.record(PathEvent::RecheckStarted);
-            let events = inner.events.clone();
-            drop(inner);
-
-            let outcome = race_attempts(
-                direct_attempts.clone(),
-                config,
-                caller_cancellation.clone(),
-                manager_cancellation.clone(),
-                events,
-            )
-            .await;
-
-            let Some(inner) = manager.upgrade() else {
-                return;
-            };
-            match outcome {
-                Ok(selected) if selected.kind() != PathKind::Relay => {
-                    if inner.transition(PathState::Direct).is_err() {
-                        return;
-                    }
-                    inner.set_selected(selected.clone());
-                    inner.record(PathEvent::Promoted(selected.kind()));
+            match record.recheck.as_ref() {
+                Some(recheck) if !recheck.handle.is_finished() => return,
+                Some(_) => record.recheck.take(),
+                None => {
+                    let id = record.next_recheck_id;
+                    record.next_recheck_id = record.next_recheck_id.wrapping_add(1).max(1);
+                    let cancellation = inner.lifetime.child_token();
+                    let task_cancellation = cancellation.clone();
+                    let weak = Arc::downgrade(&inner);
+                    let attempts = direct_attempts.clone();
+                    let caller = caller_cancellation.clone();
+                    let config = inner.config;
+                    let handle = tokio::spawn(async move {
+                        recheck_loop(weak, id, config, attempts, caller, task_cancellation).await;
+                    });
+                    record.recheck = Some(OwnedRecheck {
+                        id,
+                        cancellation,
+                        handle,
+                    });
                     return;
                 }
-                Err(PathError::Cancelled) => return,
-                _ => {
-                    if inner.transition(PathState::Relay).is_err() {
-                        return;
-                    }
-                    inner.record(PathEvent::RecheckScheduled);
+            }
+        };
+        if let Some(finished) = finished {
+            finished.shutdown().await;
+        }
+    }
+}
+
+async fn recheck_loop(
+    manager: std::sync::Weak<ManagerInner>,
+    id: u64,
+    config: PathManagerConfig,
+    direct_attempts: Vec<Attempt>,
+    caller_cancellation: CancellationToken,
+    recheck_cancellation: CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            biased;
+            () = caller_cancellation.cancelled() => return,
+            () = recheck_cancellation.cancelled() => return,
+            () = tokio::time::sleep(config.recheck_interval()) => {}
+        }
+
+        let Some(inner) = manager.upgrade() else {
+            return;
+        };
+        if !inner.begin_background_recheck(id) {
+            return;
+        }
+        let winner = race_attempts(
+            direct_attempts.clone(),
+            config,
+            caller_cancellation.clone(),
+            recheck_cancellation.clone(),
+            inner.clone(),
+        )
+        .await;
+        match winner {
+            Ok(winner) => {
+                let _ = install_winner(
+                    &inner,
+                    PathState::Rechecking,
+                    Some(id),
+                    winner,
+                    caller_cancellation.clone(),
+                )
+                .await;
+                return;
+            }
+            Err(PathError::Cancelled) => return,
+            Err(_) => {
+                if !inner.finish_failed_recheck(id) {
+                    return;
                 }
             }
         }
-    });
+    }
 }

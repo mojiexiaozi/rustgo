@@ -56,6 +56,8 @@ fn every_undocumented_transition_is_illegal() {
     ];
     let legal = [
         (PathState::Discovering, PathState::Checking),
+        (PathState::Discovering, PathState::Closed),
+        (PathState::Checking, PathState::Closed),
         (PathState::Checking, PathState::Direct),
         (PathState::Checking, PathState::Relay),
         (PathState::Direct, PathState::Rechecking),

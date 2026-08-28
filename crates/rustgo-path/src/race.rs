@@ -1,17 +1,27 @@
 use std::sync::Arc;
 
-use tokio::{task::JoinSet, time::Instant};
+use tokio::{
+    task::{Id, JoinSet},
+    time::Instant,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    PathAttempt, PathError, PathEvent, PathKind, PathManagerConfig, SelectedPath, SharedEvents,
-    record_event,
+    ManagerInner, PathAttempt, PathError, PathEvent, PathKind, PathManagerConfig, SelectedPath,
 };
 
 type Attempt = Arc<dyn PathAttempt>;
+type AttemptResult = (usize, PathKind, Result<SelectedPath, PathError>);
+
+pub(crate) struct RaceWinner {
+    pub(crate) path: SelectedPath,
+    pub(crate) cancellation: CancellationToken,
+}
 
 struct RunningAttempt {
     id: usize,
+    task_id: Id,
+    kind: PathKind,
     cancellation: CancellationToken,
 }
 
@@ -19,9 +29,9 @@ pub(crate) async fn race_attempts(
     attempts: Vec<Attempt>,
     config: PathManagerConfig,
     caller_cancellation: CancellationToken,
-    manager_cancellation: CancellationToken,
-    events: SharedEvents,
-) -> Result<SelectedPath, PathError> {
+    operation_cancellation: CancellationToken,
+    manager: Arc<ManagerInner>,
+) -> Result<RaceWinner, PathError> {
     let mut groups: [Vec<Attempt>; 4] = std::array::from_fn(|_| Vec::new());
     for attempt in attempts {
         groups[group_index(attempt.kind())].push(attempt);
@@ -60,8 +70,7 @@ pub(crate) async fn race_attempts(
             &mut running,
             &mut next_id,
             direct_attempt_deadline,
-            &caller_cancellation,
-            &events,
+            &manager,
         );
     }
 
@@ -75,14 +84,11 @@ pub(crate) async fn race_attempts(
                 &mut running,
                 &mut next_id,
                 Instant::now() + config.attempt_timeout(),
-                &caller_cancellation,
-                &events,
+                &manager,
             );
         }
 
-        let direct_done = direct_active == 0;
-        let relay_done = relay_started && relay_active == 0;
-        if direct_done && relay_done {
+        if direct_active == 0 && relay_started && relay_active == 0 {
             cleanup(&mut tasks, &running).await;
             return Err(PathError::NoViablePath);
         }
@@ -93,92 +99,163 @@ pub(crate) async fn race_attempts(
                 cleanup(&mut tasks, &running).await;
                 return Err(PathError::Cancelled);
             }
-            () = manager_cancellation.cancelled() => {
+            () = operation_cancellation.cancelled() => {
+                cleanup(&mut tasks, &running).await;
+                return Err(PathError::Cancelled);
+            }
+            () = manager.lifetime.cancelled() => {
                 cleanup(&mut tasks, &running).await;
                 return Err(PathError::Cancelled);
             }
             () = tokio::time::sleep_until(relay_start), if !relay_started => {}
-            outcome = tasks.join_next(), if !tasks.is_empty() => {
-                let Some(outcome) = outcome else {
-                    cleanup(&mut tasks, &running).await;
-                    return Err(PathError::NoViablePath);
-                };
-                let (id, kind, result) = match outcome {
-                    Ok(outcome) => outcome,
-                    Err(_) => {
+            outcome = tasks.join_next_with_id(), if !tasks.is_empty() => {
+                match outcome {
+                    Some(Ok((_task_id, (id, kind, result)))) => {
+                        let Some(position) = running.iter().position(|entry| entry.id == id) else {
+                            continue;
+                        };
+                        let completed = running.swap_remove(position);
+                        decrement_active(kind, &mut direct_active, &mut relay_active);
+                        match result {
+                            Ok(path) if path.kind() == kind => {
+                                let winner = resolve_ready_ties(
+                                    id,
+                                    RaceWinner {
+                                        path,
+                                        cancellation: completed.cancellation,
+                                    },
+                                    &mut tasks,
+                                    &mut running,
+                                    &manager,
+                                )
+                                .await;
+                                cleanup(&mut tasks, &running).await;
+                                return Ok(winner);
+                            }
+                            Ok(_) | Err(_) => {
+                                completed.cancellation.cancel();
+                                manager.record_event(PathEvent::AttemptFailed(kind));
+                            }
+                        }
+                    }
+                    Some(Err(error)) => {
+                        let task_id = error.id();
+                        if let Some(position) = running.iter().position(|entry| entry.task_id == task_id) {
+                            let failed = running.swap_remove(position);
+                            failed.cancellation.cancel();
+                            decrement_active(failed.kind, &mut direct_active, &mut relay_active);
+                            manager.record_event(PathEvent::AttemptFailed(failed.kind));
+                        }
+                    }
+                    None => {
                         cleanup(&mut tasks, &running).await;
-                        return Err(PathError::AttemptTaskFailed);
+                        return Err(PathError::NoViablePath);
                     }
-                };
-                running.retain(|entry| entry.id != id);
-                if kind == PathKind::Relay {
-                    relay_active = relay_active.saturating_sub(1);
-                } else {
-                    direct_active = direct_active.saturating_sub(1);
-                }
-
-                match result {
-                    Ok(selected) if selected.kind() == kind => {
-                        cleanup(&mut tasks, &running).await;
-                        return Ok(selected);
-                    }
-                    Ok(_) => {
-                        record(&events, PathEvent::AttemptFailed(kind));
-                    }
-                    Err(_) => record(&events, PathEvent::AttemptFailed(kind)),
                 }
             }
         }
     }
 }
 
+async fn resolve_ready_ties(
+    mut winner_id: usize,
+    mut winner: RaceWinner,
+    tasks: &mut JoinSet<AttemptResult>,
+    running: &mut Vec<RunningAttempt>,
+    manager: &Arc<ManagerInner>,
+) -> RaceWinner {
+    tokio::task::yield_now().await;
+    while let Some(outcome) = tasks.try_join_next_with_id() {
+        match outcome {
+            Ok((_task_id, (id, kind, result))) => {
+                let Some(position) = running.iter().position(|entry| entry.id == id) else {
+                    continue;
+                };
+                let completed = running.swap_remove(position);
+                match result {
+                    Ok(path) if path.kind() == kind => {
+                        if id < winner_id {
+                            winner.cancellation.cancel();
+                            winner_id = id;
+                            winner = RaceWinner {
+                                path,
+                                cancellation: completed.cancellation,
+                            };
+                        } else {
+                            completed.cancellation.cancel();
+                        }
+                    }
+                    Ok(_) | Err(_) => {
+                        completed.cancellation.cancel();
+                        manager.record_event(PathEvent::AttemptFailed(kind));
+                    }
+                }
+            }
+            Err(error) => {
+                let task_id = error.id();
+                if let Some(position) = running.iter().position(|entry| entry.task_id == task_id) {
+                    let failed = running.swap_remove(position);
+                    failed.cancellation.cancel();
+                    manager.record_event(PathEvent::AttemptFailed(failed.kind));
+                }
+            }
+        }
+    }
+    winner
+}
+
 fn spawn_group(
     group: Vec<Attempt>,
-    tasks: &mut JoinSet<(usize, PathKind, Result<SelectedPath, PathError>)>,
+    tasks: &mut JoinSet<AttemptResult>,
     running: &mut Vec<RunningAttempt>,
     next_id: &mut usize,
     deadline: Instant,
-    caller_cancellation: &CancellationToken,
-    events: &SharedEvents,
+    manager: &Arc<ManagerInner>,
 ) {
     for attempt in group {
         let id = *next_id;
         *next_id += 1;
         let kind = attempt.kind();
-        let cancellation = caller_cancellation.child_token();
+        let cancellation = manager.lifetime.child_token();
+        manager.record_event(PathEvent::AttemptStarted(kind));
+        let task_cancellation = cancellation.clone();
+        let abort = tasks.spawn(async move {
+            let result =
+                match tokio::time::timeout_at(deadline, attempt.connect(task_cancellation.clone()))
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(_) => {
+                        task_cancellation.cancel();
+                        Err(PathError::AttemptTimedOut(kind))
+                    }
+                };
+            (id, kind, result)
+        });
         running.push(RunningAttempt {
             id,
-            cancellation: cancellation.clone(),
-        });
-        record(events, PathEvent::AttemptStarted(kind));
-        tasks.spawn(async move {
-            let result = match tokio::time::timeout_at(
-                deadline,
-                attempt.connect(cancellation.clone()),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => {
-                    cancellation.cancel();
-                    Err(PathError::AttemptTimedOut(kind))
-                }
-            };
-            (id, kind, result)
+            task_id: abort.id(),
+            kind,
+            cancellation,
         });
     }
 }
 
-async fn cleanup(
-    tasks: &mut JoinSet<(usize, PathKind, Result<SelectedPath, PathError>)>,
-    running: &[RunningAttempt],
-) {
+async fn cleanup(tasks: &mut JoinSet<AttemptResult>, running: &[RunningAttempt]) {
     for attempt in running {
         attempt.cancellation.cancel();
     }
     tokio::task::yield_now().await;
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
+}
+
+fn decrement_active(kind: PathKind, direct_active: &mut usize, relay_active: &mut usize) {
+    if kind == PathKind::Relay {
+        *relay_active = relay_active.saturating_sub(1);
+    } else {
+        *direct_active = direct_active.saturating_sub(1);
+    }
 }
 
 const fn group_index(kind: PathKind) -> usize {
@@ -188,8 +265,4 @@ const fn group_index(kind: PathKind) -> usize {
         PathKind::NativeTcp => 2,
         PathKind::Relay => 3,
     }
-}
-
-fn record(events: &SharedEvents, event: PathEvent) {
-    record_event(events, event);
 }
