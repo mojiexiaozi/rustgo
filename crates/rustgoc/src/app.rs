@@ -9,8 +9,8 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    ChildSessionSupervisor, ClientError, ControlClient, RegisteredTunnel, SessionGeneration,
-    udp::RelaySessionSupervisor,
+    ChildSessionSupervisor, ClientError, ControlClient, ExportRegistry, RegisteredTunnel,
+    SessionGeneration, udp::RelaySessionSupervisor,
 };
 
 const INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(1);
@@ -74,11 +74,14 @@ pub struct ClientApp {
     backoff: Box<dyn ReconnectBackoff>,
     supervisor: Arc<dyn ChildSessionSupervisor>,
     status: watch::Sender<ClientStatus>,
+    exports: ExportRegistry,
     last_generation: u64,
 }
 
 impl ClientApp {
     pub fn from_config(config: ClientConfig) -> Result<Self, ClientError> {
+        let exports = ExportRegistry::new(config.exports.clone())
+            .map_err(|_| ClientError::InvalidConfiguration)?;
         let control = ControlClient::from_config(config)?;
         let backoff = Backoff::<RandomJitter, SystemBackoffClock>::new(BackoffConfig {
             initial_delay: INITIAL_RECONNECT_DELAY,
@@ -88,7 +91,9 @@ impl ClientApp {
         })
         .map_err(|_| ClientError::InvalidConfiguration)?;
         let supervisor = Arc::new(RelaySessionSupervisor::new(&control));
-        Ok(Self::with_runtime(control, backoff, supervisor))
+        Ok(Self::with_runtime_and_exports(
+            control, backoff, supervisor, exports,
+        ))
     }
 
     pub fn with_runtime<B>(
@@ -99,18 +104,37 @@ impl ClientApp {
     where
         B: ReconnectBackoff,
     {
+        let exports = ExportRegistry::new(control.config().exports.clone())
+            .expect("validated client configuration has valid exports");
+        Self::with_runtime_and_exports(control, backoff, supervisor, exports)
+    }
+
+    fn with_runtime_and_exports<B>(
+        control: ControlClient,
+        backoff: B,
+        supervisor: Arc<dyn ChildSessionSupervisor>,
+        exports: ExportRegistry,
+    ) -> Self
+    where
+        B: ReconnectBackoff,
+    {
         let (status, _) = watch::channel(ClientStatus::default());
         Self {
             control,
             backoff: Box::new(backoff),
             supervisor,
             status,
+            exports,
             last_generation: 0,
         }
     }
 
     pub fn subscribe(&self) -> watch::Receiver<ClientStatus> {
         self.status.subscribe()
+    }
+
+    pub fn exports(&self) -> &ExportRegistry {
+        &self.exports
     }
 
     pub async fn run(self) -> Result<(), ClientError> {
@@ -205,6 +229,7 @@ impl std::fmt::Debug for ClientApp {
         formatter
             .debug_struct("ClientApp")
             .field("last_generation", &self.last_generation)
+            .field("exports", &self.exports)
             .finish_non_exhaustive()
     }
 }
