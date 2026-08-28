@@ -22,6 +22,8 @@ const SESSION_DOMAIN: &[u8] = b"rustgo-peer-session-v1";
 const FRAME_DOMAIN: &[u8] = b"rustgo-peer-frame-v1";
 const FRAME_KEY_DOMAIN: &[u8] = b"rustgo-peer-frame-key-v1";
 const HANDSHAKE_DOMAIN: &[u8] = b"rustgo-peer-handshake-confirmation-v1";
+pub const PEER_HANDSHAKE_TAG_BYTES: usize = 16;
+pub const PEER_TRANSPORT_BINDING_BYTES: usize = 32;
 const AEAD_TAG_BYTES: usize = 16;
 const REPLAY_WINDOW_BITS: u64 = 64;
 
@@ -275,26 +277,33 @@ impl PeerSessionKeys {
     }
 
     #[must_use]
-    pub fn handshake_tag(&self) -> [u8; AEAD_TAG_BYTES] {
+    pub fn handshake_tag(
+        &self,
+        transport_binding: &[u8; PEER_TRANSPORT_BINDING_BYTES],
+    ) -> [u8; PEER_HANDSHAKE_TAG_BYTES] {
         let cipher = self.outgoing_handshake_key().0.cipher();
         let mut empty = [];
         let tag = cipher
             .encrypt_in_place_detached(
                 Nonce::from_slice(&[0_u8; 12]),
-                &handshake_aad(&self.context_hash),
+                &handshake_aad(&self.context_hash, transport_binding),
                 &mut empty,
             )
             .expect("empty ChaCha20-Poly1305 handshake tag cannot fail");
         tag.into()
     }
 
-    pub fn verify_handshake_tag(&self, tag: &[u8; AEAD_TAG_BYTES]) -> Result<(), PeerCryptoError> {
+    pub fn verify_handshake_tag(
+        &self,
+        transport_binding: &[u8; PEER_TRANSPORT_BINDING_BYTES],
+        tag: &[u8; PEER_HANDSHAKE_TAG_BYTES],
+    ) -> Result<(), PeerCryptoError> {
         let cipher = self.incoming_handshake_key().0.cipher();
         let mut empty = [];
         cipher
             .decrypt_in_place_detached(
                 Nonce::from_slice(&[0_u8; 12]),
-                &handshake_aad(&self.context_hash),
+                &handshake_aad(&self.context_hash, transport_binding),
                 &mut empty,
                 Tag::from_slice(tag),
             )
@@ -700,10 +709,16 @@ fn derive_frame_key(
     expand_key(&hkdf, &info)
 }
 
-fn handshake_aad(context_hash: &[u8; 32]) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(HANDSHAKE_DOMAIN.len() + context_hash.len() + 4);
+fn handshake_aad(
+    context_hash: &[u8; 32],
+    transport_binding: &[u8; PEER_TRANSPORT_BINDING_BYTES],
+) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(
+        HANDSHAKE_DOMAIN.len() + context_hash.len() + transport_binding.len() + 8,
+    );
     aad.extend_from_slice(HANDSHAKE_DOMAIN);
     append_bytes(&mut aad, context_hash);
+    append_bytes(&mut aad, transport_binding);
     aad
 }
 

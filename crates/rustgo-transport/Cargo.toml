@@ -5,7 +5,13 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+quinn.workspace = true
 rand.workspace = true
+rcgen.workspace = true
+rustgo-crypto = { path = "../rustgo-crypto" }
+rustgo-path = { path = "../rustgo-path" }
 rustgo-protocol = { path = "../rustgo-protocol" }
 rustls.workspace = true
 rustls-pemfile.workspace = true
@@ -13,10 +19,10 @@ thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
-tokio-util = { version = "0.7.19", features = ["rt"] }
+tokio-util.workspace = true
 tracing-subscriber.workspace = true
 x509-parser = "0.18.1"
 
 [dev-dependencies]
-rcgen = "0.14.9"
+rustgo-rendezvous = { path = "../rustgo-rendezvous" }
 tempfile = "3.27.0"

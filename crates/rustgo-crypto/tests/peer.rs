@@ -110,11 +110,16 @@ fn signed(mut envelope: RendezvousEnvelope, signer: &DeviceKeypair) -> Rendezvou
 fn both_role_orderings_derive_matching_directional_keys() {
     let fixture = PeerFixture::new();
     let (mut initiator, mut responder) = fixture.keys("ssh");
+    let transport_binding = [0x5a; 32];
 
-    let initiator_tag = initiator.handshake_tag();
-    responder.verify_handshake_tag(&initiator_tag).unwrap();
-    let responder_tag = responder.handshake_tag();
-    initiator.verify_handshake_tag(&responder_tag).unwrap();
+    let initiator_tag = initiator.handshake_tag(&transport_binding);
+    responder
+        .verify_handshake_tag(&transport_binding, &initiator_tag)
+        .unwrap();
+    let responder_tag = responder.handshake_tag(&transport_binding);
+    initiator
+        .verify_handshake_tag(&transport_binding, &responder_tag)
+        .unwrap();
 
     let mut initiator_sealer = initiator.stream_sealer(9).unwrap();
     let mut responder_opener = responder.stream_opener(9).unwrap();
@@ -129,6 +134,24 @@ fn both_role_orderings_derive_matching_directional_keys() {
         .seal(b"responder payload", PeerRelayFlags::RELIABLE)
         .unwrap();
     assert_eq!(initiator_opener.open(&frame).unwrap(), b"responder payload");
+}
+
+#[test]
+fn handshake_confirmation_rejects_cross_connection_exporter_substitution() {
+    let fixture = PeerFixture::new();
+    let (initiator, responder) = fixture.keys("ssh");
+    let first_connection_exporter = [0x31; 32];
+    let substituted_connection_exporter = [0x32; 32];
+
+    let tag = initiator.handshake_tag(&first_connection_exporter);
+
+    assert_eq!(
+        responder.verify_handshake_tag(&substituted_connection_exporter, &tag),
+        Err(PeerCryptoError::HandshakeAuthenticationFailed)
+    );
+    responder
+        .verify_handshake_tag(&first_connection_exporter, &tag)
+        .unwrap();
 }
 
 #[test]
@@ -214,7 +237,8 @@ fn export_name_is_bound_into_session_keys() {
     let admin_responder = PeerSessionKeys::derive(PeerRole::Responder, responder, &admin).unwrap();
 
     assert_eq!(
-        admin_responder.verify_handshake_tag(&ssh_initiator.handshake_tag()),
+        admin_responder
+            .verify_handshake_tag(&[0x44; 32], &ssh_initiator.handshake_tag(&[0x44; 32])),
         Err(PeerCryptoError::HandshakeAuthenticationFailed)
     );
 }
@@ -292,7 +316,8 @@ fn session_peer_generation_version_and_rendezvous_hash_are_bound_into_keys() {
         let changed_responder =
             PeerSessionKeys::derive(PeerRole::Responder, responder, &changed).unwrap();
         assert_eq!(
-            changed_responder.verify_handshake_tag(&base_initiator.handshake_tag()),
+            changed_responder
+                .verify_handshake_tag(&[0x44; 32], &base_initiator.handshake_tag(&[0x44; 32]),),
             Err(PeerCryptoError::HandshakeAuthenticationFailed)
         );
     }
@@ -456,7 +481,10 @@ fn envelope_signature_binds_all_payload_variants() {
 fn handshake_stream_datagram_and_directions_use_separate_keys() {
     let fixture = PeerFixture::new();
     let (mut initiator, mut responder) = fixture.keys("ssh");
-    assert_ne!(initiator.handshake_tag(), responder.handshake_tag());
+    assert_ne!(
+        initiator.handshake_tag(&[0x44; 32]),
+        responder.handshake_tag(&[0x44; 32])
+    );
 
     let mut stream = initiator.stream_sealer(9).unwrap();
     let mut datagram = initiator.datagram_sealer(9).unwrap();
