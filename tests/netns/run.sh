@@ -3,8 +3,8 @@ set -euo pipefail
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 source "$script_dir/topology.sh"
 
-usage() { echo "usage: sudo bash tests/netns/run.sh {smoke|all|quic|tcp|symmetric}" >&2; exit 2; }
-case "${1:-}" in smoke|all|quic|tcp|symmetric) suite=$1 ;; *) usage ;; esac
+usage() { echo "usage: sudo bash tests/netns/run.sh {smoke|all|quic|restricted|tcp|symmetric}" >&2; exit 2; }
+case "${1:-}" in smoke|all|quic|restricted|tcp|symmetric) suite=$1 ;; *) usage ;; esac
 [ "$#" -eq 1 ] || usage
 require_linux_root || { status=$?; exit "$status"; }
 
@@ -47,6 +47,7 @@ case "$suite" in
         run_case test_quic.sh shared-lan
         run_case test_quic.sh ipv6-direct
         ;;
+    restricted) run_case test_quic.sh restricted ;;
     tcp) run_case test_tcp.sh udp-drop ;;
     symmetric) run_case test_symmetric.sh symmetric ;;
     all)
