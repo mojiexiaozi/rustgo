@@ -496,7 +496,9 @@ assert_restricted_filtering() {
     start_in_ns "$RG_SERVER_NS" restricted-probe python3 -u -c 'import socket,sys,time
 marker=sys.argv[1].encode(); primary=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); primary.bind(("10.231.0.2",17600))
 alternate=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); alternate.bind(("10.231.0.2",17601))
+print("READY",flush=True)
 d,a=primary.recvfrom(1024); assert d==marker; primary.sendto(d,a); time.sleep(.1); alternate.sendto(b"unsolicited",a)' "$marker" "$RG_PREFIX" >/dev/null
+    wait_log "$RG_STATE_DIR/restricted-probe.log" READY
     ip netns exec "$RG_CLIENT_B_NS" timeout 8 python3 -c 'import socket,sys
 marker=sys.argv[1].encode(); s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.bind(("10.231.2.2",40999)); s.settimeout(3)
 s.sendto(marker,("10.231.0.2",17600)); assert s.recvfrom(1024)[0]==marker
