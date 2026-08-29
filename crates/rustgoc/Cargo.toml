@@ -8,6 +8,7 @@ license.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 clap.workspace = true
+postcard.workspace = true
 rustgo-config = { path = "../rustgo-config" }
 rustgo-crypto = { path = "../rustgo-crypto" }
 rustgo-protocol = { path = "../rustgo-protocol" }

@@ -363,6 +363,7 @@ pub enum ControlEvent {
     ServerNotice(rustgo_protocol::ServerNotice),
     PeerRelayFrame(PeerRelayFrame),
     PeerIdentityBinding(rustgo_protocol::PeerIdentityBinding),
+    PunchGrant(rustgo_protocol::PunchGrant),
 }
 
 impl ControlSession {
@@ -462,6 +463,7 @@ impl ControlSession {
                 .map(ControlEvent::PeerRelayFrame)
                 .map_err(|_| ClientError::InvalidState),
             Message::PeerIdentityBinding(binding) => Ok(ControlEvent::PeerIdentityBinding(binding)),
+            Message::PunchGrant(grant) => Ok(ControlEvent::PunchGrant(grant)),
             Message::Error(error) => Err(ClientError::Protocol(error.code)),
             _ => Err(ClientError::InvalidState),
         }

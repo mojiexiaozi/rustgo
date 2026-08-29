@@ -547,6 +547,7 @@ fn is_v02_control_message(message: &Message) -> bool {
             | Message::PeerRelayFrame(_)
             | Message::PeerIdentityBinding(_)
             | Message::PeerIdentityLookup(_)
+            | Message::PunchGrant(_)
     )
 }
 

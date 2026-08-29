@@ -296,6 +296,7 @@ impl MessageId {
     pub const PEER_IDENTITY_BINDING: Self = Self(26);
     pub const PEER_IDENTITY_LOOKUP: Self = Self(27);
     pub const RENDEZVOUS_CANDIDATE_SET_V2: Self = Self(28);
+    pub const PUNCH_GRANT: Self = Self(29);
 
     pub const fn as_u16(self) -> u16 {
         self.0
@@ -325,6 +326,7 @@ impl MessageId {
             26 => 512,
             27 => 256,
             28 => MAX_RENDEZVOUS_ENVELOPE_BYTES,
+            29 => 160,
             _ => 0,
         }
     }
@@ -335,7 +337,7 @@ impl TryFrom<u16> for MessageId {
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
         match value {
-            1..=28 => Ok(Self(value)),
+            1..=29 => Ok(Self(value)),
             _ => Err(value),
         }
     }
@@ -650,6 +652,20 @@ pub struct ServerNotice {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObservationGrantRequest {}
 
+/// Authenticated by the existing TLS control channel and issued only after
+/// both signed candidate sets for one generation have been verified.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PunchGrant {
+    pub session_id: [u8; 32],
+    pub generation: u64,
+    pub start_unix_millis: u64,
+    pub window_millis: u16,
+    pub cadence_millis: u16,
+    pub initiator_candidates_sha256: [u8; 32],
+    pub responder_candidates_sha256: [u8; 32],
+    pub token: [u8; 32],
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerIdentityBinding {
     pub session_id: [u8; 32],
@@ -700,6 +716,7 @@ pub enum Message {
     ServerNotice(ServerNotice),
     PeerIdentityBinding(PeerIdentityBinding),
     PeerIdentityLookup(PeerIdentityLookup),
+    PunchGrant(PunchGrant),
 }
 
 impl Message {
@@ -733,6 +750,7 @@ impl Message {
             Self::ServerNotice(_) => MessageId::SERVER_NOTICE,
             Self::PeerIdentityBinding(_) => MessageId::PEER_IDENTITY_BINDING,
             Self::PeerIdentityLookup(_) => MessageId::PEER_IDENTITY_LOOKUP,
+            Self::PunchGrant(_) => MessageId::PUNCH_GRANT,
         }
     }
 }

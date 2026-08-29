@@ -347,6 +347,9 @@ struct Session {
     candidate_sent_generation: u64,
     quic_socket: Option<std::net::UdpSocket>,
     observed_udp: Vec<rustgo_protocol::SocketAddress>,
+    punch_grant: Option<rustgo_protocol::PunchGrant>,
+    local_candidates_digest: Option<[u8; 32]>,
+    peer_candidates_digest: Option<[u8; 32]>,
 }
 
 type PathRecheckReply = oneshot::Sender<Result<Vec<Arc<dyn PathAttempt>>, PathError>>;
@@ -575,6 +578,9 @@ impl Actor {
                 candidate_sent_generation: 0,
                 quic_socket: None,
                 observed_udp: Vec::new(),
+                punch_grant: None,
+                local_candidates_digest: None,
+                peer_candidates_digest: None,
             },
         );
         if !resolve_only {
@@ -677,6 +683,9 @@ impl Actor {
         session.recheck_reply = Some(reply);
         session.quic_socket = None;
         session.observed_udp.clear();
+        session.punch_grant = None;
+        session.local_candidates_digest = None;
+        session.peer_candidates_digest = None;
         tracing::info!(
             generation = next.get(),
             "starting fresh direct-path generation; active relay stays fenced for existing I/O"
@@ -710,6 +719,7 @@ impl Actor {
                 ),
             ),
             ControlEvent::ObservationGrant(grant) => self.handle_observation_grant(grant),
+            ControlEvent::PunchGrant(grant) => self.handle_punch_grant(grant).await,
         }
     }
 
@@ -754,6 +764,39 @@ impl Actor {
             let _ = sender.send(ActorInput::ObservationResult { session_id, result }).await;
         });
         Ok(())
+    }
+
+    async fn handle_punch_grant(&mut self, grant: rustgo_protocol::PunchGrant) -> io::Result<()> {
+        let id = SessionId::from(grant.session_id);
+        let Some(session) = self.sessions.get_mut(&id) else {
+            return Ok(());
+        };
+        if grant.generation != session.generation.get()
+            || grant.window_millis == 0
+            || grant.window_millis > 5_000
+            || grant.cadence_millis < 10
+            || grant.cadence_millis > 250
+        {
+            return Ok(());
+        }
+        let (expected_local, expected_peer) = match session.role {
+            PeerRole::Initiator => (
+                grant.initiator_candidates_sha256,
+                grant.responder_candidates_sha256,
+            ),
+            PeerRole::Responder => (
+                grant.responder_candidates_sha256,
+                grant.initiator_candidates_sha256,
+            ),
+        };
+        if session.local_candidates_digest != Some(expected_local)
+            || session.peer_candidates_digest != Some(expected_peer)
+        {
+            return Ok(());
+        }
+        session.punch_grant = Some(grant);
+        tracing::info!(session_id = %session_log_id(id), generation = session.generation.get(), event = "punch_grant_ready", "authenticated coordinated punch grant accepted");
+        self.ensure_direct(id).await
     }
 
     async fn request_observation(&mut self, id: SessionId) -> io::Result<()> {
@@ -827,6 +870,9 @@ impl Actor {
                     candidate_sent_generation: 0,
                     quic_socket: None,
                     observed_udp: Vec::new(),
+                    punch_grant: None,
+                    local_candidates_digest: None,
+                    peer_candidates_digest: None,
                 },
             );
             self.request_observation(envelope.session_id).await?;
@@ -916,6 +962,9 @@ impl Actor {
             session.direct_failed = false;
             session.quic_socket = None;
             session.observed_udp.clear();
+            session.punch_grant = None;
+            session.local_candidates_digest = None;
+            session.peer_candidates_digest = None;
             needs_observation = true;
         }
         if needs_observation {
@@ -995,6 +1044,8 @@ impl Actor {
                 if set.owner_is_initiator != expected_initiator {
                     return Err(invalid());
                 }
+                let digest: [u8; 32] =
+                    Sha256::digest(postcard::to_allocvec(&set).map_err(|_| invalid())?).into();
                 let session = self.sessions.get_mut(&id).ok_or_else(invalid)?;
                 for binding in set.bindings.into_vec() {
                     let public: [u8; 32] = binding
@@ -1011,6 +1062,7 @@ impl Actor {
                     }
                 }
                 session.peer_candidates = set.candidates.into_vec();
+                session.peer_candidates_digest = Some(digest);
                 if self.sessions[&id].candidate_sent_generation
                     < self.sessions[&id].generation.get()
                 {
@@ -1098,20 +1150,24 @@ impl Actor {
                     .map_err(|_| invalid())?,
             });
         }
-        self.send_payload(
-            id,
-            RendezvousPayload::CandidateSetV2(CandidateSetV2 {
-                owner_is_initiator,
-                bindings: BoundedVec::try_from(bindings).map_err(|_| invalid())?,
-                candidates: BoundedVec::try_from(candidates).map_err(|_| invalid())?,
-            }),
-        )
-        .await?;
+        let set = CandidateSetV2 {
+            owner_is_initiator,
+            bindings: BoundedVec::try_from(bindings).map_err(|_| invalid())?,
+            candidates: BoundedVec::try_from(candidates).map_err(|_| invalid())?,
+        };
+        let digest: [u8; 32] =
+            Sha256::digest(postcard::to_allocvec(&set).map_err(|_| invalid())?).into();
+        self.send_payload(id, RendezvousPayload::CandidateSetV2(set))
+            .await?;
         let generation = self.sessions.get(&id).ok_or_else(invalid)?.generation.get();
         self.sessions
             .get_mut(&id)
             .ok_or_else(invalid)?
             .candidate_sent_generation = generation;
+        self.sessions
+            .get_mut(&id)
+            .ok_or_else(invalid)?
+            .local_candidates_digest = Some(digest);
         Ok(())
     }
 
@@ -1142,6 +1198,12 @@ impl Actor {
         if transport == CandidateTransport::QuicUdp
             && observation_enabled
             && session.quic_socket.is_none()
+        {
+            return Ok(());
+        }
+        if transport == CandidateTransport::QuicUdp
+            && observation_enabled
+            && session.punch_grant.is_none()
         {
             return Ok(());
         }
@@ -1200,6 +1262,7 @@ impl Actor {
                         .map_err(|_| invalid())?,
                 ))));
                 if let Some(socket) = session.quic_socket.take() {
+                    let grant = session.punch_grant.as_ref().ok_or_else(invalid)?;
                     Arc::new(
                         QuicPathAttempt::with_socket(
                             socket,
@@ -1207,7 +1270,16 @@ impl Actor {
                             QuicPeerConfig::default(),
                             auth,
                         )
-                        .map_err(|_| invalid())?,
+                        .map_err(|_| invalid())?
+                        .with_punch(rustgo_transport::QuicPunchConfig {
+                            session_id: *id.as_bytes(),
+                            generation: session.generation.get(),
+                            start_unix_millis: grant.start_unix_millis,
+                            window: Duration::from_millis(u64::from(grant.window_millis)),
+                            cadence: Duration::from_millis(u64::from(grant.cadence_millis)),
+                            token: grant.token,
+                            role: session.role,
+                        }),
                     )
                 } else {
                     Arc::new(QuicPathAttempt::new(
@@ -2448,5 +2520,6 @@ fn event_kind(event: &ControlEvent) -> &'static str {
         ControlEvent::ServerNotice(_) => "server_notice",
         ControlEvent::PeerRelayFrame(_) => "relay_frame",
         ControlEvent::PeerIdentityBinding(_) => "identity_binding",
+        ControlEvent::PunchGrant(_) => "punch_grant",
     }
 }

@@ -424,6 +424,7 @@ fn control_event(message: Message) -> Result<ControlEvent, ClientError> {
                 .map_err(|_| ClientError::InvalidState)
         }
         Message::PeerIdentityBinding(value) => Ok(ControlEvent::PeerIdentityBinding(value)),
+        Message::PunchGrant(value) => Ok(ControlEvent::PunchGrant(value)),
         message @ Message::PeerRelayFrame(_) => {
             rustgo_rendezvous::PeerRelayFrame::from_protocol_message(message)
                 .map(ControlEvent::PeerRelayFrame)

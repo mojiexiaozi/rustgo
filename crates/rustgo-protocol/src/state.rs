@@ -80,7 +80,8 @@ impl ClientHandshakeState {
                 | Message::RendezvousError(_)
                 | Message::PeerRelayFrame(_)
                 | Message::PeerIdentityBinding(_)
-                | Message::PeerIdentityLookup(_),
+                | Message::PeerIdentityLookup(_)
+                | Message::PunchGrant(_),
             ) => Ok(self.clone()),
             _ => Err(StateError::invalid_state()),
         }

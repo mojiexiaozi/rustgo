@@ -4,7 +4,7 @@ use std::{
     pin::Pin,
     sync::{Arc, Mutex, OnceLock},
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
@@ -47,6 +47,18 @@ const DATAGRAM_BUFFER_BYTES: usize = 64 * 1024;
 
 /// Hard application payload ceiling, kept below QUIC's minimum path datagram capacity.
 pub const MAX_PEER_DATAGRAM_BYTES: usize = 1024;
+const PUNCH_MAGIC: &[u8; 8] = b"RGOPNCH1";
+
+#[derive(Debug, Clone)]
+pub struct QuicPunchConfig {
+    pub session_id: [u8; 32],
+    pub generation: u64,
+    pub start_unix_millis: u64,
+    pub window: Duration,
+    pub cadence: Duration,
+    pub token: [u8; 32],
+    pub role: PeerRole,
+}
 
 #[derive(Debug, Clone)]
 pub struct QuicPeerConfig {
@@ -480,6 +492,7 @@ pub struct QuicPathAttempt {
     authentication_factory: Arc<dyn PeerAuthenticationFactory>,
     kind: PathKind,
     socket: Mutex<Option<UdpSocket>>,
+    punch: Option<QuicPunchConfig>,
 }
 
 impl QuicPathAttempt {
@@ -501,6 +514,7 @@ impl QuicPathAttempt {
             authentication_factory,
             kind,
             socket: Mutex::new(None),
+            punch: None,
         }
     }
 
@@ -514,6 +528,11 @@ impl QuicPathAttempt {
         let mut attempt = Self::new(local_addr, remote_addr, config, authentication_factory);
         attempt.socket = Mutex::new(Some(socket));
         Ok(attempt)
+    }
+
+    pub fn with_punch(mut self, punch: QuicPunchConfig) -> Self {
+        self.punch = Some(punch);
+        self
     }
 }
 
@@ -535,10 +554,17 @@ impl PathAttempt for QuicPathAttempt {
             .map(Ok)
             .unwrap_or_else(|| UdpSocket::bind(self.local_addr));
         let socket = socket.map_err(|_| PathError::AttemptFailed(self.kind))?;
-        // Both peers must emit a packet from the advertised socket before the
-        // QUIC client/server roles diverge. This opens address-dependent NAT
-        // filters for the responder, which otherwise only waits in `accept`.
-        let _ = socket.send_to(&[0], self.remote_addr);
+        if let Some(punch) = &self.punch {
+            coordinated_punch(
+                socket
+                    .try_clone()
+                    .map_err(|_| PathError::AttemptFailed(self.kind))?,
+                self.remote_addr,
+                punch,
+                cancellation.clone(),
+            )
+            .await?;
+        }
         let endpoint = QuicPeerEndpoint::from_socket(socket, self.config.clone())
             .map_err(|_| PathError::AttemptFailed(self.kind))?;
         let authentication = match self.authentication_factory.create() {
@@ -581,6 +607,63 @@ impl PathAttempt for QuicPathAttempt {
         }
         let handle = Arc::new(QuicPeerPathHandle::new(endpoint, session, cancellation));
         Ok(SelectedPath::authenticated_with(self.kind, handle))
+    }
+}
+
+async fn coordinated_punch(
+    socket: UdpSocket,
+    remote: SocketAddr,
+    config: &QuicPunchConfig,
+    cancellation: CancellationToken,
+) -> Result<(), PathError> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let start = Duration::from_millis(config.start_unix_millis);
+    if start > now {
+        tokio::select! {
+            () = cancellation.cancelled() => return Err(PathError::Cancelled),
+            () = tokio::time::sleep(start - now) => {}
+        }
+    }
+    let mut probe = Vec::with_capacity(81);
+    probe.extend_from_slice(PUNCH_MAGIC);
+    probe.extend_from_slice(&config.session_id);
+    probe.extend_from_slice(&config.generation.to_be_bytes());
+    probe.push(if config.role == PeerRole::Initiator {
+        1
+    } else {
+        2
+    });
+    probe.extend_from_slice(&config.token);
+    let expected_role = if config.role == PeerRole::Initiator {
+        2
+    } else {
+        1
+    };
+    let socket = tokio::net::UdpSocket::from_std(socket)
+        .map_err(|_| PathError::AttemptFailed(PathKind::QuicV4))?;
+    let deadline = tokio::time::Instant::now() + config.window;
+    let mut interval = tokio::time::interval(config.cadence);
+    let mut buffer = [0_u8; 96];
+    loop {
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return Err(PathError::Cancelled),
+            _ = tokio::time::sleep_until(deadline) => return Err(PathError::AttemptFailed(if remote.is_ipv6() { PathKind::QuicV6 } else { PathKind::QuicV4 })),
+            _ = interval.tick() => { let _ = socket.send_to(&probe, remote).await; }
+            received = socket.recv_from(&mut buffer) => {
+                if let Ok((size, source)) = received
+                    && source == remote
+                    && size == probe.len()
+                    && buffer[..8] == *PUNCH_MAGIC
+                    && buffer[8..40] == config.session_id
+                    && buffer[40..48] == config.generation.to_be_bytes()
+                    && buffer[48] == expected_role
+                    && buffer[49..81] == config.token
+                { return Ok(()); }
+            }
+        }
     }
 }
 

@@ -7,13 +7,14 @@ use std::{
 
 use rustgo_config::AuthorizedClient;
 use rustgo_protocol::{
-    BoundedString, Message, PeerIdentityBinding, PeerIdentityLookup, ProtocolVersion, ServerNotice,
-    TunnelProtocol,
+    BoundedString, Message, PeerIdentityBinding, PeerIdentityLookup, ProtocolVersion, PunchGrant,
+    ServerNotice, TunnelProtocol,
 };
 use rustgo_rendezvous::{
     MAX_ERROR_DETAIL_BYTES, PeerRelayFlags, PeerRelayFrame, RendezvousEnvelope, RendezvousPayload,
     RendezvousPhase, RendezvousState, SessionId,
 };
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::mpsc::error::TrySendError;
 
@@ -163,6 +164,7 @@ struct StoredSession {
     state: RendezvousState,
     relay: RelayAdmission,
     candidate_generation_announced_by: u8,
+    candidate_digests: [Option<[u8; 32]>; 2],
     generation_started: Instant,
 }
 
@@ -535,6 +537,7 @@ impl RendezvousCoordinator {
                 state: rendezvous_state,
                 relay: RelayAdmission::new(),
                 candidate_generation_announced_by: 0,
+                candidate_digests: [None, None],
                 generation_started: Instant::now(),
             })),
         );
@@ -614,6 +617,15 @@ impl RendezvousCoordinator {
         ) {
             return Err(RendezvousErrorCode::INVALID_STATE.into());
         }
+        let candidate_digest = match &envelope.payload {
+            RendezvousPayload::CandidateSetV2(set) => Some(
+                Sha256::digest(
+                    postcard::to_allocvec(set).map_err(|_| RendezvousErrorCode::INVALID_STATE)?,
+                )
+                .into(),
+            ),
+            _ => None,
+        };
         let message = envelope
             .to_protocol_message()
             .map_err(|_| RendezvousErrorCode::INVALID_STATE)?;
@@ -713,14 +725,53 @@ impl RendezvousCoordinator {
             if advanced {
                 session.generation_started = Instant::now();
                 session.relay = RelayAdmission::new();
+                session.candidate_digests = [None, None];
             }
         }
+        if let Some(digest) = candidate_digest {
+            let index = if authenticated.identity().name() == session.consumer.name {
+                0
+            } else {
+                1
+            };
+            session.candidate_digests[index] = Some(digest);
+        }
+        let punch = if candidate_digest.is_some()
+            && session.candidate_generation_announced_by == 0b11
+        {
+            match session.candidate_digests {
+                [Some(initiator), Some(responder)] => Some((
+                    session.consumer.clone(),
+                    session.provider.clone(),
+                    PunchGrant {
+                        session_id: *envelope.session_id.as_bytes(),
+                        generation: envelope.generation.get(),
+                        start_unix_millis: now_unix_millis().saturating_add(250),
+                        window_millis: 1_500,
+                        cadence_millis: 25,
+                        initiator_candidates_sha256: initiator,
+                        responder_candidates_sha256: responder,
+                        token: rand::random(),
+                    },
+                )),
+                _ => None,
+            }
+        } else {
+            None
+        };
         if let Some((participant, datagram)) = relay_update {
             session.relay.requested_by |= participant;
             session.relay.datagram = Some(datagram);
         }
         drop(state);
         permit.send(message);
+        if let Some((consumer, provider, grant)) = punch {
+            let consumer_permit = self.reserve_to(&consumer)?;
+            let provider_permit = self.reserve_to(&provider)?;
+            consumer_permit.send(Message::PunchGrant(grant.clone()));
+            provider_permit.send(Message::PunchGrant(grant));
+            tracing::info!(session_id = ?envelope.session_id, generation = envelope.generation.get(), event = "punch_grant_issued", "coordinated punch epoch released");
+        }
         Ok(())
     }
 
@@ -1014,6 +1065,15 @@ fn now_unix_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs())
+}
+
+fn now_unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]

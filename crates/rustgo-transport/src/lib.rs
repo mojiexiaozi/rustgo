@@ -25,7 +25,7 @@ pub use peer_tcp::{
 pub use quic::{
     MAX_PEER_DATAGRAM_BYTES, PeerAuthentication, PeerAuthenticationFactory, PeerDatagram,
     PeerStream, QuicPathAttempt, QuicPeerConfig, QuicPeerEndpoint, QuicPeerError,
-    QuicPeerPathHandle, QuicPeerSession,
+    QuicPeerPathHandle, QuicPeerSession, QuicPunchConfig,
 };
 pub use tls::{
     BindingError, ChannelBinding, ChannelBindingStore, ChannelKind, TlsClient, TlsError, TlsServer,

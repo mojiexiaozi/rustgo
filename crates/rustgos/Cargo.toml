@@ -8,6 +8,8 @@ license.workspace = true
 bytes.workspace = true
 clap.workspace = true
 rand.workspace = true
+postcard.workspace = true
+sha2.workspace = true
 rustgo-config = { path = "../rustgo-config" }
 rustgo-crypto = { path = "../rustgo-crypto" }
 rustgo-protocol = { path = "../rustgo-protocol" }
