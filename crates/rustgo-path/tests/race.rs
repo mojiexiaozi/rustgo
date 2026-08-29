@@ -10,7 +10,7 @@ use std::{
 use async_trait::async_trait;
 use rustgo_path::{
     PathAttempt, PathError, PathEvent, PathKind, PathManager, PathManagerConfig, PathState,
-    SelectedPath,
+    RecheckAttemptFactory, SelectedPath,
 };
 use tokio::{sync::Barrier, task::yield_now};
 use tokio_util::sync::CancellationToken;
@@ -28,6 +28,30 @@ enum Outcome {
         entered: Arc<Barrier>,
         release: Arc<Barrier>,
     },
+}
+
+struct FreshFactory {
+    generations: Mutex<Vec<u64>>,
+    attempts: Mutex<VecDeque<Vec<Arc<dyn PathAttempt>>>>,
+}
+
+#[async_trait]
+impl RecheckAttemptFactory for FreshFactory {
+    async fn create(
+        &self,
+        generation: u64,
+        cancellation: CancellationToken,
+    ) -> Result<Vec<Arc<dyn PathAttempt>>, PathError> {
+        if cancellation.is_cancelled() {
+            return Err(PathError::Cancelled);
+        }
+        self.generations.lock().unwrap().push(generation);
+        self.attempts
+            .lock()
+            .unwrap()
+            .pop_front()
+            .ok_or(PathError::NoViablePath)
+    }
 }
 
 struct FakeAttempt {
@@ -861,6 +885,36 @@ async fn repeated_failed_rechecks_keep_the_diagnostic_event_buffer_bounded() {
 
     let event_count = manager.events().len();
     assert!(event_count <= 256, "recorded {event_count} events");
+}
+
+#[tokio::test(start_paused = true)]
+async fn relay_promotion_consumes_a_fresh_attempt_generation() {
+    let initial_direct = FakeAttempt::new(PathKind::QuicV4, [Outcome::FailAfter(Duration::ZERO)]);
+    let relay = FakeAttempt::new(PathKind::Relay, [Outcome::SuccessAfter(Duration::ZERO)]);
+    let promoted = FakeAttempt::new(PathKind::QuicV6, [Outcome::SuccessAfter(Duration::ZERO)]);
+    let factory = Arc::new(FreshFactory {
+        generations: Mutex::new(Vec::new()),
+        attempts: Mutex::new(VecDeque::from([vec![
+            promoted.clone() as Arc<dyn PathAttempt>
+        ]])),
+    });
+    let manager = PathManager::new(config());
+    let selected = manager
+        .connect_with_recheck(
+            vec![initial_direct, relay],
+            Some(factory.clone()),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(selected.kind(), PathKind::Relay);
+    settle().await;
+    tokio::time::advance(Duration::from_secs(30)).await;
+    settle().await;
+    assert_eq!(manager.selected().unwrap().kind(), PathKind::QuicV6);
+    assert_eq!(*factory.generations.lock().unwrap(), vec![1]);
+    assert_eq!(promoted.starts(), 1);
+    manager.close().await.unwrap();
 }
 
 #[test]

@@ -93,6 +93,37 @@ pub trait PathAttempt: Send + Sync {
     async fn connect(&self, cancellation: CancellationToken) -> Result<SelectedPath, PathError>;
 }
 
+/// Produces a completely new signed candidate generation and fresh path
+/// attempts for one background promotion check. Implementations must never
+/// reuse ephemeral authentication material from an earlier generation.
+#[async_trait]
+pub trait RecheckAttemptFactory: Send + Sync {
+    async fn create(
+        &self,
+        generation: u64,
+        cancellation: CancellationToken,
+    ) -> Result<Vec<Arc<dyn PathAttempt>>, PathError>;
+}
+
+struct ReuseAttemptFactory {
+    attempts: Vec<Attempt>,
+}
+
+#[async_trait]
+impl RecheckAttemptFactory for ReuseAttemptFactory {
+    async fn create(
+        &self,
+        _: u64,
+        cancellation: CancellationToken,
+    ) -> Result<Vec<Attempt>, PathError> {
+        if cancellation.is_cancelled() {
+            Err(PathError::Cancelled)
+        } else {
+            Ok(self.attempts.clone())
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PathEvent {
     StateChanged { from: PathState, to: PathState },
@@ -413,8 +444,20 @@ impl PathManager {
         attempts: Vec<Arc<dyn PathAttempt>>,
         caller_cancellation: CancellationToken,
     ) -> Result<SelectedPath, PathError> {
+        let reusable = Arc::new(ReuseAttemptFactory {
+            attempts: direct_attempts(&attempts),
+        });
+        self.connect_with_recheck(attempts, Some(reusable), caller_cancellation)
+            .await
+    }
+
+    pub async fn connect_with_recheck(
+        &self,
+        attempts: Vec<Arc<dyn PathAttempt>>,
+        recheck_factory: Option<Arc<dyn RecheckAttemptFactory>>,
+        caller_cancellation: CancellationToken,
+    ) -> Result<SelectedPath, PathError> {
         let operation = self.inner.begin(PathState::Checking)?;
-        let direct_attempts = direct_attempts(&attempts);
         let operation_cancellation = self.inner.lifetime.child_token();
         let winner = race::race_attempts(
             attempts,
@@ -448,8 +491,10 @@ impl PathManager {
                 return Err(error);
             }
         };
-        if selected.kind() == PathKind::Relay {
-            health::start_recheck(self.inner.clone(), direct_attempts, caller_cancellation).await;
+        if selected.kind() == PathKind::Relay
+            && let Some(factory) = recheck_factory
+        {
+            health::start_recheck(self.inner.clone(), factory, caller_cancellation).await;
         }
         let expected = if selected.kind().is_direct() {
             PathState::Direct
@@ -468,9 +513,21 @@ impl PathManager {
         attempts: Vec<Arc<dyn PathAttempt>>,
         caller_cancellation: CancellationToken,
     ) -> Result<SelectedPath, PathError> {
+        let reusable = Arc::new(ReuseAttemptFactory {
+            attempts: direct_attempts(&attempts),
+        });
+        self.report_failed_with_recheck(attempts, Some(reusable), caller_cancellation)
+            .await
+    }
+
+    pub async fn report_failed_with_recheck(
+        &self,
+        attempts: Vec<Arc<dyn PathAttempt>>,
+        recheck_factory: Option<Arc<dyn RecheckAttemptFactory>>,
+        caller_cancellation: CancellationToken,
+    ) -> Result<SelectedPath, PathError> {
         let (resources, operation) = self.inner.begin_failure()?;
         shutdown_resources(resources).await;
-        let direct_attempts = direct_attempts(&attempts);
         let operation_cancellation = self.inner.lifetime.child_token();
         let winner = race::race_attempts(
             attempts,
@@ -504,8 +561,10 @@ impl PathManager {
                 return Err(error);
             }
         };
-        if selected.kind() == PathKind::Relay {
-            health::start_recheck(self.inner.clone(), direct_attempts, caller_cancellation).await;
+        if selected.kind() == PathKind::Relay
+            && let Some(factory) = recheck_factory
+        {
+            health::start_recheck(self.inner.clone(), factory, caller_cancellation).await;
         }
         let expected = if selected.kind().is_direct() {
             PathState::Direct

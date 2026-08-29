@@ -3,7 +3,8 @@ use std::{sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    Attempt, ManagerInner, OwnedRecheck, PathError, PathState, install_winner, race::race_attempts,
+    ManagerInner, OwnedRecheck, PathError, PathState, RecheckAttemptFactory, install_winner,
+    race::race_attempts,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,12 +57,9 @@ impl PathManagerConfig {
 
 pub(crate) async fn start_recheck(
     inner: Arc<ManagerInner>,
-    direct_attempts: Vec<Attempt>,
+    factory: Arc<dyn RecheckAttemptFactory>,
     caller_cancellation: CancellationToken,
 ) {
-    if direct_attempts.is_empty() {
-        return;
-    }
     loop {
         let finished = {
             let mut record = inner.record.lock().expect("path record mutex poisoned");
@@ -77,11 +75,11 @@ pub(crate) async fn start_recheck(
                     let cancellation = inner.lifetime.child_token();
                     let task_cancellation = cancellation.clone();
                     let weak = Arc::downgrade(&inner);
-                    let attempts = direct_attempts.clone();
+                    let factory = factory.clone();
                     let caller = caller_cancellation.clone();
                     let config = inner.config;
                     let handle = tokio::spawn(async move {
-                        recheck_loop(weak, id, config, attempts, caller, task_cancellation).await;
+                        recheck_loop(weak, id, config, factory, caller, task_cancellation).await;
                     });
                     record.recheck = Some(OwnedRecheck {
                         id,
@@ -102,10 +100,11 @@ async fn recheck_loop(
     manager: std::sync::Weak<ManagerInner>,
     id: u64,
     config: PathManagerConfig,
-    direct_attempts: Vec<Attempt>,
+    factory: Arc<dyn RecheckAttemptFactory>,
     caller_cancellation: CancellationToken,
     recheck_cancellation: CancellationToken,
 ) {
+    let mut generation = 1_u64;
     loop {
         tokio::select! {
             biased;
@@ -120,8 +119,25 @@ async fn recheck_loop(
         if !inner.begin_background_recheck(id) {
             return;
         }
+        let attempts = tokio::select! {
+            biased;
+            () = caller_cancellation.cancelled() => return,
+            () = recheck_cancellation.cancelled() => return,
+            result = factory.create(generation, recheck_cancellation.child_token()) => result,
+        };
+        generation = generation.wrapping_add(1).max(1);
+        let direct_attempts = match attempts {
+            Ok(attempts) if !attempts.is_empty() => attempts,
+            Ok(_) | Err(PathError::Cancelled) => return,
+            Err(_) => {
+                if !inner.finish_failed_recheck(id) {
+                    return;
+                }
+                continue;
+            }
+        };
         let winner = race_attempts(
-            direct_attempts.clone(),
+            direct_attempts,
             config,
             caller_cancellation.clone(),
             recheck_cancellation.clone(),

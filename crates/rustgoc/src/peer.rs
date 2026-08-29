@@ -10,7 +10,10 @@ use rustgo_crypto::{
     DevicePublicKey, PeerCryptoError, PeerFrameOpener, PeerFrameSealer, PeerSessionKeys,
     verify_peer_envelope,
 };
-use rustgo_path::{PathAttempt, PathError, PathKind, PathManager, PathManagerConfig, SelectedPath};
+use rustgo_path::{
+    PathAttempt, PathError, PathKind, PathManager, PathManagerConfig, RecheckAttemptFactory,
+    SelectedPath,
+};
 use rustgo_rendezvous::{PeerRelayFlags, PeerRelayFrame, RendezvousEnvelope, SessionId};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -101,8 +104,20 @@ impl PeerSessionRuntime {
         &self,
         session_id: SessionId,
         expires_unix_secs: u64,
+        attempts: Vec<Arc<dyn PathAttempt>>,
+        relay: Option<Arc<PeerRelayChannel>>,
+    ) -> Result<PeerSessionHandle, PeerRuntimeError> {
+        self.connect_with_recheck(session_id, expires_unix_secs, attempts, relay, None)
+            .await
+    }
+
+    pub async fn connect_with_recheck(
+        &self,
+        session_id: SessionId,
+        expires_unix_secs: u64,
         mut attempts: Vec<Arc<dyn PathAttempt>>,
         relay: Option<Arc<PeerRelayChannel>>,
+        recheck_factory: Option<Arc<dyn RecheckAttemptFactory>>,
     ) -> Result<PeerSessionHandle, PeerRuntimeError> {
         if expires_unix_secs <= now_unix_secs() {
             return Err(PeerRuntimeError::Expired);
@@ -131,7 +146,9 @@ impl PeerSessionRuntime {
             self.inner.options.attempt_timeout,
             self.inner.options.recheck_interval,
         )?));
-        let selected = manager.connect(attempts, cancellation.clone()).await;
+        let selected = manager
+            .connect_with_recheck(attempts, recheck_factory, cancellation.clone())
+            .await;
         let selected = match selected {
             Ok(path) => path,
             Err(error) => {
