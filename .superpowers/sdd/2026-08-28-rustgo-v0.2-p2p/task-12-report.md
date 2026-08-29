@@ -14,6 +14,7 @@
 
 - Symmetric NAT now assigns deterministic, destination-dependent external observation ports for authenticated 7443/7444 probes. The gate reads both clients' real namespace conntrack tuples, requires all four mappings, and rejects unchanged ports.
 - Relay acceptance also requires nonzero namespace firewall counters for blocked native-TCP candidate attempts, separating intended direct filtering from an unrelated implementation failure.
+- UDP-drop snapshots the exact `rustgo_netns/forward` UDP-range counters on both NAT routers before the service open and requires both to increase before accepting `NativeTcp`. All-direct-drop applies the same delta requirement to both UDP and TCP rules on both routers before accepting `Relay` or removing rules for promotion.
 - The restricted topology runs an active kernel-filter probe: the established server tuple is echoed, while an unsolicited datagram from an alternate server port must time out.
 - Relay promotion requires a second authenticated observation generation and correlates the only post-marker payload open to a distinct structured `session_id`, `open_id`, `generation`, `io_start`, and `NativeTcp` path.
 - Every case, including smoke and failing cases, uses one cleanup/final-audit path. A deterministic cleanup-audit self-test proves owned residue is rejected before smoke can pass.

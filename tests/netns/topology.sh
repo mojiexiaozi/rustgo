@@ -460,24 +460,28 @@ assert_changed_observation_mappings() {
     done
 }
 
-assert_direct_drop_evidence() {
-    local namespace=$1 protocol=$2 range=$3 evidence=$RG_STATE_DIR/direct-drop-${namespace##*-}.txt
+direct_drop_count() {
+    local namespace=$1 protocol=$2 range=$3 evidence=$RG_STATE_DIR/direct-drop-${namespace##*-}-${protocol}.txt
     if [ "$RG_FIREWALL" = nft ]; then
         ip netns exec "$namespace" nft list chain ip rustgo_netns forward >"$evidence"
         awk -v p="$protocol" -v r="${range/:/-}" '
             index($0,p" dport "r) && match($0,/packets [0-9]+/) {
-                value=substr($0,RSTART+8,RLENGTH-8); if (value+0 > 0) found=1
-            } END { exit !found }' "$evidence" || {
-            echo "FAIL: no packet-counter evidence for blocked $protocol direct attempt in $namespace" >&2
-            return 1
-        }
+                value=substr($0,RSTART+8,RLENGTH-8); total+=value
+            } END { print total+0 }' "$evidence"
     else
         ip netns exec "$namespace" iptables -L FORWARD -v -n -x >"$evidence"
-        awk -v p="$protocol" -v r="$range" '$1+0 > 0 && $4==p && index($0,"dpts:"r) {found=1} END {exit !found}' "$evidence" || {
-            echo "FAIL: no packet-counter evidence for blocked $protocol direct attempt in $namespace" >&2
-            return 1
-        }
+        awk -v p="$protocol" -v r="$range" '$4==p && index($0,"dpts:"r) {total+=$1} END {print total+0}' "$evidence"
     fi
+}
+
+assert_direct_drop_evidence() {
+    local namespace=$1 protocol=$2 range=$3 baseline=${4:-0} current
+    current=$(direct_drop_count "$namespace" "$protocol" "$range")
+    case "$baseline:$current" in *[!0-9:]*) echo "FAIL: invalid scoped drop counter evidence" >&2; return 1 ;; esac
+    [ "$current" -gt "$baseline" ] || {
+        echo "FAIL: scoped rustgo_netns/forward $protocol $range counter did not increase in $namespace ($baseline -> $current)" >&2
+        return 1
+    }
 }
 
 assert_restricted_filtering() {
