@@ -425,6 +425,13 @@ where
                         )
                         .await?;
                     }
+                    Message::PeerIdentityLookup(lookup) => {
+                        let response = runtime.rendezvous.identity_binding(guard, lookup)
+                            .unwrap_or_else(|_| protocol_error(ProtocolErrorCode::UNKNOWN_SESSION));
+                        send_active_message(
+                            framed, state, negotiated, response, &mut heartbeat_deadline,
+                        ).await?;
+                    }
                     message if is_rendezvous_message(&message) => {
                         let envelope = match RendezvousEnvelope::from_protocol_message(message) {
                             Ok(envelope) => envelope,
@@ -482,7 +489,8 @@ where
                         }
                     }
                     Message::ObservationGrant(_)
-                    | Message::ServerNotice(_) => {
+                    | Message::ServerNotice(_)
+                    | Message::PeerIdentityBinding(_) => {
                         send_active_message(
                             framed,
                             state,
@@ -536,6 +544,8 @@ fn is_v02_control_message(message: &Message) -> bool {
             | Message::RendezvousClose(_)
             | Message::RendezvousError(_)
             | Message::PeerRelayFrame(_)
+            | Message::PeerIdentityBinding(_)
+            | Message::PeerIdentityLookup(_)
     )
 }
 

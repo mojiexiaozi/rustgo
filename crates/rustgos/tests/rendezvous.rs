@@ -13,13 +13,13 @@ use rustgo_e2e::{
 };
 use rustgo_protocol::{
     AuthResult, BoundedBytes, BoundedString, BoundedVec, ErrorMessage, Frame, Heartbeat, Message,
-    ObservationGrantRequest, ProtocolErrorCode, ProtocolVersion, RegisterTunnels, TcpStreamReady,
-    TunnelProtocol, TunnelRegistration,
+    ObservationGrantRequest, PeerIdentityLookup, ProtocolErrorCode, ProtocolVersion,
+    RegisterTunnels, TcpStreamReady, TunnelProtocol, TunnelRegistration,
 };
 use rustgo_rendezvous::{
     CandidateGeneration, ConnectivityResult, ObservationGrant, PeerRelayFlags, PeerRelayFrame,
-    ProviderDecision, RendezvousClose, RendezvousEnvelope, RendezvousPayload, RendezvousRequest,
-    SessionId,
+    ProviderDecision, RelayRequest, RendezvousClose, RendezvousEnvelope, RendezvousPayload,
+    RendezvousRequest, SessionId,
 };
 use rustgos::{RendezvousErrorCode, ServerApp, ServerRuntimeLimits};
 use tempfile::TempDir;
@@ -282,6 +282,21 @@ async fn accepted_session_routes_bounded_relay_ciphertext_to_authenticated_peer(
     ))
     .await?;
     let _ = b.receive_envelope().await?;
+    b.send(
+        V02,
+        Message::PeerIdentityLookup(PeerIdentityLookup {
+            session_id: [70; 32],
+            peer: text("a"),
+        }),
+    )
+    .await?;
+    let binding = timeout(Duration::from_secs(2), b.receive()).await??;
+    let Message::PeerIdentityBinding(binding) = binding.message else {
+        return Err("expected authenticated peer identity binding".into());
+    };
+    assert_eq!(binding.peer.as_str(), "a");
+    assert_eq!(binding.public_key.as_str(), a_key.public_key().to_string());
+    assert!(!binding.peer_is_provider);
     b.send_envelope(&envelope(
         70,
         "b",
@@ -289,6 +304,38 @@ async fn accepted_session_routes_bounded_relay_ciphertext_to_authenticated_peer(
         2,
         expires,
         RendezvousPayload::ProviderDecision(ProviderDecision::accepted(TunnelProtocol::TCP)),
+    ))
+    .await?;
+    let _ = a.receive_envelope().await?;
+    a.send_envelope(&envelope(
+        70,
+        "a",
+        "b",
+        3,
+        expires,
+        RendezvousPayload::RelayRequest(RelayRequest { datagram: false }),
+    ))
+    .await?;
+    let _ = b.receive_envelope().await?;
+    let premature = PeerRelayFrame::new(
+        SessionId::from([70; 32]),
+        9,
+        0,
+        PeerRelayFlags::RELIABLE,
+        vec![0xa4; 16],
+    )?;
+    a.send(V02, premature.to_protocol_message()?).await?;
+    let rejected = timeout(Duration::from_secs(2), a.receive()).await??;
+    assert!(
+        matches!(rejected.message, Message::Error(ref error) if error.code == ProtocolErrorCode::INVALID_STATE)
+    );
+    b.send_envelope(&envelope(
+        70,
+        "b",
+        "a",
+        4,
+        expires,
+        RendezvousPayload::RelayRequest(RelayRequest { datagram: false }),
     ))
     .await?;
     let _ = a.receive_envelope().await?;

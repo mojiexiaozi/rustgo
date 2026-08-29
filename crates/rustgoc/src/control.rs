@@ -358,6 +358,7 @@ pub enum ControlEvent {
     Rendezvous(RendezvousEnvelope),
     ServerNotice(rustgo_protocol::ServerNotice),
     PeerRelayFrame(PeerRelayFrame),
+    PeerIdentityBinding(rustgo_protocol::PeerIdentityBinding),
 }
 
 impl ControlSession {
@@ -391,6 +392,23 @@ impl ControlSession {
             .send(
                 self.version,
                 Message::ObservationGrantRequest(rustgo_protocol::ObservationGrantRequest {}),
+            )
+            .await
+    }
+
+    pub async fn request_peer_identity(
+        &mut self,
+        session_id: rustgo_rendezvous::SessionId,
+        peer: &str,
+    ) -> Result<(), ClientError> {
+        self.require_v02()?;
+        self.framed
+            .send(
+                self.version,
+                Message::PeerIdentityLookup(rustgo_protocol::PeerIdentityLookup {
+                    session_id: *session_id.as_bytes(),
+                    peer: BoundedString::try_from(peer).map_err(|_| ClientError::InvalidState)?,
+                }),
             )
             .await
     }
@@ -439,6 +457,7 @@ impl ControlSession {
             message @ Message::PeerRelayFrame(_) => PeerRelayFrame::from_protocol_message(message)
                 .map(ControlEvent::PeerRelayFrame)
                 .map_err(|_| ClientError::InvalidState),
+            Message::PeerIdentityBinding(binding) => Ok(ControlEvent::PeerIdentityBinding(binding)),
             Message::Error(error) => Err(ClientError::Protocol(error.code)),
             _ => Err(ClientError::InvalidState),
         }

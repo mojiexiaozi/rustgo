@@ -4,10 +4,10 @@ use rustgo_protocol::{
     AuthResult, BoundedBytes, BoundedString, BoundedVec, ClientAuthenticate, ClientHello,
     DataChannelBind, DataChannelKind, ErrorMessage, FrameCodec, FrameError, HEADER_LEN, Heartbeat,
     MAGIC, MAX_BINDING_TOKEN_BYTES, MAX_OBSERVATION_GRANT_BYTES, MAX_UDP_PAYLOAD_BYTES, Message,
-    MessageId, ObservationGrantRequest, OpenTcpStream, OpenUdpChannel, ProtocolErrorCode,
-    ProtocolVersion, RegisterTunnels, ServerChallenge, ServerNotice, SocketAddress, TcpStreamReady,
-    TunnelProtocol, TunnelRegistration, TunnelResult, TunnelResults, UDP_METADATA_LEN, UdpDatagram,
-    UdpSessionRetired,
+    MessageId, ObservationGrantRequest, OpenTcpStream, OpenUdpChannel, PeerIdentityBinding,
+    PeerIdentityLookup, ProtocolErrorCode, ProtocolVersion, RegisterTunnels, ServerChallenge,
+    ServerNotice, SocketAddress, TcpStreamReady, TunnelProtocol, TunnelRegistration, TunnelResult,
+    TunnelResults, UDP_METADATA_LEN, UdpDatagram, UdpSessionRetired,
 };
 
 const VERSION: ProtocolVersion = ProtocolVersion::new(1, 7);
@@ -113,6 +113,18 @@ fn messages() -> Vec<Message> {
             detail: text("peer disconnected"),
             peer: Some(text("laptop")),
         }),
+        Message::PeerIdentityLookup(PeerIdentityLookup {
+            session_id: [0xcc; 32],
+            peer: text("laptop"),
+        }),
+        Message::PeerIdentityBinding(PeerIdentityBinding {
+            session_id: [0xcc; 32],
+            peer: text("laptop"),
+            public_key: text("ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+            protocol: Some(TunnelProtocol::TCP),
+            peer_is_provider: true,
+            expires_unix_secs: 2_000_000_000,
+        }),
     ]
 }
 
@@ -175,6 +187,8 @@ fn message_ids_are_explicit_and_stable() {
     assert_eq!(MessageId::OBSERVATION_GRANT_REQUEST.as_u16(), 23);
     assert_eq!(MessageId::OBSERVATION_GRANT.as_u16(), 24);
     assert_eq!(MessageId::SERVER_NOTICE.as_u16(), 25);
+    assert_eq!(MessageId::PEER_IDENTITY_BINDING.as_u16(), 26);
+    assert_eq!(MessageId::PEER_IDENTITY_LOOKUP.as_u16(), 27);
 }
 
 #[test]

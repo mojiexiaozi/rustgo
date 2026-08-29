@@ -77,7 +77,9 @@ impl ClientHandshakeState {
                 | Message::RendezvousRelayRequest(_)
                 | Message::RendezvousClose(_)
                 | Message::RendezvousError(_)
-                | Message::PeerRelayFrame(_),
+                | Message::PeerRelayFrame(_)
+                | Message::PeerIdentityBinding(_)
+                | Message::PeerIdentityLookup(_),
             ) => Ok(self.clone()),
             _ => Err(StateError::invalid_state()),
         }

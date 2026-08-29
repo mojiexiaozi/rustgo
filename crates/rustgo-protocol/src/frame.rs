@@ -226,6 +226,8 @@ fn encode_payload(message: &Message) -> Result<Vec<u8>, FrameError> {
         Message::ObservationGrantRequest(value) => serialize(value),
         Message::ObservationGrant(value) => Ok(value.as_slice().to_vec()),
         Message::ServerNotice(value) => serialize(value),
+        Message::PeerIdentityBinding(value) => serialize(value),
+        Message::PeerIdentityLookup(value) => serialize(value),
     }
 }
 
@@ -299,6 +301,14 @@ fn decode_payload(message: MessageId, payload: &[u8]) -> Result<Message, FrameEr
         MessageId::OBSERVATION_GRANT => decode_opaque(payload).map(Message::ObservationGrant),
         MessageId::SERVER_NOTICE => {
             deserialize::<ServerNotice>(message, payload).map(Message::ServerNotice)
+        }
+        MessageId::PEER_IDENTITY_BINDING => {
+            deserialize::<crate::PeerIdentityBinding>(message, payload)
+                .map(Message::PeerIdentityBinding)
+        }
+        MessageId::PEER_IDENTITY_LOOKUP => {
+            deserialize::<crate::PeerIdentityLookup>(message, payload)
+                .map(Message::PeerIdentityLookup)
         }
         _ => unreachable!("MessageId values are validated before payload dispatch"),
     }

@@ -293,6 +293,8 @@ impl MessageId {
     pub const OBSERVATION_GRANT_REQUEST: Self = Self(23);
     pub const OBSERVATION_GRANT: Self = Self(24);
     pub const SERVER_NOTICE: Self = Self(25);
+    pub const PEER_IDENTITY_BINDING: Self = Self(26);
+    pub const PEER_IDENTITY_LOOKUP: Self = Self(27);
 
     pub const fn as_u16(self) -> u16 {
         self.0
@@ -319,6 +321,8 @@ impl MessageId {
             23 => 0,
             24 => MAX_OBSERVATION_GRANT_BYTES,
             25 => MAX_SERVER_NOTICE_BYTES,
+            26 => 512,
+            27 => 256,
             _ => 0,
         }
     }
@@ -329,7 +333,7 @@ impl TryFrom<u16> for MessageId {
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
         match value {
-            1..=25 => Ok(Self(value)),
+            1..=27 => Ok(Self(value)),
             _ => Err(value),
         }
     }
@@ -644,6 +648,22 @@ pub struct ServerNotice {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObservationGrantRequest {}
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerIdentityBinding {
+    pub session_id: [u8; 32],
+    pub peer: BoundedString<MAX_CLIENT_NAME_BYTES>,
+    pub public_key: BoundedString<MAX_PUBLIC_KEY_BYTES>,
+    pub protocol: Option<TunnelProtocol>,
+    pub peer_is_provider: bool,
+    pub expires_unix_secs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerIdentityLookup {
+    pub session_id: [u8; 32],
+    pub peer: BoundedString<MAX_CLIENT_NAME_BYTES>,
+}
+
 pub type OpaqueRendezvousMessage = BoundedBytes<MAX_RENDEZVOUS_ENVELOPE_BYTES>;
 pub type OpaquePeerRelayFrame = BoundedBytes<MAX_PEER_RELAY_FRAME_BYTES>;
 pub type OpaqueObservationGrant = BoundedBytes<MAX_OBSERVATION_GRANT_BYTES>;
@@ -675,6 +695,8 @@ pub enum Message {
     ObservationGrantRequest(ObservationGrantRequest),
     ObservationGrant(OpaqueObservationGrant),
     ServerNotice(ServerNotice),
+    PeerIdentityBinding(PeerIdentityBinding),
+    PeerIdentityLookup(PeerIdentityLookup),
 }
 
 impl Message {
@@ -705,6 +727,8 @@ impl Message {
             Self::ObservationGrantRequest(_) => MessageId::OBSERVATION_GRANT_REQUEST,
             Self::ObservationGrant(_) => MessageId::OBSERVATION_GRANT,
             Self::ServerNotice(_) => MessageId::SERVER_NOTICE,
+            Self::PeerIdentityBinding(_) => MessageId::PEER_IDENTITY_BINDING,
+            Self::PeerIdentityLookup(_) => MessageId::PEER_IDENTITY_LOOKUP,
         }
     }
 }

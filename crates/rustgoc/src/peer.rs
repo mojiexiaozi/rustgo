@@ -6,9 +6,12 @@ use std::{
     time::Duration,
 };
 
-use rustgo_crypto::{PeerCryptoError, PeerFrameOpener, PeerFrameSealer, PeerSessionKeys};
+use rustgo_crypto::{
+    DevicePublicKey, PeerCryptoError, PeerFrameOpener, PeerFrameSealer, PeerSessionKeys,
+    verify_peer_envelope,
+};
 use rustgo_path::{PathAttempt, PathError, PathKind, PathManager, PathManagerConfig, SelectedPath};
-use rustgo_rendezvous::{PeerRelayFlags, PeerRelayFrame, SessionId};
+use rustgo_rendezvous::{PeerRelayFlags, PeerRelayFrame, RendezvousEnvelope, SessionId};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
@@ -49,6 +52,10 @@ pub enum PeerRuntimeError {
     Path(#[from] PathError),
     #[error("peer relay crypto failed: {0}")]
     Crypto(#[from] PeerCryptoError),
+    #[error("invalid or mismatched authoritative peer identity binding")]
+    InvalidPeerBinding,
+    #[error("authoritative peer identity binding already exists")]
+    DuplicatePeerBinding,
 }
 
 #[derive(Clone)]
@@ -58,6 +65,7 @@ pub struct PeerSessionRuntime {
 
 struct RuntimeInner {
     sessions: Mutex<HashMap<SessionId, CancellationToken>>,
+    bindings: Mutex<HashMap<SessionId, AuthoritativePeerBinding>>,
     options: PeerSessionRuntimeOptions,
     shutdown: CancellationToken,
 }
@@ -79,6 +87,7 @@ impl PeerSessionRuntime {
         Ok(Self {
             inner: Arc::new(RuntimeInner {
                 sessions: Mutex::new(HashMap::new()),
+                bindings: Mutex::new(HashMap::new()),
                 options,
                 shutdown: cancellation.child_token(),
             }),
@@ -167,6 +176,63 @@ impl PeerSessionRuntime {
             .len()
     }
 
+    pub fn register_peer_binding(
+        &self,
+        binding: rustgo_protocol::PeerIdentityBinding,
+        expected_peer: &str,
+        expected_provider_role: bool,
+    ) -> Result<DevicePublicKey, PeerRuntimeError> {
+        if binding.peer.as_str() != expected_peer
+            || binding.peer_is_provider != expected_provider_role
+            || binding.expires_unix_secs <= now_unix_secs()
+        {
+            return Err(PeerRuntimeError::InvalidPeerBinding);
+        }
+        let public_key = binding
+            .public_key
+            .as_str()
+            .parse::<DevicePublicKey>()
+            .map_err(|_| PeerRuntimeError::InvalidPeerBinding)?;
+        let session_id = SessionId::from(binding.session_id);
+        let authoritative = AuthoritativePeerBinding {
+            peer: binding.peer.as_str().to_owned(),
+            public_key,
+            expires_unix_secs: binding.expires_unix_secs,
+        };
+        let mut bindings = self
+            .inner
+            .bindings
+            .lock()
+            .expect("peer binding mutex poisoned");
+        if bindings.contains_key(&session_id) {
+            return Err(PeerRuntimeError::DuplicatePeerBinding);
+        }
+        bindings.insert(session_id, authoritative);
+        Ok(public_key)
+    }
+
+    pub fn verify_authoritative_envelope(
+        &self,
+        envelope: &RendezvousEnvelope,
+    ) -> Result<DevicePublicKey, PeerRuntimeError> {
+        let bindings = self
+            .inner
+            .bindings
+            .lock()
+            .expect("peer binding mutex poisoned");
+        let binding = bindings
+            .get(&envelope.session_id)
+            .ok_or(PeerRuntimeError::InvalidPeerBinding)?;
+        if envelope.sender.as_str() != binding.peer
+            || envelope.expires_unix_secs != binding.expires_unix_secs
+            || binding.expires_unix_secs <= now_unix_secs()
+        {
+            return Err(PeerRuntimeError::InvalidPeerBinding);
+        }
+        verify_peer_envelope(&binding.public_key, envelope)?;
+        Ok(binding.public_key)
+    }
+
     pub async fn shutdown(&self) {
         self.inner.shutdown.cancel();
         let tokens = self
@@ -180,7 +246,18 @@ impl PeerSessionRuntime {
         for token in tokens {
             token.cancel();
         }
+        self.inner
+            .bindings
+            .lock()
+            .expect("peer binding mutex poisoned")
+            .clear();
     }
+}
+
+struct AuthoritativePeerBinding {
+    peer: String,
+    public_key: DevicePublicKey,
+    expires_unix_secs: u64,
 }
 
 pub struct PeerSessionHandle {

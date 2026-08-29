@@ -4,10 +4,14 @@ use std::{
 };
 
 use async_trait::async_trait;
-use rustgo_crypto::{DeviceKeypair, EphemeralPeerKey, PeerRole, PeerSessionKeys, PeerTranscript};
+use rustgo_crypto::{
+    DeviceKeypair, EphemeralPeerKey, PeerRole, PeerSessionKeys, PeerTranscript, sign_peer_envelope,
+};
 use rustgo_path::{PathAttempt, PathError, PathKind, SelectedPath};
-use rustgo_protocol::{BoundedString, ProtocolVersion};
-use rustgo_rendezvous::{CandidateGeneration, SessionId};
+use rustgo_protocol::{BoundedBytes, BoundedString, PeerIdentityBinding, ProtocolVersion};
+use rustgo_rendezvous::{
+    CandidateGeneration, RendezvousEnvelope, RendezvousPayload, RendezvousRequest, SessionId,
+};
 use rustgoc::{PeerRelayChannel, PeerSessionRuntime, PeerSessionRuntimeOptions};
 use tokio_util::sync::CancellationToken;
 
@@ -51,6 +55,55 @@ fn expiry() -> u64 {
         .unwrap()
         .as_secs()
         + 30
+}
+
+#[test]
+fn tls_authoritative_binding_rejects_duplicate_mismatch_expiry_and_key_substitution() {
+    let runtime = PeerSessionRuntime::new(
+        PeerSessionRuntimeOptions::default(),
+        CancellationToken::new(),
+    )
+    .unwrap();
+    let peer = DeviceKeypair::from_secret_bytes([0x91; 32]);
+    let substituted = DeviceKeypair::from_secret_bytes([0x92; 32]);
+    let expires = expiry();
+    let encoded_peer_key = peer.public_key().to_string();
+    let binding = PeerIdentityBinding {
+        session_id: [0x90; 32],
+        peer: BoundedString::try_from("provider").unwrap(),
+        public_key: BoundedString::try_from(encoded_peer_key.as_str()).unwrap(),
+        protocol: None,
+        peer_is_provider: true,
+        expires_unix_secs: expires,
+    };
+    runtime
+        .register_peer_binding(binding.clone(), "provider", true)
+        .unwrap();
+    assert!(
+        runtime
+            .register_peer_binding(binding, "provider", true)
+            .is_err()
+    );
+
+    let mut envelope = RendezvousEnvelope {
+        version: ProtocolVersion::V0_2,
+        session_id: SessionId::from([0x90; 32]),
+        sender: BoundedString::try_from("provider").unwrap(),
+        target: BoundedString::try_from("consumer").unwrap(),
+        step: 2,
+        generation: CandidateGeneration::INITIAL,
+        expires_unix_secs: expires,
+        payload: RendezvousPayload::Request(RendezvousRequest {
+            export: BoundedString::try_from("ssh").unwrap(),
+        }),
+        signature: BoundedBytes::try_from(Vec::new()).unwrap(),
+    };
+    envelope.signature = sign_peer_envelope(&peer, &envelope).unwrap();
+    runtime.verify_authoritative_envelope(&envelope).unwrap();
+    envelope.signature = sign_peer_envelope(&substituted, &envelope).unwrap();
+    assert!(runtime.verify_authoritative_envelope(&envelope).is_err());
+    envelope.sender = BoundedString::try_from("spoofed").unwrap();
+    assert!(runtime.verify_authoritative_envelope(&envelope).is_err());
 }
 
 #[test]

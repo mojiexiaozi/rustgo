@@ -2,14 +2,17 @@ use std::{
     cmp::{Ordering, Reverse},
     collections::{BinaryHeap, HashMap},
     sync::{Arc, Mutex},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use rustgo_config::AuthorizedClient;
-use rustgo_protocol::{BoundedString, Message, ProtocolVersion, ServerNotice, TunnelProtocol};
+use rustgo_protocol::{
+    BoundedString, Message, PeerIdentityBinding, PeerIdentityLookup, ProtocolVersion, ServerNotice,
+    TunnelProtocol,
+};
 use rustgo_rendezvous::{
-    MAX_ERROR_DETAIL_BYTES, PeerRelayFrame, RendezvousEnvelope, RendezvousPayload, RendezvousPhase,
-    RendezvousState, SessionId,
+    MAX_ERROR_DETAIL_BYTES, PeerRelayFlags, PeerRelayFrame, RendezvousEnvelope, RendezvousPayload,
+    RendezvousPhase, RendezvousState, SessionId,
 };
 use thiserror::Error;
 use tokio::sync::mpsc::error::TrySendError;
@@ -131,9 +134,14 @@ pub(crate) struct RendezvousLimits {
 #[derive(Clone)]
 pub struct RendezvousCoordinator {
     registry: ClientRegistry,
-    directory: Arc<HashMap<String, bool>>,
+    directory: Arc<HashMap<String, DirectoryEntry>>,
     limits: RendezvousLimits,
     state: Arc<Mutex<CoordinatorState>>,
+}
+
+struct DirectoryEntry {
+    public_key: String,
+    enabled: bool,
 }
 
 #[derive(Default)]
@@ -153,6 +161,50 @@ struct StoredSession {
     consumer: SessionOwner,
     provider: SessionOwner,
     state: RendezvousState,
+    relay: RelayAdmission,
+}
+
+struct RelayAdmission {
+    requested_by: u8,
+    datagram: Option<bool>,
+    window_started: Instant,
+    frames_in_window: u32,
+    bytes_in_window: usize,
+}
+
+impl RelayAdmission {
+    fn new() -> Self {
+        Self {
+            requested_by: 0,
+            datagram: None,
+            window_started: Instant::now(),
+            frames_in_window: 0,
+            bytes_in_window: 0,
+        }
+    }
+
+    fn authorized(&self) -> bool {
+        self.requested_by == 0b11
+    }
+
+    fn admit(&mut self, bytes: usize) -> bool {
+        const MAX_FRAMES_PER_SECOND: u32 = 256;
+        const MAX_BYTES_PER_SECOND: usize = 4 * 1024 * 1024;
+        if self.window_started.elapsed() >= Duration::from_secs(1) {
+            self.window_started = Instant::now();
+            self.frames_in_window = 0;
+            self.bytes_in_window = 0;
+        }
+        let Some(next_bytes) = self.bytes_in_window.checked_add(bytes) else {
+            return false;
+        };
+        if self.frames_in_window >= MAX_FRAMES_PER_SECOND || next_bytes > MAX_BYTES_PER_SECOND {
+            return false;
+        }
+        self.frames_in_window += 1;
+        self.bytes_in_window = next_bytes;
+        true
+    }
 }
 
 struct SessionTombstone {
@@ -255,6 +307,44 @@ impl std::fmt::Debug for RendezvousCoordinator {
 }
 
 impl RendezvousCoordinator {
+    pub fn identity_binding(
+        &self,
+        authenticated: &ControlSessionGuard,
+        lookup: PeerIdentityLookup,
+    ) -> Result<Message, RendezvousCoordinatorError> {
+        if !self.registry.is_active_session(authenticated.identity()) {
+            return Err(RendezvousErrorCode::IDENTITY_MISMATCH.into());
+        }
+        let session_id = SessionId::from(lookup.session_id);
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| RendezvousErrorCode::INVALID_STATE)?;
+        let session = state
+            .sessions
+            .get(&session_id)
+            .and_then(SessionRecord::active)
+            .ok_or(RendezvousErrorCode::UNKNOWN_SESSION)?;
+        if session.metadata.expires_unix_secs <= now_unix_secs() {
+            return Err(RendezvousErrorCode::EXPIRED.into());
+        }
+        let peer = other_participant(session, authenticated.identity(), lookup.peer.as_str())?;
+        let directory = self
+            .directory
+            .get(&peer.name)
+            .filter(|entry| entry.enabled)
+            .ok_or(RendezvousErrorCode::UNKNOWN_PEER)?;
+        Ok(Message::PeerIdentityBinding(PeerIdentityBinding {
+            session_id: lookup.session_id,
+            peer: BoundedString::try_from(peer.name.as_str())
+                .map_err(|_| RendezvousErrorCode::INVALID_STATE)?,
+            public_key: BoundedString::try_from(directory.public_key.as_str())
+                .map_err(|_| RendezvousErrorCode::INVALID_STATE)?,
+            protocol: session.metadata.protocol,
+            peer_is_provider: session.provider == *peer,
+            expires_unix_secs: session.metadata.expires_unix_secs,
+        }))
+    }
     /// Routes an already encrypted peer frame without inspecting its payload.
     /// The authenticated control identity, rather than any client supplied name,
     /// selects the opposite participant of the live rendezvous session.
@@ -267,15 +357,15 @@ impl RendezvousCoordinator {
             return Err(RendezvousErrorCode::IDENTITY_MISMATCH.into());
         }
         self.expire_sessions_batch(now_unix_secs());
-        let (target, message) = {
-            let state = self
+        let (permit, message) = {
+            let mut state = self
                 .state
                 .lock()
                 .map_err(|_| RendezvousErrorCode::INVALID_STATE)?;
             let session = state
                 .sessions
-                .get(&frame.session_id)
-                .and_then(SessionRecord::active)
+                .get_mut(&frame.session_id)
+                .and_then(SessionRecord::active_mut)
                 .ok_or(RendezvousErrorCode::UNKNOWN_SESSION)?;
             if session.state.phase() != RendezvousPhase::Accepted {
                 return Err(RendezvousErrorCode::INVALID_STATE.into());
@@ -287,12 +377,31 @@ impl RendezvousCoordinator {
             } else {
                 return Err(RendezvousErrorCode::NOT_PARTICIPANT.into());
             };
+            if !session.relay.authorized() {
+                return Err(RendezvousErrorCode::INVALID_STATE.into());
+            }
+            let datagram = session
+                .relay
+                .datagram
+                .ok_or(RendezvousErrorCode::INVALID_STATE)?;
+            let flags = frame.flags.bits();
+            let flags_match = if datagram {
+                flags == PeerRelayFlags::DATAGRAM.bits()
+            } else {
+                flags == PeerRelayFlags::RELIABLE.bits()
+                    || flags == (PeerRelayFlags::RELIABLE | PeerRelayFlags::FIN).bits()
+            };
+            if !flags_match || !session.relay.admit(frame.ciphertext().len()) {
+                return Err(RendezvousErrorCode::CAPACITY_REACHED.into());
+            }
+            let permit = self.reserve_to(&target)?;
             let message = frame
                 .to_protocol_message()
                 .map_err(|_| RendezvousErrorCode::INVALID_STATE)?;
-            (target, message)
+            (permit, message)
         };
-        self.route_to(&target, message)
+        permit.send(message);
+        Ok(())
     }
     pub(crate) fn new(
         registry: ClientRegistry,
@@ -301,7 +410,15 @@ impl RendezvousCoordinator {
     ) -> Self {
         let directory = clients
             .iter()
-            .map(|client| (client.name.clone(), client.enabled))
+            .map(|client| {
+                (
+                    client.name.clone(),
+                    DirectoryEntry {
+                        public_key: client.public_key.clone(),
+                        enabled: client.enabled,
+                    },
+                )
+            })
             .collect();
         Self {
             registry,
@@ -340,8 +457,8 @@ impl RendezvousCoordinator {
         }
         match self.directory.get(envelope.target.as_str()) {
             None => return Err(RendezvousErrorCode::UNKNOWN_PEER.into()),
-            Some(false) => return Err(RendezvousErrorCode::PEER_DISABLED.into()),
-            Some(true) => {}
+            Some(entry) if !entry.enabled => return Err(RendezvousErrorCode::PEER_DISABLED.into()),
+            Some(_) => {}
         }
         let provider = self
             .registry
@@ -414,6 +531,7 @@ impl RendezvousCoordinator {
                 consumer: consumer_owner,
                 provider: provider_owner,
                 state: rendezvous_state,
+                relay: RelayAdmission::new(),
             })),
         );
         drop(state);
@@ -499,7 +617,7 @@ impl RendezvousCoordinator {
             .state
             .lock()
             .map_err(|_| RendezvousErrorCode::DELIVERY_UNAVAILABLE)?;
-        let (target, next_session_state) = {
+        let (target, next_session_state, relay_update) = {
             let record = state
                 .sessions
                 .get(&envelope.session_id)
@@ -525,15 +643,40 @@ impl RendezvousCoordinator {
                 now_unix_secs(),
             )
             .map_err(|_| RendezvousErrorCode::INVALID_STATE)?;
-            (target, next)
+            let relay_update = if let RendezvousPayload::RelayRequest(request) = &envelope.payload {
+                let expected_datagram = session.metadata.protocol == Some(TunnelProtocol::UDP);
+                if request.datagram != expected_datagram {
+                    return Err(RendezvousErrorCode::INVALID_STATE.into());
+                }
+                let participant = if session.consumer.matches(authenticated.identity()) {
+                    0b01
+                } else {
+                    0b10
+                };
+                if session
+                    .relay
+                    .datagram
+                    .is_some_and(|value| value != request.datagram)
+                {
+                    return Err(RendezvousErrorCode::INVALID_STATE.into());
+                }
+                Some((participant, request.datagram))
+            } else {
+                None
+            };
+            (target, next, relay_update)
         };
         let permit = self.reserve_to(&target)?;
-        state
+        let session = state
             .sessions
             .get_mut(&envelope.session_id)
             .and_then(SessionRecord::active_mut)
-            .expect("coordinator lock serializes the validated session")
-            .state = next_session_state;
+            .expect("coordinator lock serializes the validated session");
+        session.state = next_session_state;
+        if let Some((participant, datagram)) = relay_update {
+            session.relay.requested_by |= participant;
+            session.relay.datagram = Some(datagram);
+        }
         drop(state);
         permit.send(message);
         Ok(())

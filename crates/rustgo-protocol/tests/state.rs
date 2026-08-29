@@ -253,6 +253,18 @@ fn active_state_accepts_v02_control_events_only_after_registration() {
         Message::RendezvousRelayRequest(bytes(&[12])),
         Message::RendezvousClose(bytes(&[13])),
         Message::RendezvousError(bytes(&[14])),
+        Message::PeerIdentityLookup(rustgo_protocol::PeerIdentityLookup {
+            session_id: [16; 32],
+            peer: text("peer"),
+        }),
+        Message::PeerIdentityBinding(rustgo_protocol::PeerIdentityBinding {
+            session_id: [16; 32],
+            peer: text("peer"),
+            public_key: text("key"),
+            protocol: Some(rustgo_protocol::TunnelProtocol::TCP),
+            peer_is_provider: true,
+            expires_unix_secs: 2_000_000_000,
+        }),
     ];
 
     for event in &events {
