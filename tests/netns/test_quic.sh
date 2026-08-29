@@ -5,6 +5,9 @@ mode=${1:-endpoint-independent}
 create_topology "$mode"
 create_credentials_and_configs
 start_stack
+if [ "$mode" = restricted ]; then
+    assert_restricted_filtering
+fi
 payload="quic-${mode}-${RG_RUN_ID}"
 assert_udp_payload "$payload"
 expected=QuicV4

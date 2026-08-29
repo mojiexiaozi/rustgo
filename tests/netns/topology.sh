@@ -38,7 +38,7 @@ RG_UDP_FORWARD_PORT=19081
 require_linux_root() {
     [ "$(uname -s)" = Linux ] || { echo "SKIP: Linux ip-netns is required" >&2; return 77; }
     [ "${EUID:-$(id -u)}" -eq 0 ] || { echo "SKIP: root is required for disposable network namespaces" >&2; return 77; }
-    for command in ip python3 timeout openssl; do
+    for command in ip python3 timeout openssl conntrack ping pgrep awk sed grep sysctl ss; do
         command -v "$command" >/dev/null || { echo "SKIP: required command is missing: $command" >&2; return 77; }
     done
     if command -v nft >/dev/null; then
@@ -51,12 +51,26 @@ require_linux_root() {
     fi
     export RG_FIREWALL
     [ -x "$RG_BIN_DIR/rustgos" ] && [ -x "$RG_BIN_DIR/rustgoc" ] || {
-        echo "FAIL: release rustgos/rustgoc binaries are missing in $RG_BIN_DIR" >&2
-        return 1
+        echo "SKIP: release rustgos/rustgoc prerequisites are missing in $RG_BIN_DIR" >&2
+        return 77
     }
-    ip netns add "${RG_PREFIX}-capcheck"
-    ip netns exec "${RG_PREFIX}-capcheck" ip link set lo up
-    ip netns del "${RG_PREFIX}-capcheck"
+    local capcheck=${RG_PREFIX}-capcheck capability_ok=1
+    ip netns del "$capcheck" 2>/dev/null || true
+    ip netns add "$capcheck" || capability_ok=0
+    if [ "$capability_ok" -eq 1 ]; then
+        ip netns exec "$capcheck" ip link set lo up || capability_ok=0
+        if [ "$RG_FIREWALL" = nft ]; then
+            ip netns exec "$capcheck" nft list ruleset >/dev/null || capability_ok=0
+        else
+            ip netns exec "$capcheck" iptables -L >/dev/null || capability_ok=0
+        fi
+    fi
+    ip netns del "$capcheck" 2>/dev/null || capability_ok=0
+    if [ "$capability_ok" -ne 1 ]; then
+        ip netns del "$capcheck" 2>/dev/null || true
+        echo "SKIP: kernel namespace/firewall capabilities are unavailable" >&2
+        return 77
+    fi
 }
 
 record_pid() { printf '%s\n' "$1" >>"$RG_STATE_DIR/pids"; }
@@ -105,6 +119,7 @@ cleanup_topology() {
     done
     ip link del "$RG_BRIDGE" 2>/dev/null || true
     rm -rf -- "$RG_STATE_DIR"
+    set -e
 }
 
 create_link() {
@@ -204,6 +219,8 @@ table ip rustgo_netns {
 }
 EOF
         if [ "$mode" = symmetric ]; then
+            ip netns exec "$namespace" nft add rule ip rustgo_netns postrouting oifname ext0 ip daddr "$RG_SERVER_IP" udp dport "$RG_CONTROL_PORT" snat to "$external_ip:43043"
+            ip netns exec "$namespace" nft add rule ip rustgo_netns postrouting oifname ext0 ip daddr "$RG_SERVER_IP" udp dport "$RG_OBSERVE_ALT_PORT" snat to "$external_ip:43044"
             ip netns exec "$namespace" nft add rule ip rustgo_netns postrouting oifname ext0 masquerade random,fully-random
         else
             ip netns exec "$namespace" nft add rule ip rustgo_netns postrouting oifname ext0 snat to "$external_ip"
@@ -219,6 +236,8 @@ EOF
         ip netns exec "$namespace" iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
         ip netns exec "$namespace" iptables -A FORWARD -i int0 -o ext0 -j ACCEPT
         if [ "$mode" = symmetric ]; then
+            ip netns exec "$namespace" iptables -t nat -A POSTROUTING -o ext0 -p udp -d "$RG_SERVER_IP" --dport "$RG_CONTROL_PORT" -j SNAT --to-source "$external_ip:43043"
+            ip netns exec "$namespace" iptables -t nat -A POSTROUTING -o ext0 -p udp -d "$RG_SERVER_IP" --dport "$RG_OBSERVE_ALT_PORT" -j SNAT --to-source "$external_ip:43044"
             ip netns exec "$namespace" iptables -t nat -A POSTROUTING -o ext0 -j MASQUERADE --random-fully
         else
             ip netns exec "$namespace" iptables -t nat -A POSTROUTING -o ext0 -j SNAT --to-source "$external_ip"
@@ -241,7 +260,7 @@ EOF
 firewall_drop_range() {
     local namespace=$1 protocol=$2 range=$3
     if [ "$RG_FIREWALL" = nft ]; then
-        ip netns exec "$namespace" nft insert rule ip rustgo_netns forward "$protocol" dport "${range/:/-}" drop
+        ip netns exec "$namespace" nft insert rule ip rustgo_netns forward "$protocol" dport "${range/:/-}" counter drop
     else
         ip netns exec "$namespace" iptables -I FORWARD 1 -p "$protocol" --dport "$range" -j DROP
     fi
@@ -403,7 +422,106 @@ assert_selected_path() {
     grep -F "authoritative peer path selected" "$RG_STATE_DIR/consumer.log" | grep -Fq "path=$expected"
 }
 
+capture_observation_mappings() {
+    local label=$1 namespace internal_ip external_ip output=$RG_STATE_DIR/observation-$label.tsv
+    : >"$output"
+    for side in provider consumer; do
+        if [ "$side" = provider ]; then
+            namespace=$RG_NAT_A_NS; internal_ip=$RG_PROVIDER_IP; external_ip=$RG_NAT_A_IP
+        else
+            namespace=$RG_NAT_B_NS; internal_ip=$RG_CONSUMER_IP; external_ip=$RG_NAT_B_IP
+        fi
+        ip netns exec "$namespace" conntrack -L -p udp 2>/dev/null |
+            python3 -c 'import re,sys
+side,internal,external,server=sys.argv[1:]
+found={}
+for line in sys.stdin:
+ fields=re.findall(r"(?:src|dst|sport|dport)=([^ ]+)",line)
+ if len(fields) < 8: continue
+ osrc,odst,osport,odport,rsrc,rdst,rsport,rdport=fields[:8]
+ if osrc==internal and odst==server and odport in {"7443","7444"} and rdst==external:
+  found[odport]=rdport
+for endpoint in ("7443","7444"):
+ if endpoint not in found: raise SystemExit(f"missing authenticated observation mapping for {side}/{endpoint}")
+ print(f"{side}\t{endpoint}\t{found[endpoint]}")' "$side" "$internal_ip" "$external_ip" "$RG_SERVER_IP" >>"$output"
+    done
+    [ "$(wc -l <"$output")" -eq 4 ] || { echo "FAIL: incomplete observation mapping evidence" >&2; return 1; }
+}
+
+assert_changed_observation_mappings() {
+    local file=$1 side primary alternate
+    for side in provider consumer; do
+        primary=$(awk -v s="$side" '$1==s && $2==7443 {print $3}' "$file")
+        alternate=$(awk -v s="$side" '$1==s && $2==7444 {print $3}' "$file")
+        [ -n "$primary" ] && [ -n "$alternate" ] && [ "$primary" != "$alternate" ] || {
+            echo "FAIL: $side observation mappings did not change across 7443/7444: $primary/$alternate" >&2
+            return 1
+        }
+    done
+}
+
+assert_direct_drop_evidence() {
+    local namespace=$1 protocol=$2 range=$3 evidence=$RG_STATE_DIR/direct-drop-${namespace##*-}.txt
+    if [ "$RG_FIREWALL" = nft ]; then
+        ip netns exec "$namespace" nft list chain ip rustgo_netns forward >"$evidence"
+        awk -v p="$protocol" -v r="${range/:/-}" '
+            index($0,p" dport "r) && match($0,/packets [0-9]+/) {
+                value=substr($0,RSTART+8,RLENGTH-8); if (value+0 > 0) found=1
+            } END { exit !found }' "$evidence" || {
+            echo "FAIL: no packet-counter evidence for blocked $protocol direct attempt in $namespace" >&2
+            return 1
+        }
+    else
+        ip netns exec "$namespace" iptables -L FORWARD -v -n -x >"$evidence"
+        awk -v p="$protocol" -v r="$range" '$1+0 > 0 && $4==p && index($0,"dpts:"r) {found=1} END {exit !found}' "$evidence" || {
+            echo "FAIL: no packet-counter evidence for blocked $protocol direct attempt in $namespace" >&2
+            return 1
+        }
+    fi
+}
+
+assert_restricted_filtering() {
+    local marker="restricted-${RG_RUN_ID}"
+    start_in_ns "$RG_SERVER_NS" restricted-probe python3 -u -c 'import socket,sys,time
+marker=sys.argv[1].encode(); primary=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); primary.bind(("10.231.0.2",17600))
+alternate=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); alternate.bind(("10.231.0.2",17601))
+d,a=primary.recvfrom(1024); assert d==marker; primary.sendto(d,a); time.sleep(.1); alternate.sendto(b"unsolicited",a)' "$marker" "$RG_PREFIX" >/dev/null
+    ip netns exec "$RG_CLIENT_B_NS" timeout 8 python3 -c 'import socket,sys
+marker=sys.argv[1].encode(); s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.bind(("10.231.2.2",40999)); s.settimeout(3)
+s.sendto(marker,("10.231.0.2",17600)); assert s.recvfrom(1024)[0]==marker
+try: s.recvfrom(1024)
+except socket.timeout: raise SystemExit(0)
+raise SystemExit("address/port-dependent filter admitted an unsolicited alternate-source packet")' "$marker"
+}
+
+assert_new_direct_flow_since() {
+    local start_line=$1 expected_path=$2 relay_session=$3 evidence=$RG_STATE_DIR/promoted-flow.log deadline=$((SECONDS + 20))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        tail -n "+$((start_line + 1))" "$RG_STATE_DIR/consumer.log" |
+            grep -F "peer service flow" | grep -F 'lifecycle="selected"' | grep -F "path=$expected_path" >"$evidence" || true
+        if [ -s "$evidence" ]; then
+            local line session open generation
+            line=$(tail -n 1 "$evidence")
+            session=$(sed -n 's/.*session_id=\([^ ]*\).*/\1/p' <<<"$line")
+            open=$(sed -n 's/.*open_id=\([^ ]*\).*/\1/p' <<<"$line")
+            generation=$(sed -n 's/.*generation=\([^ ]*\).*/\1/p' <<<"$line")
+            [ -n "$session" ] && [ -n "$open" ] && [ -n "$generation" ] && [ "$session" != "$relay_session" ] || {
+                echo "FAIL: promoted flow lacks distinct structured session/open/generation evidence" >&2
+                return 1
+            }
+            tail -n "+$((start_line + 1))" "$RG_STATE_DIR/consumer.log" |
+                grep -F "session_id=$session" | grep -F "open_id=$open" | grep -Fq 'lifecycle="io_start"' || continue
+            printf '%s\n' "$line" >"$evidence"
+            return 0
+        fi
+        sleep 0.1
+    done
+    echo "FAIL: post-promotion service open did not select $expected_path" >&2
+    return 1
+}
+
 export RG_PREFIX RG_STATE_DIR RG_ROOT RG_BIN_DIR RG_SERVER_NS RG_NAT_A_NS RG_NAT_B_NS
 export RG_CLIENT_A_NS RG_CLIENT_B_NS RG_BRIDGE RG_SERVER_IP RG_PROVIDER_IP RG_CONSUMER_IP
 export RG_CONTROL_PORT RG_OBSERVE_ALT_PORT RG_UDP_FIRST RG_UDP_LAST RG_TCP_FIRST RG_TCP_LAST
 export RG_TCP_FORWARD_PORT RG_UDP_FORWARD_PORT
+export RG_TAG

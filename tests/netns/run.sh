@@ -8,6 +8,15 @@ case "${1:-}" in smoke|all|quic|tcp|symmetric) suite=$1 ;; *) usage ;; esac
 [ "$#" -eq 1 ] || usage
 require_linux_root || { status=$?; exit "$status"; }
 
+finalize_case() {
+    local original_status=$1 cleanup_status=0 audit_status=0
+    trap - EXIT INT TERM
+    cleanup_topology || cleanup_status=$?
+    RG_AUDIT_PREFIX="$RG_PREFIX" RG_AUDIT_TAG="$RG_TAG" "$script_dir/assert_cleanup.sh" || audit_status=$?
+    if [ "$original_status" -ne 0 ]; then return "$original_status"; fi
+    if [ "$cleanup_status" -ne 0 ] || [ "$audit_status" -ne 0 ]; then return 1; fi
+}
+
 run_case() {
     local test=$1 mode=$2
     export RG_RUN_ID="$(date +%s)-$$-${RANDOM}"
@@ -15,22 +24,22 @@ run_case() {
     export RG_STATE_DIR="/run/${RG_PREFIX}"
     # Re-source after assigning the run identity so every scoped name matches.
     source "$script_dir/topology.sh"
-    trap 'status=$?; cleanup_topology; trap - EXIT; "$script_dir/assert_cleanup.sh" || status=1; exit "$status"' EXIT INT TERM
+    trap 'status=$?; finalize_case "$status"; exit $?' EXIT INT TERM
     bash "$script_dir/$test" "$mode"
-    cleanup_topology
-    trap - EXIT INT TERM
-    "$script_dir/assert_cleanup.sh"
+    finalize_case 0
 }
 
 case "$suite" in
     smoke)
+        "$script_dir/assert_cleanup.sh" --self-test
         export RG_RUN_ID="smoke-$$"
         export RG_PREFIX="rgnt-${RG_RUN_ID}"
         export RG_STATE_DIR="/run/${RG_PREFIX}"
         source "$script_dir/topology.sh"
-        trap 'cleanup_topology' EXIT INT TERM
+        trap 'status=$?; finalize_case "$status"; exit $?' EXIT INT TERM
         create_topology endpoint-independent
         echo "PASS: topology isolates both private client networks"
+        finalize_case 0
         ;;
     quic)
         run_case test_quic.sh endpoint-independent

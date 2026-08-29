@@ -10,6 +10,15 @@
 - Added scoped PID, namespace, veth, firewall, and state cleanup plus an independent residue audit.
 - Added a Linux CI gate that runs the complete suite twice and audits cleanup.
 
+## Review hardening
+
+- Symmetric NAT now assigns deterministic, destination-dependent external observation ports for authenticated 7443/7444 probes. The gate reads both clients' real namespace conntrack tuples, requires all four mappings, and rejects unchanged ports.
+- Relay acceptance also requires nonzero namespace firewall counters for blocked native-TCP candidate attempts, separating intended direct filtering from an unrelated implementation failure.
+- The restricted topology runs an active kernel-filter probe: the established server tuple is echoed, while an unsolicited datagram from an alternate server port must time out.
+- Relay promotion requires a second authenticated observation generation and correlates the only post-marker payload open to a distinct structured `session_id`, `open_id`, `generation`, `io_start`, and `NativeTcp` path.
+- Every case, including smoke and failing cases, uses one cleanup/final-audit path. A deterministic cleanup-audit self-test proves owned residue is rejected before smoke can pass.
+- Missing commands, binaries, root, Linux, firewall support, or namespace capability now normalize to explicit exit 77. The disposable capability namespace is deleted on every probe path.
+
 ## Safety
 
 - All namespaces and host veth/bridge names are scoped to `rgnt-<run-id>`.
@@ -31,7 +40,7 @@ SKIP: Linux ip-netns is required
 exit 77
 ```
 
-`git diff --check` also exits 0 (Git reports only the existing Windows LF-to-CRLF advisory).
+The review-hardening validation evidence is recorded by the follow-up commit. Live kernel assertions remain intentionally unaccepted on this host.
 
 ## External acceptance gate
 
