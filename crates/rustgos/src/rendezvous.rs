@@ -212,16 +212,16 @@ impl RelayAdmission {
 }
 
 struct SessionTombstone {
-    consumer: String,
-    provider: String,
+    consumer: SessionOwner,
+    provider: SessionOwner,
     expires_unix_secs: u64,
 }
 
 impl SessionTombstone {
     fn from_session(session: &StoredSession) -> Self {
         Self {
-            consumer: session.consumer.name.clone(),
-            provider: session.provider.name.clone(),
+            consumer: session.consumer.clone(),
+            provider: session.provider.clone(),
             expires_unix_secs: session.metadata.expires_unix_secs,
         }
     }
@@ -252,7 +252,7 @@ impl SessionRecord {
     fn devices(&self) -> (&str, &str) {
         match self {
             Self::Active(session) => (&session.consumer.name, &session.provider.name),
-            Self::Tombstone(tombstone) => (&tombstone.consumer, &tombstone.provider),
+            Self::Tombstone(tombstone) => (&tombstone.consumer.name, &tombstone.provider.name),
         }
     }
 }
@@ -376,15 +376,28 @@ impl RendezvousCoordinator {
             let session = match state.sessions.get_mut(&frame.session_id) {
                 Some(SessionRecord::Active(session)) => session,
                 Some(SessionRecord::Tombstone(tombstone)) => {
+                    if tombstone.consumer.matches(authenticated.identity())
+                        || tombstone.provider.matches(authenticated.identity())
+                    {
+                        tracing::info!(
+                            session_id = ?frame.session_id,
+                            sender = authenticated.identity().name(),
+                            expires_unix_secs = tombstone.expires_unix_secs,
+                            reason = "late_frame_after_close",
+                            event = "peer_relay_frame_dropped",
+                            "late peer relay frame dropped"
+                        );
+                        return Ok(());
+                    }
                     tracing::warn!(
                         session_id = ?frame.session_id,
                         sender = authenticated.identity().name(),
                         expires_unix_secs = tombstone.expires_unix_secs,
-                        reason = "closed_session",
+                        reason = "closed_session_wrong_participant",
                         event = "peer_relay_frame_rejected",
                         "peer relay frame rejected"
                     );
-                    return Err(RendezvousErrorCode::UNKNOWN_SESSION.into());
+                    return Err(RendezvousErrorCode::NOT_PARTICIPANT.into());
                 }
                 None => {
                     tracing::warn!(

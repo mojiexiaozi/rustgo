@@ -191,3 +191,31 @@ Task 12 namespace topology and Task 13 packaging/deployment were not implemented
   `cargo test -p rustgoc --test peer_process -- --nocapture --test-threads=1` passed;
   `cargo clippy -p rustgos -p rustgoc --all-targets -- -D warnings` passed, as did
   `cargo fmt --all -- --check` and `git diff --check`.
+
+## Closed-session in-flight relay frame handling (2026-08-29)
+
+- Production diagnostics identified the mixed-OS control reset as a late consumer TCP
+  relay frame arriving 60 ms after the provider had finished I/O and closed the same
+  fully authorized session. The frame hit the tombstone and the generic relay-frame
+  rejection path returned connection-fatal protocol code 5; the following UDP open was
+  consequently interrupted before reaching the provider.
+- Tombstones now retain the two exact authenticated control-session owners until their
+  existing fixed expiry. A relay frame for that exact closed session from either owner
+  is dropped idempotently without forwarding, refreshing expiry, changing admission or
+  consuming relay counters. A different authenticated identity and an unknown session
+  remain rejected, as do all active-session authorization, protocol, flag, rate and
+  queue violations. Session/tombstone capacity and expiry behavior are unchanged.
+- Safe structured diagnostics remain for RelayRequest admission transitions and every
+  relay-frame rejection/drop reason. They correlate session, sender role, generation,
+  protocol, admission bits, phase, expiry and flags without recording ciphertext,
+  tokens or keys.
+- A real TLS functional regression establishes bilateral TCP relay, closes it from the
+  provider, sends a delayed consumer frame, proves the frame is not forwarded and the
+  control heartbeat remains usable, rejects wrong-identity and unknown-session frames,
+  then establishes and transfers an independent bilateral UDP relay session on the same
+  control connections.
+- Final evidence:
+  `cargo test -p rustgos --test rendezvous -- --test-threads=1` passed 12/12;
+  `cargo test -p rustgoc --test peer_process -- --nocapture --test-threads=1` passed;
+  `cargo clippy -p rustgos -p rustgoc --all-targets -- -D warnings` passed, as did
+  `cargo fmt --all -- --check` and `git diff --check`.

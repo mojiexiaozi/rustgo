@@ -548,10 +548,18 @@ async fn delayed_datagram_relay_survives_candidate_generation_advance_until_clos
     .await?;
     let _ = b.receive_envelope().await?;
     a.send(V02, outbound.to_protocol_message()?).await?;
-    let revoked = timeout(Duration::from_secs(2), a.receive()).await??;
     assert!(
-        matches!(revoked.message, Message::Error(ref error) if error.code == ProtocolErrorCode::INVALID_STATE)
+        timeout(Duration::from_millis(100), b.receive())
+            .await
+            .is_err()
     );
+    a.send(V02, Message::Heartbeat(Heartbeat { sequence: 72 }))
+        .await?;
+    let heartbeat = timeout(Duration::from_secs(2), a.receive()).await??;
+    assert!(matches!(
+        heartbeat.message,
+        Message::Heartbeat(Heartbeat { sequence: 72 })
+    ));
 
     shutdown.cancel();
     task.await??;
@@ -701,6 +709,203 @@ async fn partial_relay_requests_cannot_compose_across_candidate_generations() ->
     assert_eq!(
         PeerRelayFrame::from_protocol_message(routed.message)?,
         frame
+    );
+
+    shutdown.cancel();
+    task.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn authenticated_late_frame_after_close_does_not_end_control_or_next_udp_relay()
+-> Result<(), AnyError> {
+    let pki = TestPki::generate()?;
+    let a_key = DeviceKeypair::from_secret_bytes([77; 32]);
+    let b_key = DeviceKeypair::from_secret_bytes([78; 32]);
+    let c_key = DeviceKeypair::from_secret_bytes([79; 32]);
+    let (address, _coordinator, shutdown, task) = start_server(
+        &pki,
+        vec![
+            authorized("a", &a_key, true),
+            authorized("b", &b_key, true),
+            authorized("c", &c_key, true),
+        ],
+        ServerRuntimeLimits::default(),
+    )
+    .await?;
+    let mut a = Client::connect(&pki, address, "a", &a_key, V02, vec![]).await?;
+    let mut b = Client::connect(&pki, address, "b", &b_key, V02, vec![]).await?;
+    let mut c = Client::connect(&pki, address, "c", &c_key, V02, vec![]).await?;
+    let expires = future_expiry();
+
+    send_and_forward(
+        &mut a,
+        &mut b,
+        envelope(
+            77,
+            "a",
+            "b",
+            1,
+            expires,
+            RendezvousPayload::Request(RendezvousRequest {
+                export: text("ssh"),
+            }),
+        ),
+    )
+    .await?;
+    send_and_forward(
+        &mut b,
+        &mut a,
+        envelope(
+            77,
+            "b",
+            "a",
+            2,
+            expires,
+            RendezvousPayload::ProviderDecision(ProviderDecision::accepted(TunnelProtocol::TCP)),
+        ),
+    )
+    .await?;
+    send_and_forward(
+        &mut a,
+        &mut b,
+        envelope(
+            77,
+            "a",
+            "b",
+            3,
+            expires,
+            RendezvousPayload::RelayRequest(RelayRequest { datagram: false }),
+        ),
+    )
+    .await?;
+    send_and_forward(
+        &mut b,
+        &mut a,
+        envelope(
+            77,
+            "b",
+            "a",
+            4,
+            expires,
+            RendezvousPayload::RelayRequest(RelayRequest { datagram: false }),
+        ),
+    )
+    .await?;
+    let late = PeerRelayFrame::new(
+        SessionId::from([77; 32]),
+        1,
+        0,
+        PeerRelayFlags::RELIABLE | PeerRelayFlags::FIN,
+        vec![0xd7; 24],
+    )?;
+    send_and_forward(
+        &mut b,
+        &mut a,
+        envelope(
+            77,
+            "b",
+            "a",
+            5,
+            expires,
+            RendezvousPayload::Close(RendezvousClose { detail: None }),
+        ),
+    )
+    .await?;
+
+    a.send(V02, late.to_protocol_message()?).await?;
+    a.send(V02, Message::Heartbeat(Heartbeat { sequence: 77 }))
+        .await?;
+    let heartbeat = timeout(Duration::from_secs(2), a.receive()).await??;
+    assert!(matches!(
+        heartbeat.message,
+        Message::Heartbeat(Heartbeat { sequence: 77 })
+    ));
+
+    c.send(V02, late.to_protocol_message()?).await?;
+    let rejected = timeout(Duration::from_secs(2), c.receive()).await??;
+    assert!(
+        matches!(rejected.message, Message::Error(ref error) if error.code == ProtocolErrorCode::INVALID_STATE)
+    );
+    let unknown = PeerRelayFrame::new(
+        SessionId::from([80; 32]),
+        1,
+        0,
+        PeerRelayFlags::DATAGRAM,
+        vec![0xe8; 24],
+    )?;
+    a.send(V02, unknown.to_protocol_message()?).await?;
+    let rejected = timeout(Duration::from_secs(2), a.receive()).await??;
+    assert!(
+        matches!(rejected.message, Message::Error(ref error) if error.code == ProtocolErrorCode::INVALID_STATE)
+    );
+
+    send_and_forward(
+        &mut a,
+        &mut b,
+        envelope(
+            78,
+            "a",
+            "b",
+            1,
+            expires,
+            RendezvousPayload::Request(RendezvousRequest {
+                export: text("dns"),
+            }),
+        ),
+    )
+    .await?;
+    send_and_forward(
+        &mut b,
+        &mut a,
+        envelope(
+            78,
+            "b",
+            "a",
+            2,
+            expires,
+            RendezvousPayload::ProviderDecision(ProviderDecision::accepted(TunnelProtocol::UDP)),
+        ),
+    )
+    .await?;
+    send_and_forward(
+        &mut a,
+        &mut b,
+        envelope(
+            78,
+            "a",
+            "b",
+            3,
+            expires,
+            RendezvousPayload::RelayRequest(RelayRequest { datagram: true }),
+        ),
+    )
+    .await?;
+    send_and_forward(
+        &mut b,
+        &mut a,
+        envelope(
+            78,
+            "b",
+            "a",
+            4,
+            expires,
+            RendezvousPayload::RelayRequest(RelayRequest { datagram: true }),
+        ),
+    )
+    .await?;
+    let datagram = PeerRelayFrame::new(
+        SessionId::from([78; 32]),
+        1,
+        0,
+        PeerRelayFlags::DATAGRAM,
+        vec![0xf9; 24],
+    )?;
+    a.send(V02, datagram.to_protocol_message()?).await?;
+    let routed = timeout(Duration::from_secs(2), b.receive()).await??;
+    assert_eq!(
+        PeerRelayFrame::from_protocol_message(routed.message)?,
+        datagram
     );
 
     shutdown.cancel();
