@@ -428,7 +428,15 @@ while True:
 assert_tcp_payload() {
     local payload=$1
     ip netns exec "$RG_CLIENT_B_NS" timeout 15 python3 -c 'import socket,sys
-p=sys.argv[1].encode(); s=socket.create_connection(("127.0.0.1",19080),10); s.sendall(p); d=s.recv(65536); assert d==p,(d,p)' "$payload"
+p=sys.argv[1].encode(); last=None
+for _ in range(4):
+ try:
+  with socket.create_connection(("127.0.0.1",19080),3) as s:
+   s.sendall(p); d=s.recv(65536)
+   if d==p: raise SystemExit(0)
+   last=AssertionError((d,p))
+ except OSError as error: last=error
+raise last or AssertionError("TCP echo unavailable")' "$payload"
 }
 
 assert_udp_payload() {
