@@ -1243,6 +1243,9 @@ impl Actor {
                 return Err(invalid());
             }
             self.apply_verified(envelope).await?;
+            if !self.sessions.contains_key(&id) {
+                break;
+            }
         }
         Ok(())
     }

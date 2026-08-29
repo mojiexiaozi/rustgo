@@ -262,6 +262,7 @@ listen_addr = "127.0.0.1:{udp_forward}"
 
     if delay_identity_binding {
         let provider_lifecycle_log = fs::read_to_string(provider_config.with_extension("log"))?;
+        let consumer_lifecycle_log = fs::read_to_string(consumer_config.with_extension("log"))?;
         let observation_ready = provider_lifecycle_log
             .find("authenticated NAT observation candidates ready")
             .expect("provider did not finish observation before the delayed identity binding");
@@ -275,6 +276,10 @@ listen_addr = "127.0.0.1:{udp_forward}"
         assert!(
             !provider_lifecycle_log.contains("server rejected rendezvous with code"),
             "early observation emitted an invalid pre-decision candidate set:\n{provider_lifecycle_log}"
+        );
+        assert!(
+            !consumer_lifecycle_log.contains("peer orchestration event rejected"),
+            "resolve-only terminal pending envelopes produced a spurious state error:\n{consumer_lifecycle_log}"
         );
         let candidate_events = provider_lifecycle_log
             .lines()

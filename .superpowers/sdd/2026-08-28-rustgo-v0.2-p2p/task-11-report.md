@@ -243,3 +243,20 @@ Task 12 namespace topology and Task 13 packaging/deployment were not implemented
   `cargo test -p rustgoc --test peer_process -- --nocapture --test-threads=1` passed
   all three real-process scenarios; the control functional target passed 11/11;
   rustgoc all-target Clippy with warnings denied, fmt check and diff check passed.
+
+## Resolve-only terminal pending drain (2026-08-29)
+
+- Startup protocol discovery could queue ProviderDecision and CandidateSetV2 before the
+  peer identity binding. Applying the accepted decision completed the resolve, sent one
+  Close and removed the exact session, but the binding loop then tried to apply the
+  remaining candidate to the removed session and logged a spurious invalid-state event.
+- Pending drain now stops only when applying the preceding authenticated envelope
+  terminally removes that exact session. Remaining pending values are dropped normally;
+  live-session errors are still propagated and ordinary non-terminal pending decision
+  plus candidate ordering continues through the same validation path.
+- The deterministic delayed-binding real-process scenario now asserts that both startup
+  resolve-only probes emit no orchestration rejection, while listeners become ready and
+  subsequent non-terminal TCP and UDP sessions still transfer successfully.
+- Final evidence: the three-scenario real-process peer test passed; the control
+  functional target passed 11/11; rustgoc all-target Clippy with warnings denied, fmt
+  check and diff check passed.
