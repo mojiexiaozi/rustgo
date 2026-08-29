@@ -413,6 +413,7 @@ fn is_peer_inbound(message: &Message) -> bool {
             | Message::RendezvousRelayRequest(_)
             | Message::RendezvousClose(_)
             | Message::RendezvousError(_)
+            | Message::PunchGrant(_)
     )
 }
 
