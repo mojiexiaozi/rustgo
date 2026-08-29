@@ -924,15 +924,87 @@ impl Actor {
 
     async fn handle_punch_grant(&mut self, grant: rustgo_protocol::PunchGrant) -> io::Result<()> {
         let id = SessionId::from(grant.session_id);
+        let actor_generation = self.context.generation().get();
+        let now_millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_millis() as u64);
         let Some(session) = self.sessions.get_mut(&id) else {
+            tracing::warn!(
+                session_id = %session_log_id(id),
+                actor_generation,
+                grant_generation = grant.generation,
+                start_unix_millis = grant.start_unix_millis,
+                start_in_past = grant.start_unix_millis < now_millis,
+                window_millis = grant.window_millis,
+                cadence_millis = grant.cadence_millis,
+                reason = "unknown_session",
+                event = "punch_grant_rejected",
+                "coordinated punch grant rejected"
+            );
             return Ok(());
         };
-        if grant.generation != session.generation.get()
-            || grant.window_millis == 0
-            || grant.window_millis > 5_000
-            || grant.cadence_millis < 10
-            || grant.cadence_millis > 250
-        {
+        let session_generation = session.generation.get();
+        let local_candidate_set_present = session.candidate_sent_generation == session_generation
+            && session.local_candidates_digest.is_some();
+        let peer_candidate_set_present = session.peer_candidates_digest.is_some();
+        let duplicate = session.punch_grant.is_some();
+        let session_expired = session.expiry <= now();
+        if grant.generation != session_generation {
+            tracing::warn!(
+                session_id = %session_log_id(id),
+                actor_generation,
+                authority_generation = session.authority_generation,
+                role = ?session.role,
+                session_generation,
+                grant_generation = grant.generation,
+                local_candidate_set_present,
+                peer_candidate_set_present,
+                duplicate,
+                session_expired,
+                reason = "generation_mismatch",
+                event = "punch_grant_rejected",
+                "coordinated punch grant rejected"
+            );
+            return Ok(());
+        }
+        if grant.window_millis == 0 || grant.window_millis > 5_000 {
+            tracing::warn!(
+                session_id = %session_log_id(id),
+                actor_generation,
+                authority_generation = session.authority_generation,
+                role = ?session.role,
+                session_generation,
+                grant_generation = grant.generation,
+                start_unix_millis = grant.start_unix_millis,
+                start_in_past = grant.start_unix_millis < now_millis,
+                window_millis = grant.window_millis,
+                cadence_millis = grant.cadence_millis,
+                duplicate,
+                session_expired,
+                reason = "invalid_window",
+                event = "punch_grant_rejected",
+                "coordinated punch grant rejected"
+            );
+            return Ok(());
+        }
+        if grant.cadence_millis < 10 || grant.cadence_millis > 250 {
+            tracing::warn!(
+                session_id = %session_log_id(id),
+                actor_generation,
+                authority_generation = session.authority_generation,
+                role = ?session.role,
+                session_generation,
+                grant_generation = grant.generation,
+                start_unix_millis = grant.start_unix_millis,
+                start_in_past = grant.start_unix_millis < now_millis,
+                window_millis = grant.window_millis,
+                cadence_millis = grant.cadence_millis,
+                duplicate,
+                session_expired,
+                reason = "invalid_cadence",
+                event = "punch_grant_rejected",
+                "coordinated punch grant rejected"
+            );
             return Ok(());
         }
         let (expected_local, expected_peer) = match session.role {
@@ -945,13 +1017,52 @@ impl Actor {
                 grant.initiator_candidates_sha256,
             ),
         };
-        if session.local_candidates_digest != Some(expected_local)
-            || session.peer_candidates_digest != Some(expected_peer)
-        {
+        let local_digest_matches = session.local_candidates_digest == Some(expected_local);
+        let peer_digest_matches = session.peer_candidates_digest == Some(expected_peer);
+        if !local_digest_matches || !peer_digest_matches {
+            tracing::warn!(
+                session_id = %session_log_id(id),
+                actor_generation,
+                authority_generation = session.authority_generation,
+                role = ?session.role,
+                session_generation,
+                grant_generation = grant.generation,
+                local_candidate_set_present,
+                peer_candidate_set_present,
+                local_digest_matches,
+                peer_digest_matches,
+                start_unix_millis = grant.start_unix_millis,
+                start_in_past = grant.start_unix_millis < now_millis,
+                window_millis = grant.window_millis,
+                cadence_millis = grant.cadence_millis,
+                duplicate,
+                session_expired,
+                reason = "candidate_digest_mismatch",
+                event = "punch_grant_rejected",
+                "coordinated punch grant rejected"
+            );
             return Ok(());
         }
-        session.punch_grant = Some(grant);
-        tracing::info!(session_id = %session_log_id(id), generation = session.generation.get(), event = "punch_grant_ready", "authenticated coordinated punch grant accepted");
+        session.punch_grant = Some(grant.clone());
+        tracing::info!(
+            session_id = %session_log_id(id),
+            actor_generation,
+            authority_generation = session.authority_generation,
+            role = ?session.role,
+            generation = session.generation.get(),
+            local_candidate_set_present,
+            peer_candidate_set_present,
+            local_digest_matches,
+            peer_digest_matches,
+            start_unix_millis = grant.start_unix_millis,
+            start_in_past = grant.start_unix_millis < now_millis,
+            window_millis = grant.window_millis,
+            cadence_millis = grant.cadence_millis,
+            duplicate,
+            session_expired,
+            event = "punch_grant_ready",
+            "authenticated coordinated punch grant accepted"
+        );
         self.ensure_direct(id).await
     }
 
