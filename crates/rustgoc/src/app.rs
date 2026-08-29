@@ -162,6 +162,25 @@ impl ClientApp {
 
     pub async fn run_until(mut self, shutdown: CancellationToken) -> Result<(), ClientError> {
         self.status.send_replace(ClientStatus::default());
+        let peer_runtime = self.peer_handler.clone().unwrap_or_else(|| {
+            Arc::new(ProductionPeerRuntime::new(
+                Arc::new(self.control.config().clone()),
+                self.control.keypair(),
+                self.exports.clone(),
+            ))
+        });
+        let result = self
+            .run_reconnect_loop(shutdown, peer_runtime.clone())
+            .await;
+        let shutdown_result = peer_runtime.shutdown().await;
+        shutdown_result.and(result)
+    }
+
+    async fn run_reconnect_loop(
+        &mut self,
+        shutdown: CancellationToken,
+        peer_runtime: Arc<dyn PeerGenerationHandler>,
+    ) -> Result<(), ClientError> {
         loop {
             let connected = tokio::select! {
                 biased;
@@ -193,20 +212,13 @@ impl ClientApp {
                     );
                     let status = self.status.clone();
                     let supervisor = self.supervisor.clone();
-                    let peer_runtime = self.peer_handler.clone().unwrap_or_else(|| {
-                        Arc::new(ProductionPeerRuntime::new(
-                            Arc::new(self.control.config().clone()),
-                            self.control.keypair(),
-                            self.exports.clone(),
-                        ))
-                    });
                     let backoff = &mut self.backoff;
                     let result = session
                         .run_generation_with_peer(
                             generation,
                             shutdown.clone(),
                             supervisor,
-                            Some(peer_runtime),
+                            Some(peer_runtime.clone()),
                             move || {
                                 backoff.mark_disconnected();
                             },

@@ -86,6 +86,10 @@ pub trait PeerGenerationHandler: Send + Sync + 'static {
         event: ControlEvent,
         shutdown: CancellationToken,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+    fn shutdown(&self) -> Pin<Box<dyn Future<Output = Result<(), ClientError>> + Send + 'static>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 struct ChildSignals<'a> {

@@ -58,6 +58,7 @@ const AUTH_RECORD: &[u8] = b"rustgo-relay-auth-v1";
 const OPEN_OK: &[u8] = b"rustgo-relay-open-ok-v1";
 const OPEN_REJECTED: &[u8] = b"rustgo-relay-open-rejected-v1";
 const MAX_RELAY_PLAINTEXT: usize = 60 * 1024;
+const CONTROL_RECONNECT_GRACE: Duration = Duration::from_secs(15);
 type OpenReply = oneshot::Sender<io::Result<OpenedIo>>;
 
 #[derive(Clone)]
@@ -67,6 +68,13 @@ pub(crate) struct ProductionPeerRuntime {
     config: Arc<ClientConfig>,
     keypair: Arc<DeviceKeypair>,
     exports: ExportRegistry,
+    owner: Arc<tokio::sync::Mutex<Option<PeerRuntimeOwner>>>,
+    lifetime: CancellationToken,
+}
+
+struct PeerRuntimeOwner {
+    actor: tokio::task::JoinHandle<io::Result<()>>,
+    forward: ForwardRuntime,
 }
 
 impl ProductionPeerRuntime {
@@ -82,6 +90,8 @@ impl ProductionPeerRuntime {
             config,
             keypair,
             exports,
+            owner: Arc::new(tokio::sync::Mutex::new(None)),
+            lifetime: CancellationToken::new(),
         }
     }
 
@@ -126,49 +136,92 @@ impl PeerGenerationHandler for ProductionPeerRuntime {
         context: ChildSessionContext,
         shutdown: CancellationToken,
     ) -> Pin<Box<dyn Future<Output = Result<(), ClientError>> + Send + 'static>> {
-        let receiver = self.receiver.lock().ok().and_then(|mut value| value.take());
         let runtime = self.clone();
         Box::pin(async move {
-            let Some(receiver) = receiver else {
-                return Err(ClientError::PeerGenerationFailed);
-            };
-            let actor = tokio::spawn(
-                Actor::new(runtime.clone(), context, receiver, shutdown.clone()).run(),
-            );
-            let forward = match ForwardRuntime::start(
-                runtime.config.forwards.clone(),
-                Arc::new(runtime.clone()),
-                shutdown.child_token(),
-            )
-            .await
+            let generation = context.generation().get();
             {
-                Ok(forward) => forward,
-                Err(error) => {
-                    tracing::error!(error = %error, "failed to start peer forwards");
-                    shutdown.cancel();
-                    let _ = actor_result(actor.await);
-                    return Err(ClientError::PeerGenerationFailed);
+                let mut owner = runtime.owner.lock().await;
+                if owner.is_none() {
+                    let receiver = runtime
+                        .receiver
+                        .lock()
+                        .ok()
+                        .and_then(|mut value| value.take())
+                        .ok_or(ClientError::PeerGenerationFailed)?;
+                    let actor = tokio::spawn(
+                        Actor::new(
+                            runtime.clone(),
+                            context.clone(),
+                            receiver,
+                            runtime.lifetime.child_token(),
+                        )
+                        .run(),
+                    );
+                    let forward = match ForwardRuntime::start(
+                        runtime.config.forwards.clone(),
+                        Arc::new(runtime.clone()),
+                        runtime.lifetime.child_token(),
+                    )
+                    .await
+                    {
+                        Ok(forward) => forward,
+                        Err(error) => {
+                            tracing::error!(error = %error, "failed to start peer forwards");
+                            runtime.lifetime.cancel();
+                            let _ = actor_result(actor.await);
+                            return Err(ClientError::PeerGenerationFailed);
+                        }
+                    };
+                    *owner = Some(PeerRuntimeOwner { actor, forward });
+                    tracing::info!(event = %"peer_forwards_ready", "peer forward listeners ready");
+                } else {
+                    runtime
+                        .commands
+                        .send(ActorInput::ControlAttached(context.clone()))
+                        .await
+                        .map_err(|_| ClientError::PeerGenerationFailed)?;
                 }
-            };
-            tracing::info!(event = %"peer_forwards_ready", "peer forward listeners ready");
+            }
             shutdown.cancelled().await;
-            forward.shutdown().await;
-            actor_result(actor.await)
+            runtime
+                .commands
+                .send(ActorInput::ControlDetached(generation))
+                .await
+                .map_err(|_| ClientError::PeerGenerationFailed)
         })
     }
 
     fn run_event(
         &self,
-        _context: ChildSessionContext,
+        context: ChildSessionContext,
         event: ControlEvent,
         shutdown: CancellationToken,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
-        let accepted =
-            !shutdown.is_cancelled() && self.commands.try_send(ActorInput::Event(event)).is_ok();
+        let accepted = !shutdown.is_cancelled()
+            && self
+                .commands
+                .try_send(ActorInput::Event {
+                    generation: context.generation().get(),
+                    event,
+                })
+                .is_ok();
         Box::pin(async move {
             if !accepted {
                 tracing::warn!("peer event queue unavailable");
             }
+        })
+    }
+
+    fn shutdown(&self) -> Pin<Box<dyn Future<Output = Result<(), ClientError>> + Send + 'static>> {
+        let runtime = self.clone();
+        Box::pin(async move {
+            runtime.lifetime.cancel();
+            let owner = runtime.owner.lock().await.take();
+            let Some(owner) = owner else {
+                return Ok(());
+            };
+            owner.forward.shutdown().await;
+            actor_result(owner.actor.await)
         })
     }
 }
@@ -246,7 +299,12 @@ enum ActorInput {
         cancellation: CancellationToken,
         reply: oneshot::Sender<io::Result<OpenedIo>>,
     },
-    Event(ControlEvent),
+    Event {
+        generation: u64,
+        event: ControlEvent,
+    },
+    ControlAttached(ChildSessionContext),
+    ControlDetached(u64),
     PathSelected {
         session_id: SessionId,
         result: Result<SelectedPath, PathError>,
@@ -317,6 +375,8 @@ struct Actor {
     observed_ip_cache: Vec<ObservedIpCacheEntry>,
     promoted: HashSet<(String, String, TunnelProtocol)>,
     tasks: JoinSet<()>,
+    control_available: bool,
+    detached_deadline: Option<tokio::time::Instant>,
 }
 
 #[derive(Clone)]
@@ -326,6 +386,7 @@ struct ObservedIpCacheEntry {
 }
 
 struct Session {
+    authority_generation: u64,
     peer: String,
     export: String,
     role: PeerRole,
@@ -359,6 +420,7 @@ struct Session {
     punch_grant: Option<rustgo_protocol::PunchGrant>,
     local_candidates_digest: Option<[u8; 32]>,
     peer_candidates_digest: Option<[u8; 32]>,
+    selected_kind: Option<PathKind>,
 }
 
 type PathRecheckReply = oneshot::Sender<Result<Vec<Arc<dyn PathAttempt>>, PathError>>;
@@ -380,6 +442,8 @@ impl Actor {
             observed_ip_cache: Vec::new(),
             promoted: HashSet::new(),
             tasks: JoinSet::new(),
+            control_available: true,
+            detached_deadline: None,
         }
     }
 
@@ -403,7 +467,30 @@ impl Actor {
                     self.begin_open(peer, export, resolve_only, cancellation, reply)
                         .await
                 }
-                ActorInput::Event(event) => self.handle_event(event).await,
+                ActorInput::Event { generation, event } => {
+                    if self.control_available && self.context.generation().get() == generation {
+                        self.handle_event(event).await
+                    } else {
+                        tracing::warn!(generation, event = %"stale_peer_control_event", "ignored peer event from a detached control generation");
+                        Ok(())
+                    }
+                }
+                ActorInput::ControlAttached(context) => {
+                    let generation = context.generation().get();
+                    if generation <= self.context.generation().get() {
+                        Err(invalid())
+                    } else {
+                        self.context = context;
+                        self.control_available = true;
+                        self.detached_deadline = None;
+                        tracing::info!(generation, event = %"peer_control_rebound", "peer data plane rebound to authenticated control generation");
+                        Ok(())
+                    }
+                }
+                ActorInput::ControlDetached(generation) => {
+                    self.detach_control(generation);
+                    Ok(())
+                }
                 ActorInput::PathSelected { session_id, result } => {
                     self.handle_direct_result(session_id, result).await
                 }
@@ -488,6 +575,7 @@ impl Actor {
                 },
                 ActorInput::Sweep => {
                     self.expire_sessions();
+                    self.expire_control_grace();
                     Ok(())
                 }
             };
@@ -561,6 +649,13 @@ impl Actor {
         reply: oneshot::Sender<io::Result<OpenedIo>>,
     ) -> io::Result<()> {
         tracing::trace!(peer = %peer, export = %export, resolve_only, "peer open command admitted");
+        if !self.control_available {
+            let _ = reply.send(Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "peer control generation is reconnecting",
+            )));
+            return Ok(());
+        }
         if self
             .runtime
             .config
@@ -589,6 +684,7 @@ impl Actor {
         self.sessions.insert(
             session_id,
             Session {
+                authority_generation: self.context.generation().get(),
                 peer,
                 export,
                 role: PeerRole::Initiator,
@@ -622,6 +718,7 @@ impl Actor {
                 punch_grant: None,
                 local_candidates_digest: None,
                 peer_candidates_digest: None,
+                selected_kind: None,
             },
         );
         if !resolve_only {
@@ -900,6 +997,7 @@ impl Actor {
             self.sessions.insert(
                 envelope.session_id,
                 Session {
+                    authority_generation: self.context.generation().get(),
                     peer: envelope.sender.as_str().to_owned(),
                     export,
                     role: PeerRole::Responder,
@@ -933,6 +1031,7 @@ impl Actor {
                     punch_grant: None,
                     local_candidates_digest: None,
                     peer_candidates_digest: None,
+                    selected_kind: None,
                 },
             );
             self.request_observation(envelope.session_id).await?;
@@ -1452,6 +1551,7 @@ impl Actor {
                     return Ok(());
                 }
                 if path.kind() == PathKind::Relay {
+                    session.selected_kind = Some(PathKind::Relay);
                     let relay_reply = session.reply.take();
                     session
                         .relay_ready
@@ -1463,6 +1563,7 @@ impl Actor {
                 if let Some(ready) = &session.relay_ready {
                     ready.reject();
                 }
+                session.selected_kind = Some(path.kind());
                 if let Some(tcp) = path.handle::<EncryptedPeerTcp>() {
                     let sender = self.runtime.commands.clone();
                     let flow = meta.clone();
@@ -1733,6 +1834,65 @@ impl Actor {
         }
     }
 
+    fn detach_control(&mut self, generation: u64) {
+        if !self.control_available || self.context.generation().get() != generation {
+            return;
+        }
+        self.control_available = false;
+        let configured_grace = self
+            .runtime
+            .config
+            .p2p
+            .as_ref()
+            .map_or(Duration::from_secs(1), |p2p| {
+                Duration::from_secs(p2p.reconnect_timeout_secs)
+            });
+        let grace = configured_grace.max(CONTROL_RECONNECT_GRACE);
+        self.detached_deadline = Some(tokio::time::Instant::now() + grace);
+        let control_dependent = self
+            .sessions
+            .iter()
+            .filter_map(|(id, session)| {
+                (!session.selected_kind.is_some_and(PathKind::is_direct)).then_some(*id)
+            })
+            .collect::<Vec<_>>();
+        for id in control_dependent {
+            let _ = self.fail_session(
+                id,
+                io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "control connection lost before a direct path could remain independent",
+                ),
+            );
+        }
+        tracing::info!(
+            generation,
+            grace_millis = grace.as_millis(),
+            retained_direct_sessions = self.sessions.len(),
+            event = %"peer_control_detached",
+            "control-dependent peer work closed; authenticated direct sessions retained during reconnect grace"
+        );
+    }
+
+    fn expire_control_grace(&mut self) {
+        if self.control_available
+            || self
+                .detached_deadline
+                .is_none_or(|deadline| tokio::time::Instant::now() < deadline)
+        {
+            return;
+        }
+        self.detached_deadline = None;
+        let expired = self.sessions.keys().copied().collect::<Vec<_>>();
+        for id in expired {
+            let _ = self.fail_session(
+                id,
+                io::Error::new(io::ErrorKind::TimedOut, "control reconnect grace expired"),
+            );
+        }
+        tracing::warn!(event = %"peer_control_grace_expired", "authenticated direct sessions closed after control reconnect grace expired");
+    }
+
     async fn finish_session(&mut self, id: SessionId) {
         let Some(mut session) = self.sessions.remove(&id) else {
             return;
@@ -1744,15 +1904,18 @@ impl Actor {
         if let Some(reply) = session.reply.take() {
             let _ = reply.send(Err(closed()));
         }
-        let envelope = self.signed_envelope(
-            id,
-            &session.peer,
-            session.next_step,
-            session.expiry,
-            RendezvousPayload::Close(RendezvousClose { detail: None }),
-        );
-        if let Ok(envelope) = envelope {
-            let _ = self.send_envelope(&envelope).await;
+        if self.control_available && session.authority_generation == self.context.generation().get()
+        {
+            let envelope = self.signed_envelope(
+                id,
+                &session.peer,
+                session.next_step,
+                session.expiry,
+                RendezvousPayload::Close(RendezvousClose { detail: None }),
+            );
+            if let Ok(envelope) = envelope {
+                let _ = self.send_envelope(&envelope).await;
+            }
         }
     }
 }

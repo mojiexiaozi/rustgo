@@ -117,3 +117,33 @@ Task 12 namespace topology and Task 13 packaging/deployment were not implemented
   `cargo test -p rustgoc --test control -- --test-threads=1` passed 11/11;
   `cargo test -p rustgoc --tests -- --test-threads=1` passed all rustgoc unit and
   functional targets, including the real rustgos plus two-rustgoc TCP/UDP process test.
+
+## Direct data-plane control-loss isolation (2026-08-29)
+
+- `ProductionPeerRuntime`, its actor, and configured `ForwardRuntime` are now
+  process-lifetime owners rather than TLS-control-generation children. Each authenticated
+  control generation attaches/detaches an explicitly fenced `ChildSessionContext`; stale
+  events from an older generation are ignored, while reconnect installs only a strictly
+  newer authoritative generation.
+- Control detach immediately rejects new rendezvous/service opens and cancels relay or
+  not-yet-selected sessions. Sessions whose application flow already selected
+  `NativeTcp`, `QuicV4`, or `QuicV6` retain their independently authenticated transport
+  and existing forward/export pumps for a bounded 15-second control-reconnect grace.
+  Relay remains honestly dependent on rustgos and cannot survive the detach.
+- The control grace is intentionally independent from `reconnect_timeout_secs`, which
+  remains the PathManager direct-path recovery/recheck interval. Successful control
+  reconnect clears the grace fence and rebinds new control-dependent work without
+  changing the identity, transcript, session, or path generation of retained flows.
+- Session cryptographic expiry still closes retained direct work. Authentication/key
+  revocation that prevents reconnect leaves the runtime detached and closes retained
+  work at the grace deadline. Explicit process shutdown cancels the persistent owner,
+  shuts down forwards, and drains the actor's structured tasks before returning.
+- The real rustgos plus two-rustgoc process test now holds an authenticated NativeTcp
+  stream and QuicV4 UDP session open, kills rustgos, and proves both continue carrying
+  payload while a new open is fenced and the existing relay flow fails. It restarts
+  rustgos, observes both clients' `peer_control_rebound`, and proves the exact retained
+  direct TCP and UDP flows still transfer payload before final process cleanup.
+- Final evidence:
+  `cargo test -p rustgoc --test peer_process -- --nocapture --test-threads=1` passed;
+  `cargo test -p rustgoc --tests -- --test-threads=1` passed all rustgoc targets,
+  including control lifecycle, forwards/exports, relay and the expanded process test.

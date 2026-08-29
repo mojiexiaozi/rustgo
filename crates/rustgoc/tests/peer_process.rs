@@ -191,6 +191,7 @@ listen_addr = "127.0.0.1:{udp_forward}"
     assert_eq!(echoed, b"tcp-process-e2e");
     eprintln!("initial tcp echoed");
 
+    let mut direct_tcp = None;
     if prefer_direct {
         // The first stream stays on relay while generation 2 authenticates. A new
         // open then consumes the atomically promoted direct preference.
@@ -224,6 +225,7 @@ listen_addr = "127.0.0.1:{udp_forward}"
         promoted_result??;
         assert_eq!(promoted_echo, b"tcp-promoted");
         eprintln!("promoted tcp echoed");
+        direct_tcp = Some(promoted);
     }
 
     let udp = UdpSocket::bind("127.0.0.1:0").await?;
@@ -301,6 +303,96 @@ listen_addr = "127.0.0.1:{udp_forward}"
             4,
             "each transferred open must have a distinct correlated session: {flows:?}"
         );
+
+        children.0[0].kill()?;
+        children.0[0].wait()?;
+        wait_for_log_pair(
+            &consumer_config.with_extension("log"),
+            &provider_config.with_extension("log"),
+            "peer_control_detached",
+            1,
+        )
+        .await?;
+
+        let direct_tcp = direct_tcp.as_mut().expect("direct TCP flow is retained");
+        direct_tcp.write_all(b"tcp-control-down").await?;
+        let mut down_tcp_echo = [0_u8; 16];
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            direct_tcp.read_exact(&mut down_tcp_echo),
+        )
+        .await??;
+        assert_eq!(&down_tcp_echo, b"tcp-control-down");
+
+        let direct_udp = &promoted_udp;
+        direct_udp
+            .send_to(
+                b"udp-control-down",
+                SocketAddr::from(([127, 0, 0, 1], udp_forward)),
+            )
+            .await?;
+        let (length, _) =
+            tokio::time::timeout(Duration::from_secs(3), direct_udp.recv_from(&mut buffer))
+                .await??;
+        assert_eq!(&buffer[..length], b"udp-control-down");
+
+        let mut blocked_open =
+            TcpStream::connect(SocketAddr::from(([127, 0, 0, 1], tcp_forward))).await?;
+        blocked_open.write_all(b"new-open-control-down").await?;
+        let mut blocked_buffer = [0_u8; 21];
+        let blocked_result = tokio::time::timeout(
+            Duration::from_secs(2),
+            blocked_open.read_exact(&mut blocked_buffer),
+        )
+        .await;
+        assert!(
+            !matches!(blocked_result, Ok(Ok(_))) || blocked_buffer != *b"new-open-control-down",
+            "new rendezvous/open must remain fenced while control is detached"
+        );
+
+        let mut relay_buffer = [0_u8; 18];
+        let relay_survived = if stream.write_all(b"relay-control-down").await.is_ok() {
+            matches!(
+                tokio::time::timeout(Duration::from_secs(1), stream.read_exact(&mut relay_buffer))
+                    .await,
+                Ok(Ok(_))
+            ) && relay_buffer == *b"relay-control-down"
+        } else {
+            false
+        };
+        assert!(
+            !relay_survived,
+            "relay flow must not survive loss of its control transport"
+        );
+
+        children.0[0] = spawn("rustgos", &server_config)?;
+        wait_tcp(SocketAddr::from(([127, 0, 0, 1], server_port))).await?;
+        wait_for_log_pair(
+            &consumer_config.with_extension("log"),
+            &provider_config.with_extension("log"),
+            "peer_control_rebound",
+            1,
+        )
+        .await?;
+
+        direct_tcp.write_all(b"tcp-control-back").await?;
+        let mut back_tcp_echo = [0_u8; 16];
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            direct_tcp.read_exact(&mut back_tcp_echo),
+        )
+        .await??;
+        assert_eq!(&back_tcp_echo, b"tcp-control-back");
+        direct_udp
+            .send_to(
+                b"udp-control-back",
+                SocketAddr::from(([127, 0, 0, 1], udp_forward)),
+            )
+            .await?;
+        let (length, _) =
+            tokio::time::timeout(Duration::from_secs(3), direct_udp.recv_from(&mut buffer))
+                .await??;
+        assert_eq!(&buffer[..length], b"udp-control-back");
     }
 
     drop(children);
