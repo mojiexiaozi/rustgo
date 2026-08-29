@@ -724,7 +724,6 @@ impl RendezvousCoordinator {
             session.candidate_generation_announced_by = announced_by;
             if advanced {
                 session.generation_started = Instant::now();
-                session.relay = RelayAdmission::new();
                 session.candidate_digests = [None, None];
             }
         }

@@ -147,3 +147,28 @@ Task 12 namespace topology and Task 13 packaging/deployment were not implemented
   `cargo test -p rustgoc --test peer_process -- --nocapture --test-threads=1` passed;
   `cargo test -p rustgoc --tests -- --test-threads=1` passed all rustgoc targets,
   including control lifecycle, forwards/exports, relay and the expanded process test.
+
+## Mixed-OS delayed UDP relay fix (2026-08-29)
+
+- Phase-1 correlation of the Windows-consumer/Linux-provider failure identified a
+  server-side generation race rather than a persistent-runtime rebind defect. A TCP
+  relay frame arrived before background direct recheck, while the slower UDP frame
+  arrived after strict CandidateSetV2 `generation + 1`. rustgos reset the session's
+  bilateral relay admission during that candidate advance, rejected the delayed opaque
+  frame with protocol code 5, and the resulting consumer disconnect explained the
+  provider's early `io_finished`.
+- Relay authorization is now correctly session-scoped. Candidate generation advancement
+  refreshes candidate digests and transport attempts but does not revoke an already
+  bilateral relay for the same accepted session/protocol. It also cannot authorize a
+  relay that was not already bilateral. Exact expiry, explicit close/disconnect,
+  datagram/reliable flag matching, rate/byte admission and tombstones remain unchanged.
+- A real TLS control functional regression now accepts both datagram RelayRequests,
+  advances both participants to CandidateSetV2 generation 2 after the minimum generation
+  fence, delays traffic, and proves opaque datagrams route and reply in both directions.
+  It also proves an unknown session is rejected and explicit close immediately revokes
+  the previously authorized relay. Existing expiry/tombstone coverage remains green.
+- Final evidence:
+  `cargo test -p rustgos --test rendezvous -- --test-threads=1` passed 10/10;
+  `cargo test -p rustgoc --test peer_process -- --nocapture --test-threads=1` passed;
+  `cargo clippy -p rustgos -p rustgoc --all-targets -- -D warnings` passed, as did
+  `cargo fmt --all -- --check` and `git diff --check`.

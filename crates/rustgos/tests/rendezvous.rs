@@ -17,9 +17,9 @@ use rustgo_protocol::{
     RegisterTunnels, TcpStreamReady, TunnelProtocol, TunnelRegistration,
 };
 use rustgo_rendezvous::{
-    CandidateGeneration, ConnectivityResult, ObservationGrant, PeerRelayFlags, PeerRelayFrame,
-    ProviderDecision, RelayRequest, RendezvousClose, RendezvousEnvelope, RendezvousPayload,
-    RendezvousRequest, SessionId,
+    CandidateGeneration, CandidateSetV2, CandidateTransport, ConnectivityResult, ObservationGrant,
+    PeerRelayFlags, PeerRelayFrame, ProviderDecision, RelayRequest, RendezvousClose,
+    RendezvousEnvelope, RendezvousPayload, RendezvousRequest, SessionId, TransportKeyBinding,
 };
 use rustgos::{RendezvousErrorCode, ServerApp, ServerRuntimeLimits};
 use tempfile::TempDir;
@@ -149,6 +149,26 @@ fn future_expiry() -> u64 {
         + 20
 }
 
+fn candidate_set(owner_is_initiator: bool, marker: u8) -> RendezvousPayload {
+    RendezvousPayload::CandidateSetV2(CandidateSetV2 {
+        owner_is_initiator,
+        bindings: BoundedVec::try_from(vec![TransportKeyBinding {
+            transport: CandidateTransport::Relay,
+            ephemeral_public_key: BoundedBytes::try_from(vec![marker; 32]).unwrap(),
+        }])
+        .unwrap(),
+        candidates: BoundedVec::try_from(Vec::new()).unwrap(),
+    })
+}
+
+fn with_generation(
+    mut envelope: RendezvousEnvelope,
+    generation: CandidateGeneration,
+) -> RendezvousEnvelope {
+    envelope.generation = generation;
+    envelope
+}
+
 struct Client(ScriptedProtocolClient);
 
 impl Deref for Client {
@@ -244,6 +264,24 @@ async fn start_server(
 async fn expect_error(client: &mut Client, code: RendezvousErrorCode) -> Result<(), AnyError> {
     let notice = receive_notice(client).await?;
     assert_eq!(notice.code, code.as_u16());
+    Ok(())
+}
+
+async fn send_and_forward(
+    sender: &mut Client,
+    receiver: &mut Client,
+    envelope: RendezvousEnvelope,
+) -> Result<(), AnyError> {
+    sender.send_envelope(&envelope).await?;
+    assert_eq!(receiver.receive_envelope().await?, envelope);
+    Ok(())
+}
+
+async fn receive_punch(client: &mut Client) -> Result<(), AnyError> {
+    let frame = timeout(Duration::from_secs(2), client.receive()).await??;
+    if !matches!(frame.message, Message::PunchGrant(_)) {
+        return Err("expected coordinated punch grant".into());
+    }
     Ok(())
 }
 
@@ -350,6 +388,171 @@ async fn accepted_session_routes_bounded_relay_ciphertext_to_authenticated_peer(
     let received = timeout(Duration::from_secs(2), b.receive()).await??;
     let routed = PeerRelayFrame::from_protocol_message(received.message)?;
     assert_eq!(routed, relay);
+    shutdown.cancel();
+    task.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn delayed_datagram_relay_survives_candidate_generation_advance_until_close()
+-> Result<(), AnyError> {
+    let pki = TestPki::generate()?;
+    let a_key = DeviceKeypair::from_secret_bytes([73; 32]);
+    let b_key = DeviceKeypair::from_secret_bytes([74; 32]);
+    let (address, _coordinator, shutdown, task) = start_server(
+        &pki,
+        vec![authorized("a", &a_key, true), authorized("b", &b_key, true)],
+        ServerRuntimeLimits::default(),
+    )
+    .await?;
+    let mut a = Client::connect(&pki, address, "a", &a_key, V02, vec![]).await?;
+    let mut b = Client::connect(&pki, address, "b", &b_key, V02, vec![]).await?;
+    let expires = future_expiry();
+
+    a.send_envelope(&envelope(
+        72,
+        "a",
+        "b",
+        1,
+        expires,
+        RendezvousPayload::Request(RendezvousRequest {
+            export: text("dns"),
+        }),
+    ))
+    .await?;
+    let _ = b.receive_envelope().await?;
+    b.send_envelope(&envelope(
+        72,
+        "b",
+        "a",
+        2,
+        expires,
+        RendezvousPayload::ProviderDecision(ProviderDecision::accepted(TunnelProtocol::UDP)),
+    ))
+    .await?;
+    let _ = a.receive_envelope().await?;
+
+    send_and_forward(
+        &mut a,
+        &mut b,
+        envelope(72, "a", "b", 3, expires, candidate_set(true, 0x31)),
+    )
+    .await?;
+    send_and_forward(
+        &mut b,
+        &mut a,
+        envelope(72, "b", "a", 4, expires, candidate_set(false, 0x32)),
+    )
+    .await?;
+    tokio::try_join!(receive_punch(&mut a), receive_punch(&mut b))?;
+    send_and_forward(
+        &mut a,
+        &mut b,
+        envelope(
+            72,
+            "a",
+            "b",
+            5,
+            expires,
+            RendezvousPayload::RelayRequest(RelayRequest { datagram: true }),
+        ),
+    )
+    .await?;
+    send_and_forward(
+        &mut b,
+        &mut a,
+        envelope(
+            72,
+            "b",
+            "a",
+            6,
+            expires,
+            RendezvousPayload::RelayRequest(RelayRequest { datagram: true }),
+        ),
+    )
+    .await?;
+
+    tokio::time::sleep(Duration::from_millis(260)).await;
+    let generation_two = CandidateGeneration::new(2).unwrap();
+    send_and_forward(
+        &mut a,
+        &mut b,
+        with_generation(
+            envelope(72, "a", "b", 7, expires, candidate_set(true, 0x41)),
+            generation_two,
+        ),
+    )
+    .await?;
+    send_and_forward(
+        &mut b,
+        &mut a,
+        with_generation(
+            envelope(72, "b", "a", 8, expires, candidate_set(false, 0x42)),
+            generation_two,
+        ),
+    )
+    .await?;
+    tokio::try_join!(receive_punch(&mut a), receive_punch(&mut b))?;
+
+    let outbound = PeerRelayFrame::new(
+        SessionId::from([72; 32]),
+        1,
+        0,
+        PeerRelayFlags::DATAGRAM,
+        vec![0xa5; 48],
+    )?;
+    a.send(V02, outbound.to_protocol_message()?).await?;
+    let routed = timeout(Duration::from_secs(2), b.receive()).await??;
+    assert_eq!(
+        PeerRelayFrame::from_protocol_message(routed.message)?,
+        outbound
+    );
+    let reply = PeerRelayFrame::new(
+        SessionId::from([72; 32]),
+        1,
+        0,
+        PeerRelayFlags::DATAGRAM,
+        vec![0xb6; 32],
+    )?;
+    b.send(V02, reply.to_protocol_message()?).await?;
+    let routed = timeout(Duration::from_secs(2), a.receive()).await??;
+    assert_eq!(
+        PeerRelayFrame::from_protocol_message(routed.message)?,
+        reply
+    );
+
+    let unknown = PeerRelayFrame::new(
+        SessionId::from([73; 32]),
+        1,
+        0,
+        PeerRelayFlags::DATAGRAM,
+        vec![0xc7; 16],
+    )?;
+    a.send(V02, unknown.to_protocol_message()?).await?;
+    let rejected = timeout(Duration::from_secs(2), a.receive()).await??;
+    assert!(
+        matches!(rejected.message, Message::Error(ref error) if error.code == ProtocolErrorCode::INVALID_STATE)
+    );
+
+    a.send_envelope(&with_generation(
+        envelope(
+            72,
+            "a",
+            "b",
+            9,
+            expires,
+            RendezvousPayload::Close(RendezvousClose { detail: None }),
+        ),
+        generation_two,
+    ))
+    .await?;
+    let _ = b.receive_envelope().await?;
+    a.send(V02, outbound.to_protocol_message()?).await?;
+    let revoked = timeout(Duration::from_secs(2), a.receive()).await??;
+    assert!(
+        matches!(revoked.message, Message::Error(ref error) if error.code == ProtocolErrorCode::INVALID_STATE)
+    );
+
     shutdown.cancel();
     task.await??;
     Ok(())
@@ -696,7 +899,6 @@ async fn expiry_removes_the_session_and_notifies_both_authenticated_peers() -> R
     );
     a.send_envelope(&request).await?;
     assert_eq!(b.receive_envelope().await?, request);
-
     let a_notice = timeout(Duration::from_secs(3), receive_notice(&mut a)).await??;
     let b_notice = timeout(Duration::from_secs(3), receive_notice(&mut b)).await??;
     for notice in [a_notice, b_notice] {
