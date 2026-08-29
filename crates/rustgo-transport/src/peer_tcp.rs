@@ -2,7 +2,7 @@ use std::{
     fmt,
     net::SocketAddr,
     sync::{Arc, Mutex as StdMutex},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
@@ -247,6 +247,7 @@ pub struct TcpPathAttempt {
     connect_timeout: Duration,
     authentication_timeout: Duration,
     authentication_factory: Arc<dyn PeerTcpAuthenticationFactory>,
+    not_before_unix_millis: Option<u64>,
 }
 
 impl TcpPathAttempt {
@@ -263,7 +264,13 @@ impl TcpPathAttempt {
             connect_timeout,
             authentication_timeout,
             authentication_factory,
+            not_before_unix_millis: None,
         }
+    }
+
+    pub fn with_not_before_unix_millis(mut self, value: u64) -> Self {
+        self.not_before_unix_millis = Some(value);
+        self
     }
 }
 
@@ -274,6 +281,18 @@ impl PathAttempt for TcpPathAttempt {
     }
 
     async fn connect(&self, cancellation: CancellationToken) -> Result<SelectedPath, PathError> {
+        if let Some(not_before) = self.not_before_unix_millis {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default();
+            let start = Duration::from_millis(not_before);
+            if start > now {
+                tokio::select! {
+                    () = cancellation.cancelled() => return Err(PathError::Cancelled),
+                    () = tokio::time::sleep(start - now) => {}
+                }
+            }
+        }
         // Consume the rendezvous ephemeral exactly once per path-manager invocation. Candidate
         // pipelines share only this opaque derived authenticator; the private key is never cloned.
         let session_authentication = self

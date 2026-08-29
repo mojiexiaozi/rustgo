@@ -1302,16 +1302,22 @@ impl Actor {
                     ))
                 }
             }
-            CandidateTransport::NativeTcp => Arc::new(TcpPathAttempt::new(
-                local,
-                vec![remote],
-                Duration::from_secs(p2p.direct_timeout_secs),
-                Duration::from_secs(5),
-                Arc::new(OneTcpAuth(Mutex::new(Some(
-                    PeerTcpAuthentication::new(session.role, local_key, transcript)
-                        .map_err(|_| invalid())?,
-                )))),
-            )),
+            CandidateTransport::NativeTcp => {
+                let grant = session.punch_grant.as_ref().ok_or_else(invalid)?;
+                Arc::new(
+                    TcpPathAttempt::new(
+                        local,
+                        vec![remote],
+                        Duration::from_secs(p2p.direct_timeout_secs),
+                        Duration::from_secs(5),
+                        Arc::new(OneTcpAuth(Mutex::new(Some(
+                            PeerTcpAuthentication::new(session.role, local_key, transcript)
+                                .map_err(|_| invalid())?,
+                        )))),
+                    )
+                    .with_not_before_unix_millis(grant.start_unix_millis),
+                )
+            }
             CandidateTransport::Relay => return Err(invalid()),
         };
         session.direct_started = true;
