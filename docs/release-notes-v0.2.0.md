@@ -20,7 +20,8 @@ encrypted relay path remains available when configured.
 
 The verified commit is `dac2930`. The deployed Linux `rustgos` SHA-256 is
 `41b2147b795f9adff30cd7637d0788db52aae5b6a0dd4119e76646a6352dc9c9` and
-the rollback backup is `/opt/rustgo/backups/v0.2-20260829T130952Z`. Windows and
+the dereferenced rollback binary is
+`/opt/rustgo/backups/v0.2-20260829T130952Z/rustgos.v0.1`. Windows and
 Linux process gates and two Linux namespace passes completed successfully;
 `frps` retained its original PID, listeners, and binary hash. No generated
 private key or certificate is included in the repository or release artifact.
