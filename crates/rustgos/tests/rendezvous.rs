@@ -559,6 +559,156 @@ async fn delayed_datagram_relay_survives_candidate_generation_advance_until_clos
 }
 
 #[tokio::test]
+async fn partial_relay_requests_cannot_compose_across_candidate_generations() -> Result<(), AnyError>
+{
+    let pki = TestPki::generate()?;
+    let a_key = DeviceKeypair::from_secret_bytes([75; 32]);
+    let b_key = DeviceKeypair::from_secret_bytes([76; 32]);
+    let (address, _coordinator, shutdown, task) = start_server(
+        &pki,
+        vec![authorized("a", &a_key, true), authorized("b", &b_key, true)],
+        ServerRuntimeLimits::default(),
+    )
+    .await?;
+    let mut a = Client::connect(&pki, address, "a", &a_key, V02, vec![]).await?;
+    let mut b = Client::connect(&pki, address, "b", &b_key, V02, vec![]).await?;
+    let expires = future_expiry();
+
+    send_and_forward(
+        &mut a,
+        &mut b,
+        envelope(
+            74,
+            "a",
+            "b",
+            1,
+            expires,
+            RendezvousPayload::Request(RendezvousRequest {
+                export: text("dns"),
+            }),
+        ),
+    )
+    .await?;
+    send_and_forward(
+        &mut b,
+        &mut a,
+        envelope(
+            74,
+            "b",
+            "a",
+            2,
+            expires,
+            RendezvousPayload::ProviderDecision(ProviderDecision::accepted(TunnelProtocol::UDP)),
+        ),
+    )
+    .await?;
+    send_and_forward(
+        &mut a,
+        &mut b,
+        envelope(74, "a", "b", 3, expires, candidate_set(true, 0x51)),
+    )
+    .await?;
+    send_and_forward(
+        &mut b,
+        &mut a,
+        envelope(74, "b", "a", 4, expires, candidate_set(false, 0x52)),
+    )
+    .await?;
+    tokio::try_join!(receive_punch(&mut a), receive_punch(&mut b))?;
+
+    send_and_forward(
+        &mut a,
+        &mut b,
+        envelope(
+            74,
+            "a",
+            "b",
+            5,
+            expires,
+            RendezvousPayload::RelayRequest(RelayRequest { datagram: true }),
+        ),
+    )
+    .await?;
+    tokio::time::sleep(Duration::from_millis(260)).await;
+    let generation_two = CandidateGeneration::new(2).unwrap();
+    send_and_forward(
+        &mut a,
+        &mut b,
+        with_generation(
+            envelope(74, "a", "b", 6, expires, candidate_set(true, 0x61)),
+            generation_two,
+        ),
+    )
+    .await?;
+    send_and_forward(
+        &mut b,
+        &mut a,
+        with_generation(
+            envelope(74, "b", "a", 7, expires, candidate_set(false, 0x62)),
+            generation_two,
+        ),
+    )
+    .await?;
+    tokio::try_join!(receive_punch(&mut a), receive_punch(&mut b))?;
+
+    send_and_forward(
+        &mut b,
+        &mut a,
+        with_generation(
+            envelope(
+                74,
+                "b",
+                "a",
+                8,
+                expires,
+                RendezvousPayload::RelayRequest(RelayRequest { datagram: true }),
+            ),
+            generation_two,
+        ),
+    )
+    .await?;
+    let frame = PeerRelayFrame::new(
+        SessionId::from([74; 32]),
+        1,
+        0,
+        PeerRelayFlags::DATAGRAM,
+        vec![0xe9; 24],
+    )?;
+    b.send(V02, frame.to_protocol_message()?).await?;
+    let rejected = timeout(Duration::from_secs(2), b.receive()).await??;
+    assert!(
+        matches!(rejected.message, Message::Error(ref error) if error.code == ProtocolErrorCode::INVALID_STATE)
+    );
+
+    send_and_forward(
+        &mut a,
+        &mut b,
+        with_generation(
+            envelope(
+                74,
+                "a",
+                "b",
+                9,
+                expires,
+                RendezvousPayload::RelayRequest(RelayRequest { datagram: true }),
+            ),
+            generation_two,
+        ),
+    )
+    .await?;
+    b.send(V02, frame.to_protocol_message()?).await?;
+    let routed = timeout(Duration::from_secs(2), a.receive()).await??;
+    assert_eq!(
+        PeerRelayFrame::from_protocol_message(routed.message)?,
+        frame
+    );
+
+    shutdown.cancel();
+    task.await??;
+    Ok(())
+}
+
+#[tokio::test]
 async fn admission_rejects_untrusted_identity_target_and_capacity_inputs() -> Result<(), AnyError> {
     let pki = TestPki::generate()?;
     let a_key = DeviceKeypair::from_secret_bytes([1; 32]);

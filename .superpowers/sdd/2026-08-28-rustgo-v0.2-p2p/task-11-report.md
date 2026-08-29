@@ -172,3 +172,22 @@ Task 12 namespace topology and Task 13 packaging/deployment were not implemented
   `cargo test -p rustgoc --test peer_process -- --nocapture --test-threads=1` passed;
   `cargo clippy -p rustgos -p rustgoc --all-targets -- -D warnings` passed, as did
   `cargo fmt --all -- --check` and `git diff --check`.
+
+## Cross-generation partial relay authorization fence (2026-08-29)
+
+- CandidateSetV2 advancement now preserves relay state only when both participants had
+  already authorized the relay before the generation boundary. Any partial
+  `requested_by` state and its associated datagram/rate admission are reset when the
+  session advances, so requests from different generations cannot compose into an
+  authorization.
+- A real TLS control regression covers one initiator request in generation 1, advances
+  the same accepted datagram session to generation 2, and proves the responder's lone
+  generation-2 request still rejects an opaque frame. A fresh initiator request in
+  generation 2 then completes bilateral authorization and the identical frame routes.
+  The existing regression continues to prove that a relay already bilateral before a
+  recheck remains usable across the generation advance.
+- Final evidence:
+  `cargo test -p rustgos --test rendezvous -- --test-threads=1` passed 11/11;
+  `cargo test -p rustgoc --test peer_process -- --nocapture --test-threads=1` passed;
+  `cargo clippy -p rustgos -p rustgoc --all-targets -- -D warnings` passed, as did
+  `cargo fmt --all -- --check` and `git diff --check`.
