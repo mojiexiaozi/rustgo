@@ -18,6 +18,35 @@ use tokio::{
 const SERVER_NAME: &str = "peer-process.test";
 
 struct Children(Vec<Child>);
+impl Children {
+    async fn shutdown(&mut self) -> Result<(), Box<dyn Error + Send + Sync>> {
+        for child in &mut self.0 {
+            if let Some(status) = child.try_wait()? {
+                return Err(format!(
+                    "owned process {} exited before shutdown: {status}",
+                    child.id()
+                )
+                .into());
+            }
+            child.kill()?;
+            let status = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Some(status) = child.try_wait()? {
+                        return Ok::<_, std::io::Error>(status);
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .map_err(|_| format!("timed out reaping owned process {}", child.id()))??;
+            if status.success() {
+                return Err(format!("killed owned process {} reported success", child.id()).into());
+            }
+        }
+        self.0.clear();
+        Ok(())
+    }
+}
 impl Drop for Children {
     fn drop(&mut self) {
         for child in &mut self.0 {
@@ -306,12 +335,53 @@ listen_addr = "127.0.0.1:{udp_forward}"
             4,
             "each transferred open must have a distinct correlated session: {flows:?}"
         );
+    } else {
+        let consumer_log = fs::read_to_string(consumer_config.with_extension("log"))?;
+        let flows = selected_flows(&consumer_log);
+        let tcp = flows
+            .iter()
+            .filter(|flow| flow.export == "tcp-echo")
+            .collect::<Vec<_>>();
+        let udp = flows
+            .iter()
+            .filter(|flow| flow.export == "udp-echo")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tcp.len(),
+            1,
+            "forced relay must select exactly one transferred TCP open: {flows:?}"
+        );
+        assert_eq!(
+            udp.len(),
+            1,
+            "forced relay must select exactly one transferred UDP open: {flows:?}"
+        );
+        assert_flow(tcp[0], "Tcp", "Relay");
+        assert_flow(udp[0], "Udp", "Relay");
+        assert_ne!(
+            tcp[0].session_id, udp[0].session_id,
+            "TCP and UDP opens must be independently correlated"
+        );
     }
 
-    drop(children);
+    drop(stream);
+    drop(udp);
+    children.shutdown().await?;
     echo_shutdown.cancel();
     tcp_task.await?;
     udp_task.await?;
+    StdTcpListener::bind(("127.0.0.1", server_port))?;
+    StdTcpListener::bind(("127.0.0.1", tcp_forward))?;
+    StdUdpSocket::bind(("127.0.0.1", udp_forward))?;
+    StdUdpSocket::bind(("127.0.0.1", observation_primary))?;
+    StdUdpSocket::bind(("127.0.0.1", observation_alternate))?;
+    let root_path = root.path().to_path_buf();
+    root.close()?;
+    assert!(
+        !root_path.exists(),
+        "owned temporary directory remains: {}",
+        root_path.display()
+    );
     Ok(())
 }
 
