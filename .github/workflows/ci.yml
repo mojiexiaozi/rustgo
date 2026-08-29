@@ -44,6 +44,11 @@ jobs:
       - run: cargo test --workspace
       - name: Release E2E
         run: bash scripts/e2e.sh
+      - name: Complex NAT namespace gate
+        run: |
+          sudo env "PATH=$PATH" bash tests/netns/run.sh all
+          sudo env "PATH=$PATH" bash tests/netns/run.sh all
+          sudo bash tests/netns/assert_cleanup.sh
 
   windows:
     name: Windows
