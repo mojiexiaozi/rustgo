@@ -1146,7 +1146,8 @@ impl Actor {
         let peer_candidate = session
             .peer_candidates
             .iter()
-            .find(|candidate| candidate.transport == transport)
+            .filter(|candidate| candidate.transport == transport)
+            .max_by_key(|candidate| candidate.priority)
             .cloned();
         let Some(peer_candidate) = peer_candidate else {
             session.direct_failed = true;
