@@ -466,7 +466,8 @@ assert_changed_observation_mappings() {
 }
 
 direct_drop_count() {
-    local namespace=$1 protocol=$2 range=$3 evidence=$RG_STATE_DIR/direct-drop-${namespace##*-}-${protocol}.txt
+    local namespace=$1 protocol=$2 range=$3 evidence
+    evidence=$RG_STATE_DIR/direct-drop-${namespace##*-}-${protocol}.txt
     if [ "$RG_FIREWALL" = nft ]; then
         ip netns exec "$namespace" nft list chain ip rustgo_netns forward >"$evidence"
         awk -v p="$protocol" -v r="${range/:/-}" '
