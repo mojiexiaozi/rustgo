@@ -2186,7 +2186,19 @@ fn local_socket(
         CandidateTransport::Relay => return Err(invalid()),
     };
     let width = u32::from(range.end) - u32::from(range.start) + 1;
-    let marker = u32::from_be_bytes(id.as_bytes()[..4].try_into().expect("fixed session id"));
+    let session_marker =
+        u32::from_be_bytes(id.as_bytes()[..4].try_into().expect("fixed session id"));
+    let client_marker = config
+        .client
+        .name
+        .bytes()
+        .fold(2_166_136_261_u32, |hash, byte| {
+            hash.wrapping_mul(16_777_619) ^ u32::from(byte)
+        });
+    // Both peers share a session id. Salt the deterministic choice with the
+    // authenticated client name so simultaneous NAT mappings do not compete
+    // for the same public five-tuple.
+    let marker = session_marker ^ client_marker;
     let port = u32::from(range.start) + marker % width;
     Ok(SocketAddr::new(
         local_ip(config)?,
