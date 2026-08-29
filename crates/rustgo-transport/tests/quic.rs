@@ -447,6 +447,67 @@ async fn path_attempt_cancellation_releases_its_fresh_udp_endpoint() {
 }
 
 #[tokio::test]
+async fn observed_fixed_socket_is_the_exact_socket_transferred_to_quic_and_released() {
+    let config = QuicPeerConfig::default();
+    let server_endpoint = QuicPeerEndpoint::bind(loopback(), config.clone()).unwrap();
+    let retained = UdpSocket::bind(loopback()).unwrap();
+    let observed_local = retained.local_addr().unwrap();
+    let simulated_external_mapping = SocketAddr::new(
+        observed_local.ip(),
+        observed_local
+            .port()
+            .checked_add(1)
+            .unwrap_or(observed_local.port() - 1),
+    );
+    let (client_auth, server_auth) = authentication_pair();
+    let attempt = QuicPathAttempt::with_socket(
+        retained,
+        server_endpoint.local_addr().unwrap(),
+        config,
+        QueueAuthenticationFactory::new([client_auth]),
+    )
+    .unwrap();
+
+    assert!(
+        UdpSocket::bind(observed_local).is_err(),
+        "fixed observation tuple must stay owned before QUIC starts"
+    );
+    let cancellation = CancellationToken::new();
+    let (server, selected) = tokio::join!(
+        server_endpoint.accept(server_auth, CancellationToken::new()),
+        attempt.connect(cancellation.clone()),
+    );
+    let server = server.unwrap();
+    let selected = selected.unwrap();
+    assert_eq!(
+        selected
+            .handle::<QuicPeerPathHandle>()
+            .unwrap()
+            .local_addr()
+            .unwrap(),
+        observed_local
+    );
+    assert_ne!(
+        observed_local, simulated_external_mapping,
+        "external candidate metadata must never replace the owned local tuple"
+    );
+
+    cancellation.cancel();
+    drop(selected);
+    drop(server);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if let Ok(socket) = UdpSocket::bind(observed_local) {
+                break socket;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("teardown must release the observed fixed tuple");
+}
+
+#[tokio::test]
 async fn selected_path_token_releases_socket_while_opaque_handle_is_still_retained() {
     let config = QuicPeerConfig::default();
     let server_endpoint = QuicPeerEndpoint::bind(loopback(), config.clone()).unwrap();

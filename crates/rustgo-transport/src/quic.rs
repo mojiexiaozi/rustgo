@@ -178,6 +178,24 @@ impl QuicPeerEndpoint {
         })
     }
 
+    pub fn from_socket(socket: UdpSocket, config: QuicPeerConfig) -> Result<Self, QuicPeerError> {
+        let server_config = server_config(&config)?;
+        let mut endpoint = quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            Some(server_config),
+            socket,
+            Arc::new(quinn::TokioRuntime),
+        )
+        .map_err(QuicPeerError::EndpointIo)?;
+        endpoint.set_default_client_config(client_config(&config)?);
+        Ok(Self {
+            inner: Arc::new(EndpointOwner {
+                endpoint: Mutex::new(Some(endpoint)),
+            }),
+            config,
+        })
+    }
+
     pub fn local_addr(&self) -> Result<SocketAddr, QuicPeerError> {
         self.inner
             .endpoint()?
@@ -461,6 +479,7 @@ pub struct QuicPathAttempt {
     config: QuicPeerConfig,
     authentication_factory: Arc<dyn PeerAuthenticationFactory>,
     kind: PathKind,
+    socket: Mutex<Option<UdpSocket>>,
 }
 
 impl QuicPathAttempt {
@@ -481,7 +500,20 @@ impl QuicPathAttempt {
             config,
             authentication_factory,
             kind,
+            socket: Mutex::new(None),
         }
+    }
+
+    pub fn with_socket(
+        socket: UdpSocket,
+        remote_addr: SocketAddr,
+        config: QuicPeerConfig,
+        authentication_factory: Arc<dyn PeerAuthenticationFactory>,
+    ) -> Result<Self, QuicPeerError> {
+        let local_addr = socket.local_addr().map_err(QuicPeerError::EndpointIo)?;
+        let mut attempt = Self::new(local_addr, remote_addr, config, authentication_factory);
+        attempt.socket = Mutex::new(Some(socket));
+        Ok(attempt)
     }
 }
 
@@ -495,8 +527,16 @@ impl PathAttempt for QuicPathAttempt {
         if cancellation.is_cancelled() {
             return Err(PathError::Cancelled);
         }
-        let endpoint = QuicPeerEndpoint::bind(self.local_addr, self.config.clone())
-            .map_err(|_| PathError::AttemptFailed(self.kind))?;
+        let socket = self
+            .socket
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let endpoint = match socket {
+            Some(socket) => QuicPeerEndpoint::from_socket(socket, self.config.clone()),
+            None => QuicPeerEndpoint::bind(self.local_addr, self.config.clone()),
+        }
+        .map_err(|_| PathError::AttemptFailed(self.kind))?;
         let authentication = match self.authentication_factory.create() {
             Ok(authentication) => authentication,
             Err(QuicPeerError::Cancelled) => {

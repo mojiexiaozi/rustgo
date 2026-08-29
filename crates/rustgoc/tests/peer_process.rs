@@ -162,9 +162,28 @@ listen_addr = "127.0.0.1:{udp_forward}"
     children.0.push(spawn("rustgos", &server_config)?);
     wait_tcp(SocketAddr::from(([127, 0, 0, 1], server_port))).await?;
     children.0.push(spawn("rustgoc", &provider_config)?);
+    wait_for_log(
+        &provider_config.with_extension("log"),
+        "client tunnel registration ready",
+        1,
+    )
+    .await?;
     children.0.push(spawn("rustgoc", &consumer_config)?);
 
-    let mut stream = wait_tcp(SocketAddr::from(([127, 0, 0, 1], tcp_forward))).await?;
+    let mut stream = match wait_tcp(SocketAddr::from(([127, 0, 0, 1], tcp_forward))).await {
+        Ok(stream) => stream,
+        Err(error) => {
+            eprintln!(
+                "consumer log:\n{}",
+                fs::read_to_string(consumer_config.with_extension("log")).unwrap_or_default()
+            );
+            eprintln!(
+                "provider log:\n{}",
+                fs::read_to_string(provider_config.with_extension("log")).unwrap_or_default()
+            );
+            return Err(error);
+        }
+    };
     eprintln!("tcp forward accepted");
     stream.write_all(b"tcp-process-e2e").await?;
     let mut echoed = vec![0_u8; 15];
@@ -175,16 +194,34 @@ listen_addr = "127.0.0.1:{udp_forward}"
     if prefer_direct {
         // The first stream stays on relay while generation 2 authenticates. A new
         // open then consumes the atomically promoted direct preference.
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        wait_for_log_pair(
+            &consumer_config.with_extension("log"),
+            &provider_config.with_extension("log"),
+            "fresh direct path promoted for subsequent service opens",
+            1,
+        )
+        .await?;
         let mut promoted =
             TcpStream::connect(SocketAddr::from(([127, 0, 0, 1], tcp_forward))).await?;
         promoted.write_all(b"tcp-promoted").await?;
         let mut promoted_echo = vec![0_u8; 12];
-        tokio::time::timeout(
+        let promoted_result = tokio::time::timeout(
             Duration::from_secs(15),
             promoted.read_exact(&mut promoted_echo),
         )
-        .await??;
+        .await;
+        if let Err(error) = promoted_result
+            .as_ref()
+            .map_err(|_| "timeout")
+            .and_then(|value| value.as_ref().map(|_| ()).map_err(|_| "io"))
+        {
+            eprintln!(
+                "promoted TCP failed ({error}); consumer:\n{}\nprovider:\n{}",
+                fs::read_to_string(consumer_config.with_extension("log")).unwrap_or_default(),
+                fs::read_to_string(provider_config.with_extension("log")).unwrap_or_default()
+            );
+        }
+        promoted_result??;
         assert_eq!(promoted_echo, b"tcp-promoted");
         eprintln!("promoted tcp echoed");
     }
@@ -202,7 +239,13 @@ listen_addr = "127.0.0.1:{udp_forward}"
     eprintln!("initial udp echoed");
 
     if prefer_direct {
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        wait_for_log_pair(
+            &consumer_config.with_extension("log"),
+            &provider_config.with_extension("log"),
+            "fresh direct path promoted for subsequent service opens",
+            2,
+        )
+        .await?;
         let promoted_udp = UdpSocket::bind("127.0.0.1:0").await?;
         promoted_udp
             .send_to(
@@ -226,6 +269,9 @@ listen_addr = "127.0.0.1:{udp_forward}"
             consumer_log.contains("fresh direct path promoted for subsequent service opens"),
             "direct promotion missing:\nCONSUMER\n{consumer_log}\nPROVIDER\n{provider_log}\nSERVER\n{server_log}"
         );
+        assert!(consumer_log.contains("selected promoted direct path for new service open"));
+        assert!(consumer_log.contains("path=NativeTcp"));
+        assert!(consumer_log.contains("path=QuicV4"));
     }
 
     drop(children);
@@ -291,6 +337,49 @@ fn spawn(package: &str, config: &Path) -> Result<Child, Box<dyn Error>> {
         command.env("RUSTGO_INTERNAL_TEST_FORCE_INITIAL_RELAY", "1");
     }
     Ok(command.spawn()?)
+}
+
+async fn wait_for_log_pair(
+    first: &Path,
+    second: &Path,
+    needle: &str,
+    count: usize,
+) -> Result<(), Box<dyn Error>> {
+    let waited = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let first_ready =
+                fs::read_to_string(first).is_ok_and(|value| value.matches(needle).count() >= count);
+            let second_ready = fs::read_to_string(second)
+                .is_ok_and(|value| value.matches(needle).count() >= count);
+            if first_ready && second_ready {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    if waited.is_err() {
+        eprintln!(
+            "log wait failed first:\n{}\nsecond:\n{}",
+            fs::read_to_string(first).unwrap_or_default(),
+            fs::read_to_string(second).unwrap_or_default()
+        );
+    }
+    waited?;
+    Ok(())
+}
+
+async fn wait_for_log(path: &Path, needle: &str, count: usize) -> Result<(), Box<dyn Error>> {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if fs::read_to_string(path).is_ok_and(|value| value.matches(needle).count() >= count) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await?;
+    Ok(())
 }
 
 async fn wait_tcp(address: SocketAddr) -> Result<TcpStream, Box<dyn Error>> {

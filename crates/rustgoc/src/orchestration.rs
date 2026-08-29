@@ -1,7 +1,7 @@
 //! Production ownership for P2P control events and relay-backed forward I/O.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     future::Future,
     io,
     net::{IpAddr, SocketAddr, ToSocketAddrs},
@@ -39,6 +39,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::UdpSocket,
     sync::{mpsc, oneshot},
+    task::JoinSet,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -57,6 +58,7 @@ const AUTH_RECORD: &[u8] = b"rustgo-relay-auth-v1";
 const OPEN_OK: &[u8] = b"rustgo-relay-open-ok-v1";
 const OPEN_REJECTED: &[u8] = b"rustgo-relay-open-rejected-v1";
 const MAX_RELAY_PLAINTEXT: usize = 60 * 1024;
+type OpenReply = oneshot::Sender<io::Result<OpenedIo>>;
 
 #[derive(Clone)]
 pub(crate) struct ProductionPeerRuntime {
@@ -249,7 +251,10 @@ enum ActorInput {
         cancellation: CancellationToken,
         reply: oneshot::Sender<Result<Vec<Arc<dyn PathAttempt>>, PathError>>,
     },
-    ObservationResult(io::Result<Vec<rustgo_protocol::SocketAddress>>),
+    ObservationResult {
+        session_id: SessionId,
+        result: io::Result<(std::net::UdpSocket, Vec<rustgo_protocol::SocketAddress>)>,
+    },
     Sweep,
 }
 
@@ -265,8 +270,9 @@ struct Actor {
     input: mpsc::Receiver<ActorInput>,
     shutdown: CancellationToken,
     sessions: HashMap<SessionId, Session>,
-    observed_udp: Vec<rustgo_protocol::SocketAddress>,
+    observation_waiters: VecDeque<SessionId>,
     promoted: HashSet<(String, String, TunnelProtocol)>,
+    tasks: JoinSet<()>,
 }
 
 struct Session {
@@ -297,6 +303,8 @@ struct Session {
     manager: Option<Arc<PathManager>>,
     relay_ready: Option<Arc<RelayReady>>,
     candidate_sent_generation: u64,
+    quic_socket: Option<std::net::UdpSocket>,
+    observed_udp: Vec<rustgo_protocol::SocketAddress>,
 }
 
 impl Actor {
@@ -312,27 +320,20 @@ impl Actor {
             input,
             shutdown,
             sessions: HashMap::new(),
-            observed_udp: Vec::new(),
+            observation_waiters: VecDeque::new(),
             promoted: HashSet::new(),
+            tasks: JoinSet::new(),
         }
     }
 
     async fn run(mut self) {
-        if self.observation_endpoints().is_some() {
-            let _ = self
-                .context
-                .send_peer_control(
-                    Message::ObservationGrantRequest(rustgo_protocol::ObservationGrantRequest {}),
-                    &self.shutdown,
-                )
-                .await;
-        }
         let mut sweep = tokio::time::interval(Duration::from_secs(1));
         while let Some(input) = tokio::select! {
             biased;
             () = self.shutdown.cancelled() => None,
             input = self.input.recv() => input,
             _ = sweep.tick() => Some(ActorInput::Sweep),
+            joined = self.tasks.join_next(), if !self.tasks.is_empty() => { let _ = joined; Some(ActorInput::Sweep) },
         } {
             let result = match input {
                 ActorInput::Open {
@@ -378,21 +379,26 @@ impl Actor {
                     self.begin_recheck(session_id, generation, cancellation, reply)
                         .await
                 }
-                ActorInput::ObservationResult(result) => {
-                    match result {
-                        Ok(addresses) => {
-                            self.observed_udp = addresses;
-                            tracing::info!(
-                                count = self.observed_udp.len(),
-                                "authenticated NAT observation candidates ready"
-                            );
+                ActorInput::ObservationResult { session_id, result } => match result {
+                    Ok((socket, addresses)) => {
+                        if let Some(session) = self.sessions.get_mut(&session_id) {
+                            session.quic_socket = Some(socket);
+                            session.observed_udp = addresses;
                         }
-                        Err(error) => {
-                            tracing::warn!(error = %error, "NAT observation failed; relay fallback remains available")
+                        tracing::info!(
+                            session = ?session_id,
+                            "authenticated NAT observation candidates ready"
+                        );
+                        match self.send_candidates(session_id).await {
+                            Ok(()) => self.ensure_direct(session_id).await,
+                            Err(error) => Err(error),
                         }
                     }
-                    Ok(())
-                }
+                    Err(error) => {
+                        tracing::warn!(error = %error, "NAT observation failed; relay fallback remains available");
+                        Ok(())
+                    }
+                },
                 ActorInput::Sweep => {
                     self.expire_sessions();
                     Ok(())
@@ -403,12 +409,23 @@ impl Actor {
             }
             self.remove_cancelled();
         }
+        let mut managers = Vec::new();
         for (_, mut session) in self.sessions.drain() {
             session.cancellation.cancel();
+            if let Some(manager) = session.manager.take() {
+                managers.push(manager);
+            }
             if let Some(reply) = session.reply.take() {
                 let _ = reply.send(Err(closed()));
             }
         }
+        for manager in managers {
+            let _ = manager.close().await;
+        }
+        let _ = tokio::time::timeout(Duration::from_secs(5), async {
+            while self.tasks.join_next().await.is_some() {}
+        })
+        .await;
     }
 
     async fn begin_open(
@@ -475,8 +492,13 @@ impl Actor {
                 manager: None,
                 relay_ready: None,
                 candidate_sent_generation: 0,
+                quic_socket: None,
+                observed_udp: Vec::new(),
             },
         );
+        if !resolve_only {
+            self.request_observation(session_id).await?;
+        }
         self.send_envelope(&envelope).await
     }
 
@@ -503,9 +525,13 @@ impl Actor {
         session.manager = Some(manager.clone());
         let forced = std::env::var_os("RUSTGO_INTERNAL_TESTING").is_some()
             && std::env::var_os("RUSTGO_INTERNAL_TEST_FORCE_INITIAL_RELAY").is_some();
+        let promoted = session.protocol.is_some_and(|protocol| {
+            self.promoted
+                .contains(&(session.peer.clone(), session.export.clone(), protocol))
+        });
         let mut attempts = Vec::<Arc<dyn PathAttempt>>::new();
         if p2p.prefer_direct
-            && !forced
+            && (!forced || promoted)
             && let Some(direct) = session.direct_attempt.take()
         {
             attempts.push(direct);
@@ -519,7 +545,7 @@ impl Actor {
         });
         let cancellation = session.cancellation.child_token();
         let sender = self.runtime.commands.clone();
-        tokio::spawn(async move {
+        self.tasks.spawn(async move {
             let result = manager
                 .connect_with_recheck(attempts, factory, cancellation)
                 .await;
@@ -568,10 +594,13 @@ impl Actor {
         session.direct_failed = false;
         session.direct_attempt = None;
         session.recheck_reply = Some(reply);
+        session.quic_socket = None;
+        session.observed_udp.clear();
         tracing::info!(
             generation = next.get(),
             "starting fresh direct-path generation; active relay stays fenced for existing I/O"
         );
+        self.request_observation(id).await?;
         self.send_candidates(id).await
     }
 
@@ -611,7 +640,7 @@ impl Actor {
         ))
     }
 
-    fn handle_observation_grant(&self, grant: ObservationGrant) -> io::Result<()> {
+    fn handle_observation_grant(&mut self, grant: ObservationGrant) -> io::Result<()> {
         if grant.expires_unix_secs() <= now() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -621,13 +650,47 @@ impl Actor {
         let Some((primary, alternate)) = self.observation_endpoints() else {
             return Ok(());
         };
+        let session_id = self.observation_waiters.pop_front().ok_or_else(invalid)?;
+        let local = local_socket(
+            &self.runtime.config,
+            session_id,
+            CandidateTransport::QuicUdp,
+        )?;
+        let socket = std::net::UdpSocket::bind(local)?;
+        socket.set_nonblocking(true)?;
+        let observer = socket.try_clone()?;
         let sender = self.runtime.commands.clone();
-        let cancellation = self.shutdown.child_token();
-        tokio::spawn(async move {
-            let result = observe_nat(primary, alternate, grant, cancellation).await;
-            let _ = sender.send(ActorInput::ObservationResult(result)).await;
+        let cancellation = self
+            .sessions
+            .get(&session_id)
+            .ok_or_else(invalid)?
+            .cancellation
+            .child_token();
+        self.tasks.spawn(async move {
+            let result = match observe_nat(observer, primary, alternate, grant, cancellation).await {
+                Ok((_observer, addresses)) => Ok((socket, addresses)),
+                Err(error) => {
+                    tracing::warn!(error = %error, "NAT observation failed; retained fixed socket for local candidate and relay fallback");
+                    Ok((socket, Vec::new()))
+                }
+            };
+            let _ = sender.send(ActorInput::ObservationResult { session_id, result }).await;
         });
         Ok(())
+    }
+
+    async fn request_observation(&mut self, id: SessionId) -> io::Result<()> {
+        if self.observation_endpoints().is_none() {
+            return Ok(());
+        }
+        self.observation_waiters.push_back(id);
+        self.context
+            .send_peer_control(
+                Message::ObservationGrantRequest(rustgo_protocol::ObservationGrantRequest {}),
+                &self.shutdown,
+            )
+            .await
+            .map_err(|_| closed())
     }
 
     async fn handle_envelope(&mut self, envelope: RendezvousEnvelope) -> io::Result<()> {
@@ -685,8 +748,11 @@ impl Actor {
                     manager: None,
                     relay_ready: None,
                     candidate_sent_generation: 0,
+                    quic_socket: None,
+                    observed_udp: Vec::new(),
                 },
             );
+            self.request_observation(envelope.session_id).await?;
             self.lookup_identity(envelope.session_id).await?;
             return Ok(());
         }
@@ -755,6 +821,7 @@ impl Actor {
         let id = envelope.session_id;
         let incoming_generation = envelope.generation;
         let current_generation = self.sessions.get(&id).ok_or_else(invalid)?.generation;
+        let mut needs_observation = false;
         if incoming_generation != current_generation {
             if !matches!(envelope.payload, RendezvousPayload::CandidateSetV2(_))
                 || incoming_generation.get() != current_generation.get().saturating_add(1)
@@ -770,6 +837,12 @@ impl Actor {
             session.peer_candidates.clear();
             session.direct_started = false;
             session.direct_failed = false;
+            session.quic_socket = None;
+            session.observed_udp.clear();
+            needs_observation = true;
+        }
+        if needs_observation {
+            self.request_observation(id).await?;
         }
         {
             let session = self.sessions.get_mut(&id).ok_or_else(invalid)?;
@@ -901,6 +974,12 @@ impl Actor {
 
     async fn send_candidates(&mut self, id: SessionId) -> io::Result<()> {
         let session = self.sessions.get(&id).ok_or_else(invalid)?;
+        if session.protocol.is_none() || session.resolve_only {
+            return Ok(());
+        }
+        if self.observation_endpoints().is_some() && session.quic_socket.is_none() {
+            return Ok(());
+        }
         let bindings = session
             .local_ephemeral_public
             .iter()
@@ -915,7 +994,7 @@ impl Actor {
         let owner_is_initiator = session.role == PeerRole::Initiator;
         let mut candidates =
             local_candidates(&self.runtime.config, id, session.expiry, session.generation)?;
-        for (index, address) in self.observed_udp.iter().take(2).cloned().enumerate() {
+        for (index, address) in session.observed_udp.iter().take(2).cloned().enumerate() {
             candidates.push(Candidate {
                 transport: CandidateTransport::QuicUdp,
                 address,
@@ -958,6 +1037,7 @@ impl Actor {
                     .contains(&(session.peer.clone(), session.export.clone(), protocol))
             })
         });
+        let observation_enabled = self.observation_endpoints().is_some();
         let session = self.sessions.get_mut(&id).ok_or_else(invalid)?;
         let p2p = self.runtime.config.p2p.as_ref().ok_or_else(invalid)?;
         if session.direct_started || !p2p.prefer_direct || session.resolve_only {
@@ -972,6 +1052,12 @@ impl Actor {
         } else {
             CandidateTransport::NativeTcp
         };
+        if transport == CandidateTransport::QuicUdp
+            && observation_enabled
+            && session.quic_socket.is_none()
+        {
+            return Ok(());
+        }
         let peer_candidate = session
             .peer_candidates
             .iter()
@@ -1011,15 +1097,30 @@ impl Actor {
         let local = local_socket(&self.runtime.config, id, transport)?;
         let remote = socket_addr(&peer_candidate.address);
         let attempt: Arc<dyn PathAttempt> = match transport {
-            CandidateTransport::QuicUdp => Arc::new(QuicPathAttempt::new(
-                local,
-                remote,
-                QuicPeerConfig::default(),
-                Arc::new(OneQuicAuth(Mutex::new(Some(
+            CandidateTransport::QuicUdp => {
+                let auth = Arc::new(OneQuicAuth(Mutex::new(Some(
                     PeerAuthentication::new(session.role, local_key, transcript)
                         .map_err(|_| invalid())?,
-                )))),
-            )),
+                ))));
+                if let Some(socket) = session.quic_socket.take() {
+                    Arc::new(
+                        QuicPathAttempt::with_socket(
+                            socket,
+                            remote,
+                            QuicPeerConfig::default(),
+                            auth,
+                        )
+                        .map_err(|_| invalid())?,
+                    )
+                } else {
+                    Arc::new(QuicPathAttempt::new(
+                        local,
+                        remote,
+                        QuicPeerConfig::default(),
+                        auth,
+                    ))
+                }
+            }
             CandidateTransport::NativeTcp => Arc::new(TcpPathAttempt::new(
                 local,
                 vec![remote],
@@ -1054,14 +1155,31 @@ impl Actor {
                 self.ensure_relay_request(id).await
             }
             Ok(path) => {
+                let promoted_open = self.sessions.get(&id).is_some_and(|session| {
+                    session.protocol.is_some_and(|protocol| {
+                        self.promoted.contains(&(
+                            session.peer.clone(),
+                            session.export.clone(),
+                            protocol,
+                        ))
+                    })
+                });
                 let session = self.sessions.get_mut(&id).ok_or_else(invalid)?;
                 let role = session.role;
                 let protocol = session.protocol.ok_or_else(invalid)?;
                 let peer = session.peer.clone();
                 let export = session.export.clone();
-                let reply = session.reply.take();
+                let reply = if path.kind() == PathKind::Relay {
+                    None
+                } else {
+                    session.reply.take()
+                };
                 let cancellation = session.cancellation.child_token();
                 let exports = self.runtime.exports.clone();
+                tracing::info!(path = ?path.kind(), generation = session.generation.get(), peer = %peer, export = %export, promoted_open, "authoritative peer path selected");
+                if promoted_open && path.kind().is_direct() {
+                    tracing::info!(path = ?path.kind(), generation = session.generation.get(), peer = %peer, export = %export, "selected promoted direct path for new service open");
+                }
                 if path.kind().is_direct()
                     && session.generation != CandidateGeneration::INITIAL
                     && session.worker.is_some()
@@ -1071,7 +1189,12 @@ impl Actor {
                     return Ok(());
                 }
                 if path.kind() == PathKind::Relay {
-                    session.relay_ready.as_ref().ok_or_else(invalid)?.select();
+                    let relay_reply = session.reply.take();
+                    session
+                        .relay_ready
+                        .as_ref()
+                        .ok_or_else(invalid)?
+                        .select(relay_reply);
                     return Ok(());
                 }
                 if let Some(ready) = &session.relay_ready {
@@ -1079,13 +1202,13 @@ impl Actor {
                 }
                 if let Some(tcp) = path.handle::<EncryptedPeerTcp>() {
                     let sender = self.runtime.commands.clone();
-                    tokio::spawn(async move {
+                    self.tasks.spawn(async move {
                         run_direct_tcp(role, peer, export, tcp, exports, reply, cancellation).await;
                         let _ = sender.send(ActorInput::SessionFinished(id)).await;
                     });
                 } else if let Some(quic) = path.handle::<QuicPeerPathHandle>() {
                     let sender = self.runtime.commands.clone();
-                    tokio::spawn(async move {
+                    self.tasks.spawn(async move {
                         run_direct_quic(
                             role,
                             protocol,
@@ -1205,14 +1328,13 @@ impl Actor {
         let protocol = session.protocol.ok_or_else(invalid)?;
         let peer = session.peer.clone();
         let export = session.export.clone();
-        let reply = session.reply.take();
         let cancellation = session.cancellation.child_token();
         let context = self.context.clone();
         let exports = self.runtime.exports.clone();
         let sender = self.runtime.commands.clone();
         let worker_sender = sender.clone();
-        tokio::spawn(async move {
-            run_relay_session(RelayWorker {
+        self.tasks.spawn(async move {
+            let owned_flow = run_relay_session(RelayWorker {
                 session_id: id,
                 actor: worker_sender,
                 role,
@@ -1223,11 +1345,14 @@ impl Actor {
                 frames: receiver,
                 context,
                 exports,
-                reply,
+                reply: None,
+                selection_reply: None,
                 cancellation,
             })
             .await;
-            let _ = sender.send(ActorInput::SessionFinished(id)).await;
+            if owned_flow {
+                let _ = sender.send(ActorInput::SessionFinished(id)).await;
+            }
         });
         Ok(())
     }
@@ -1333,6 +1458,9 @@ impl Actor {
             return;
         };
         session.cancellation.cancel();
+        if let Some(manager) = session.manager.take() {
+            let _ = manager.close().await;
+        }
         if let Some(reply) = session.reply.take() {
             let _ = reply.send(Err(closed()));
         }
@@ -1361,15 +1489,22 @@ struct RelayWorker {
     context: ChildSessionContext,
     exports: ExportRegistry,
     reply: Option<oneshot::Sender<io::Result<OpenedIo>>>,
+    selection_reply: Option<oneshot::Receiver<Option<OpenReply>>>,
     cancellation: CancellationToken,
 }
 
 struct RelayReady {
     gate: Mutex<Option<oneshot::Sender<bool>>>,
+    reply: Mutex<Option<oneshot::Sender<Option<OpenReply>>>>,
 }
 
 impl RelayReady {
-    fn select(&self) {
+    fn select(&self, reply: Option<OpenReply>) {
+        if let Ok(mut target) = self.reply.lock()
+            && let Some(target) = target.take()
+        {
+            let _ = target.send(reply);
+        }
         if let Ok(mut gate) = self.gate.lock()
             && let Some(gate) = gate.take()
         {
@@ -1467,11 +1602,15 @@ impl PathAttempt for PromotionAttempt {
     }
 }
 
-async fn run_relay_session(mut worker: RelayWorker) {
+async fn run_relay_session(mut worker: RelayWorker) -> bool {
     let result = run_relay_session_inner(&mut worker).await;
+    let not_selected = result
+        .as_ref()
+        .is_err_and(|error| error.kind() == io::ErrorKind::WouldBlock);
     if let (Err(error), Some(reply)) = (result, worker.reply.take()) {
         let _ = reply.send(Err(error));
     }
+    !not_selected
 }
 
 async fn run_relay_session_inner(worker: &mut RelayWorker) -> io::Result<()> {
@@ -1481,9 +1620,12 @@ async fn run_relay_session_inner(worker: &mut RelayWorker) -> io::Result<()> {
         return Err(invalid());
     }
     let (gate, selected) = oneshot::channel();
+    let (reply, selection_reply) = oneshot::channel();
     let ready = Arc::new(RelayReady {
         gate: Mutex::new(Some(gate)),
+        reply: Mutex::new(Some(reply)),
     });
+    worker.selection_reply = Some(selection_reply);
     worker
         .actor
         .send(ActorInput::RelayAuthenticated {
@@ -1498,8 +1640,17 @@ async fn run_relay_session_inner(worker: &mut RelayWorker) -> io::Result<()> {
         selected = selected => selected.map_err(|_| closed())?,
     };
     if !selected {
-        return Err(cancelled());
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "relay path was not selected",
+        ));
     }
+    worker.reply = worker
+        .selection_reply
+        .take()
+        .ok_or_else(invalid)?
+        .await
+        .map_err(|_| closed())?;
     match worker.role {
         PeerRole::Initiator => {
             let accepted = recv_plain(worker).await?;
@@ -1955,11 +2106,12 @@ fn protocol_socket(address: SocketAddr) -> rustgo_protocol::SocketAddress {
 }
 
 async fn observe_nat(
+    socket: std::net::UdpSocket,
     primary: String,
     alternate: String,
     grant: ObservationGrant,
     cancellation: CancellationToken,
-) -> io::Result<Vec<rustgo_protocol::SocketAddress>> {
+) -> io::Result<(std::net::UdpSocket, Vec<rustgo_protocol::SocketAddress>)> {
     if grant.expires_unix_secs() <= now() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -1971,12 +2123,10 @@ async fn observe_nat(
     if primary == alternate || primary.is_ipv4() != alternate.is_ipv4() {
         return Err(invalid());
     }
-    let bind = if primary.is_ipv4() {
-        "0.0.0.0:0"
-    } else {
-        "[::]:0"
-    };
-    let socket = UdpSocket::bind(bind).await?;
+    if socket.local_addr()?.is_ipv4() != primary.is_ipv4() {
+        return Err(invalid());
+    }
+    let io_socket = UdpSocket::from_std(socket.try_clone()?)?;
     let mut observed = Vec::with_capacity(2);
     for (remote, endpoint, token) in [
         (
@@ -1998,12 +2148,12 @@ async fn observe_nat(
         let probe = ObservationProbe::new(token, nonce)
             .encode()
             .map_err(|_| invalid())?;
-        socket.send_to(&probe, remote).await?;
+        io_socket.send_to(&probe, remote).await?;
         let mut buffer = [0_u8; ObservationReply::MAX_WIRE_BYTES + 1];
         let received = tokio::select! {
             biased;
             () = cancellation.cancelled() => return Err(cancelled()),
-            result = tokio::time::timeout(Duration::from_secs(2), socket.recv_from(&mut buffer)) => result.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "observation endpoint timed out"))??,
+            result = tokio::time::timeout(Duration::from_secs(2), io_socket.recv_from(&mut buffer)) => result.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "observation endpoint timed out"))??,
         };
         if received.1 != remote || received.0 > ObservationReply::MAX_WIRE_BYTES {
             return Err(invalid());
@@ -2020,7 +2170,8 @@ async fn observe_nat(
         }
         observed.push(reply.observed_source().clone());
     }
-    Ok(observed)
+    drop(io_socket);
+    Ok((socket, observed))
 }
 fn socket_addr(address: &rustgo_protocol::SocketAddress) -> SocketAddr {
     match address {

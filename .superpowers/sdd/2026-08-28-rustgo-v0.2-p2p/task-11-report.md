@@ -46,3 +46,26 @@
 ## Scope
 
 Task 12 namespace topology and Task 13 packaging/deployment were not implemented.
+
+## Re-review closure (2026-08-29)
+
+- NAT observation now binds the rendezvous generation's deterministic fixed port from
+  `udp_port_range`. Both authenticated probes use a cloned handle to that exact socket;
+  the owning handle remains live and is transferred directly into the Quinn endpoint.
+  Observation failure retains the same fixed socket for the local candidate/fallback.
+- `QuicPathAttempt::with_socket` consumes the retained socket rather than rebinding.
+  Functional transport coverage proves the tuple cannot be rebound while observed,
+  becomes the selected QUIC local tuple, and is released only on cancellation/teardown.
+- The production actor owns observation, PathManager, relay and direct I/O tasks in a
+  `JoinSet`; teardown cancels sessions, closes managers, then drains tasks with a bounded
+  timeout before the control generation returns and fixed ports are released.
+- Relay selection now transfers the pending service-open reply only after PathManager
+  chooses relay. Rejecting the gated relay cannot close a concurrently selected direct
+  flow. Existing relay streams/datagram sessions continue to drain normally.
+- The process test waits for both peers' authoritative promotion state and asserts the
+  selected post-promotion paths: TCP `NativeTcp` and UDP `QuicV4`, while the initial
+  flows are `Relay`.
+- Final evidence:
+  `cargo test -p rustgoc --test peer_process -- --nocapture --test-threads=1` passed;
+  `cargo test --workspace --all-targets -- --test-threads=1` passed in full, including
+  the fixed-socket QUIC regression and real three-process test.
