@@ -413,14 +413,7 @@ p=sys.argv[1].encode(); s=socket.create_connection(("127.0.0.1",19080),10); s.se
 assert_udp_payload() {
     local payload=$1
     ip netns exec "$RG_CLIENT_B_NS" timeout 15 python3 -c 'import socket,sys
-p=sys.argv[1].encode(); s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(.5)
-for _ in range(24):
- s.sendto(p,("127.0.0.1",19081))
- try:
-  d,_=s.recvfrom(65535)
-  assert d==p,(d,p); break
- except TimeoutError: pass
-else: raise TimeoutError("UDP echo was not ready before the deadline")' "$payload"
+p=sys.argv[1].encode(); s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(10); s.sendto(p,("127.0.0.1",19081)); d,_=s.recvfrom(65535); assert d==p,(d,p)' "$payload"
 }
 
 assert_selected_path() {
