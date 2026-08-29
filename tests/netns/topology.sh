@@ -452,7 +452,8 @@ assert_selected_path() {
 }
 
 capture_observation_mappings() {
-    local label=$1 namespace internal_ip external_ip output=$RG_STATE_DIR/observation-$label.tsv
+    local label=$1 namespace internal_ip external_ip output
+    output=$RG_STATE_DIR/observation-$label.tsv
     : >"$output"
     for side in provider consumer; do
         if [ "$side" = provider ]; then
