@@ -219,3 +219,27 @@ Task 12 namespace topology and Task 13 packaging/deployment were not implemented
   `cargo test -p rustgoc --test peer_process -- --nocapture --test-threads=1` passed;
   `cargo clippy -p rustgos -p rustgoc --all-targets -- -D warnings` passed, as did
   `cargo fmt --all -- --check` and `git diff --check`.
+
+## Responder decision/candidate ordering fence (2026-08-29)
+
+- Clean-start mixed-OS tracing proved that the provider's authenticated NAT observation
+  could finish before peer identity binding. Because the locally authorized export had
+  already populated `protocol`, the responder emitted CandidateSetV2 before its signed
+  ProviderDecision. rustgos correctly returned an invalid-state ServerNotice; the actor
+  removed the session, and the later valid PunchGrant was rejected as `unknown_session`.
+- A session now tracks authoritative provider-decision acceptance separately from local
+  export protocol authorization. Observation completion retains the bounded owned socket
+  and candidates, but CandidateSetV2 cannot be emitted until the accepted decision has
+  been sent in protocol order. Candidate emission is fenced to once per generation;
+  rejection, expiry, cancellation and normal structured socket teardown retain their
+  existing behavior. ServerNotice handling remains fail-closed.
+- The real rustgos plus two-rustgoc process test adds a deterministic lifecycle scenario
+  that delays identity binding while authenticated observation completes first. It
+  proves no pre-decision candidate rejection occurs, then transfers TCP and UDP over the
+  resulting relay session, with structured correlation asserting at most one candidate
+  emission for each session generation. Existing direct promotion and forced-relay
+  scenarios remain separate and unchanged.
+- Final evidence:
+  `cargo test -p rustgoc --test peer_process -- --nocapture --test-threads=1` passed
+  all three real-process scenarios; the control functional target passed 11/11;
+  rustgoc all-target Clippy with warnings denied, fmt check and diff check passed.

@@ -329,6 +329,7 @@ enum ActorInput {
         grant_expires_unix_secs: u64,
         result: io::Result<(std::net::UdpSocket, Vec<rustgo_protocol::SocketAddress>)>,
     },
+    DelayedIdentityBinding(PeerIdentityBinding),
     Sweep,
 }
 
@@ -392,6 +393,7 @@ struct Session {
     role: PeerRole,
     expiry: u64,
     protocol: Option<TunnelProtocol>,
+    provider_decision_accepted: bool,
     next_step: u64,
     local_ephemerals: HashMap<CandidateTransport, EphemeralPeerKey>,
     local_ephemeral_public: HashMap<CandidateTransport, [u8; 32]>,
@@ -573,6 +575,14 @@ impl Actor {
                         Ok(())
                     }
                 },
+                ActorInput::DelayedIdentityBinding(binding) => {
+                    tracing::info!(
+                        session_id = %session_log_id(SessionId::from(binding.session_id)),
+                        event = "peer_identity_binding_delay_complete",
+                        "test-delayed peer identity binding released"
+                    );
+                    self.handle_binding(binding).await
+                }
                 ActorInput::Sweep => {
                     self.expire_sessions();
                     self.expire_control_grace();
@@ -690,6 +700,7 @@ impl Actor {
                 role: PeerRole::Initiator,
                 expiry,
                 protocol: None,
+                provider_decision_accepted: false,
                 next_step: 2,
                 local_ephemerals: ephemerals,
                 local_ephemeral_public: publics,
@@ -836,7 +847,32 @@ impl Actor {
         tracing::trace!(kind = event_kind(&event), "peer control event admitted");
         match event {
             ControlEvent::Rendezvous(envelope) => self.handle_envelope(envelope).await,
-            ControlEvent::PeerIdentityBinding(binding) => self.handle_binding(binding).await,
+            ControlEvent::PeerIdentityBinding(binding) => {
+                let delay = std::env::var("RUSTGO_INTERNAL_TEST_DELAY_IDENTITY_BINDING_MS")
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .filter(|delay| {
+                        *delay > 0 && std::env::var_os("RUSTGO_INTERNAL_TESTING").is_some()
+                    });
+                if let Some(delay) = delay {
+                    tracing::info!(
+                        session_id = %session_log_id(SessionId::from(binding.session_id)),
+                        delay_millis = delay,
+                        event = "peer_identity_binding_delayed",
+                        "peer identity binding delayed by internal lifecycle test"
+                    );
+                    let sender = self.runtime.commands.clone();
+                    self.tasks.spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                        let _ = sender
+                            .send(ActorInput::DelayedIdentityBinding(binding))
+                            .await;
+                    });
+                    Ok(())
+                } else {
+                    self.handle_binding(binding).await
+                }
+            }
             ControlEvent::PeerRelayFrame(frame) => {
                 if let Some(worker) = self
                     .sessions
@@ -1114,6 +1150,7 @@ impl Actor {
                     role: PeerRole::Responder,
                     expiry: envelope.expires_unix_secs,
                     protocol: protocol.ok(),
+                    provider_decision_accepted: false,
                     next_step: envelope.step + 1,
                     local_ephemerals: ephemerals,
                     local_ephemeral_public: publics,
@@ -1262,7 +1299,9 @@ impl Actor {
                     .sessions
                     .get(&id)
                     .is_some_and(|session| session.resolve_only);
-                self.sessions.get_mut(&id).ok_or_else(invalid)?.protocol = Some(protocol);
+                let session = self.sessions.get_mut(&id).ok_or_else(invalid)?;
+                session.protocol = Some(protocol);
+                session.provider_decision_accepted = true;
                 if resolve {
                     if let Some(reply) = self
                         .sessions
@@ -1360,13 +1399,18 @@ impl Actor {
 
     async fn provider_accept(&mut self, id: SessionId) -> io::Result<()> {
         let session = self.sessions.get(&id).ok_or_else(invalid)?;
+        let accepted = session.protocol.is_some();
         let decision = match session.protocol {
             Some(protocol) => ProviderDecision::accepted(protocol_to_wire(protocol)),
             None => ProviderDecision::rejected(None),
         };
         self.send_payload(id, RendezvousPayload::ProviderDecision(decision))
             .await?;
-        if self.sessions.get(&id).and_then(|s| s.protocol).is_some() {
+        if accepted {
+            self.sessions
+                .get_mut(&id)
+                .ok_or_else(invalid)?
+                .provider_decision_accepted = true;
             self.send_candidates(id).await?;
         }
         Ok(())
@@ -1374,7 +1418,11 @@ impl Actor {
 
     async fn send_candidates(&mut self, id: SessionId) -> io::Result<()> {
         let session = self.sessions.get(&id).ok_or_else(invalid)?;
-        if session.protocol.is_none() || session.resolve_only {
+        if session.protocol.is_none()
+            || !session.provider_decision_accepted
+            || session.resolve_only
+            || session.candidate_sent_generation >= session.generation.get()
+        {
             return Ok(());
         }
         if self.observation_endpoints().is_some() && session.quic_socket.is_none() {
@@ -1450,14 +1498,16 @@ impl Actor {
         self.send_payload(id, RendezvousPayload::CandidateSetV2(set))
             .await?;
         let generation = self.sessions.get(&id).ok_or_else(invalid)?.generation.get();
-        self.sessions
-            .get_mut(&id)
-            .ok_or_else(invalid)?
-            .candidate_sent_generation = generation;
-        self.sessions
-            .get_mut(&id)
-            .ok_or_else(invalid)?
-            .local_candidates_digest = Some(digest);
+        let session = self.sessions.get_mut(&id).ok_or_else(invalid)?;
+        session.candidate_sent_generation = generation;
+        session.local_candidates_digest = Some(digest);
+        tracing::info!(
+            session_id = %session_log_id(id),
+            generation,
+            role = ?session.role,
+            event = "candidate_set_sent",
+            "candidate set emitted after authoritative provider decision"
+        );
         Ok(())
     }
 

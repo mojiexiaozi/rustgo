@@ -33,13 +33,19 @@ impl Drop for Children {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rustgos_and_two_rustgoc_processes_transfer_tcp_and_udp_direct_and_relay()
 -> Result<(), Box<dyn Error>> {
-    run_scenario(true).await?;
-    run_scenario(false).await?;
+    run_scenario(true, false).await?;
+    run_scenario(false, false).await?;
+    run_scenario(false, true).await?;
     Ok(())
 }
 
-async fn run_scenario(prefer_direct: bool) -> Result<(), Box<dyn Error>> {
-    eprintln!("peer process scenario prefer_direct={prefer_direct}");
+async fn run_scenario(
+    prefer_direct: bool,
+    delay_identity_binding: bool,
+) -> Result<(), Box<dyn Error>> {
+    eprintln!(
+        "peer process scenario prefer_direct={prefer_direct} delay_identity_binding={delay_identity_binding}"
+    );
     let root = tempfile::tempdir()?;
     let (ca, certificate, server_key) = pki(root.path())?;
     let consumer_keys = root.path().join("consumer-keys");
@@ -159,16 +165,20 @@ listen_addr = "127.0.0.1:{udp_forward}"
     )?;
 
     let mut children = Children(Vec::new());
-    children.0.push(spawn("rustgos", &server_config)?);
+    children.0.push(spawn("rustgos", &server_config, false)?);
     wait_tcp(SocketAddr::from(([127, 0, 0, 1], server_port))).await?;
-    children.0.push(spawn("rustgoc", &provider_config)?);
+    children
+        .0
+        .push(spawn("rustgoc", &provider_config, delay_identity_binding)?);
     wait_for_log(
         &provider_config.with_extension("log"),
         "client tunnel registration ready",
         1,
     )
     .await?;
-    children.0.push(spawn("rustgoc", &consumer_config)?);
+    children
+        .0
+        .push(spawn("rustgoc", &consumer_config, delay_identity_binding)?);
 
     let mut stream = match wait_tcp(SocketAddr::from(([127, 0, 0, 1], tcp_forward))).await {
         Ok(stream) => stream,
@@ -187,7 +197,17 @@ listen_addr = "127.0.0.1:{udp_forward}"
     eprintln!("tcp forward accepted");
     stream.write_all(b"tcp-process-e2e").await?;
     let mut echoed = vec![0_u8; 15];
-    tokio::time::timeout(Duration::from_secs(15), stream.read_exact(&mut echoed)).await??;
+    if let Err(error) =
+        tokio::time::timeout(Duration::from_secs(15), stream.read_exact(&mut echoed)).await?
+    {
+        eprintln!(
+            "consumer log:\n{}\nprovider log:\n{}\nserver log:\n{}",
+            fs::read_to_string(consumer_config.with_extension("log")).unwrap_or_default(),
+            fs::read_to_string(provider_config.with_extension("log")).unwrap_or_default(),
+            fs::read_to_string(server_config.with_extension("log")).unwrap_or_default()
+        );
+        return Err(error.into());
+    }
     assert_eq!(echoed, b"tcp-process-e2e");
     eprintln!("initial tcp echoed");
 
@@ -239,6 +259,49 @@ listen_addr = "127.0.0.1:{udp_forward}"
         tokio::time::timeout(Duration::from_secs(15), udp.recv_from(&mut buffer)).await??;
     assert_eq!(&buffer[..length], b"udp-process-e2e");
     eprintln!("initial udp echoed");
+
+    if delay_identity_binding {
+        let provider_lifecycle_log = fs::read_to_string(provider_config.with_extension("log"))?;
+        let observation_ready = provider_lifecycle_log
+            .find("authenticated NAT observation candidates ready")
+            .expect("provider did not finish observation before the delayed identity binding");
+        let binding_released = provider_lifecycle_log
+            .find("test-delayed peer identity binding released")
+            .expect("provider identity binding was not deterministically delayed");
+        assert!(
+            observation_ready < binding_released,
+            "identity binding was released before the early-observation race was exercised:\n{provider_lifecycle_log}"
+        );
+        assert!(
+            !provider_lifecycle_log.contains("server rejected rendezvous with code"),
+            "early observation emitted an invalid pre-decision candidate set:\n{provider_lifecycle_log}"
+        );
+        let candidate_events = provider_lifecycle_log
+            .lines()
+            .filter(|line| line.contains("event=\"candidate_set_sent\""))
+            .filter_map(|line| {
+                let session = line
+                    .split_whitespace()
+                    .find(|field| field.starts_with("session_id="))?;
+                let generation = line
+                    .split_whitespace()
+                    .find(|field| field.starts_with("generation="))?;
+                Some(format!("{session}:{generation}"))
+            })
+            .collect::<Vec<_>>();
+        let unique_candidate_events = candidate_events
+            .iter()
+            .collect::<std::collections::HashSet<_>>();
+        assert!(
+            !candidate_events.is_empty(),
+            "no candidate emission was observed"
+        );
+        assert_eq!(
+            candidate_events.len(),
+            unique_candidate_events.len(),
+            "a candidate set was emitted more than once for one session generation:\n{provider_lifecycle_log}"
+        );
+    }
 
     if prefer_direct {
         wait_for_log_pair(
@@ -365,7 +428,7 @@ listen_addr = "127.0.0.1:{udp_forward}"
             "relay flow must not survive loss of its control transport"
         );
 
-        children.0[0] = spawn("rustgos", &server_config)?;
+        children.0[0] = spawn("rustgos", &server_config, false)?;
         wait_tcp(SocketAddr::from(([127, 0, 0, 1], server_port))).await?;
         wait_for_log_pair(
             &consumer_config.with_extension("log"),
@@ -485,7 +548,11 @@ observation_alternate_addr = "127.0.0.1:{observation_alternate}"
     )
 }
 
-fn spawn(package: &str, config: &Path) -> Result<Child, Box<dyn Error>> {
+fn spawn(
+    package: &str,
+    config: &Path,
+    delay_identity_binding: bool,
+) -> Result<Child, Box<dyn Error>> {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let mut command = Command::new("cargo");
     let log = fs::File::create(config.with_extension("log"))?;
@@ -499,6 +566,9 @@ fn spawn(package: &str, config: &Path) -> Result<Child, Box<dyn Error>> {
         command.env("RUST_LOG", "info");
         command.env("RUSTGO_INTERNAL_TESTING", "1");
         command.env("RUSTGO_INTERNAL_TEST_FORCE_INITIAL_RELAY", "1");
+        if delay_identity_binding {
+            command.env("RUSTGO_INTERNAL_TEST_DELAY_IDENTITY_BINDING_MS", "500");
+        }
     }
     Ok(command.spawn()?)
 }
