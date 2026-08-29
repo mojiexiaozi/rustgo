@@ -1150,6 +1150,21 @@ impl Actor {
                     .map_err(|_| invalid())?,
             });
         }
+        if let Some(observed) = session.observed_udp.first() {
+            let tcp_port =
+                local_socket(&self.runtime.config, id, CandidateTransport::NativeTcp)?.port();
+            candidates.push(Candidate {
+                transport: CandidateTransport::NativeTcp,
+                address: protocol_socket_with_port(observed, tcp_port),
+                priority: 650,
+                foundation: BoundedString::try_from("observed-ip-native-tcp")
+                    .map_err(|_| invalid())?,
+                generation: session.generation,
+                expires_unix_secs: session.expiry,
+                observation_source: BoundedString::try_from("rustgos-authenticated-observation-ip")
+                    .map_err(|_| invalid())?,
+            });
+        }
         let set = CandidateSetV2 {
             owner_is_initiator,
             bindings: BoundedVec::try_from(bindings).map_err(|_| invalid())?,
@@ -2341,6 +2356,22 @@ fn protocol_socket(address: SocketAddr) -> rustgo_protocol::SocketAddress {
         SocketAddr::V6(value) => rustgo_protocol::SocketAddress::V6 {
             octets: value.ip().octets(),
             port: value.port(),
+        },
+    }
+}
+
+fn protocol_socket_with_port(
+    address: &rustgo_protocol::SocketAddress,
+    port: u16,
+) -> rustgo_protocol::SocketAddress {
+    match address {
+        rustgo_protocol::SocketAddress::V4 { octets, .. } => rustgo_protocol::SocketAddress::V4 {
+            octets: *octets,
+            port,
+        },
+        rustgo_protocol::SocketAddress::V6 { octets, .. } => rustgo_protocol::SocketAddress::V6 {
+            octets: *octets,
+            port,
         },
     }
 }
