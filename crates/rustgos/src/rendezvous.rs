@@ -358,6 +358,13 @@ impl RendezvousCoordinator {
         frame: PeerRelayFrame,
     ) -> Result<(), RendezvousCoordinatorError> {
         if !self.registry.is_active_session(authenticated.identity()) {
+            tracing::warn!(
+                session_id = ?frame.session_id,
+                sender = authenticated.identity().name(),
+                reason = "inactive_control_session",
+                event = "peer_relay_frame_rejected",
+                "peer relay frame rejected"
+            );
             return Err(RendezvousErrorCode::IDENTITY_MISMATCH.into());
         }
         self.expire_sessions_batch(now_unix_secs());
@@ -366,12 +373,55 @@ impl RendezvousCoordinator {
                 .state
                 .lock()
                 .map_err(|_| RendezvousErrorCode::INVALID_STATE)?;
-            let session = state
-                .sessions
-                .get_mut(&frame.session_id)
-                .and_then(SessionRecord::active_mut)
-                .ok_or(RendezvousErrorCode::UNKNOWN_SESSION)?;
+            let session = match state.sessions.get_mut(&frame.session_id) {
+                Some(SessionRecord::Active(session)) => session,
+                Some(SessionRecord::Tombstone(tombstone)) => {
+                    tracing::warn!(
+                        session_id = ?frame.session_id,
+                        sender = authenticated.identity().name(),
+                        expires_unix_secs = tombstone.expires_unix_secs,
+                        reason = "closed_session",
+                        event = "peer_relay_frame_rejected",
+                        "peer relay frame rejected"
+                    );
+                    return Err(RendezvousErrorCode::UNKNOWN_SESSION.into());
+                }
+                None => {
+                    tracing::warn!(
+                        session_id = ?frame.session_id,
+                        sender = authenticated.identity().name(),
+                        reason = "unknown_session",
+                        event = "peer_relay_frame_rejected",
+                        "peer relay frame rejected"
+                    );
+                    return Err(RendezvousErrorCode::UNKNOWN_SESSION.into());
+                }
+            };
+            let role = if session.consumer.matches(authenticated.identity()) {
+                "consumer"
+            } else if session.provider.matches(authenticated.identity()) {
+                "provider"
+            } else {
+                "non_participant"
+            };
+            let generation = session.state.generation().get();
+            let protocol = session.metadata.protocol;
+            let relay_datagram = session.relay.datagram;
+            let requested_by = session.relay.requested_by;
+            let expires = session.metadata.expires_unix_secs;
+            let phase = session.state.phase();
             if session.state.phase() != RendezvousPhase::Accepted {
+                tracing::warn!(
+                    session_id = ?frame.session_id,
+                    sender = authenticated.identity().name(), role,
+                    generation, ?protocol, ?relay_datagram, requested_by,
+                    authorized = session.relay.authorized(),
+                    phase = ?phase, expires_unix_secs = expires,
+                    frame_flags = frame.flags.bits(),
+                    reason = "session_not_accepted",
+                    event = "peer_relay_frame_rejected",
+                    "peer relay frame rejected"
+                );
                 return Err(RendezvousErrorCode::INVALID_STATE.into());
             }
             let target = if session.consumer.matches(authenticated.identity()) {
@@ -379,15 +429,47 @@ impl RendezvousCoordinator {
             } else if session.provider.matches(authenticated.identity()) {
                 session.consumer.clone()
             } else {
+                tracing::warn!(
+                    session_id = ?frame.session_id,
+                    sender = authenticated.identity().name(), role,
+                    generation, ?protocol, ?relay_datagram, requested_by,
+                    authorized = session.relay.authorized(),
+                    phase = ?phase, expires_unix_secs = expires,
+                    frame_flags = frame.flags.bits(),
+                    reason = "not_participant",
+                    event = "peer_relay_frame_rejected",
+                    "peer relay frame rejected"
+                );
                 return Err(RendezvousErrorCode::NOT_PARTICIPANT.into());
             };
             if !session.relay.authorized() {
+                tracing::warn!(
+                    session_id = ?frame.session_id,
+                    sender = authenticated.identity().name(), role,
+                    generation, ?protocol, ?relay_datagram, requested_by,
+                    authorized = false,
+                    phase = ?phase, expires_unix_secs = expires,
+                    frame_flags = frame.flags.bits(),
+                    reason = "relay_not_bilateral",
+                    event = "peer_relay_frame_rejected",
+                    "peer relay frame rejected"
+                );
                 return Err(RendezvousErrorCode::INVALID_STATE.into());
             }
-            let datagram = session
-                .relay
-                .datagram
-                .ok_or(RendezvousErrorCode::INVALID_STATE)?;
+            let Some(datagram) = session.relay.datagram else {
+                tracing::warn!(
+                    session_id = ?frame.session_id,
+                    sender = authenticated.identity().name(), role,
+                    generation, ?protocol, ?relay_datagram, requested_by,
+                    authorized = true,
+                    phase = ?phase, expires_unix_secs = expires,
+                    frame_flags = frame.flags.bits(),
+                    reason = "relay_protocol_unset",
+                    event = "peer_relay_frame_rejected",
+                    "peer relay frame rejected"
+                );
+                return Err(RendezvousErrorCode::INVALID_STATE.into());
+            };
             let flags = frame.flags.bits();
             let flags_match = if datagram {
                 flags == PeerRelayFlags::DATAGRAM.bits()
@@ -395,13 +477,51 @@ impl RendezvousCoordinator {
                 flags == PeerRelayFlags::RELIABLE.bits()
                     || flags == (PeerRelayFlags::RELIABLE | PeerRelayFlags::FIN).bits()
             };
-            if !flags_match || !session.relay.admit(frame.ciphertext().len()) {
+            if !flags_match {
+                tracing::warn!(
+                    session_id = ?frame.session_id,
+                    sender = authenticated.identity().name(), role,
+                    generation, ?protocol, relay_datagram = datagram, requested_by,
+                    authorized = true,
+                    phase = ?phase, expires_unix_secs = expires,
+                    frame_flags = flags,
+                    reason = "relay_flag_mismatch",
+                    event = "peer_relay_frame_rejected",
+                    "peer relay frame rejected"
+                );
                 return Err(RendezvousErrorCode::CAPACITY_REACHED.into());
             }
-            let permit = self.reserve_to(&target)?;
+            if !session.relay.admit(frame.ciphertext().len()) {
+                tracing::warn!(
+                    session_id = ?frame.session_id,
+                    sender = authenticated.identity().name(), role,
+                    generation, ?protocol, relay_datagram = datagram, requested_by,
+                    authorized = true,
+                    phase = ?phase, expires_unix_secs = expires,
+                    frame_flags = flags, frame_bytes = frame.ciphertext().len(),
+                    reason = "relay_rate_or_byte_limit",
+                    event = "peer_relay_frame_rejected",
+                    "peer relay frame rejected"
+                );
+                return Err(RendezvousErrorCode::CAPACITY_REACHED.into());
+            }
             let message = frame
                 .to_protocol_message()
                 .map_err(|_| RendezvousErrorCode::INVALID_STATE)?;
+            let permit = self.reserve_to(&target).inspect_err(|error| {
+                tracing::warn!(
+                    session_id = ?frame.session_id,
+                    sender = authenticated.identity().name(),
+                    generation, ?protocol, relay_datagram = datagram, requested_by,
+                    authorized = true,
+                    phase = ?phase, expires_unix_secs = expires,
+                    frame_flags = frame.flags.bits(),
+                    reason = "target_queue_or_control_unavailable",
+                    coordinator_code = error.code.as_u16(),
+                    event = "peer_relay_frame_rejected",
+                    "peer relay frame rejected"
+                );
+            })?;
             (permit, message)
         };
         permit.send(message);
@@ -761,8 +881,28 @@ impl RendezvousCoordinator {
                 None
             };
         if let Some((participant, datagram)) = relay_update {
+            let requested_before = session.relay.requested_by;
             session.relay.requested_by |= participant;
             session.relay.datagram = Some(datagram);
+            let role = if participant == 0b01 {
+                "consumer"
+            } else {
+                "provider"
+            };
+            tracing::info!(
+                session_id = ?envelope.session_id,
+                sender = authenticated.identity().name(), role,
+                generation = envelope.generation.get(),
+                protocol = ?session.metadata.protocol,
+                relay_datagram = datagram,
+                requested_before,
+                requested_by = session.relay.requested_by,
+                authorized = session.relay.authorized(),
+                phase = ?session.state.phase(),
+                expires_unix_secs = session.metadata.expires_unix_secs,
+                event = "peer_relay_admission_transition",
+                "peer relay request admitted"
+            );
         }
         drop(state);
         permit.send(message);

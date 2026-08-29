@@ -478,7 +478,15 @@ where
                         let result = match rustgo_rendezvous::PeerRelayFrame::from_protocol_message(message) {
                             Ok(frame) => runtime.rendezvous.forward_relay_frame(guard, frame).await
                                 .map_err(|_| ControlError::InvalidState),
-                            Err(_) => Err(ControlError::InvalidState),
+                            Err(_) => {
+                                tracing::warn!(
+                                    sender = guard.identity().name(),
+                                    reason = "malformed_frame",
+                                    event = "peer_relay_frame_rejected",
+                                    "peer relay frame rejected"
+                                );
+                                Err(ControlError::InvalidState)
+                            }
                         };
                         if result.is_err() {
                             send_active_message(
