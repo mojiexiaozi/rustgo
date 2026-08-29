@@ -1,5 +1,5 @@
 [server]
-bind_addr = "0.0.0.0:7000"
+bind_addr = "0.0.0.0:7443"
 # Optional P2P NAT observation service. Configure both fields together.
 p2p_observation_bind = "0.0.0.0:7443"
 p2p_observation_alternate_bind = "0.0.0.0:7444"
@@ -21,3 +21,4 @@ max_udp_payload_bytes = 65507
 name = "home-pc"
 public_key = "${RUSTGO_DEVICE_PUBLIC_KEY}"
 enabled = true
+# Add one entry per peer. Client names and device public keys must both be unique.

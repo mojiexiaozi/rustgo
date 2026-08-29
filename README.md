@@ -1,13 +1,16 @@
 # Rustgo
 
-Rustgo V0.1 is a self-hosted, fixed-port TCP and UDP tunnel. A private-network
+Rustgo V0.2 is a self-hosted, fixed-port TCP, UDP, and authenticated P2P tunnel. A private-network
 client (`rustgoc`) connects to a public relay server (`rustgos`) over TLS 1.3,
 authenticates with an independent Ed25519 device key, and exposes explicitly
 configured ports.
 
-V0.1 is **relay-only**: every application byte passes through `rustgos`. NAT
-discovery, hole punching, direct P2P transport, and automatic P2P-to-relay
-fallback are V0.2 work and are not partially implemented here.
+V0.2 keeps the V0.1 relay protocol compatible and adds named `[[exports]]` and
+`[[forwards]]`. Peers authenticate with their server-authorized device keys,
+try QUIC/UDP or native-TCP direct paths from fixed client port ranges, and fall
+back to the encrypted server relay when policy permits. Complex NAT can still
+prevent a direct path; relay fallback is a supported operating mode, not an
+authentication bypass.
 
 ## Build and validate
 
@@ -81,6 +84,19 @@ and missing files are not generated implicitly.
 See [docs/operations.md](docs/operations.md) for certificate commands,
 firewalls, service restarts, logging, key rotation, troubleshooting, and the
 complete release checklist.
+
+## P2P ports and policy
+
+The standard server layout uses `7443/tcp` for TLS control and relay traffic,
+`7443/udp` plus `7444/udp` for authenticated NAT observation. Each client also
+needs inbound/outbound access for its configured `p2p.udp_port_range` and
+`p2p.tcp_port_range`; choose non-overlapping ranges when several clients share
+one host. An export with omitted or empty `allowed_peers` permits every
+authenticated client and emits `P2P_EXPORT_ALLOW_ALL`. Set an explicit list for
+least privilege.
+
+Human-readable logs report observation, selected path, promotion, and fallback
+events. Rustgo intentionally has no JSON log mode or web UI.
 
 ## Security and diagnostics
 

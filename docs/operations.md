@@ -1,15 +1,15 @@
-# Rustgo V0.1 operations
+# Rustgo V0.2 operations
 
 ## Scope and topology
 
-Rustgo V0.1 is a relay-only release. `rustgoc` maintains one authenticated TLS
-control connection to `rustgos`; TCP sessions use independent TLS data
-connections, while each UDP tunnel uses a persistent TLS data channel. Direct
-P2P, NAT discovery, and hole punching are deferred to V0.2, where the V0.1
-relay remains the fallback path.
+Rustgo V0.2 preserves the V0.1 relay protocol and adds authenticated P2P.
+`rustgoc` maintains one TLS control connection to `rustgos`; configured legacy
+`[[tunnels]]` remain relay mappings. P2P `[[forwards]]` request named
+`[[exports]]`, attempt fixed-port QUIC/UDP or native-TCP direct paths, and use
+the encrypted relay when direct connectivity fails and fallback is enabled.
 
 The server needs a stable DNS name and public address. In the examples below,
-`tunnel.example.com` resolves to the server, TCP 7000 is the TLS control/data
+`tunnel.example.com` resolves to the server, TCP 7443 is the TLS control/data
 listener, TCP 2222 is a public forwarded port, and UDP 27015 is a public
 forwarded port.
 
@@ -151,16 +151,36 @@ files are fatal; Rustgo does not search parent directories or generate them.
 
 Allow only configured ports:
 
-- inbound TCP 7000 to `rustgos` for TLS control and data connections;
+- inbound TCP 7443 to `rustgos` for TLS control, legacy relay, and P2P relay;
+- inbound UDP 7443 and UDP 7444 for authenticated NAT observation;
 - inbound TCP 2222 for the example TCP mapping;
 - inbound UDP 27015 for the example UDP mapping;
-- outbound access from `rustgoc` to `tunnel.example.com:7000`;
+- outbound access from `rustgoc` to `tunnel.example.com:7443` over TCP and to
+  `7443/udp` plus `7444/udp` when observation is enabled;
+- inbound and outbound TCP/UDP for each client's configured fixed P2P port
+  ranges (the example uses `7400-7499`); do not expose unrelated ports;
 - client-host loopback access from `rustgoc` to the configured local targets.
 
 Do not expose the local target itself to an untrusted LAN merely to make the
 tunnel work. Every additional tunnel requires its own public firewall rule for
 the configured transport. TCP and UDP can use the same numeric port because
 they are distinct protocols.
+
+## P2P exports, diagnostics, and fallback
+
+An export names one local TCP or UDP service. `allowed_peers = ["laptop"]`
+authorizes only those authenticated device names. If `allowed_peers` is omitted
+or empty, all authenticated clients are authorized and rustgoc emits warning
+code `P2P_EXPORT_ALLOW_ALL`. A forward binds a local address and selects the
+provider peer plus export name; keep it on loopback unless LAN exposure is
+intentional.
+
+Direct connectivity is opportunistic. Symmetric or endpoint-dependent NAT,
+carrier NAT, host firewalls, and short mapping lifetimes may prevent hole
+punching. Inspect human-readable logs for authenticated observation candidates,
+`peer service flow` path selection, direct promotion, and relay fallback. A
+relay result is expected when `allow_relay_fallback = true`; disabling fallback
+makes failure closed. Never weaken device authorization to improve NAT reachability.
 
 ## Start, restart, and upgrade
 
@@ -173,18 +193,24 @@ authenticate again, and re-register all configured tunnels. During the restart
 public mappings are unavailable. A client disconnect releases its server-side
 listeners and data sessions; stale listener ownership is not retained.
 
-For upgrades:
+For systemd upgrades:
 
 1. save the checked configuration and artifact hashes;
 2. stop the client, then replace its binary and restart it for a client-only
    upgrade;
-3. for a server upgrade, stop `rustgos`, replace the binary, run `check`, and
-   start it; clients reconnect automatically;
+3. for a server upgrade, copy the new binary beside the installed binary,
+   verify its SHA-256, run `new-rustgos check -c /etc/rustgo/server.toml`, stop
+   `rustgos`, preserve the old binary as a rollback copy, atomically rename the
+   new binary into place, and start it; clients reconnect automatically;
 4. verify one TCP and one UDP transfer and inspect both process logs.
+
+After restart run `systemctl is-active rustgos` and inspect
+`journalctl -u rustgos`; confirm unrelated services (including `frps` when
+co-hosted) were neither restarted nor reconfigured.
 
 ## Logs
 
-V0.1 emits human-readable, single-line text only. JSON logging and a web status
+V0.2 emits human-readable, single-line text only. JSON logging and a web status
 UI are not supported. Levels are `error`, `warn`, `info`, `debug`, and `trace`;
 the default is `info`. Set `RUST_LOG` before process startup, for example:
 

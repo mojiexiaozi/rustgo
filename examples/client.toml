@@ -1,6 +1,6 @@
 [client]
 name = "home-pc"
-server_addr = "tunnel.example.com:7000"
+server_addr = "tunnel.example.com:7443"
 server_name = "tunnel.example.com"
 certificate_authority_file = "${RUSTGO_CERTIFICATE_AUTHORITY_FILE}"
 private_key_file = "${RUSTGO_DEVICE_PRIVATE_KEY_FILE}"
@@ -35,6 +35,8 @@ name = "ssh"
 protocol = "tcp"
 local_addr = "127.0.0.1:22"
 allowed_peers = ["laptop"]
+# Omit allowed_peers, or set it to [], only when every authenticated client
+# should be authorized; rustgoc emits P2P_EXPORT_ALLOW_ALL in that case.
 
 [[forwards]]
 name = "office-ssh"

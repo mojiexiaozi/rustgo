@@ -340,13 +340,15 @@ struct Session {
     direct_failed: bool,
     generation: CandidateGeneration,
     direct_attempt: Option<Arc<dyn PathAttempt>>,
-    recheck_reply: Option<oneshot::Sender<Result<Vec<Arc<dyn PathAttempt>>, PathError>>>,
+    recheck_reply: Option<PathRecheckReply>,
     manager: Option<Arc<PathManager>>,
     relay_ready: Option<Arc<RelayReady>>,
     candidate_sent_generation: u64,
     quic_socket: Option<std::net::UdpSocket>,
     observed_udp: Vec<rustgo_protocol::SocketAddress>,
 }
+
+type PathRecheckReply = oneshot::Sender<Result<Vec<Arc<dyn PathAttempt>>, PathError>>;
 
 impl Actor {
     fn new(
@@ -392,15 +394,15 @@ impl Actor {
                     self.handle_direct_result(session_id, result).await
                 }
                 ActorInput::Promoted { session_id, kind } => {
-                    if let Some(session) = self.sessions.get(&session_id) {
-                        if let Some(protocol) = session.protocol {
-                            self.promoted.insert((
-                                session.peer.clone(),
-                                session.export.clone(),
-                                protocol,
-                            ));
-                            tracing::info!(generation = session.generation.get(), path = ?kind, "fresh direct path promoted for subsequent service opens; existing relay I/O remains fenced");
-                        }
+                    if let Some(session) = self.sessions.get(&session_id)
+                        && let Some(protocol) = session.protocol
+                    {
+                        self.promoted.insert((
+                            session.peer.clone(),
+                            session.export.clone(),
+                            protocol,
+                        ));
+                        tracing::info!(generation = session.generation.get(), path = ?kind, "fresh direct path promoted for subsequent service opens; existing relay I/O remains fenced");
                     }
                     Ok(())
                 }

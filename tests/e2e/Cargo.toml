@@ -15,4 +15,5 @@ rustgo-transport = { path = "../../crates/rustgo-transport" }
 tempfile = "3.27.0"
 thiserror.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 tokio-rustls.workspace = true

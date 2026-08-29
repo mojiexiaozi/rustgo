@@ -258,6 +258,7 @@ try {
     if (-not $StartupGateOnly) {
         Invoke-Native -FilePath "cargo" -Arguments @("test", "-p", "rustgo-e2e", "--test", "tcp", "tcp_echo", "--", "--exact", "--test-threads=1")
         Invoke-Native -FilePath "cargo" -Arguments @("test", "-p", "rustgo-e2e", "--test", "udp", "udp_echo", "--", "--exact", "--test-threads=1")
+        Invoke-Native -FilePath "cargo" -Arguments @("test", "-p", "rustgo-e2e", "--test", "p2p", "--", "--test-threads=1")
     }
 }
 finally {

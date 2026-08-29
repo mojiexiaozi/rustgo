@@ -88,6 +88,13 @@ fn execute<H: CommandHandler>(cli: Cli, handler: &H) -> Result<(), String> {
     }
 
     let config = load_client(&cli.config).map_err(|error| error.to_string())?;
+    for warning in config.validation_warnings() {
+        tracing::warn!(
+            code = warning.code(),
+            message = warning.message(),
+            "configuration warning"
+        );
+    }
     check_client_references(&cli.config, &config).map_err(|error| error.to_string())?;
     match action {
         Action::Run => handler.run(config),

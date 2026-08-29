@@ -725,4 +725,5 @@ done
 if [ "$startup_gate_only" = false ]; then
     cargo test -p rustgo-e2e --test tcp tcp_echo -- --exact --test-threads=1
     cargo test -p rustgo-e2e --test udp udp_echo -- --exact --test-threads=1
+    cargo test -p rustgo-e2e --test p2p -- --test-threads=1
 fi
