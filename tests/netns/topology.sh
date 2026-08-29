@@ -272,9 +272,17 @@ EOF
 firewall_drop_range() {
     local namespace=$1 protocol=$2 range=$3
     if [ "$RG_FIREWALL" = nft ]; then
-        ip netns exec "$namespace" nft insert rule ip rustgo_netns forward "$protocol" dport "${range/:/-}" counter drop
+        if [ "$protocol" = udp ]; then
+            ip netns exec "$namespace" nft insert rule ip rustgo_netns forward ip saddr != "$RG_SERVER_IP" udp dport "${range/:/-}" counter drop
+        else
+            ip netns exec "$namespace" nft insert rule ip rustgo_netns forward "$protocol" dport "${range/:/-}" counter drop
+        fi
     else
-        ip netns exec "$namespace" iptables -I FORWARD 1 -p "$protocol" --dport "$range" -j DROP
+        if [ "$protocol" = udp ]; then
+            ip netns exec "$namespace" iptables -I FORWARD 1 ! -s "$RG_SERVER_IP" -p udp --dport "$range" -j DROP
+        else
+            ip netns exec "$namespace" iptables -I FORWARD 1 -p "$protocol" --dport "$range" -j DROP
+        fi
     fi
 }
 
