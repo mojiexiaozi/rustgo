@@ -225,16 +225,16 @@ EOF
         else
             ip netns exec "$namespace" nft add rule ip rustgo_netns postrouting oifname ext0 snat to "$external_ip"
         fi
-        if [ "$mode" = endpoint-independent ] || [ "$mode" = shared-lan ] || [ "$mode" = restricted ]; then
+        if [ "$mode" = endpoint-independent ] || [ "$mode" = shared-lan ] || [ "$mode" = restricted ] || [ "$mode" = all-direct-drop ]; then
             ip netns exec "$namespace" nft add rule ip rustgo_netns prerouting iifname ext0 udp dport "$RG_UDP_FIRST-$RG_UDP_LAST" dnat to "$internal_ip"
         fi
-        if [ "$mode" = endpoint-independent ] || [ "$mode" = shared-lan ] || [ "$mode" = udp-drop ]; then
+        if [ "$mode" = endpoint-independent ] || [ "$mode" = shared-lan ] || [ "$mode" = udp-drop ] || [ "$mode" = all-direct-drop ]; then
             ip netns exec "$namespace" nft add rule ip rustgo_netns prerouting iifname ext0 tcp dport "$RG_TCP_FIRST-$RG_TCP_LAST" dnat to "$internal_ip"
         fi
-        if [ "$mode" = endpoint-independent ] || [ "$mode" = shared-lan ]; then
+        if [ "$mode" = endpoint-independent ] || [ "$mode" = shared-lan ] || [ "$mode" = all-direct-drop ]; then
             ip netns exec "$namespace" nft add rule ip rustgo_netns forward iifname ext0 oifname int0 udp dport "$RG_UDP_FIRST-$RG_UDP_LAST" accept
         fi
-        if [ "$mode" = endpoint-independent ] || [ "$mode" = shared-lan ] || [ "$mode" = udp-drop ]; then
+        if [ "$mode" = endpoint-independent ] || [ "$mode" = shared-lan ] || [ "$mode" = udp-drop ] || [ "$mode" = all-direct-drop ]; then
             ip netns exec "$namespace" nft add rule ip rustgo_netns forward iifname ext0 oifname int0 tcp dport "$RG_TCP_FIRST-$RG_TCP_LAST" accept
         fi
     else
@@ -248,16 +248,16 @@ EOF
         else
             ip netns exec "$namespace" iptables -t nat -A POSTROUTING -o ext0 -j SNAT --to-source "$external_ip"
         fi
-        if [ "$mode" = endpoint-independent ] || [ "$mode" = shared-lan ] || [ "$mode" = restricted ]; then
+        if [ "$mode" = endpoint-independent ] || [ "$mode" = shared-lan ] || [ "$mode" = restricted ] || [ "$mode" = all-direct-drop ]; then
             ip netns exec "$namespace" iptables -t nat -A PREROUTING -i ext0 -p udp --dport "$RG_UDP_FIRST:$RG_UDP_LAST" -j DNAT --to-destination "$internal_ip"
         fi
-        if [ "$mode" = endpoint-independent ] || [ "$mode" = shared-lan ] || [ "$mode" = udp-drop ]; then
+        if [ "$mode" = endpoint-independent ] || [ "$mode" = shared-lan ] || [ "$mode" = udp-drop ] || [ "$mode" = all-direct-drop ]; then
             ip netns exec "$namespace" iptables -t nat -A PREROUTING -i ext0 -p tcp --dport "$RG_TCP_FIRST:$RG_TCP_LAST" -j DNAT --to-destination "$internal_ip"
         fi
-        if [ "$mode" = endpoint-independent ] || [ "$mode" = shared-lan ]; then
+        if [ "$mode" = endpoint-independent ] || [ "$mode" = shared-lan ] || [ "$mode" = all-direct-drop ]; then
             ip netns exec "$namespace" iptables -A FORWARD -i ext0 -o int0 -p udp --dport "$RG_UDP_FIRST:$RG_UDP_LAST" -j ACCEPT
         fi
-        if [ "$mode" = endpoint-independent ] || [ "$mode" = shared-lan ] || [ "$mode" = udp-drop ]; then
+        if [ "$mode" = endpoint-independent ] || [ "$mode" = shared-lan ] || [ "$mode" = udp-drop ] || [ "$mode" = all-direct-drop ]; then
             ip netns exec "$namespace" iptables -A FORWARD -i ext0 -o int0 -p tcp --dport "$RG_TCP_FIRST:$RG_TCP_LAST" -j ACCEPT
         fi
     fi
@@ -295,6 +295,8 @@ allow_direct_after_relay() {
             ip netns exec "$namespace" nft flush chain ip rustgo_netns forward
             ip netns exec "$namespace" nft add rule ip rustgo_netns forward ct state established,related accept
             ip netns exec "$namespace" nft add rule ip rustgo_netns forward iifname int0 oifname ext0 accept
+            ip netns exec "$namespace" nft add rule ip rustgo_netns forward iifname ext0 oifname int0 udp dport "$RG_UDP_FIRST-$RG_UDP_LAST" accept
+            ip netns exec "$namespace" nft add rule ip rustgo_netns forward iifname ext0 oifname int0 tcp dport "$RG_TCP_FIRST-$RG_TCP_LAST" accept
         else
             ip netns exec "$namespace" iptables -D FORWARD 1 2>/dev/null || true
             ip netns exec "$namespace" iptables -D FORWARD 1 2>/dev/null || true
