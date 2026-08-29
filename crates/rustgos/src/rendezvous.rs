@@ -162,6 +162,8 @@ struct StoredSession {
     provider: SessionOwner,
     state: RendezvousState,
     relay: RelayAdmission,
+    candidate_generation_announced_by: u8,
+    generation_started: Instant,
 }
 
 struct RelayAdmission {
@@ -532,6 +534,8 @@ impl RendezvousCoordinator {
                 provider: provider_owner,
                 state: rendezvous_state,
                 relay: RelayAdmission::new(),
+                candidate_generation_announced_by: 0,
+                generation_started: Instant::now(),
             })),
         );
         drop(state);
@@ -617,7 +621,7 @@ impl RendezvousCoordinator {
             .state
             .lock()
             .map_err(|_| RendezvousErrorCode::DELIVERY_UNAVAILABLE)?;
-        let (target, next_session_state, relay_update) = {
+        let (target, next_session_state, relay_update, generation_update) = {
             let record = state
                 .sessions
                 .get(&envelope.session_id)
@@ -634,7 +638,43 @@ impl RendezvousCoordinator {
             let target =
                 other_participant(session, authenticated.identity(), envelope.target.as_str())?
                     .clone();
+            let participant = if session.consumer.matches(authenticated.identity()) {
+                0b01
+            } else {
+                0b10
+            };
             let mut next = session.state.clone();
+            let generation_update =
+                if let RendezvousPayload::CandidateSetV2(set) = &envelope.payload {
+                    let is_initiator = participant == 0b01;
+                    if set.owner_is_initiator != is_initiator {
+                        return Err(RendezvousErrorCode::INVALID_STATE.into());
+                    }
+                    let current = session.state.generation().get();
+                    let actual = envelope.generation.get();
+                    if actual == current {
+                        if session.candidate_generation_announced_by & participant != 0 {
+                            return Err(RendezvousErrorCode::INVALID_STATE.into());
+                        }
+                        Some((
+                            actual,
+                            session.candidate_generation_announced_by | participant,
+                            false,
+                        ))
+                    } else if actual == current.saturating_add(1)
+                        && session.candidate_generation_announced_by == 0b11
+                        && actual <= 32
+                        && session.generation_started.elapsed() >= Duration::from_millis(250)
+                    {
+                        next.advance_generation(envelope.generation)
+                            .map_err(|_| RendezvousErrorCode::INVALID_STATE)?;
+                        Some((actual, participant, true))
+                    } else {
+                        return Err(RendezvousErrorCode::INVALID_STATE.into());
+                    }
+                } else {
+                    None
+                };
             next.accept_metadata(
                 &envelope.session_id,
                 envelope.step,
@@ -648,11 +688,6 @@ impl RendezvousCoordinator {
                 if request.datagram != expected_datagram {
                     return Err(RendezvousErrorCode::INVALID_STATE.into());
                 }
-                let participant = if session.consumer.matches(authenticated.identity()) {
-                    0b01
-                } else {
-                    0b10
-                };
                 if session
                     .relay
                     .datagram
@@ -664,7 +699,7 @@ impl RendezvousCoordinator {
             } else {
                 None
             };
-            (target, next, relay_update)
+            (target, next, relay_update, generation_update)
         };
         let permit = self.reserve_to(&target)?;
         let session = state
@@ -673,6 +708,13 @@ impl RendezvousCoordinator {
             .and_then(SessionRecord::active_mut)
             .expect("coordinator lock serializes the validated session");
         session.state = next_session_state;
+        if let Some((_generation, announced_by, advanced)) = generation_update {
+            session.candidate_generation_announced_by = announced_by;
+            if advanced {
+                session.generation_started = Instant::now();
+                session.relay = RelayAdmission::new();
+            }
+        }
         if let Some((participant, datagram)) = relay_update {
             session.relay.requested_by |= participant;
             session.relay.datagram = Some(datagram);

@@ -5,7 +5,7 @@ use rustgo_protocol::{Heartbeat, Message, OpenTcpStream, OpenUdpChannel, Protoco
 use tokio::{sync::mpsc, task::JoinSet, time::MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 
-use crate::{ClientError, ControlSession};
+use crate::{ClientError, ControlEvent, ControlSession};
 
 const CHILD_CONTROL_CAPACITY: usize = 1024;
 
@@ -59,6 +59,33 @@ impl ChildSessionContext {
             _ = self.control_outbound.send(message) => {}
         }
     }
+
+    pub async fn send_peer_control(
+        &self,
+        message: Message,
+        shutdown: &CancellationToken,
+    ) -> Result<(), ClientError> {
+        tokio::select! {
+            biased;
+            () = shutdown.cancelled() => Err(ClientError::Closed),
+            result = self.control_outbound.send(message) => result.map_err(|_| ClientError::Closed),
+        }
+    }
+}
+
+pub trait PeerGenerationHandler: Send + Sync + 'static {
+    fn run_generation(
+        &self,
+        context: ChildSessionContext,
+        shutdown: CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+    fn run_event(
+        &self,
+        context: ChildSessionContext,
+        event: ControlEvent,
+        shutdown: CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 }
 
 struct ChildSignals<'a> {
@@ -100,11 +127,27 @@ impl ChildSessionSupervisor for NoopChildSessionSupervisor {
 }
 
 impl ControlSession {
+    #[cfg(test)]
     pub(crate) async fn run_generation<F>(
+        self,
+        generation: SessionGeneration,
+        shutdown: CancellationToken,
+        supervisor: Arc<dyn ChildSessionSupervisor>,
+        on_inactive: F,
+    ) -> Result<(), ClientError>
+    where
+        F: FnOnce(),
+    {
+        self.run_generation_with_peer(generation, shutdown, supervisor, None, on_inactive)
+            .await
+    }
+
+    pub(crate) async fn run_generation_with_peer<F>(
         mut self,
         generation: SessionGeneration,
         shutdown: CancellationToken,
         supervisor: Arc<dyn ChildSessionSupervisor>,
+        peer_handler: Option<Arc<dyn PeerGenerationHandler>>,
         on_inactive: F,
     ) -> Result<(), ClientError>
     where
@@ -122,12 +165,17 @@ impl ControlSession {
         let mut child_signals = ChildSignals {
             control: &mut child_control,
         };
+        if let Some(handler) = &peer_handler {
+            children
+                .spawn(handler.run_generation(child_context.clone(), child_shutdown.child_token()));
+        }
         let result = self
             .run_control_loop(
                 &child_context,
                 &shutdown,
                 &child_shutdown,
                 &supervisor,
+                peer_handler.as_ref(),
                 &mut children,
                 &mut child_signals,
             )
@@ -151,12 +199,14 @@ impl ControlSession {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_control_loop(
         &mut self,
         child_context: &ChildSessionContext,
         shutdown: &CancellationToken,
         child_shutdown: &CancellationToken,
         supervisor: &Arc<dyn ChildSessionSupervisor>,
+        peer_handler: Option<&Arc<dyn PeerGenerationHandler>>,
         children: &mut JoinSet<()>,
         child_signals: &mut ChildSignals<'_>,
     ) -> Result<(), ClientError> {
@@ -214,7 +264,9 @@ impl ControlSession {
                     let Some(message) = child_message else {
                         return Err(ClientError::InvalidState);
                     };
-                    if !matches!(message, Message::TcpStreamReady(_)) {
+                    if !matches!(message, Message::TcpStreamReady(_))
+                        && !is_peer_outbound(&message)
+                    {
                         return Err(ClientError::InvalidState);
                     }
                     let write = self.framed.send(self.version, message);
@@ -269,6 +321,13 @@ impl ControlSession {
                             ));
                         }
                         Message::Error(error) => return Err(ClientError::Protocol(error.code)),
+                        message if is_peer_inbound(&message) => {
+                            let Some(handler) = peer_handler else { return Err(ClientError::InvalidState); };
+                            let event = control_event(message)?;
+                            children.spawn(handler.run_event(
+                                child_context.clone(), event, child_shutdown.child_token(),
+                            ));
+                        }
                         _ => return Err(ClientError::InvalidState),
                     }
                 }
@@ -288,6 +347,61 @@ impl ControlSession {
         } else {
             Err(ClientError::InvalidState)
         }
+    }
+}
+
+fn is_peer_outbound(message: &Message) -> bool {
+    matches!(
+        message,
+        Message::ObservationGrantRequest(_)
+            | Message::PeerIdentityLookup(_)
+            | Message::PeerRelayFrame(_)
+            | Message::RendezvousRequest(_)
+            | Message::RendezvousProviderDecision(_)
+            | Message::RendezvousCandidateSet(_)
+            | Message::RendezvousCandidateSetV2(_)
+            | Message::RendezvousConnectivityResult(_)
+            | Message::RendezvousRelayRequest(_)
+            | Message::RendezvousClose(_)
+            | Message::RendezvousError(_)
+    )
+}
+
+fn is_peer_inbound(message: &Message) -> bool {
+    matches!(
+        message,
+        Message::ObservationGrant(_)
+            | Message::PeerIdentityBinding(_)
+            | Message::PeerRelayFrame(_)
+            | Message::ServerNotice(_)
+            | Message::RendezvousRequest(_)
+            | Message::RendezvousProviderDecision(_)
+            | Message::RendezvousCandidateSet(_)
+            | Message::RendezvousCandidateSetV2(_)
+            | Message::RendezvousConnectivityResult(_)
+            | Message::RendezvousRelayRequest(_)
+            | Message::RendezvousClose(_)
+            | Message::RendezvousError(_)
+    )
+}
+
+fn control_event(message: Message) -> Result<ControlEvent, ClientError> {
+    match message {
+        message @ Message::ObservationGrant(_) => {
+            rustgo_rendezvous::ObservationGrant::from_protocol_message(message)
+                .map(ControlEvent::ObservationGrant)
+                .map_err(|_| ClientError::InvalidState)
+        }
+        Message::PeerIdentityBinding(value) => Ok(ControlEvent::PeerIdentityBinding(value)),
+        message @ Message::PeerRelayFrame(_) => {
+            rustgo_rendezvous::PeerRelayFrame::from_protocol_message(message)
+                .map(ControlEvent::PeerRelayFrame)
+                .map_err(|_| ClientError::InvalidState)
+        }
+        Message::ServerNotice(value) => Ok(ControlEvent::ServerNotice(value)),
+        message => rustgo_rendezvous::RendezvousEnvelope::from_protocol_message(message)
+            .map(ControlEvent::Rendezvous)
+            .map_err(|_| ClientError::InvalidState),
     }
 }
 

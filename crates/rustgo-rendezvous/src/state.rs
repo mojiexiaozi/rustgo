@@ -102,6 +102,26 @@ impl RendezvousState {
         Ok(())
     }
 
+    pub fn advance_generation(
+        &mut self,
+        generation: CandidateGeneration,
+    ) -> Result<(), StateError> {
+        if generation.get()
+            != self
+                .generation
+                .get()
+                .checked_add(1)
+                .ok_or(StateError::IllegalTransition)?
+        {
+            return Err(StateError::GenerationMismatch {
+                expected: self.generation,
+                actual: generation,
+            });
+        }
+        self.generation = generation;
+        Ok(())
+    }
+
     pub const fn accept_generation(
         &self,
         generation: CandidateGeneration,

@@ -17,6 +17,10 @@ pub struct P2pConfig {
     pub allow_relay_fallback: bool,
     pub udp_port_range: PortRange,
     pub tcp_port_range: PortRange,
+    #[serde(default)]
+    pub observation_primary_addr: Option<String>,
+    #[serde(default)]
+    pub observation_alternate_addr: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -73,6 +73,7 @@ impl ClientHandshakeState {
                 | Message::RendezvousRequest(_)
                 | Message::RendezvousProviderDecision(_)
                 | Message::RendezvousCandidateSet(_)
+                | Message::RendezvousCandidateSetV2(_)
                 | Message::RendezvousConnectivityResult(_)
                 | Message::RendezvousRelayRequest(_)
                 | Message::RendezvousClose(_)

@@ -6,6 +6,7 @@ mod app;
 mod control;
 mod exports;
 mod forwards;
+mod orchestration;
 mod peer;
 mod session;
 mod tcp;
@@ -26,5 +27,5 @@ pub use peer::{
 };
 pub use session::{
     ChildSessionContext, ChildSessionRequest, ChildSessionSupervisor, NoopChildSessionSupervisor,
-    SessionGeneration,
+    PeerGenerationHandler, SessionGeneration,
 };

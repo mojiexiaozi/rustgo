@@ -218,6 +218,7 @@ fn encode_payload(message: &Message) -> Result<Vec<u8>, FrameError> {
         Message::RendezvousRequest(value)
         | Message::RendezvousProviderDecision(value)
         | Message::RendezvousCandidateSet(value)
+        | Message::RendezvousCandidateSetV2(value)
         | Message::RendezvousConnectivityResult(value)
         | Message::RendezvousRelayRequest(value)
         | Message::RendezvousClose(value)
@@ -284,6 +285,9 @@ fn decode_payload(message: MessageId, payload: &[u8]) -> Result<Message, FrameEr
         }
         MessageId::RENDEZVOUS_CANDIDATE_SET => {
             decode_opaque(payload).map(Message::RendezvousCandidateSet)
+        }
+        MessageId::RENDEZVOUS_CANDIDATE_SET_V2 => {
+            decode_opaque(payload).map(Message::RendezvousCandidateSetV2)
         }
         MessageId::RENDEZVOUS_CONNECTIVITY_RESULT => {
             decode_opaque(payload).map(Message::RendezvousConnectivityResult)

@@ -55,6 +55,10 @@ impl ControlClient {
         self.tls_client.clone()
     }
 
+    pub(crate) fn keypair(&self) -> Arc<DeviceKeypair> {
+        self.keypair.clone()
+    }
+
     pub(crate) const fn protocol_version(&self) -> ProtocolVersion {
         self.version
     }
@@ -486,6 +490,7 @@ fn is_rendezvous_message(message: &Message) -> bool {
         Message::RendezvousRequest(_)
             | Message::RendezvousProviderDecision(_)
             | Message::RendezvousCandidateSet(_)
+            | Message::RendezvousCandidateSetV2(_)
             | Message::RendezvousConnectivityResult(_)
             | Message::RendezvousRelayRequest(_)
             | Message::RendezvousClose(_)

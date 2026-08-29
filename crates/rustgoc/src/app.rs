@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     ChildSessionSupervisor, ClientError, ControlClient, ExportRegistry, RegisteredTunnel,
-    SessionGeneration, udp::RelaySessionSupervisor,
+    SessionGeneration, orchestration::ProductionPeerRuntime, udp::RelaySessionSupervisor,
 };
 
 const INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(1);
@@ -183,12 +183,23 @@ impl ClientApp {
                     );
                     let status = self.status.clone();
                     let supervisor = self.supervisor.clone();
+                    let peer_runtime = Arc::new(ProductionPeerRuntime::new(
+                        Arc::new(self.control.config().clone()),
+                        self.control.keypair(),
+                        self.exports.clone(),
+                    ));
                     let backoff = &mut self.backoff;
                     let result = session
-                        .run_generation(generation, shutdown.clone(), supervisor, move || {
-                            backoff.mark_disconnected();
-                            status.send_replace(ClientStatus::default());
-                        })
+                        .run_generation_with_peer(
+                            generation,
+                            shutdown.clone(),
+                            supervisor,
+                            Some(peer_runtime),
+                            move || {
+                                backoff.mark_disconnected();
+                                status.send_replace(ClientStatus::default());
+                            },
+                        )
                         .await;
                     if shutdown.is_cancelled() {
                         return Ok(());

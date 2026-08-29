@@ -987,6 +987,29 @@ fn append_payload(encoded: &mut Vec<u8>, payload: &RendezvousPayload) {
                 append_candidate(encoded, candidate);
             }
         }
+        RendezvousPayload::CandidateSetV2(set) => {
+            encoded.push(8);
+            encoded.push(u8::from(set.owner_is_initiator));
+            append_u32(
+                encoded,
+                u32::try_from(set.bindings.as_slice().len()).expect("bounded bindings"),
+            );
+            for binding in set.bindings.as_slice() {
+                encoded.push(match binding.transport {
+                    CandidateTransport::QuicUdp => 1,
+                    CandidateTransport::NativeTcp => 2,
+                    CandidateTransport::Relay => 3,
+                });
+                append_bytes(encoded, binding.ephemeral_public_key.as_slice());
+            }
+            append_u32(
+                encoded,
+                u32::try_from(set.candidates.as_slice().len()).expect("bounded candidates"),
+            );
+            for candidate in set.candidates.as_slice() {
+                append_candidate(encoded, candidate);
+            }
+        }
         RendezvousPayload::ConnectivityResult(result) => {
             encoded.push(4);
             append_connectivity_result(encoded, result);

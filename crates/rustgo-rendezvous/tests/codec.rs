@@ -3,11 +3,11 @@ use rustgo_protocol::{
     SocketAddress, TunnelProtocol,
 };
 use rustgo_rendezvous::{
-    Candidate, CandidateGeneration, CandidateSet, CandidateTransport, ConnectivityResult,
-    MAX_CANDIDATES, MAX_DEVICE_NAME_BYTES, MAX_EPHEMERAL_PUBLIC_KEY_BYTES, MAX_ERROR_DETAIL_BYTES,
-    MAX_PEER_RELAY_CIPHERTEXT_BYTES, PeerRelayFlags, PeerRelayFrame, ProviderDecision,
-    RelayRequest, RendezvousClose, RendezvousEnvelope, RendezvousError, RendezvousPayload,
-    RendezvousRequest, SessionId, WireError,
+    Candidate, CandidateGeneration, CandidateSet, CandidateSetV2, CandidateTransport,
+    ConnectivityResult, MAX_CANDIDATES, MAX_DEVICE_NAME_BYTES, MAX_EPHEMERAL_PUBLIC_KEY_BYTES,
+    MAX_ERROR_DETAIL_BYTES, MAX_PEER_RELAY_CIPHERTEXT_BYTES, PeerRelayFlags, PeerRelayFrame,
+    ProviderDecision, RelayRequest, RendezvousClose, RendezvousEnvelope, RendezvousError,
+    RendezvousPayload, RendezvousRequest, SessionId, TransportKeyBinding, WireError,
 };
 use serde::Serialize;
 
@@ -83,6 +83,56 @@ fn candidate_set_round_trips_through_the_real_frame_codec() {
     assert_eq!(
         RendezvousEnvelope::from_protocol_message(decoded.message).unwrap(),
         envelope
+    );
+}
+
+#[test]
+fn versioned_candidate_set_has_independent_transport_keys_and_rejects_substitution() {
+    let bindings = vec![
+        TransportKeyBinding {
+            transport: CandidateTransport::QuicUdp,
+            ephemeral_public_key: BoundedBytes::try_from(vec![1; 32]).unwrap(),
+        },
+        TransportKeyBinding {
+            transport: CandidateTransport::NativeTcp,
+            ephemeral_public_key: BoundedBytes::try_from(vec![2; 32]).unwrap(),
+        },
+        TransportKeyBinding {
+            transport: CandidateTransport::Relay,
+            ephemeral_public_key: BoundedBytes::try_from(vec![3; 32]).unwrap(),
+        },
+    ];
+    let mut envelope = request_envelope();
+    envelope.step = 3;
+    envelope.payload = RendezvousPayload::CandidateSetV2(CandidateSetV2 {
+        owner_is_initiator: true,
+        bindings: BoundedVec::try_from(bindings.clone()).unwrap(),
+        candidates: BoundedVec::try_from(vec![candidate()]).unwrap(),
+    });
+    let message = envelope.to_protocol_message().unwrap();
+    assert_eq!(message.id(), MessageId::RENDEZVOUS_CANDIDATE_SET_V2);
+    assert_eq!(
+        RendezvousEnvelope::from_protocol_message(message).unwrap(),
+        envelope
+    );
+
+    let substituted = vec![
+        bindings[0].clone(),
+        TransportKeyBinding {
+            transport: CandidateTransport::QuicUdp,
+            ephemeral_public_key: bindings[1].ephemeral_public_key.clone(),
+        },
+    ];
+    envelope.payload = RendezvousPayload::CandidateSetV2(CandidateSetV2 {
+        owner_is_initiator: true,
+        bindings: BoundedVec::try_from(substituted).unwrap(),
+        candidates: BoundedVec::try_from(vec![candidate()]).unwrap(),
+    });
+    let encoded = postcard::to_allocvec(&envelope).unwrap();
+    let opaque = rustgo_protocol::OpaqueRendezvousMessage::try_from(encoded).unwrap();
+    assert_eq!(
+        RendezvousEnvelope::from_protocol_message(Message::RendezvousCandidateSetV2(opaque)),
+        Err(WireError::InvalidTransportBindings)
     );
 }
 

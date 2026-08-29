@@ -129,6 +129,26 @@ pub(crate) fn validate_client(config: &ClientConfig) -> Result<(), ValidationErr
     if let Some(p2p) = &config.p2p {
         require_nonzero("p2p.direct_timeout_secs", p2p.direct_timeout_secs)?;
         require_nonzero("p2p.reconnect_timeout_secs", p2p.reconnect_timeout_secs)?;
+        match (
+            &p2p.observation_primary_addr,
+            &p2p.observation_alternate_addr,
+        ) {
+            (Some(primary), Some(alternate)) => {
+                validate_host_address("p2p.observation_primary_addr", primary)?;
+                validate_host_address("p2p.observation_alternate_addr", alternate)?;
+                if primary == alternate {
+                    return Err(ValidationError::new(
+                        "P2P observation endpoints must be distinct",
+                    ));
+                }
+            }
+            (None, None) => {}
+            _ => {
+                return Err(ValidationError::new(
+                    "P2P observation primary and alternate endpoints must be configured together",
+                ));
+            }
+        }
     }
 
     if config.exports.len() > MAX_EXPORTS {

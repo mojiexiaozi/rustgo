@@ -14,6 +14,9 @@ reconnect_timeout_secs = 3
 allow_relay_fallback = true
 udp_port_range = "7400-7499"
 tcp_port_range = "7400-7499"
+# Optional; both addresses are required when NAT observation is enabled.
+# observation_primary_addr = "tunnel.example.com:7443"
+# observation_alternate_addr = "tunnel.example.com:7444"
 
 [[tunnels]]
 name = "ssh"

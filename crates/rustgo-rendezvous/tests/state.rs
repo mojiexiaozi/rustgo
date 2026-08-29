@@ -32,6 +32,31 @@ fn state_rejects_a_candidate_generation_mismatch() {
 }
 
 #[test]
+fn generation_advance_accepts_only_exactly_one_and_rejects_replay_and_skip() {
+    let id = SessionId::from([0x71; 32]);
+    let mut state = RendezvousState::new(id);
+    state.request(1, CandidateGeneration::INITIAL).unwrap();
+    assert!(
+        state
+            .advance_generation(CandidateGeneration::new(3).unwrap())
+            .is_err()
+    );
+    state
+        .advance_generation(CandidateGeneration::new(2).unwrap())
+        .unwrap();
+    assert!(
+        state
+            .advance_generation(CandidateGeneration::new(2).unwrap())
+            .is_err()
+    );
+    assert!(
+        state
+            .advance_generation(CandidateGeneration::new(4).unwrap())
+            .is_err()
+    );
+}
+
+#[test]
 fn state_rejects_provider_accept_before_request() {
     let mut state = RendezvousState::new(session_id());
     assert_eq!(

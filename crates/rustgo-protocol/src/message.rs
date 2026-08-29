@@ -295,6 +295,7 @@ impl MessageId {
     pub const SERVER_NOTICE: Self = Self(25);
     pub const PEER_IDENTITY_BINDING: Self = Self(26);
     pub const PEER_IDENTITY_LOOKUP: Self = Self(27);
+    pub const RENDEZVOUS_CANDIDATE_SET_V2: Self = Self(28);
 
     pub const fn as_u16(self) -> u16 {
         self.0
@@ -323,6 +324,7 @@ impl MessageId {
             25 => MAX_SERVER_NOTICE_BYTES,
             26 => 512,
             27 => 256,
+            28 => MAX_RENDEZVOUS_ENVELOPE_BYTES,
             _ => 0,
         }
     }
@@ -333,7 +335,7 @@ impl TryFrom<u16> for MessageId {
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
         match value {
-            1..=27 => Ok(Self(value)),
+            1..=28 => Ok(Self(value)),
             _ => Err(value),
         }
     }
@@ -687,6 +689,7 @@ pub enum Message {
     RendezvousRequest(OpaqueRendezvousMessage),
     RendezvousProviderDecision(OpaqueRendezvousMessage),
     RendezvousCandidateSet(OpaqueRendezvousMessage),
+    RendezvousCandidateSetV2(OpaqueRendezvousMessage),
     RendezvousConnectivityResult(OpaqueRendezvousMessage),
     RendezvousRelayRequest(OpaqueRendezvousMessage),
     RendezvousClose(OpaqueRendezvousMessage),
@@ -719,6 +722,7 @@ impl Message {
             Self::RendezvousRequest(_) => MessageId::RENDEZVOUS_REQUEST,
             Self::RendezvousProviderDecision(_) => MessageId::RENDEZVOUS_PROVIDER_DECISION,
             Self::RendezvousCandidateSet(_) => MessageId::RENDEZVOUS_CANDIDATE_SET,
+            Self::RendezvousCandidateSetV2(_) => MessageId::RENDEZVOUS_CANDIDATE_SET_V2,
             Self::RendezvousConnectivityResult(_) => MessageId::RENDEZVOUS_CONNECTIVITY_RESULT,
             Self::RendezvousRelayRequest(_) => MessageId::RENDEZVOUS_RELAY_REQUEST,
             Self::RendezvousClose(_) => MessageId::RENDEZVOUS_CLOSE,

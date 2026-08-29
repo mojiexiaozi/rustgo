@@ -189,6 +189,7 @@ fn message_ids_are_explicit_and_stable() {
     assert_eq!(MessageId::SERVER_NOTICE.as_u16(), 25);
     assert_eq!(MessageId::PEER_IDENTITY_BINDING.as_u16(), 26);
     assert_eq!(MessageId::PEER_IDENTITY_LOOKUP.as_u16(), 27);
+    assert_eq!(MessageId::RENDEZVOUS_CANDIDATE_SET_V2.as_u16(), 28);
 }
 
 #[test]

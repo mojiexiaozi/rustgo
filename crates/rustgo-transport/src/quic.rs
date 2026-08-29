@@ -508,10 +508,18 @@ impl PathAttempt for QuicPathAttempt {
                 return Err(PathError::AttemptFailed(self.kind));
             }
         };
-        let session = match endpoint
-            .connect(self.remote_addr, authentication, cancellation.clone())
-            .await
-        {
+        let role = authentication.role;
+        let established = async {
+            match role {
+                PeerRole::Initiator => {
+                    endpoint
+                        .connect(self.remote_addr, authentication, cancellation.clone())
+                        .await
+                }
+                PeerRole::Responder => endpoint.accept(authentication, cancellation.clone()).await,
+            }
+        };
+        let session = match established.await {
             Ok(session) => session,
             Err(QuicPeerError::Cancelled) => {
                 endpoint.shutdown(CLOSE_CANCELLED, b"path cancelled").await;

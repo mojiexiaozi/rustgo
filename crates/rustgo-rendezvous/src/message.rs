@@ -14,6 +14,7 @@ pub const MAX_EXPORT_NAME_BYTES: usize = 128;
 pub const MAX_FOUNDATION_BYTES: usize = 64;
 pub const MAX_OBSERVATION_SOURCE_BYTES: usize = 128;
 pub const MAX_EPHEMERAL_PUBLIC_KEY_BYTES: usize = 64;
+pub const MAX_TRANSPORT_KEY_BINDINGS: usize = 3;
 pub const MAX_SIGNATURE_BYTES: usize = 128;
 pub const MAX_ERROR_DETAIL_BYTES: usize = 512;
 pub const MAX_PEER_RELAY_CIPHERTEXT_BYTES: usize = 65_536;
@@ -361,6 +362,42 @@ pub struct CandidateSet {
     pub candidates: BoundedVec<Candidate, MAX_CANDIDATES>,
 }
 
+/// Versioned candidates with one non-reusable X25519 domain per transport.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransportKeyBinding {
+    pub transport: CandidateTransport,
+    pub ephemeral_public_key: BoundedBytes<MAX_EPHEMERAL_PUBLIC_KEY_BYTES>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CandidateSetV2 {
+    pub owner_is_initiator: bool,
+    pub bindings: BoundedVec<TransportKeyBinding, MAX_TRANSPORT_KEY_BINDINGS>,
+    pub candidates: BoundedVec<Candidate, MAX_CANDIDATES>,
+}
+
+impl CandidateSetV2 {
+    pub fn validate(&self) -> Result<(), WireError> {
+        let mut seen = Vec::new();
+        for binding in self.bindings.as_slice() {
+            if binding.ephemeral_public_key.as_slice().len() != 32
+                || seen.contains(&binding.transport)
+            {
+                return Err(WireError::InvalidTransportBindings);
+            }
+            seen.push(binding.transport);
+        }
+        if seen.is_empty()
+            || self.candidates.as_slice().iter().any(|candidate| {
+                candidate.generation.get() == 0 || !seen.contains(&candidate.transport)
+            })
+        {
+            return Err(WireError::InvalidTransportBindings);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectivityResult {
     pub connected: bool,
@@ -389,6 +426,7 @@ pub enum RendezvousPayload {
     Request(RendezvousRequest),
     ProviderDecision(ProviderDecision),
     CandidateSet(CandidateSet),
+    CandidateSetV2(CandidateSetV2),
     ConnectivityResult(ConnectivityResult),
     RelayRequest(RelayRequest),
     Close(RendezvousClose),
@@ -401,6 +439,7 @@ impl RendezvousPayload {
             Self::Request(_) => MessageId::RENDEZVOUS_REQUEST,
             Self::ProviderDecision(_) => MessageId::RENDEZVOUS_PROVIDER_DECISION,
             Self::CandidateSet(_) => MessageId::RENDEZVOUS_CANDIDATE_SET,
+            Self::CandidateSetV2(_) => MessageId::RENDEZVOUS_CANDIDATE_SET_V2,
             Self::ConnectivityResult(_) => MessageId::RENDEZVOUS_CONNECTIVITY_RESULT,
             Self::RelayRequest(_) => MessageId::RENDEZVOUS_RELAY_REQUEST,
             Self::Close(_) => MessageId::RENDEZVOUS_CLOSE,
@@ -439,6 +478,7 @@ impl RendezvousEnvelope {
             MessageId::RENDEZVOUS_REQUEST => Message::RendezvousRequest(opaque),
             MessageId::RENDEZVOUS_PROVIDER_DECISION => Message::RendezvousProviderDecision(opaque),
             MessageId::RENDEZVOUS_CANDIDATE_SET => Message::RendezvousCandidateSet(opaque),
+            MessageId::RENDEZVOUS_CANDIDATE_SET_V2 => Message::RendezvousCandidateSetV2(opaque),
             MessageId::RENDEZVOUS_CONNECTIVITY_RESULT => {
                 Message::RendezvousConnectivityResult(opaque)
             }
@@ -455,6 +495,7 @@ impl RendezvousEnvelope {
             Message::RendezvousRequest(value)
             | Message::RendezvousProviderDecision(value)
             | Message::RendezvousCandidateSet(value)
+            | Message::RendezvousCandidateSetV2(value)
             | Message::RendezvousConnectivityResult(value)
             | Message::RendezvousRelayRequest(value)
             | Message::RendezvousClose(value)
@@ -466,6 +507,15 @@ impl RendezvousEnvelope {
         let expected = envelope.message_id();
         if expected != actual {
             return Err(WireError::MessageIdMismatch { expected, actual });
+        }
+        if let RendezvousPayload::CandidateSetV2(candidate_set) = &envelope.payload {
+            candidate_set.validate()?;
+            if candidate_set.candidates.as_slice().iter().any(|candidate| {
+                candidate.generation != envelope.generation
+                    || candidate.expires_unix_secs != envelope.expires_unix_secs
+            }) {
+                return Err(WireError::InvalidTransportBindings);
+            }
         }
         Ok(envelope)
     }
@@ -658,6 +708,8 @@ pub enum WireError {
     ZeroRelayChannel,
     #[error("unsupported peer relay flags {0:#04x}")]
     UnsupportedRelayFlags(u8),
+    #[error("candidate transport key bindings are missing, duplicated, or mismatched")]
+    InvalidTransportBindings,
     #[error("rendezvous inner message ID {expected:?} does not match outer ID {actual:?}")]
     MessageIdMismatch {
         expected: MessageId,
