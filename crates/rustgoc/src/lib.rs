@@ -6,6 +6,7 @@ mod app;
 mod control;
 mod exports;
 mod forwards;
+mod peer;
 mod session;
 mod tcp;
 mod udp;
@@ -18,6 +19,10 @@ pub use exports::{AuthorizedExport, ExportError, ExportRegistry, PeerOpenRequest
 pub use forwards::{
     BoxPeerDatagramSession, BoxPeerStream, ForwardConnector, ForwardError, ForwardRuntime,
     ForwardRuntimeOptions, PeerDatagramSession, PeerFuture, PeerIo,
+};
+pub use peer::{
+    PeerRelayChannel, PeerRuntimeError, PeerSessionHandle, PeerSessionRuntime,
+    PeerSessionRuntimeOptions,
 };
 pub use session::{
     ChildSessionContext, ChildSessionRequest, ChildSessionSupervisor, NoopChildSessionSupervisor,

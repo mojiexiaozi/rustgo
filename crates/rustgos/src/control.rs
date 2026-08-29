@@ -466,9 +466,23 @@ where
                             .await?;
                         }
                     }
+                    Message::PeerRelayFrame(opaque) => {
+                        let message = Message::PeerRelayFrame(opaque);
+                        let result = match rustgo_rendezvous::PeerRelayFrame::from_protocol_message(message) {
+                            Ok(frame) => runtime.rendezvous.forward_relay_frame(guard, frame).await
+                                .map_err(|_| ControlError::InvalidState),
+                            Err(_) => Err(ControlError::InvalidState),
+                        };
+                        if result.is_err() {
+                            send_active_message(
+                                framed, state, negotiated,
+                                protocol_error(ProtocolErrorCode::INVALID_STATE),
+                                &mut heartbeat_deadline,
+                            ).await?;
+                        }
+                    }
                     Message::ObservationGrant(_)
-                    | Message::ServerNotice(_)
-                    | Message::PeerRelayFrame(_) => {
+                    | Message::ServerNotice(_) => {
                         send_active_message(
                             framed,
                             state,

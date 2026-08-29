@@ -8,7 +8,8 @@ use std::{
 use rustgo_config::AuthorizedClient;
 use rustgo_protocol::{BoundedString, Message, ProtocolVersion, ServerNotice, TunnelProtocol};
 use rustgo_rendezvous::{
-    MAX_ERROR_DETAIL_BYTES, RendezvousEnvelope, RendezvousPayload, RendezvousState, SessionId,
+    MAX_ERROR_DETAIL_BYTES, PeerRelayFrame, RendezvousEnvelope, RendezvousPayload, RendezvousPhase,
+    RendezvousState, SessionId,
 };
 use thiserror::Error;
 use tokio::sync::mpsc::error::TrySendError;
@@ -254,6 +255,45 @@ impl std::fmt::Debug for RendezvousCoordinator {
 }
 
 impl RendezvousCoordinator {
+    /// Routes an already encrypted peer frame without inspecting its payload.
+    /// The authenticated control identity, rather than any client supplied name,
+    /// selects the opposite participant of the live rendezvous session.
+    pub async fn forward_relay_frame(
+        &self,
+        authenticated: &ControlSessionGuard,
+        frame: PeerRelayFrame,
+    ) -> Result<(), RendezvousCoordinatorError> {
+        if !self.registry.is_active_session(authenticated.identity()) {
+            return Err(RendezvousErrorCode::IDENTITY_MISMATCH.into());
+        }
+        self.expire_sessions_batch(now_unix_secs());
+        let (target, message) = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| RendezvousErrorCode::INVALID_STATE)?;
+            let session = state
+                .sessions
+                .get(&frame.session_id)
+                .and_then(SessionRecord::active)
+                .ok_or(RendezvousErrorCode::UNKNOWN_SESSION)?;
+            if session.state.phase() != RendezvousPhase::Accepted {
+                return Err(RendezvousErrorCode::INVALID_STATE.into());
+            }
+            let target = if session.consumer.matches(authenticated.identity()) {
+                session.provider.clone()
+            } else if session.provider.matches(authenticated.identity()) {
+                session.consumer.clone()
+            } else {
+                return Err(RendezvousErrorCode::NOT_PARTICIPANT.into());
+            };
+            let message = frame
+                .to_protocol_message()
+                .map_err(|_| RendezvousErrorCode::INVALID_STATE)?;
+            (target, message)
+        };
+        self.route_to(&target, message)
+    }
     pub(crate) fn new(
         registry: ClientRegistry,
         clients: &[AuthorizedClient],

@@ -17,8 +17,9 @@ use rustgo_protocol::{
     TunnelProtocol, TunnelRegistration,
 };
 use rustgo_rendezvous::{
-    CandidateGeneration, ConnectivityResult, ObservationGrant, ProviderDecision, RendezvousClose,
-    RendezvousEnvelope, RendezvousPayload, RendezvousRequest, SessionId,
+    CandidateGeneration, ConnectivityResult, ObservationGrant, PeerRelayFlags, PeerRelayFrame,
+    ProviderDecision, RendezvousClose, RendezvousEnvelope, RendezvousPayload, RendezvousRequest,
+    SessionId,
 };
 use rustgos::{RendezvousErrorCode, ServerApp, ServerRuntimeLimits};
 use tempfile::TempDir;
@@ -252,6 +253,59 @@ async fn receive_notice(client: &mut Client) -> Result<rustgo_protocol::ServerNo
         return Err("expected a distinct server notice".into());
     };
     Ok(notice)
+}
+
+#[tokio::test]
+async fn accepted_session_routes_bounded_relay_ciphertext_to_authenticated_peer()
+-> Result<(), AnyError> {
+    let pki = TestPki::generate()?;
+    let a_key = DeviceKeypair::from_secret_bytes([71; 32]);
+    let b_key = DeviceKeypair::from_secret_bytes([72; 32]);
+    let (address, _coordinator, shutdown, task) = start_server(
+        &pki,
+        vec![authorized("a", &a_key, true), authorized("b", &b_key, true)],
+        ServerRuntimeLimits::default(),
+    )
+    .await?;
+    let mut a = Client::connect(&pki, address, "a", &a_key, V02, vec![]).await?;
+    let mut b = Client::connect(&pki, address, "b", &b_key, V02, vec![]).await?;
+    let expires = future_expiry();
+    a.send_envelope(&envelope(
+        70,
+        "a",
+        "b",
+        1,
+        expires,
+        RendezvousPayload::Request(RendezvousRequest {
+            export: text("ssh"),
+        }),
+    ))
+    .await?;
+    let _ = b.receive_envelope().await?;
+    b.send_envelope(&envelope(
+        70,
+        "b",
+        "a",
+        2,
+        expires,
+        RendezvousPayload::ProviderDecision(ProviderDecision::accepted(TunnelProtocol::TCP)),
+    ))
+    .await?;
+    let _ = a.receive_envelope().await?;
+    let relay = PeerRelayFrame::new(
+        SessionId::from([70; 32]),
+        9,
+        0,
+        PeerRelayFlags::RELIABLE,
+        vec![0xa5; 48],
+    )?;
+    a.send(V02, relay.to_protocol_message()?).await?;
+    let received = timeout(Duration::from_secs(2), b.receive()).await??;
+    let routed = PeerRelayFrame::from_protocol_message(received.message)?;
+    assert_eq!(routed, relay);
+    shutdown.cancel();
+    task.await??;
+    Ok(())
 }
 
 #[tokio::test]

@@ -9,7 +9,7 @@ use rustgo_protocol::{
     MAX_PUBLIC_KEY_BYTES, MAX_SIGNATURE_BYTES, MAX_TUNNEL_NAME_BYTES, Message, ProtocolErrorCode,
     ProtocolVersion, RegisterTunnels, TunnelProtocol, TunnelRegistration,
 };
-use rustgo_rendezvous::{ObservationGrant, RendezvousEnvelope};
+use rustgo_rendezvous::{ObservationGrant, PeerRelayFrame, RendezvousEnvelope};
 use rustgo_transport::{TlsClient, TlsError};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -357,6 +357,7 @@ pub enum ControlEvent {
     ObservationGrant(ObservationGrant),
     Rendezvous(RendezvousEnvelope),
     ServerNotice(rustgo_protocol::ServerNotice),
+    PeerRelayFrame(PeerRelayFrame),
 }
 
 impl ControlSession {
@@ -408,6 +409,17 @@ impl ControlSession {
         self.framed.send(self.version, message).await
     }
 
+    pub async fn send_peer_relay_frame(
+        &mut self,
+        frame: &PeerRelayFrame,
+    ) -> Result<(), ClientError> {
+        self.require_v02()?;
+        let message = frame
+            .to_protocol_message()
+            .map_err(|_| ClientError::InvalidState)?;
+        self.framed.send(self.version, message).await
+    }
+
     pub async fn next_control_event(&mut self) -> Result<ControlEvent, ClientError> {
         self.require_v02()?;
         let frame = self.framed.receive().await?;
@@ -424,6 +436,9 @@ impl ControlSession {
                     .map_err(|_| ClientError::InvalidState)
             }
             Message::ServerNotice(notice) => Ok(ControlEvent::ServerNotice(notice)),
+            message @ Message::PeerRelayFrame(_) => PeerRelayFrame::from_protocol_message(message)
+                .map(ControlEvent::PeerRelayFrame)
+                .map_err(|_| ClientError::InvalidState),
             Message::Error(error) => Err(ClientError::Protocol(error.code)),
             _ => Err(ClientError::InvalidState),
         }

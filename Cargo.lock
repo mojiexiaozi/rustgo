@@ -1498,12 +1498,14 @@ name = "rustgoc"
 version = "0.1.0"
 dependencies = [
  "assert_cmd",
+ "async-trait",
  "bytes",
  "clap",
  "predicates",
  "rcgen",
  "rustgo-config",
  "rustgo-crypto",
+ "rustgo-path",
  "rustgo-protocol",
  "rustgo-rendezvous",
  "rustgo-transport",
