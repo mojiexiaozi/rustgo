@@ -731,12 +731,7 @@ impl Actor {
             return Ok(());
         };
         let session_id = self.observation_waiters.pop_front().ok_or_else(invalid)?;
-        let local = local_socket(
-            &self.runtime.config,
-            session_id,
-            CandidateTransport::QuicUdp,
-        )?;
-        let socket = std::net::UdpSocket::bind(local)?;
+        let socket = bind_quic_socket(&self.runtime.config, session_id)?;
         socket.set_nonblocking(true)?;
         let observer = socket.try_clone()?;
         let sender = self.runtime.commands.clone();
@@ -1074,6 +1069,16 @@ impl Actor {
         let owner_is_initiator = session.role == PeerRole::Initiator;
         let mut candidates =
             local_candidates(&self.runtime.config, id, session.expiry, session.generation)?;
+        if let Some(bound) = session
+            .quic_socket
+            .as_ref()
+            .and_then(|socket| socket.local_addr().ok())
+            && let Some(candidate) = candidates
+                .iter_mut()
+                .find(|candidate| candidate.transport == CandidateTransport::QuicUdp)
+        {
+            candidate.address = protocol_socket(bound);
+        }
         for (index, address) in session.observed_udp.iter().take(2).cloned().enumerate() {
             candidates.push(Candidate {
                 transport: CandidateTransport::QuicUdp,
@@ -2181,6 +2186,26 @@ fn local_socket(
     Ok(SocketAddr::new(
         local_ip(config)?,
         u16::try_from(port).map_err(|_| invalid())?,
+    ))
+}
+
+fn bind_quic_socket(config: &ClientConfig, id: SessionId) -> io::Result<std::net::UdpSocket> {
+    let p2p = config.p2p.as_ref().ok_or_else(invalid)?;
+    let preferred = local_socket(config, id, CandidateTransport::QuicUdp)?;
+    let width = u32::from(p2p.udp_port_range.end) - u32::from(p2p.udp_port_range.start) + 1;
+    let preferred_offset = u32::from(preferred.port()) - u32::from(p2p.udp_port_range.start);
+    for offset in 0..width {
+        let port = u32::from(p2p.udp_port_range.start) + (preferred_offset + offset) % width;
+        let address = SocketAddr::new(preferred.ip(), u16::try_from(port).map_err(|_| invalid())?);
+        match std::net::UdpSocket::bind(address) {
+            Ok(socket) => return Ok(socket),
+            Err(error) if error.kind() == io::ErrorKind::AddrInUse => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AddrInUse,
+        "configured P2P UDP port range is fully occupied",
     ))
 }
 
