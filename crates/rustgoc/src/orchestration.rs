@@ -731,7 +731,8 @@ impl Actor {
             return Ok(());
         };
         let session_id = self.observation_waiters.pop_front().ok_or_else(invalid)?;
-        let socket = bind_quic_socket(&self.runtime.config, session_id)?;
+        let role = self.sessions.get(&session_id).ok_or_else(invalid)?.role;
+        let socket = bind_quic_socket(&self.runtime.config, session_id, role)?;
         socket.set_nonblocking(true)?;
         let observer = socket.try_clone()?;
         let sender = self.runtime.commands.clone();
@@ -2206,14 +2207,19 @@ fn local_socket(
     ))
 }
 
-fn bind_quic_socket(config: &ClientConfig, id: SessionId) -> io::Result<std::net::UdpSocket> {
+fn bind_quic_socket(
+    config: &ClientConfig,
+    id: SessionId,
+    role: PeerRole,
+) -> io::Result<std::net::UdpSocket> {
     let p2p = config.p2p.as_ref().ok_or_else(invalid)?;
-    let preferred = local_socket(config, id, CandidateTransport::QuicUdp)?;
     let width = u32::from(p2p.udp_port_range.end) - u32::from(p2p.udp_port_range.start) + 1;
-    let preferred_offset = u32::from(preferred.port()) - u32::from(p2p.udp_port_range.start);
+    let marker = u32::from_be_bytes(id.as_bytes()[..4].try_into().expect("fixed session id"));
+    let preferred_offset = (marker + if role == PeerRole::Responder { 1 } else { 0 }) % width;
+    let ip = local_ip(config)?;
     for offset in 0..width {
         let port = u32::from(p2p.udp_port_range.start) + (preferred_offset + offset) % width;
-        let address = SocketAddr::new(preferred.ip(), u16::try_from(port).map_err(|_| invalid())?);
+        let address = SocketAddr::new(ip, u16::try_from(port).map_err(|_| invalid())?);
         match std::net::UdpSocket::bind(address) {
             Ok(socket) => return Ok(socket),
             Err(error) if error.kind() == io::ErrorKind::AddrInUse => {}
