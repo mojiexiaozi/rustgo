@@ -1677,11 +1677,15 @@ impl RecheckAttemptFactory for ActorRecheckFactory {
             })
             .await
             .map_err(|_| PathError::Cancelled)?;
-        tokio::select! {
+        let result = tokio::select! {
             biased;
             () = cancellation.cancelled() => Err(PathError::Cancelled),
             result = result => result.map_err(|_| PathError::Cancelled)?.map(|attempts| attempts.into_iter().map(|inner| Arc::new(PromotionAttempt { inner, actor: self.actor.clone(), session_id: self.session_id }) as Arc<dyn PathAttempt>).collect()),
+        };
+        if let Err(error) = &result {
+            tracing::warn!(session_id = %session_log_id(self.session_id), error = %error, "fresh direct promotion generation could not create an attempt");
         }
+        result
     }
 }
 
