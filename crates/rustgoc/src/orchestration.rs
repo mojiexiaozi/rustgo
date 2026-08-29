@@ -1216,10 +1216,7 @@ impl Actor {
         {
             return Ok(());
         }
-        if transport == CandidateTransport::QuicUdp
-            && observation_enabled
-            && session.punch_grant.is_none()
-        {
+        if observation_enabled && session.punch_grant.is_none() {
             return Ok(());
         }
         let peer_candidate = session
