@@ -269,9 +269,38 @@ listen_addr = "127.0.0.1:{udp_forward}"
             consumer_log.contains("fresh direct path promoted for subsequent service opens"),
             "direct promotion missing:\nCONSUMER\n{consumer_log}\nPROVIDER\n{provider_log}\nSERVER\n{server_log}"
         );
-        assert!(consumer_log.contains("selected promoted direct path for new service open"));
-        assert!(consumer_log.contains("path=NativeTcp"));
-        assert!(consumer_log.contains("path=QuicV4"));
+        let flows = selected_flows(&consumer_log);
+        let tcp = flows
+            .iter()
+            .filter(|flow| flow.export == "tcp-echo")
+            .collect::<Vec<_>>();
+        let udp = flows
+            .iter()
+            .filter(|flow| flow.export == "udp-echo")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tcp.len(),
+            2,
+            "expected exactly initial/promoted TCP selections: {flows:?}"
+        );
+        assert_eq!(
+            udp.len(),
+            2,
+            "expected exactly initial/promoted UDP selections: {flows:?}"
+        );
+        assert_flow(tcp[0], "Tcp", "Relay");
+        assert_flow(tcp[1], "Tcp", "NativeTcp");
+        assert_flow(udp[0], "Udp", "Relay");
+        assert_flow(udp[1], "Udp", "QuicV4");
+        let ids = flows
+            .iter()
+            .map(|flow| flow.session_id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            ids.len(),
+            4,
+            "each transferred open must have a distinct correlated session: {flows:?}"
+        );
     }
 
     drop(children);
@@ -279,6 +308,49 @@ listen_addr = "127.0.0.1:{udp_forward}"
     tcp_task.await?;
     udp_task.await?;
     Ok(())
+}
+
+#[derive(Debug)]
+struct SelectedFlow {
+    session_id: String,
+    open_id: String,
+    protocol: String,
+    generation: String,
+    path: String,
+    export: String,
+}
+
+fn selected_flows(log: &str) -> Vec<SelectedFlow> {
+    log.lines()
+        .filter(|line| {
+            line.contains("peer service flow") && line.contains("lifecycle=\"selected\"")
+        })
+        .filter_map(|line| {
+            Some(SelectedFlow {
+                session_id: log_field(line, "session_id")?,
+                open_id: log_field(line, "open_id")?,
+                protocol: log_field(line, "protocol")?,
+                generation: log_field(line, "generation")?,
+                path: log_field(line, "path")?,
+                export: log_field(line, "export")?,
+            })
+        })
+        .collect()
+}
+
+fn log_field(line: &str, name: &str) -> Option<String> {
+    let prefix = format!("{name}=");
+    line.split_whitespace()
+        .find_map(|field| field.strip_prefix(&prefix))
+        .map(|value| value.trim_matches('"').to_owned())
+}
+
+fn assert_flow(flow: &SelectedFlow, protocol: &str, path: &str) {
+    assert_eq!(flow.open_id, "1", "{flow:?}");
+    assert_eq!(flow.generation, "1", "{flow:?}");
+    assert_eq!(flow.protocol, protocol, "{flow:?}");
+    assert_eq!(flow.path, path, "{flow:?}");
+    assert_eq!(flow.session_id.len(), 64, "{flow:?}");
 }
 
 #[allow(clippy::too_many_arguments)]

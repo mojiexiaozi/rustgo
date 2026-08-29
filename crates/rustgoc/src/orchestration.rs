@@ -146,13 +146,13 @@ impl PeerGenerationHandler for ProductionPeerRuntime {
                 Err(error) => {
                     tracing::error!(error = %error, "failed to start peer forwards");
                     shutdown.cancel();
-                    let _ = actor.await;
+                    report_actor_exit(actor.await);
                     return;
                 }
             };
             shutdown.cancelled().await;
             forward.shutdown().await;
-            let _ = actor.await;
+            report_actor_exit(actor.await);
         })
     }
 
@@ -169,6 +169,18 @@ impl PeerGenerationHandler for ProductionPeerRuntime {
                 tracing::warn!("peer event queue unavailable");
             }
         })
+    }
+}
+
+fn report_actor_exit(result: Result<io::Result<()>, tokio::task::JoinError>) {
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::error!(error = %error, "peer orchestration generation teardown failed");
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "peer orchestration actor task failed");
+        }
     }
 }
 
@@ -264,6 +276,33 @@ enum OpenedIo {
     Udp(BoxPeerDatagramSession),
 }
 
+#[derive(Clone)]
+struct FlowMeta {
+    session_id: String,
+    open_id: u64,
+    protocol: TunnelProtocol,
+    generation: u64,
+    path: PathKind,
+    peer: String,
+    export: String,
+}
+
+impl FlowMeta {
+    fn log(&self, lifecycle: &'static str) {
+        tracing::info!(
+            session_id = %self.session_id,
+            open_id = self.open_id,
+            protocol = ?self.protocol,
+            generation = self.generation,
+            path = ?self.path,
+            peer = %self.peer,
+            export = %self.export,
+            lifecycle,
+            "peer service flow"
+        );
+    }
+}
+
 struct Actor {
     runtime: ProductionPeerRuntime,
     context: ChildSessionContext,
@@ -326,7 +365,7 @@ impl Actor {
         }
     }
 
-    async fn run(mut self) {
+    async fn run(mut self) -> io::Result<()> {
         let mut sweep = tokio::time::interval(Duration::from_secs(1));
         while let Some(input) = tokio::select! {
             biased;
@@ -410,22 +449,57 @@ impl Actor {
             self.remove_cancelled();
         }
         let mut managers = Vec::new();
+        let mut pending_replies = Vec::new();
         for (_, mut session) in self.sessions.drain() {
             session.cancellation.cancel();
             if let Some(manager) = session.manager.take() {
                 managers.push(manager);
             }
             if let Some(reply) = session.reply.take() {
-                let _ = reply.send(Err(closed()));
+                pending_replies.push(reply);
             }
         }
         for manager in managers {
             let _ = manager.close().await;
         }
-        let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut teardown_error = None;
+        if tokio::time::timeout(Duration::from_secs(5), async {
             while self.tasks.join_next().await.is_some() {}
         })
-        .await;
+        .await
+        .is_err()
+        {
+            tracing::warn!(
+                remaining = self.tasks.len(),
+                "peer generation graceful task drain timed out; aborting remaining owned tasks"
+            );
+            self.tasks.abort_all();
+            if tokio::time::timeout(Duration::from_secs(5), async {
+                while self.tasks.join_next().await.is_some() {}
+            })
+            .await
+            .is_err()
+            {
+                let remaining = self.tasks.len();
+                tracing::error!(
+                    remaining,
+                    "peer generation hard task drain timed out after abort; resources may require process-level recovery"
+                );
+                teardown_error = Some(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "peer generation teardown left {remaining} owned task(s) after abort timeout"
+                    ),
+                ));
+            }
+        }
+        for reply in pending_replies {
+            let _ = reply.send(Err(closed()));
+        }
+        match teardown_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     async fn begin_open(
@@ -1176,6 +1250,16 @@ impl Actor {
                 };
                 let cancellation = session.cancellation.child_token();
                 let exports = self.runtime.exports.clone();
+                let meta = FlowMeta {
+                    session_id: session_log_id(id),
+                    open_id: CHANNEL_ID,
+                    protocol,
+                    generation: session.generation.get(),
+                    path: path.kind(),
+                    peer: peer.clone(),
+                    export: export.clone(),
+                };
+                meta.log("selected");
                 tracing::info!(path = ?path.kind(), generation = session.generation.get(), peer = %peer, export = %export, promoted_open, "authoritative peer path selected");
                 if promoted_open && path.kind().is_direct() {
                     tracing::info!(path = ?path.kind(), generation = session.generation.get(), peer = %peer, export = %export, "selected promoted direct path for new service open");
@@ -1202,13 +1286,18 @@ impl Actor {
                 }
                 if let Some(tcp) = path.handle::<EncryptedPeerTcp>() {
                     let sender = self.runtime.commands.clone();
+                    let flow = meta.clone();
                     self.tasks.spawn(async move {
+                        flow.log("io_start");
                         run_direct_tcp(role, peer, export, tcp, exports, reply, cancellation).await;
+                        flow.log("io_finished");
                         let _ = sender.send(ActorInput::SessionFinished(id)).await;
                     });
                 } else if let Some(quic) = path.handle::<QuicPeerPathHandle>() {
                     let sender = self.runtime.commands.clone();
+                    let flow = meta.clone();
                     self.tasks.spawn(async move {
+                        flow.log("io_start");
                         run_direct_quic(
                             role,
                             protocol,
@@ -1220,6 +1309,7 @@ impl Actor {
                             cancellation,
                         )
                         .await;
+                        flow.log("io_finished");
                         let _ = sender.send(ActorInput::SessionFinished(id)).await;
                     });
                 } else {
@@ -1333,6 +1423,15 @@ impl Actor {
         let exports = self.runtime.exports.clone();
         let sender = self.runtime.commands.clone();
         let worker_sender = sender.clone();
+        let flow = FlowMeta {
+            session_id: session_log_id(id),
+            open_id: CHANNEL_ID,
+            protocol,
+            generation: session.generation.get(),
+            path: PathKind::Relay,
+            peer: peer.clone(),
+            export: export.clone(),
+        };
         self.tasks.spawn(async move {
             let owned_flow = run_relay_session(RelayWorker {
                 session_id: id,
@@ -1348,9 +1447,11 @@ impl Actor {
                 reply: None,
                 selection_reply: None,
                 cancellation,
+                flow: flow.clone(),
             })
             .await;
             if owned_flow {
+                flow.log("io_finished");
                 let _ = sender.send(ActorInput::SessionFinished(id)).await;
             }
         });
@@ -1491,6 +1592,7 @@ struct RelayWorker {
     reply: Option<oneshot::Sender<io::Result<OpenedIo>>>,
     selection_reply: Option<oneshot::Receiver<Option<OpenReply>>>,
     cancellation: CancellationToken,
+    flow: FlowMeta,
 }
 
 struct RelayReady {
@@ -1651,6 +1753,7 @@ async fn run_relay_session_inner(worker: &mut RelayWorker) -> io::Result<()> {
         .ok_or_else(invalid)?
         .await
         .map_err(|_| closed())?;
+    worker.flow.log("io_start");
     match worker.role {
         PeerRole::Initiator => {
             let accepted = recv_plain(worker).await?;
@@ -2190,6 +2293,14 @@ fn random_session_id() -> io::Result<SessionId> {
         .try_fill_bytes(&mut bytes)
         .map_err(|_| io::Error::other("OS randomness unavailable"))?;
     Ok(SessionId::from(bytes))
+}
+fn session_log_id(id: SessionId) -> String {
+    let mut value = String::with_capacity(64);
+    for byte in id.as_bytes() {
+        use std::fmt::Write as _;
+        let _ = write!(&mut value, "{byte:02x}");
+    }
+    value
 }
 fn fresh_transport_keys() -> (
     HashMap<CandidateTransport, EphemeralPeerKey>,

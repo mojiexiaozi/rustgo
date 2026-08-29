@@ -69,3 +69,27 @@ Task 12 namespace topology and Task 13 packaging/deployment were not implemented
   `cargo test -p rustgoc --test peer_process -- --nocapture --test-threads=1` passed;
   `cargo test --workspace --all-targets -- --test-threads=1` passed in full, including
   the fixed-socket QUIC regression and real three-process test.
+
+## Final P2 closure (2026-08-29)
+
+- Generation teardown now has two bounded phases. It first waits five seconds for all
+  owned tasks to drain, then calls `JoinSet::abort_all` and keeps joining for a second
+  five-second bound. A remaining task becomes an explicit `TimedOut` actor result and
+  an actionable generation-level error; pending opens are not reported closed until
+  this resource fence has completed or surfaced the hard failure.
+- Each authoritative service flow emits correlated `selected`, `io_start`, and
+  `io_finished` lifecycle records with the full rendezvous `session_id`, channel/open
+  ID, protocol, generation, selected `PathKind`, peer, and export.
+- The real-process test parses those records as structured fields. For distinct exact
+  sessions it proves the transferred initial TCP and UDP opens selected `Relay`, while
+  post-promotion TCP selected `NativeTcp` and post-promotion UDP selected `QuicV4`;
+  assertions correlate path, protocol, generation, open ID, export, and session rather
+  than accepting unrelated log substrings.
+- Final focused evidence:
+  `cargo test -p rustgoc --test peer_process -- --nocapture --test-threads=1` passed
+  (1/1). The final workspace run reached the pre-existing Windows 16 MiB TCP case and
+  stopped on OS 10057 after 9/10 TCP cases; the required single isolated rerun,
+  `cargo test -p rustgo-e2e --test tcp -- --test-threads=1`, passed 10/10 including that
+  case. The immediately preceding full workspace gate passed all targets, so the
+  isolated evidence identifies the final failure as the known non-reproducible Windows
+  socket flake rather than a Task 11 regression.
