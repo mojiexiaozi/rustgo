@@ -11,8 +11,10 @@
 - Task 8: complete (`0e1aad4..089d46e`, review clean)
 - Task 9: complete (`089d46e..f14b520`, review clean)
 - Task 10: complete (`f14b520..9e2a133`, review clean)
-- Task 11: complete (production PathManager orchestration and process E2E)
-- Tasks 12-13: pending
+- Task 11: complete (`9e2a133..5f38329`, review clean)
+- Task 12: complete (static review clean; Linux netns `all` twice, cleanup audit clean)
+- Task 13: complete (`c9fe605..104131c`, review clean; deployed and verified)
+- Final whole-branch review: clean through `104131c`
 
 ## Binding rulings
 
