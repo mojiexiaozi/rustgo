@@ -5,6 +5,8 @@ mode=${1:-endpoint-independent}
 create_topology "$mode"
 create_credentials_and_configs
 start_stack
+wait_log "$RG_STATE_DIR/provider.log" "authenticated NAT observation candidates ready"
+wait_log "$RG_STATE_DIR/consumer.log" "authenticated NAT observation candidates ready"
 if [ "$mode" = restricted ]; then
     assert_restricted_filtering
 fi
