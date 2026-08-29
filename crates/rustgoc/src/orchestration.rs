@@ -150,6 +150,7 @@ impl PeerGenerationHandler for ProductionPeerRuntime {
                     return Err(ClientError::PeerGenerationFailed);
                 }
             };
+            tracing::info!(event = %"peer_forwards_ready", "peer forward listeners ready");
             shutdown.cancelled().await;
             forward.shutdown().await;
             actor_result(actor.await)

@@ -402,6 +402,7 @@ while True:
     start_in_ns "$RG_CLIENT_B_NS" consumer "$RG_BIN_DIR/rustgoc" -c "$RG_STATE_DIR/consumer/client.toml" >/dev/null
     wait_log "$RG_STATE_DIR/provider.log" event=registration_ready
     wait_log "$RG_STATE_DIR/consumer.log" event=registration_ready
+    wait_log "$RG_STATE_DIR/consumer.log" event=peer_forwards_ready
 }
 
 assert_tcp_payload() {
