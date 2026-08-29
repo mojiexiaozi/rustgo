@@ -1183,6 +1183,15 @@ impl Actor {
         );
         let local = local_socket(&self.runtime.config, id, transport)?;
         let remote = socket_addr(&peer_candidate.address);
+        tracing::info!(
+            session_id = %session_log_id(id),
+            ?transport,
+            ?local,
+            ?remote,
+            role = ?session.role,
+            generation = session.generation.get(),
+            "starting authenticated direct path attempt"
+        );
         let attempt: Arc<dyn PathAttempt> = match transport {
             CandidateTransport::QuicUdp => {
                 let auth = Arc::new(OneQuicAuth(Mutex::new(Some(
@@ -1235,7 +1244,8 @@ impl Actor {
         result: Result<SelectedPath, PathError>,
     ) -> io::Result<()> {
         match result {
-            Err(_) => {
+            Err(error) => {
+                tracing::warn!(session_id = %session_log_id(id), error = %error, "direct path attempt failed; using relay fallback");
                 if let Some(session) = self.sessions.get_mut(&id) {
                     session.direct_failed = true;
                 }
