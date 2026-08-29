@@ -736,29 +736,28 @@ impl RendezvousCoordinator {
             };
             session.candidate_digests[index] = Some(digest);
         }
-        let punch = if candidate_digest.is_some()
-            && session.candidate_generation_announced_by == 0b11
-        {
-            match session.candidate_digests {
-                [Some(initiator), Some(responder)] => Some((
-                    session.consumer.clone(),
-                    session.provider.clone(),
-                    PunchGrant {
-                        session_id: *envelope.session_id.as_bytes(),
-                        generation: envelope.generation.get(),
-                        start_unix_millis: now_unix_millis().saturating_add(250),
-                        window_millis: 1_500,
-                        cadence_millis: 25,
-                        initiator_candidates_sha256: initiator,
-                        responder_candidates_sha256: responder,
-                        token: rand::random(),
-                    },
-                )),
-                _ => None,
-            }
-        } else {
-            None
-        };
+        let punch =
+            if candidate_digest.is_some() && session.candidate_generation_announced_by == 0b11 {
+                match session.candidate_digests {
+                    [Some(initiator), Some(responder)] => Some((
+                        session.consumer.clone(),
+                        session.provider.clone(),
+                        PunchGrant {
+                            session_id: *envelope.session_id.as_bytes(),
+                            generation: envelope.generation.get(),
+                            start_unix_millis: now_unix_millis().saturating_add(250),
+                            window_millis: 150,
+                            cadence_millis: 25,
+                            initiator_candidates_sha256: initiator,
+                            responder_candidates_sha256: responder,
+                            token: rand::random(),
+                        },
+                    )),
+                    _ => None,
+                }
+            } else {
+                None
+            };
         if let Some((participant, datagram)) = relay_update {
             session.relay.requested_by |= participant;
             session.relay.datagram = Some(datagram);

@@ -650,18 +650,21 @@ async fn coordinated_punch(
         tokio::select! {
             biased;
             () = cancellation.cancelled() => return Err(PathError::Cancelled),
-            _ = tokio::time::sleep_until(deadline) => return Err(PathError::AttemptFailed(if remote.is_ipv6() { PathKind::QuicV6 } else { PathKind::QuicV4 })),
+            _ = tokio::time::sleep_until(deadline) => return Ok(()),
             _ = interval.tick() => { let _ = socket.send_to(&probe, remote).await; }
             received = socket.recv_from(&mut buffer) => {
-                if let Ok((size, source)) = received
-                    && source == remote
-                    && size == probe.len()
-                    && buffer[..8] == *PUNCH_MAGIC
-                    && buffer[8..40] == config.session_id
-                    && buffer[40..48] == config.generation.to_be_bytes()
-                    && buffer[48] == expected_role
-                    && buffer[49..81] == config.token
-                { return Ok(()); }
+                // Validate and discard only this exact grant's probes. Keep the
+                // socket in the shared bounded phase even after success so the
+                // two Quinn endpoints transition together.
+                let _valid_peer_probe = received.is_ok_and(|(size, source)| {
+                    source == remote
+                        && size == probe.len()
+                        && buffer[..8] == *PUNCH_MAGIC
+                        && buffer[8..40] == config.session_id
+                        && buffer[40..48] == config.generation.to_be_bytes()
+                        && buffer[48] == expected_role
+                        && buffer[49..81] == config.token
+                });
             }
         }
     }
