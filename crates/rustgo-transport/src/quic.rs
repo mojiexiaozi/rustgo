@@ -531,12 +531,16 @@ impl PathAttempt for QuicPathAttempt {
             .socket
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        let endpoint = match socket {
-            Some(socket) => QuicPeerEndpoint::from_socket(socket, self.config.clone()),
-            None => QuicPeerEndpoint::bind(self.local_addr, self.config.clone()),
-        }
-        .map_err(|_| PathError::AttemptFailed(self.kind))?;
+            .take()
+            .map(Ok)
+            .unwrap_or_else(|| UdpSocket::bind(self.local_addr));
+        let socket = socket.map_err(|_| PathError::AttemptFailed(self.kind))?;
+        // Both peers must emit a packet from the advertised socket before the
+        // QUIC client/server roles diverge. This opens address-dependent NAT
+        // filters for the responder, which otherwise only waits in `accept`.
+        let _ = socket.send_to(&[0], self.remote_addr);
+        let endpoint = QuicPeerEndpoint::from_socket(socket, self.config.clone())
+            .map_err(|_| PathError::AttemptFailed(self.kind))?;
         let authentication = match self.authentication_factory.create() {
             Ok(authentication) => authentication,
             Err(QuicPeerError::Cancelled) => {
