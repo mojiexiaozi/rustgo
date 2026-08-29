@@ -554,6 +554,59 @@ fn p2p_warns_when_a_forward_listens_on_wildcard_address() {
     );
 }
 
+#[test]
+fn p2p_collection_bounds_reject_accidental_resource_explosions() {
+    let dir = TempDir::new();
+    let mut too_many_exports = valid_client();
+    for index in 0..=rustgo_config::MAX_EXPORTS {
+        too_many_exports.push_str(&format!(
+            "\n[[exports]]\nname = \"export-{index}\"\nprotocol = \"tcp\"\nlocal_addr = \"127.0.0.1:22\"\n"
+        ));
+    }
+    let export_error = load_client_text(&dir, &too_many_exports)
+        .unwrap_err()
+        .to_string();
+    assert!(export_error.contains("exports must contain at most 256 entries"));
+
+    let mut too_many_forwards = valid_client();
+    for index in 0..=rustgo_config::MAX_FORWARDS {
+        too_many_forwards.push_str(&format!(
+            "\n[[forwards]]\nname = \"forward-{index}\"\npeer = \"peer-{index}\"\nexport = \"ssh\"\nlisten_addr = \"127.0.0.1:{}\"\n",
+            20_000 + index
+        ));
+    }
+    let forward_error = load_client_text(&dir, &too_many_forwards)
+        .unwrap_err()
+        .to_string();
+    assert!(forward_error.contains("forwards must contain at most 256 entries"));
+
+    let peers = (0..=rustgo_config::MAX_ALLOWED_PEERS_PER_EXPORT)
+        .map(|index| format!("\"peer-{index}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let too_many_peers = format!(
+        "{}\n[[exports]]\nname = \"ssh-peer-list\"\nprotocol = \"tcp\"\nlocal_addr = \"127.0.0.1:22\"\nallowed_peers = [{peers}]\n",
+        valid_client()
+    );
+    let peer_error = load_client_text(&dir, &too_many_peers)
+        .unwrap_err()
+        .to_string();
+    assert!(peer_error.contains("allowed_peers must contain at most 256 entries"));
+
+    let allow_all = format!(
+        "{}\n[[exports]]\nname = \"allow-all\"\nprotocol = \"tcp\"\nlocal_addr = \"127.0.0.1:22\"\nallowed_peers = []\n",
+        valid_client()
+    );
+    assert!(
+        load_client_text(&dir, &allow_all)
+            .unwrap()
+            .exports
+            .last()
+            .unwrap()
+            .allows_peer("any-authenticated-peer")
+    );
+}
+
 #[allow(dead_code)]
 fn assert_path(path: &Path) {
     assert!(path.is_absolute());

@@ -4,7 +4,10 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use rustgo_protocol::{MAX_CLIENT_NAME_BYTES, MAX_TUNNEL_NAME_BYTES, MAX_TUNNELS};
 use thiserror::Error;
 
-use crate::{ClientConfig, ConfigWarning, ServerConfig};
+use crate::{
+    ClientConfig, ConfigWarning, MAX_ALLOWED_PEERS_PER_EXPORT, MAX_EXPORTS, MAX_FORWARDS,
+    ServerConfig,
+};
 
 const MAX_LIMIT: u32 = 1_000_000;
 const MAX_UDP_PAYLOAD_BYTES: u32 = 65_507;
@@ -128,6 +131,17 @@ pub(crate) fn validate_client(config: &ClientConfig) -> Result<(), ValidationErr
         require_nonzero("p2p.reconnect_timeout_secs", p2p.reconnect_timeout_secs)?;
     }
 
+    if config.exports.len() > MAX_EXPORTS {
+        return Err(ValidationError::new(format!(
+            "exports must contain at most {MAX_EXPORTS} entries"
+        )));
+    }
+    if config.forwards.len() > MAX_FORWARDS {
+        return Err(ValidationError::new(format!(
+            "forwards must contain at most {MAX_FORWARDS} entries"
+        )));
+    }
+
     let mut export_names = HashSet::new();
     for export in &config.exports {
         validate_wire_string("exports.name", &export.name, MAX_TUNNEL_NAME_BYTES)?;
@@ -135,6 +149,12 @@ pub(crate) fn validate_client(config: &ClientConfig) -> Result<(), ValidationErr
         if !export_names.insert(&export.name) {
             return Err(ValidationError::new(format!(
                 "duplicate export name `{}`",
+                export.name
+            )));
+        }
+        if export.allowed_peers.len() > MAX_ALLOWED_PEERS_PER_EXPORT {
+            return Err(ValidationError::new(format!(
+                "export `{}` allowed_peers must contain at most {MAX_ALLOWED_PEERS_PER_EXPORT} entries",
                 export.name
             )));
         }

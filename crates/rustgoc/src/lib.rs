@@ -17,7 +17,7 @@ pub use control::{
 pub use exports::{AuthorizedExport, ExportError, ExportRegistry, PeerOpenRequest, PeerOpenResult};
 pub use forwards::{
     BoxPeerDatagramSession, BoxPeerStream, ForwardConnector, ForwardError, ForwardRuntime,
-    PeerDatagramSession, PeerFuture, PeerIo,
+    ForwardRuntimeOptions, PeerDatagramSession, PeerFuture, PeerIo,
 };
 pub use session::{
     ChildSessionContext, ChildSessionRequest, ChildSessionSupervisor, NoopChildSessionSupervisor,

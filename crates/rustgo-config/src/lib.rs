@@ -15,5 +15,8 @@ pub use model::{
     AuthorizedClient, ClientConfig, ClientSection, Limits, ServerConfig, ServerSection,
     TunnelConfig, TunnelProtocol,
 };
-pub use p2p::{ConfigWarning, ExportConfig, ForwardConfig, P2pConfig, PortRange};
+pub use p2p::{
+    ConfigWarning, ExportConfig, ForwardConfig, MAX_ALLOWED_PEERS_PER_EXPORT, MAX_EXPORTS,
+    MAX_FORWARDS, P2pConfig, PortRange,
+};
 pub use validate::ValidationError;

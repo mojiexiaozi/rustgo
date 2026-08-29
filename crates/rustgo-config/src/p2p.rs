@@ -3,6 +3,9 @@ use serde::{Deserialize, Deserializer, de::Error as _};
 use crate::TunnelProtocol;
 
 const MAX_PORTS_PER_RANGE: u32 = 1024;
+pub const MAX_EXPORTS: usize = 256;
+pub const MAX_FORWARDS: usize = 256;
+pub const MAX_ALLOWED_PEERS_PER_EXPORT: usize = 256;
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]

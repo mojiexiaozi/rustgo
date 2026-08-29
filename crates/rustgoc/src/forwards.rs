@@ -1,18 +1,57 @@
-use std::{collections::HashMap, future::Future, io, net::SocketAddr, pin::Pin, sync::Arc};
+use std::{
+    collections::HashMap, future::Future, io, net::SocketAddr, pin::Pin, sync::Arc, time::Duration,
+};
 
 use rustgo_config::{ForwardConfig, TunnelProtocol};
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::{TcpListener, UdpSocket},
-    sync::mpsc,
+    sync::{Semaphore, mpsc},
     task::{JoinHandle, JoinSet},
 };
 use tokio_util::sync::CancellationToken;
 
-const MAX_UDP_SOURCE_SESSIONS: usize = 256;
+const ABSOLUTE_MAX_TCP_SESSIONS: usize = 1024;
+const ABSOLUTE_MAX_UDP_SOURCE_SESSIONS: usize = 1024;
 const UDP_SOURCE_QUEUE_CAPACITY: usize = 64;
 const MAX_UDP_DATAGRAM_BYTES: usize = 65_507;
+const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, Copy)]
+pub struct ForwardRuntimeOptions {
+    pub protocol_timeout: Duration,
+    pub session_open_timeout: Duration,
+    pub udp_source_idle_timeout: Duration,
+    pub max_tcp_sessions: usize,
+    pub max_udp_source_sessions: usize,
+}
+
+impl Default for ForwardRuntimeOptions {
+    fn default() -> Self {
+        Self {
+            protocol_timeout: Duration::from_secs(10),
+            session_open_timeout: Duration::from_secs(10),
+            udp_source_idle_timeout: Duration::from_secs(60),
+            max_tcp_sessions: 128,
+            max_udp_source_sessions: 256,
+        }
+    }
+}
+
+impl ForwardRuntimeOptions {
+    fn validate(self) -> Result<Self, ForwardError> {
+        if self.protocol_timeout.is_zero()
+            || self.session_open_timeout.is_zero()
+            || self.udp_source_idle_timeout.is_zero()
+            || !(1..=ABSOLUTE_MAX_TCP_SESSIONS).contains(&self.max_tcp_sessions)
+            || !(1..=ABSOLUTE_MAX_UDP_SOURCE_SESSIONS).contains(&self.max_udp_source_sessions)
+        {
+            return Err(ForwardError::InvalidOptions);
+        }
+        Ok(self)
+    }
+}
 
 pub trait PeerIo: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T> PeerIo for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -43,6 +82,8 @@ pub trait ForwardConnector: Send + Sync + 'static {
 
 #[derive(Debug, Error)]
 pub enum ForwardError {
+    #[error("invalid forward runtime resource limits or timeouts")]
+    InvalidOptions,
     #[error("duplicate forward name")]
     DuplicateForward,
     #[error("invalid forward listen address")]
@@ -51,6 +92,10 @@ pub enum ForwardError {
     Bind,
     #[error("peer export protocol could not be resolved")]
     Protocol,
+    #[error("forward startup was cancelled")]
+    Cancelled,
+    #[error("peer export protocol discovery timed out")]
+    ProtocolTimeout,
 }
 
 pub struct ForwardRuntime {
@@ -65,6 +110,22 @@ impl ForwardRuntime {
         connector: Arc<dyn ForwardConnector>,
         cancellation: CancellationToken,
     ) -> Result<Self, ForwardError> {
+        Self::start_with_options(
+            forwards,
+            connector,
+            cancellation,
+            ForwardRuntimeOptions::default(),
+        )
+        .await
+    }
+
+    pub async fn start_with_options(
+        forwards: Vec<ForwardConfig>,
+        connector: Arc<dyn ForwardConnector>,
+        cancellation: CancellationToken,
+        options: ForwardRuntimeOptions,
+    ) -> Result<Self, ForwardError> {
+        let options = options.validate()?;
         let shutdown = cancellation.child_token();
         let mut prepared = Vec::with_capacity(forwards.len());
         let mut names = std::collections::HashSet::with_capacity(forwards.len());
@@ -76,10 +137,15 @@ impl ForwardRuntime {
                 .listen_addr
                 .parse()
                 .map_err(|_| ForwardError::InvalidListenAddress)?;
-            let protocol = connector
-                .protocol(&forward.peer, &forward.export)
-                .await
-                .map_err(|_| ForwardError::Protocol)?;
+            let discovery = connector.protocol(&forward.peer, &forward.export);
+            let protocol = tokio::select! {
+                biased;
+                () = shutdown.cancelled() => return Err(ForwardError::Cancelled),
+                result = tokio::time::timeout(options.protocol_timeout, discovery) => {
+                    result.map_err(|_| ForwardError::ProtocolTimeout)?
+                        .map_err(|_| ForwardError::Protocol)?
+                }
+            };
             prepared.push((forward, listen_addr, protocol));
         }
         let mut local_addrs = HashMap::with_capacity(prepared.len());
@@ -103,6 +169,7 @@ impl ForwardRuntime {
                         forward,
                         connector.clone(),
                         shutdown.child_token(),
+                        options,
                     )));
                 }
                 TunnelProtocol::Udp => {
@@ -122,6 +189,7 @@ impl ForwardRuntime {
                         forward,
                         connector.clone(),
                         shutdown.child_token(),
+                        options,
                     )));
                 }
             }
@@ -139,16 +207,23 @@ impl ForwardRuntime {
 
     pub async fn shutdown(mut self) {
         self.shutdown.cancel();
-        for task in self.tasks.drain(..) {
-            let _ = task.await;
-        }
+        drain_tasks(&mut self.tasks).await;
     }
 }
 
 async fn cancel_started(shutdown: &CancellationToken, tasks: Vec<JoinHandle<()>>) {
     shutdown.cancel();
-    for task in tasks {
-        let _ = task.await;
+    let mut tasks = tasks;
+    drain_tasks(&mut tasks).await;
+}
+
+async fn drain_tasks(tasks: &mut Vec<JoinHandle<()>>) {
+    let deadline = tokio::time::Instant::now() + RUNTIME_SHUTDOWN_TIMEOUT;
+    for mut task in tasks.drain(..) {
+        if tokio::time::timeout_at(deadline, &mut task).await.is_err() {
+            task.abort();
+            let _ = task.await;
+        }
     }
 }
 
@@ -166,8 +241,10 @@ async fn run_tcp_forward(
     forward: ForwardConfig,
     connector: Arc<dyn ForwardConnector>,
     cancellation: CancellationToken,
+    options: ForwardRuntimeOptions,
 ) {
     let mut sessions = JoinSet::new();
+    let permits = Arc::new(Semaphore::new(options.max_tcp_sessions));
     loop {
         tokio::select! {
             biased;
@@ -175,12 +252,23 @@ async fn run_tcp_forward(
             joined = sessions.join_next(), if !sessions.is_empty() => { let _ = joined; }
             accepted = listener.accept() => {
                 let Ok((mut local, _)) = accepted else { break; };
+                let Ok(permit) = permits.clone().try_acquire_owned() else {
+                    drop(local);
+                    continue;
+                };
                 let connector = connector.clone();
                 let peer = forward.peer.clone();
                 let export = forward.export.clone();
                 let child = cancellation.child_token();
                 sessions.spawn(async move {
-                    let Ok(mut remote) = connector.open_tcp(&peer, &export, child.clone()).await else { return; };
+                    let _permit = permit;
+                    let open = connector.open_tcp(&peer, &export, child.clone());
+                    let opened = tokio::select! {
+                        biased;
+                        () = child.cancelled() => return,
+                        result = tokio::time::timeout(options.session_open_timeout, open) => result,
+                    };
+                    let Ok(Ok(mut remote)) = opened else { return; };
                     tokio::select! {
                         biased;
                         () = child.cancelled() => {}
@@ -199,68 +287,118 @@ async fn run_udp_forward(
     forward: ForwardConfig,
     connector: Arc<dyn ForwardConnector>,
     cancellation: CancellationToken,
+    options: ForwardRuntimeOptions,
 ) {
-    let mut sources: HashMap<SocketAddr, mpsc::Sender<Vec<u8>>> = HashMap::new();
+    struct SourceEntry {
+        generation: u64,
+        sender: mpsc::Sender<Vec<u8>>,
+    }
+    let mut sources: HashMap<SocketAddr, SourceEntry> = HashMap::new();
     let mut sessions = JoinSet::new();
-    let (completed, mut completions) = mpsc::channel(MAX_UDP_SOURCE_SESSIONS);
+    let (completed, mut completions) = mpsc::channel(options.max_udp_source_sessions);
+    let mut next_generation = 1_u64;
     let mut buffer = vec![0_u8; MAX_UDP_DATAGRAM_BYTES];
     loop {
         tokio::select! {
             biased;
             () = cancellation.cancelled() => break,
             completed_source = completions.recv(), if !sources.is_empty() => {
-                if let Some(source) = completed_source { sources.remove(&source); }
+                if let Some((source, generation)) = completed_source
+                    && sources.get(&source).is_some_and(|entry| entry.generation == generation)
+                {
+                    sources.remove(&source);
+                }
             }
             joined = sessions.join_next(), if !sessions.is_empty() => { let _ = joined; }
             received = socket.recv_from(&mut buffer) => {
                 let Ok((length, source)) = received else { break; };
                 if !sources.contains_key(&source) {
-                    if sources.len() >= MAX_UDP_SOURCE_SESSIONS { continue; }
+                    if sources.len() >= options.max_udp_source_sessions { continue; }
                     let (sender, receiver) = mpsc::channel(UDP_SOURCE_QUEUE_CAPACITY);
-                    sources.insert(source, sender);
+                    let generation = next_generation;
+                    next_generation = next_generation.wrapping_add(1).max(1);
+                    sources.insert(source, SourceEntry { generation, sender });
                     let socket = socket.clone();
                     let connector = connector.clone();
                     let peer = forward.peer.clone();
                     let export = forward.export.clone();
                     let child = cancellation.child_token();
                     let completed = completed.clone();
+                    let context = UdpSourceContext {
+                        socket,
+                        source,
+                        connector,
+                        peer,
+                        export,
+                        cancellation: child,
+                        options,
+                    };
                     sessions.spawn(async move {
-                        run_udp_source(socket, source, receiver, connector, peer, export, child).await;
-                        let _ = completed.send(source).await;
+                        run_udp_source(context, receiver).await;
+                        let _ = completed.send((source, generation)).await;
                     });
                 }
-                if let Some(sender) = sources.get(&source) {
-                    let _ = sender.try_send(buffer[..length].to_vec());
+                if let Some(entry) = sources.get(&source)
+                    && entry.sender.try_send(buffer[..length].to_vec()).is_err()
+                    && entry.sender.is_closed()
+                {
+                    sources.remove(&source);
                 }
             }
         }
     }
+    drop(completions);
     cancellation.cancel();
     while sessions.join_next().await.is_some() {}
 }
 
-async fn run_udp_source(
+struct UdpSourceContext {
     socket: Arc<UdpSocket>,
     source: SocketAddr,
-    mut outbound: mpsc::Receiver<Vec<u8>>,
     connector: Arc<dyn ForwardConnector>,
     peer: String,
     export: String,
     cancellation: CancellationToken,
-) {
-    let Ok(mut session) = connector
-        .open_udp(&peer, &export, cancellation.clone())
-        .await
-    else {
+    options: ForwardRuntimeOptions,
+}
+
+async fn run_udp_source(context: UdpSourceContext, mut outbound: mpsc::Receiver<Vec<u8>>) {
+    let UdpSourceContext {
+        socket,
+        source,
+        connector,
+        peer,
+        export,
+        cancellation,
+        options,
+    } = context;
+    let open = connector.open_udp(&peer, &export, cancellation.clone());
+    let opened = tokio::select! {
+        biased;
+        () = cancellation.cancelled() => return,
+        result = tokio::time::timeout(options.session_open_timeout, open) => result,
+    };
+    let Ok(Ok(mut session)) = opened else {
         return;
     };
+    let idle = tokio::time::sleep(options.udp_source_idle_timeout);
+    tokio::pin!(idle);
     loop {
         tokio::select! {
             biased;
             () = cancellation.cancelled() => return,
+            () = &mut idle => return,
             payload = outbound.recv() => {
                 let Some(payload) = payload else { return; };
-                if session.send(&payload).await.is_err() { return; }
+                let send = session.send(&payload);
+                let sent = tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => return,
+                    () = &mut idle => return,
+                    result = tokio::time::timeout(options.session_open_timeout, send) => result,
+                };
+                if !matches!(sent, Ok(Ok(()))) { return; }
+                idle.as_mut().reset(tokio::time::Instant::now() + options.udp_source_idle_timeout);
             }
             payload = session.receive() => {
                 let Ok(payload) = payload else { return; };
