@@ -268,6 +268,7 @@ enum ActorInput {
     },
     ObservationResult {
         session_id: SessionId,
+        grant_expires_unix_secs: u64,
         result: io::Result<(std::net::UdpSocket, Vec<rustgo_protocol::SocketAddress>)>,
     },
     Sweep,
@@ -313,8 +314,15 @@ struct Actor {
     shutdown: CancellationToken,
     sessions: HashMap<SessionId, Session>,
     observation_waiters: VecDeque<SessionId>,
+    observed_ip_cache: Vec<ObservedIpCacheEntry>,
     promoted: HashSet<(String, String, TunnelProtocol)>,
     tasks: JoinSet<()>,
+}
+
+#[derive(Clone)]
+struct ObservedIpCacheEntry {
+    address: rustgo_protocol::SocketAddress,
+    expires_unix_secs: u64,
 }
 
 struct Session {
@@ -347,6 +355,7 @@ struct Session {
     candidate_sent_generation: u64,
     quic_socket: Option<std::net::UdpSocket>,
     observed_udp: Vec<rustgo_protocol::SocketAddress>,
+    cached_tcp_observed_ip: Option<rustgo_protocol::SocketAddress>,
     punch_grant: Option<rustgo_protocol::PunchGrant>,
     local_candidates_digest: Option<[u8; 32]>,
     peer_candidates_digest: Option<[u8; 32]>,
@@ -368,6 +377,7 @@ impl Actor {
             shutdown,
             sessions: HashMap::new(),
             observation_waiters: VecDeque::new(),
+            observed_ip_cache: Vec::new(),
             promoted: HashSet::new(),
             tasks: JoinSet::new(),
         }
@@ -426,11 +436,41 @@ impl Actor {
                     self.begin_recheck(session_id, generation, cancellation, reply)
                         .await
                 }
-                ActorInput::ObservationResult { session_id, result } => match result {
+                ActorInput::ObservationResult {
+                    session_id,
+                    grant_expires_unix_secs,
+                    result,
+                } => match result {
                     Ok((socket, addresses)) => {
+                        let current = now();
+                        if !addresses.is_empty() {
+                            let session_expiry = self
+                                .sessions
+                                .get(&session_id)
+                                .map(|session| session.expiry)
+                                .unwrap_or(current);
+                            let cache_expiry = grant_expires_unix_secs
+                                .min(session_expiry)
+                                .min(current.saturating_add(30));
+                            for address in &addresses {
+                                self.observed_ip_cache
+                                    .retain(|entry| !same_address_family(&entry.address, address));
+                                self.observed_ip_cache.push(ObservedIpCacheEntry {
+                                    address: address.clone(),
+                                    expires_unix_secs: cache_expiry,
+                                });
+                            }
+                        }
                         if let Some(session) = self.sessions.get_mut(&session_id) {
                             session.quic_socket = Some(socket);
                             session.observed_udp = addresses;
+                            if session.observed_udp.is_empty() {
+                                session.cached_tcp_observed_ip = cached_observed_ip(
+                                    &self.observed_ip_cache,
+                                    local_ip(&self.runtime.config)?,
+                                    current,
+                                );
+                            }
                         }
                         tracing::info!(
                             session = ?session_id,
@@ -578,6 +618,7 @@ impl Actor {
                 candidate_sent_generation: 0,
                 quic_socket: None,
                 observed_udp: Vec::new(),
+                cached_tcp_observed_ip: None,
                 punch_grant: None,
                 local_candidates_digest: None,
                 peer_candidates_digest: None,
@@ -718,7 +759,7 @@ impl Actor {
                     format!("server rejected rendezvous with code {}", notice.code),
                 ),
             ),
-            ControlEvent::ObservationGrant(grant) => self.handle_observation_grant(grant),
+            ControlEvent::ObservationGrant(grant) => self.handle_observation_grant(grant).await,
             ControlEvent::PunchGrant(grant) => self.handle_punch_grant(grant).await,
         }
     }
@@ -731,7 +772,7 @@ impl Actor {
         ))
     }
 
-    fn handle_observation_grant(&mut self, grant: ObservationGrant) -> io::Result<()> {
+    async fn handle_observation_grant(&mut self, grant: ObservationGrant) -> io::Result<()> {
         if grant.expires_unix_secs() <= now() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -743,7 +784,24 @@ impl Actor {
         };
         let session_id = self.observation_waiters.pop_front().ok_or_else(invalid)?;
         let role = self.sessions.get(&session_id).ok_or_else(invalid)?.role;
-        let socket = bind_quic_socket(&self.runtime.config, session_id, role)?;
+        let socket = match bind_quic_socket(&self.runtime.config, session_id, role) {
+            Ok(socket) => socket,
+            Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
+                let current = now();
+                let cached = cached_observed_ip(
+                    &self.observed_ip_cache,
+                    local_ip(&self.runtime.config)?,
+                    current,
+                );
+                if let Some(session) = self.sessions.get_mut(&session_id) {
+                    session.cached_tcp_observed_ip = cached;
+                }
+                tracing::warn!(error = %error, "NAT observation port pool occupied; using fresh authenticated IP cache for native TCP only");
+                self.send_candidates(session_id).await?;
+                return self.ensure_direct(session_id).await;
+            }
+            Err(error) => return Err(error),
+        };
         socket.set_nonblocking(true)?;
         let observer = socket.try_clone()?;
         let sender = self.runtime.commands.clone();
@@ -753,6 +811,7 @@ impl Actor {
             .ok_or_else(invalid)?
             .cancellation
             .child_token();
+        let grant_expires_unix_secs = grant.expires_unix_secs();
         self.tasks.spawn(async move {
             let result = match observe_nat(observer, primary, alternate, grant, cancellation).await {
                 Ok((_observer, addresses)) => Ok((socket, addresses)),
@@ -761,7 +820,7 @@ impl Actor {
                     Ok((socket, Vec::new()))
                 }
             };
-            let _ = sender.send(ActorInput::ObservationResult { session_id, result }).await;
+            let _ = sender.send(ActorInput::ObservationResult { session_id, grant_expires_unix_secs, result }).await;
         });
         Ok(())
     }
@@ -870,6 +929,7 @@ impl Actor {
                     candidate_sent_generation: 0,
                     quic_socket: None,
                     observed_udp: Vec::new(),
+                    cached_tcp_observed_ip: None,
                     punch_grant: None,
                     local_candidates_digest: None,
                     peer_candidates_digest: None,
@@ -962,6 +1022,7 @@ impl Actor {
             session.direct_failed = false;
             session.quic_socket = None;
             session.observed_udp.clear();
+            session.cached_tcp_observed_ip = None;
             session.punch_grant = None;
             session.local_candidates_digest = None;
             session.peer_candidates_digest = None;
@@ -1150,7 +1211,11 @@ impl Actor {
                     .map_err(|_| invalid())?,
             });
         }
-        if let Some(observed) = session.observed_udp.first() {
+        if let Some(observed) = session
+            .observed_udp
+            .first()
+            .or(session.cached_tcp_observed_ip.as_ref())
+        {
             let tcp_port =
                 local_socket(&self.runtime.config, id, CandidateTransport::NativeTcp)?.port();
             candidates.push(Candidate {
@@ -2380,6 +2445,41 @@ fn protocol_socket_with_port(
             port,
         },
     }
+}
+
+fn same_address_family(
+    left: &rustgo_protocol::SocketAddress,
+    right: &rustgo_protocol::SocketAddress,
+) -> bool {
+    matches!(
+        (left, right),
+        (
+            rustgo_protocol::SocketAddress::V4 { .. },
+            rustgo_protocol::SocketAddress::V4 { .. }
+        ) | (
+            rustgo_protocol::SocketAddress::V6 { .. },
+            rustgo_protocol::SocketAddress::V6 { .. }
+        )
+    )
+}
+
+fn cached_observed_ip(
+    cache: &[ObservedIpCacheEntry],
+    local_ip: IpAddr,
+    current: u64,
+) -> Option<rustgo_protocol::SocketAddress> {
+    cache
+        .iter()
+        .rev()
+        .find(|entry| {
+            entry.expires_unix_secs > current
+                && matches!(
+                    (&entry.address, local_ip),
+                    (rustgo_protocol::SocketAddress::V4 { .. }, IpAddr::V4(_))
+                        | (rustgo_protocol::SocketAddress::V6 { .. }, IpAddr::V6(_))
+                )
+        })
+        .map(|entry| entry.address.clone())
 }
 
 async fn observe_nat(
