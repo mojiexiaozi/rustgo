@@ -299,6 +299,16 @@ allow_direct_after_relay() {
             ip netns exec "$namespace" iptables -D FORWARD 1 2>/dev/null || true
             ip netns exec "$namespace" iptables -D FORWARD 1 2>/dev/null || true
         fi
+        # The policy transition models a fresh reachable network. Remove only
+        # rustgo's test candidate tuples so an UNREPLIED entry created while the
+        # drop rule was active cannot keep the new policy artificially fenced.
+        local port
+        for port in $(seq "$RG_UDP_FIRST" "$RG_UDP_LAST"); do
+            ip netns exec "$namespace" conntrack -D -p udp --dport "$port" >/dev/null 2>&1 || true
+        done
+        for port in $(seq "$RG_TCP_FIRST" "$RG_TCP_LAST"); do
+            ip netns exec "$namespace" conntrack -D -p tcp --dport "$port" >/dev/null 2>&1 || true
+        done
     done
 }
 
