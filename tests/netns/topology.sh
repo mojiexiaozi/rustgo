@@ -423,7 +423,7 @@ p=sys.argv[1].encode(); s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.set
 
 assert_selected_path() {
     local expected=$1
-    wait_log "$RG_STATE_DIR/consumer.log" "path=$expected" 20
+    wait_log "$RG_STATE_DIR/consumer.log" "authoritative peer path selected path=$expected" 20
     grep -F "authoritative peer path selected" "$RG_STATE_DIR/consumer.log" | grep -Fq "path=$expected"
 }
 
