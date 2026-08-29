@@ -155,9 +155,9 @@ create_topology() {
         ip -n "$RG_CLIENT_B_NS" addr add 10.231.0.22/24 dev direct0
     fi
     if [ "$mode" = ipv6-direct ]; then
-        ip -n "$RG_SERVER_NS" addr add fd23:0::2/64 dev ext0
-        ip -n "$RG_NAT_A_NS" addr add fd23:0::11/64 dev ext0
-        ip -n "$RG_NAT_B_NS" addr add fd23:0::12/64 dev ext0
+        ip -n "$RG_SERVER_NS" addr add fd23:0::2/64 dev ext0 nodad
+        ip -n "$RG_NAT_A_NS" addr add fd23:0::11/64 dev ext0 nodad
+        ip -n "$RG_NAT_B_NS" addr add fd23:0::12/64 dev ext0 nodad
     fi
 
     ip link add "rai${RG_TAG}" type veth peer name lan0
@@ -170,8 +170,8 @@ create_topology() {
     ip -n "$RG_CLIENT_A_NS" link set lan0 up
     ip -n "$RG_CLIENT_A_NS" route add default via 10.231.1.1
     if [ "$mode" = ipv6-direct ]; then
-        ip -n "$RG_NAT_A_NS" addr add fd23:1::1/64 dev int0
-        ip -n "$RG_CLIENT_A_NS" addr add "$RG_PROVIDER_V6/64" dev lan0
+        ip -n "$RG_NAT_A_NS" addr add fd23:1::1/64 dev int0 nodad
+        ip -n "$RG_CLIENT_A_NS" addr add "$RG_PROVIDER_V6/64" dev lan0 nodad
         ip -n "$RG_CLIENT_A_NS" route add default via fd23:1::1
     fi
 
@@ -185,8 +185,8 @@ create_topology() {
     ip -n "$RG_CLIENT_B_NS" link set lan0 up
     ip -n "$RG_CLIENT_B_NS" route add default via 10.231.2.1
     if [ "$mode" = ipv6-direct ]; then
-        ip -n "$RG_NAT_B_NS" addr add fd23:2::1/64 dev int0
-        ip -n "$RG_CLIENT_B_NS" addr add "$RG_CONSUMER_V6/64" dev lan0
+        ip -n "$RG_NAT_B_NS" addr add fd23:2::1/64 dev int0 nodad
+        ip -n "$RG_CLIENT_B_NS" addr add "$RG_CONSUMER_V6/64" dev lan0 nodad
         ip -n "$RG_CLIENT_B_NS" route add default via fd23:2::1
         ip netns exec "$RG_NAT_A_NS" sysctl -qw net.ipv6.conf.all.forwarding=1
         ip netns exec "$RG_NAT_B_NS" sysctl -qw net.ipv6.conf.all.forwarding=1
