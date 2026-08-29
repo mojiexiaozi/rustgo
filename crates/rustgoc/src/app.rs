@@ -9,8 +9,9 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    ChildSessionSupervisor, ClientError, ControlClient, ExportRegistry, RegisteredTunnel,
-    SessionGeneration, orchestration::ProductionPeerRuntime, udp::RelaySessionSupervisor,
+    ChildSessionSupervisor, ClientError, ControlClient, ExportRegistry, PeerGenerationHandler,
+    RegisteredTunnel, SessionGeneration, orchestration::ProductionPeerRuntime,
+    udp::RelaySessionSupervisor,
 };
 
 const INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(1);
@@ -75,6 +76,7 @@ pub struct ClientApp {
     supervisor: Arc<dyn ChildSessionSupervisor>,
     status: watch::Sender<ClientStatus>,
     exports: ExportRegistry,
+    peer_handler: Option<Arc<dyn PeerGenerationHandler>>,
     last_generation: u64,
 }
 
@@ -125,8 +127,16 @@ impl ClientApp {
             supervisor,
             status,
             exports,
+            peer_handler: None,
             last_generation: 0,
         }
+    }
+
+    /// Overrides the production peer owner for lifecycle integration testing.
+    #[doc(hidden)]
+    pub fn with_peer_handler(mut self, handler: Arc<dyn PeerGenerationHandler>) -> Self {
+        self.peer_handler = Some(handler);
+        self
     }
 
     pub fn subscribe(&self) -> watch::Receiver<ClientStatus> {
@@ -183,11 +193,13 @@ impl ClientApp {
                     );
                     let status = self.status.clone();
                     let supervisor = self.supervisor.clone();
-                    let peer_runtime = Arc::new(ProductionPeerRuntime::new(
-                        Arc::new(self.control.config().clone()),
-                        self.control.keypair(),
-                        self.exports.clone(),
-                    ));
+                    let peer_runtime = self.peer_handler.clone().unwrap_or_else(|| {
+                        Arc::new(ProductionPeerRuntime::new(
+                            Arc::new(self.control.config().clone()),
+                            self.control.keypair(),
+                            self.exports.clone(),
+                        ))
+                    });
                     let backoff = &mut self.backoff;
                     let result = session
                         .run_generation_with_peer(
@@ -197,12 +209,27 @@ impl ClientApp {
                             Some(peer_runtime),
                             move || {
                                 backoff.mark_disconnected();
+                            },
+                            move || {
                                 status.send_replace(ClientStatus::default());
                             },
                         )
                         .await;
                     if shutdown.is_cancelled() {
                         return Ok(());
+                    }
+                    if matches!(
+                        &result,
+                        Err(ClientError::PeerGenerationFailed | ClientError::TaskJoin)
+                    ) {
+                        tracing::error!(
+                            client = %safe_display(&self.control.config().client.name),
+                            error = %safe_display(result.as_ref().expect_err("matched error")),
+                            generation = generation.get(),
+                            event = %"control_fail_stop",
+                            "client control runtime fail-stopped after generation ownership failure"
+                        );
+                        return result;
                     }
                     if let Err(error) = result {
                         tracing::warn!(

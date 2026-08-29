@@ -44,9 +44,9 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    BoxPeerDatagramSession, BoxPeerStream, ChildSessionContext, ControlEvent, ExportRegistry,
-    ForwardConnector, ForwardRuntime, PeerDatagramSession, PeerFuture, PeerGenerationHandler,
-    PeerOpenRequest, PeerRelayChannel,
+    BoxPeerDatagramSession, BoxPeerStream, ChildSessionContext, ClientError, ControlEvent,
+    ExportRegistry, ForwardConnector, ForwardRuntime, PeerDatagramSession, PeerFuture,
+    PeerGenerationHandler, PeerOpenRequest, PeerRelayChannel,
 };
 
 const ACTOR_CAPACITY: usize = 1024;
@@ -125,12 +125,12 @@ impl PeerGenerationHandler for ProductionPeerRuntime {
         &self,
         context: ChildSessionContext,
         shutdown: CancellationToken,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), ClientError>> + Send + 'static>> {
         let receiver = self.receiver.lock().ok().and_then(|mut value| value.take());
         let runtime = self.clone();
         Box::pin(async move {
             let Some(receiver) = receiver else {
-                return;
+                return Err(ClientError::PeerGenerationFailed);
             };
             let actor = tokio::spawn(
                 Actor::new(runtime.clone(), context, receiver, shutdown.clone()).run(),
@@ -146,13 +146,13 @@ impl PeerGenerationHandler for ProductionPeerRuntime {
                 Err(error) => {
                     tracing::error!(error = %error, "failed to start peer forwards");
                     shutdown.cancel();
-                    report_actor_exit(actor.await);
-                    return;
+                    let _ = actor_result(actor.await);
+                    return Err(ClientError::PeerGenerationFailed);
                 }
             };
             shutdown.cancelled().await;
             forward.shutdown().await;
-            report_actor_exit(actor.await);
+            actor_result(actor.await)
         })
     }
 
@@ -172,14 +172,16 @@ impl PeerGenerationHandler for ProductionPeerRuntime {
     }
 }
 
-fn report_actor_exit(result: Result<io::Result<()>, tokio::task::JoinError>) {
+fn actor_result(result: Result<io::Result<()>, tokio::task::JoinError>) -> Result<(), ClientError> {
     match result {
-        Ok(Ok(())) => {}
+        Ok(Ok(())) => Ok(()),
         Ok(Err(error)) => {
             tracing::error!(error = %error, "peer orchestration generation teardown failed");
+            Err(ClientError::PeerGenerationFailed)
         }
         Err(error) => {
             tracing::error!(error = %error, "peer orchestration actor task failed");
+            Err(ClientError::TaskJoin)
         }
     }
 }
@@ -462,7 +464,7 @@ impl Actor {
         for manager in managers {
             let _ = manager.close().await;
         }
-        let mut teardown_error = None;
+        let mut forced_abort = false;
         if tokio::time::timeout(Duration::from_secs(5), async {
             while self.tasks.join_next().await.is_some() {}
         })
@@ -473,32 +475,34 @@ impl Actor {
                 remaining = self.tasks.len(),
                 "peer generation graceful task drain timed out; aborting remaining owned tasks"
             );
+            forced_abort = true;
             self.tasks.abort_all();
-            if tokio::time::timeout(Duration::from_secs(5), async {
-                while self.tasks.join_next().await.is_some() {}
-            })
-            .await
-            .is_err()
-            {
-                let remaining = self.tasks.len();
-                tracing::error!(
-                    remaining,
-                    "peer generation hard task drain timed out after abort; resources may require process-level recovery"
-                );
-                teardown_error = Some(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!(
-                        "peer generation teardown left {remaining} owned task(s) after abort timeout"
-                    ),
-                ));
+            let watchdog = tokio::time::sleep(Duration::from_secs(5));
+            tokio::pin!(watchdog);
+            let mut watchdog_fired = false;
+            while !self.tasks.is_empty() {
+                tokio::select! {
+                    _ = &mut watchdog, if !watchdog_fired => {
+                        watchdog_fired = true;
+                        tracing::error!(
+                            remaining = self.tasks.len(),
+                            "peer generation abort watchdog fired; fail-stop is holding generation ownership until every task joins"
+                        );
+                    }
+                    _ = self.tasks.join_next() => {}
+                }
             }
         }
         for reply in pending_replies {
             let _ = reply.send(Err(closed()));
         }
-        match teardown_error {
-            Some(error) => Err(error),
-            None => Ok(()),
+        if forced_abort {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "peer generation required forced task abort during teardown",
+            ))
+        } else {
+            Ok(())
         }
     }
 

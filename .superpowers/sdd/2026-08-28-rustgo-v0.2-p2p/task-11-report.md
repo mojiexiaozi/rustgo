@@ -93,3 +93,27 @@ Task 12 namespace topology and Task 13 packaging/deployment were not implemented
   case. The immediately preceding full workspace gate passed all targets, so the
   isolated evidence identifies the final failure as the known non-reproducible Windows
   socket flake rather than a Task 11 regression.
+
+## Generation fail-stop closure (2026-08-29)
+
+- `PeerGenerationHandler::run_generation` now returns `Result<(), ClientError>` and the
+  control session owns its join handle separately from ordinary event/data children.
+  Actor errors and join failures therefore reach `ControlSession` and `ClientApp`
+  instead of being reduced to logs.
+- The active generation is cleared only after all data children and the peer owner have
+  joined. Control disconnect still records the backoff timestamp immediately, so a slow
+  teardown cannot be misclassified as a stable connection, but no reconnect or fixed
+  port reuse begins before the resource fence.
+- Actor teardown waits gracefully, then aborts all remaining Tokio tasks and
+  unconditionally continues `join_next` until the `JoinSet` is empty. A five-second
+  watchdog is diagnostic only and cannot release ownership; a forced abort returns a
+  peer-generation failure. `ClientApp` treats peer-owner failure or join failure as
+  fail-stop and returns the error rather than opening a new control generation.
+- Functional coverage injects a slow failing peer owner into a real TLS control
+  generation. It proves the generation remains active, the app does not finish or
+  reconnect while the owner is unjoined, and after release the exact
+  `PeerGenerationFailed` result is visible with no second socket accepted.
+- Final evidence:
+  `cargo test -p rustgoc --test control -- --test-threads=1` passed 11/11;
+  `cargo test -p rustgoc --tests -- --test-threads=1` passed all rustgoc unit and
+  functional targets, including the real rustgos plus two-rustgoc TCP/UDP process test.

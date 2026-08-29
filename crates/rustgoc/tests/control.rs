@@ -27,7 +27,8 @@ use rustgo_rendezvous::{
 use rustgo_transport::{Backoff, BackoffClock, BackoffConfig, JitterSource, TlsServer};
 use rustgoc::{
     ChildSessionContext, ChildSessionRequest, ChildSessionSupervisor, ClientApp, ClientError,
-    ClientStatus, ControlClient, ControlEvent, NoopChildSessionSupervisor, SessionGeneration,
+    ClientStatus, ControlClient, ControlEvent, NoopChildSessionSupervisor, PeerGenerationHandler,
+    SessionGeneration,
 };
 use rustgos::ServerApp;
 use tempfile::TempDir;
@@ -387,6 +388,40 @@ impl ChildSessionSupervisor for TrackingSupervisor {
     }
 }
 
+struct SlowFailingPeerOwner {
+    started: mpsc::UnboundedSender<SessionGeneration>,
+    cancelled: mpsc::UnboundedSender<SessionGeneration>,
+    release: Arc<Semaphore>,
+}
+
+impl PeerGenerationHandler for SlowFailingPeerOwner {
+    fn run_generation(
+        &self,
+        context: ChildSessionContext,
+        shutdown: CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ClientError>> + Send + 'static>> {
+        let started = self.started.clone();
+        let cancelled = self.cancelled.clone();
+        let release = self.release.clone();
+        Box::pin(async move {
+            started.send(context.generation()).unwrap();
+            shutdown.cancelled().await;
+            cancelled.send(context.generation()).unwrap();
+            release.acquire_owned().await.unwrap().forget();
+            Err(ClientError::PeerGenerationFailed)
+        })
+    }
+
+    fn run_event(
+        &self,
+        _context: ChildSessionContext,
+        _event: ControlEvent,
+        _shutdown: CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+        Box::pin(async {})
+    }
+}
+
 #[tokio::test]
 async fn strict_tls_authentication_precedes_complete_per_tunnel_registration()
 -> Result<(), AnyError> {
@@ -734,6 +769,76 @@ async fn stable_generation_resets_backoff_and_reconnect_reregisters_every_tunnel
     Ok(())
 }
 
+#[tokio::test]
+async fn peer_owner_teardown_failure_fail_stops_before_generation_or_socket_reuse()
+-> Result<(), AnyError> {
+    let pki = TestPki::generate()?;
+    let tls_server =
+        TlsServer::bind("127.0.0.1:0", &pki.certificate_file, &pki.private_key_file).await?;
+    let fixture = client_fixture(&pki, tls_server.local_addr()?.to_string())?;
+    let (registered_tx, registered_rx) = oneshot::channel();
+    let (drop_tx, drop_rx) = oneshot::channel();
+    let (reconnected_tx, reconnected_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (first, _) = accept_registered_session(&tls_server, 0xd1).await?;
+        registered_tx.send(()).unwrap();
+        let _ = drop_rx.await;
+        drop(first);
+        let reconnected = tokio::time::timeout(Duration::from_millis(500), tls_server.accept_tcp())
+            .await
+            .is_ok();
+        reconnected_tx.send(reconnected).unwrap();
+        Ok::<_, AnyError>(())
+    });
+
+    let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+    let (cancelled_tx, mut cancelled_rx) = mpsc::unbounded_channel();
+    let release = Arc::new(Semaphore::new(0));
+    let peer_owner = Arc::new(SlowFailingPeerOwner {
+        started: started_tx,
+        cancelled: cancelled_tx,
+        release: release.clone(),
+    });
+    let control = ControlClient::from_config(fixture.config)?;
+    let app = ClientApp::with_runtime(
+        control,
+        test_backoff(),
+        Arc::new(NoopChildSessionSupervisor),
+    )
+    .with_peer_handler(peer_owner);
+    let mut status = app.subscribe();
+    let app_task = tokio::spawn(app.run_until(CancellationToken::new()));
+
+    registered_rx.await?;
+    assert_eq!(started_rx.recv().await.unwrap().get(), 1);
+    wait_for_status(&mut status, |status| status.active().is_some()).await;
+    drop_tx.send(()).unwrap();
+    assert_eq!(cancelled_rx.recv().await.unwrap().get(), 1);
+
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert!(
+        status.borrow().active().is_some(),
+        "generation must remain authoritative while its peer owner is not joined"
+    );
+    assert!(
+        !app_task.is_finished(),
+        "teardown result cannot escape before join"
+    );
+
+    release.add_permits(1);
+    let result = tokio::time::timeout(Duration::from_secs(1), app_task)
+        .await
+        .expect("peer teardown failure must be visible")
+        .expect("app task must join");
+    assert!(matches!(result, Err(ClientError::PeerGenerationFailed)));
+    assert!(
+        !reconnected_rx.await?,
+        "failed ownership must prevent reconnect"
+    );
+    server.await??;
+    Ok(())
+}
+
 #[tokio::test(start_paused = true)]
 async fn slow_child_drain_does_not_turn_a_short_generation_into_a_stable_one()
 -> Result<(), AnyError> {
@@ -798,8 +903,11 @@ async fn slow_child_drain_does_not_turn_a_short_generation_into_a_stable_one()
     assert_eq!(started_rx.recv().await.unwrap().0.get(), 1);
 
     drop_tx.send(()).unwrap();
-    wait_for_status(&mut status, |status| status.active().is_none()).await;
     assert_eq!(cancelled_rx.recv().await.unwrap().get(), 1);
+    assert!(
+        status.borrow().active().is_some(),
+        "generation remains active until its slow child is joined"
+    );
     time_guard.advance(Duration::from_secs(10)).await;
     assert!(event_rx.try_recv().is_err());
 
@@ -807,6 +915,7 @@ async fn slow_child_drain_does_not_turn_a_short_generation_into_a_stable_one()
     for _ in 0..8 {
         tokio::task::yield_now().await;
     }
+    wait_for_status(&mut status, |status| status.active().is_none()).await;
     time_guard.advance(Duration::from_millis(120)).await;
     for _ in 0..8 {
         tokio::task::yield_now().await;
@@ -823,7 +932,7 @@ async fn slow_child_drain_does_not_turn_a_short_generation_into_a_stable_one()
 }
 
 #[tokio::test(start_paused = true)]
-async fn heartbeat_loss_clears_active_then_cancels_and_joins_all_children_before_next_generation()
+async fn heartbeat_loss_joins_all_children_before_clearing_and_starting_next_generation()
 -> Result<(), AnyError> {
     let mut time_guard = keep_paused_time_manual();
     let pki = TestPki::generate()?;
@@ -918,12 +1027,13 @@ async fn heartbeat_loss_clears_active_then_cancels_and_joins_all_children_before
     assert_eq!(started[1].2, [0x72; 32]);
 
     time_guard.advance(Duration::from_secs(2)).await;
-    wait_for_status(&mut status, |status| status.active().is_none()).await;
     assert_eq!(cancelled_rx.recv().await.unwrap().get(), 1);
     assert_eq!(cancelled_rx.recv().await.unwrap().get(), 1);
+    assert!(status.borrow().active().is_some());
     assert!(accepted_rx.try_recv().is_err());
 
     release.add_permits(2);
+    wait_for_status(&mut status, |status| status.active().is_none()).await;
     time_guard.advance(Duration::from_millis(119)).await;
     assert!(accepted_rx.try_recv().is_err());
     time_guard.advance(Duration::from_millis(1)).await;
@@ -941,11 +1051,12 @@ async fn heartbeat_loss_clears_active_then_cancels_and_joins_all_children_before
     assert_eq!(session_id, [0x92; 32]);
 
     shutdown.cancel();
-    wait_for_status(&mut status, |status| status.active().is_none()).await;
     assert_eq!(cancelled_rx.recv().await.unwrap().get(), 2);
+    assert!(status.borrow().active().is_some());
     tokio::task::yield_now().await;
     assert!(!app_task.is_finished());
     release.add_permits(1);
+    wait_for_status(&mut status, |status| status.active().is_none()).await;
     stop_server.cancel();
     assert!(app_task.await?.is_ok());
     server.await??;
@@ -1017,13 +1128,14 @@ async fn business_frames_cannot_mask_missing_heartbeat_acknowledgements() -> Res
     for _ in 0..8 {
         tokio::task::yield_now().await;
     }
-    assert!(status.borrow().active().is_none());
+    assert!(status.borrow().active().is_some());
     for _ in 0..3 {
         assert_eq!(cancelled_rx.recv().await.unwrap().get(), 1);
     }
 
     shutdown.cancel();
     release.add_permits(3);
+    wait_for_status(&mut status, |status| status.active().is_none()).await;
     stop_server.cancel();
     assert!(app_task.await?.is_ok());
     server.await??;

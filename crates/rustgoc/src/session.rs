@@ -78,7 +78,7 @@ pub trait PeerGenerationHandler: Send + Sync + 'static {
         &self,
         context: ChildSessionContext,
         shutdown: CancellationToken,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+    ) -> Pin<Box<dyn Future<Output = Result<(), ClientError>> + Send + 'static>>;
 
     fn run_event(
         &self,
@@ -138,19 +138,21 @@ impl ControlSession {
     where
         F: FnOnce(),
     {
-        self.run_generation_with_peer(generation, shutdown, supervisor, None, on_inactive)
+        self.run_generation_with_peer(generation, shutdown, supervisor, None, || {}, on_inactive)
             .await
     }
 
-    pub(crate) async fn run_generation_with_peer<F>(
+    pub(crate) async fn run_generation_with_peer<C, F>(
         mut self,
         generation: SessionGeneration,
         shutdown: CancellationToken,
         supervisor: Arc<dyn ChildSessionSupervisor>,
         peer_handler: Option<Arc<dyn PeerGenerationHandler>>,
+        on_control_ended: C,
         on_inactive: F,
     ) -> Result<(), ClientError>
     where
+        C: FnOnce(),
         F: FnOnce(),
     {
         let child_shutdown = CancellationToken::new();
@@ -165,10 +167,11 @@ impl ControlSession {
         let mut child_signals = ChildSignals {
             control: &mut child_control,
         };
-        if let Some(handler) = &peer_handler {
-            children
-                .spawn(handler.run_generation(child_context.clone(), child_shutdown.child_token()));
-        }
+        let mut peer_owner = peer_handler.as_ref().map(|handler| {
+            tokio::spawn(
+                handler.run_generation(child_context.clone(), child_shutdown.child_token()),
+            )
+        });
         let result = self
             .run_control_loop(
                 &child_context,
@@ -176,6 +179,7 @@ impl ControlSession {
                 &child_shutdown,
                 &supervisor,
                 peer_handler.as_ref(),
+                &mut peer_owner,
                 &mut children,
                 &mut child_signals,
             )
@@ -183,8 +187,7 @@ impl ControlSession {
 
         // No child teardown may retain a dead or backpressured generation's control socket.
         drop(self.framed);
-        // The current view must lose its generation before child teardown can block.
-        on_inactive();
+        on_control_ended();
         child_shutdown.cancel();
         let mut join_failed = false;
         while let Some(joined) = children.join_next().await {
@@ -192,10 +195,19 @@ impl ControlSession {
                 join_failed = true;
             }
         }
+        let peer_result = match peer_owner.take() {
+            Some(owner) => match owner.await {
+                Ok(result) => result,
+                Err(_) => Err(ClientError::TaskJoin),
+            },
+            None => Ok(()),
+        };
+        // The generation remains authoritative until every owner has released its resources.
+        on_inactive();
         if join_failed {
             Err(ClientError::TaskJoin)
         } else {
-            result
+            peer_result.and(result)
         }
     }
 
@@ -207,6 +219,7 @@ impl ControlSession {
         child_shutdown: &CancellationToken,
         supervisor: &Arc<dyn ChildSessionSupervisor>,
         peer_handler: Option<&Arc<dyn PeerGenerationHandler>>,
+        peer_owner: &mut Option<tokio::task::JoinHandle<Result<(), ClientError>>>,
         children: &mut JoinSet<()>,
         child_signals: &mut ChildSignals<'_>,
     ) -> Result<(), ClientError> {
@@ -235,6 +248,14 @@ impl ControlSession {
                 // only acknowledgements processed strictly before expiry may extend liveness.
                 () = shutdown.cancelled() => return Ok(()),
                 () = &mut heartbeat_deadline => return Err(ClientError::HeartbeatTimeout),
+                peer_result = wait_peer_owner(peer_owner), if peer_owner.is_some() => {
+                    peer_owner.take();
+                    let result = peer_result?;
+                    return match result {
+                        Ok(()) => Err(ClientError::PeerGenerationFailed),
+                        Err(error) => Err(error),
+                    };
+                }
                 _ = heartbeat.tick() => {
                     last_sent_sequence = last_sent_sequence
                         .checked_add(1)
@@ -348,6 +369,16 @@ impl ControlSession {
             Err(ClientError::InvalidState)
         }
     }
+}
+
+async fn wait_peer_owner(
+    owner: &mut Option<tokio::task::JoinHandle<Result<(), ClientError>>>,
+) -> Result<Result<(), ClientError>, ClientError> {
+    owner
+        .as_mut()
+        .expect("peer owner is present when selected")
+        .await
+        .map_err(|_| ClientError::TaskJoin)
 }
 
 fn is_peer_outbound(message: &Message) -> bool {
@@ -644,7 +675,7 @@ mod tests {
         tokio::time::advance(Duration::from_millis(20)).await;
 
         assert!(poll_once(runtime.as_mut()).is_pending());
-        assert!(inactive.load(Ordering::SeqCst));
+        assert!(!inactive.load(Ordering::SeqCst));
         assert_eq!(
             requested.load(Ordering::SeqCst),
             1,
@@ -654,6 +685,7 @@ mod tests {
             .await
             .expect("deadline cancellation and child join must be bounded");
         assert!(matches!(result, Err(ClientError::HeartbeatTimeout)));
+        assert!(inactive.load(Ordering::SeqCst));
         assert_eq!(cancelled.load(Ordering::SeqCst), 1);
     }
 

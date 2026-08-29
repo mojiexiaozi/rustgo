@@ -587,6 +587,8 @@ pub enum ClientError {
     FrameTooLarge,
     #[error("client task failed to join")]
     TaskJoin,
+    #[error("peer generation owner failed during teardown")]
+    PeerGenerationFailed,
     #[error("a persistent data session terminated while its control generation was active")]
     DataSessionTerminated,
     #[error("client session generation exhausted")]
