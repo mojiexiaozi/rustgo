@@ -399,8 +399,8 @@ s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(("127.0.0.1",18081))
 while True:
  d,a=s.recvfrom(65535);s.sendto(d,a)' "$RG_PREFIX" >/dev/null
     start_in_ns "$RG_CLIENT_A_NS" provider "$RG_BIN_DIR/rustgoc" -c "$RG_STATE_DIR/provider/client.toml" >/dev/null
-    start_in_ns "$RG_CLIENT_B_NS" consumer "$RG_BIN_DIR/rustgoc" -c "$RG_STATE_DIR/consumer/client.toml" >/dev/null
     wait_log "$RG_STATE_DIR/provider.log" event=registration_ready
+    start_in_ns "$RG_CLIENT_B_NS" consumer "$RG_BIN_DIR/rustgoc" -c "$RG_STATE_DIR/consumer/client.toml" >/dev/null
     wait_log "$RG_STATE_DIR/consumer.log" event=registration_ready
     wait_log "$RG_STATE_DIR/consumer.log" event=peer_forwards_ready
 }
