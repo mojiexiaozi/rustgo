@@ -2107,6 +2107,9 @@ async fn run_direct_tcp(
         }
     }
     .await;
+    if let Err(error) = &result {
+        tracing::warn!(%error, ?role, "direct TCP service flow failed");
+    }
     if let (Err(error), Some(reply)) = (result, reply) {
         let _ = reply.send(Err(error));
     }
