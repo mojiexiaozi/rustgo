@@ -22,6 +22,11 @@ pub const MAX_RENDEZVOUS_ENVELOPE_BYTES: usize = 16 * 1024;
 pub const MAX_PEER_RELAY_FRAME_BYTES: usize = 65_600;
 pub const MAX_OBSERVATION_GRANT_BYTES: usize = 96;
 pub const MAX_SERVER_NOTICE_BYTES: usize = 1024;
+/// The largest possible postcard encoding of [`TelemetryReport`].
+///
+/// Eight `u64` values require at most ten bytes each and the `u16` CPU value
+/// requires at most three bytes.
+pub const MAX_TELEMETRY_REPORT_BYTES: usize = 83;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[error("value length {actual} exceeds bound {max}")]
@@ -297,6 +302,7 @@ impl MessageId {
     pub const PEER_IDENTITY_LOOKUP: Self = Self(27);
     pub const RENDEZVOUS_CANDIDATE_SET_V2: Self = Self(28);
     pub const PUNCH_GRANT: Self = Self(29);
+    pub const TELEMETRY_REPORT: Self = Self(30);
 
     pub const fn as_u16(self) -> u16 {
         self.0
@@ -327,6 +333,7 @@ impl MessageId {
             27 => 256,
             28 => MAX_RENDEZVOUS_ENVELOPE_BYTES,
             29 => 160,
+            30 => MAX_TELEMETRY_REPORT_BYTES,
             _ => 0,
         }
     }
@@ -337,7 +344,7 @@ impl TryFrom<u16> for MessageId {
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
         match value {
-            1..=29 => Ok(Self(value)),
+            1..=30 => Ok(Self(value)),
             _ => Err(value),
         }
     }
@@ -682,6 +689,21 @@ pub struct PeerIdentityLookup {
     pub peer: BoundedString<MAX_CLIENT_NAME_BYTES>,
 }
 
+/// Compact host-resource and Rustgo traffic sample sent over an authenticated
+/// V0.3 control connection. CPU is expressed as basis points.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TelemetryReport {
+    pub sampled_unix_millis: u64,
+    pub sequence: u64,
+    pub cpu_basis_points: u16,
+    pub memory_used_bytes: u64,
+    pub memory_total_bytes: u64,
+    pub disk_used_bytes: u64,
+    pub disk_total_bytes: u64,
+    pub tx_bytes_per_sec: u64,
+    pub rx_bytes_per_sec: u64,
+}
+
 pub type OpaqueRendezvousMessage = BoundedBytes<MAX_RENDEZVOUS_ENVELOPE_BYTES>;
 pub type OpaquePeerRelayFrame = BoundedBytes<MAX_PEER_RELAY_FRAME_BYTES>;
 pub type OpaqueObservationGrant = BoundedBytes<MAX_OBSERVATION_GRANT_BYTES>;
@@ -717,6 +739,7 @@ pub enum Message {
     PeerIdentityBinding(PeerIdentityBinding),
     PeerIdentityLookup(PeerIdentityLookup),
     PunchGrant(PunchGrant),
+    TelemetryReport(TelemetryReport),
 }
 
 impl Message {
@@ -751,6 +774,7 @@ impl Message {
             Self::PeerIdentityBinding(_) => MessageId::PEER_IDENTITY_BINDING,
             Self::PeerIdentityLookup(_) => MessageId::PEER_IDENTITY_LOOKUP,
             Self::PunchGrant(_) => MessageId::PUNCH_GRANT,
+            Self::TelemetryReport(_) => MessageId::TELEMETRY_REPORT,
         }
     }
 }

@@ -3,11 +3,12 @@ use proptest::prelude::*;
 use rustgo_protocol::{
     AuthResult, BoundedBytes, BoundedString, BoundedVec, ClientAuthenticate, ClientHello,
     DataChannelBind, DataChannelKind, ErrorMessage, FrameCodec, FrameError, HEADER_LEN, Heartbeat,
-    MAGIC, MAX_BINDING_TOKEN_BYTES, MAX_OBSERVATION_GRANT_BYTES, MAX_UDP_PAYLOAD_BYTES, Message,
-    MessageId, ObservationGrantRequest, OpenTcpStream, OpenUdpChannel, PeerIdentityBinding,
-    PeerIdentityLookup, ProtocolErrorCode, ProtocolVersion, RegisterTunnels, ServerChallenge,
-    ServerNotice, SocketAddress, TcpStreamReady, TunnelProtocol, TunnelRegistration, TunnelResult,
-    TunnelResults, UDP_METADATA_LEN, UdpDatagram, UdpSessionRetired,
+    MAGIC, MAX_BINDING_TOKEN_BYTES, MAX_OBSERVATION_GRANT_BYTES, MAX_TELEMETRY_REPORT_BYTES,
+    MAX_UDP_PAYLOAD_BYTES, Message, MessageId, ObservationGrantRequest, OpenTcpStream,
+    OpenUdpChannel, PeerIdentityBinding, PeerIdentityLookup, ProtocolErrorCode, ProtocolVersion,
+    RegisterTunnels, ServerChallenge, ServerNotice, SocketAddress, TcpStreamReady, TelemetryReport,
+    TunnelProtocol, TunnelRegistration, TunnelResult, TunnelResults, UDP_METADATA_LEN, UdpDatagram,
+    UdpSessionRetired,
 };
 
 const VERSION: ProtocolVersion = ProtocolVersion::new(1, 7);
@@ -125,6 +126,7 @@ fn messages() -> Vec<Message> {
             peer_is_provider: true,
             expires_unix_secs: 2_000_000_000,
         }),
+        Message::TelemetryReport(telemetry_report()),
     ]
 }
 
@@ -190,13 +192,74 @@ fn message_ids_are_explicit_and_stable() {
     assert_eq!(MessageId::PEER_IDENTITY_BINDING.as_u16(), 26);
     assert_eq!(MessageId::PEER_IDENTITY_LOOKUP.as_u16(), 27);
     assert_eq!(MessageId::RENDEZVOUS_CANDIDATE_SET_V2.as_u16(), 28);
+    assert_eq!(MessageId::PUNCH_GRANT.as_u16(), 29);
+    assert_eq!(MessageId::TELEMETRY_REPORT.as_u16(), 30);
 }
 
 #[test]
 fn v02_is_supported_without_changing_the_major_version() {
     assert_eq!(ProtocolVersion::V0_1, ProtocolVersion::new(1, 0));
     assert_eq!(ProtocolVersion::V0_2, ProtocolVersion::new(1, 1));
-    assert_eq!(ProtocolVersion::SUPPORTED, ProtocolVersion::V0_2);
+    assert_eq!(ProtocolVersion::V0_3, ProtocolVersion::new(1, 2));
+    assert_eq!(ProtocolVersion::SUPPORTED, ProtocolVersion::V0_3);
+}
+
+fn telemetry_report() -> TelemetryReport {
+    TelemetryReport {
+        sampled_unix_millis: 1_725_000_000_000,
+        sequence: 17,
+        cpu_basis_points: 4_321,
+        memory_used_bytes: 8 * 1024 * 1024 * 1024,
+        memory_total_bytes: 16 * 1024 * 1024 * 1024,
+        disk_used_bytes: 1_000_000_000_000,
+        disk_total_bytes: 2_000_000_000_000,
+        tx_bytes_per_sec: 125_000,
+        rx_bytes_per_sec: 250_000,
+    }
+}
+
+#[test]
+fn telemetry_report_uses_a_bounded_compact_wire_payload() {
+    let codec = FrameCodec::new(MAX_TELEMETRY_REPORT_BYTES);
+    let report = TelemetryReport {
+        sampled_unix_millis: u64::MAX,
+        sequence: u64::MAX,
+        cpu_basis_points: u16::MAX,
+        memory_used_bytes: u64::MAX,
+        memory_total_bytes: u64::MAX,
+        disk_used_bytes: u64::MAX,
+        disk_total_bytes: u64::MAX,
+        tx_bytes_per_sec: u64::MAX,
+        rx_bytes_per_sec: u64::MAX,
+    };
+    let encoded = codec
+        .encode(
+            ProtocolVersion::V0_3,
+            0,
+            &Message::TelemetryReport(report.clone()),
+        )
+        .unwrap();
+
+    assert_eq!(encoded.len(), HEADER_LEN + MAX_TELEMETRY_REPORT_BYTES);
+    assert_eq!(
+        codec.decode_exact(&encoded).unwrap().message,
+        Message::TelemetryReport(report)
+    );
+
+    let mut oversized = [0_u8; HEADER_LEN];
+    oversized[0..4].copy_from_slice(&MAGIC);
+    oversized[4..6].copy_from_slice(&ProtocolVersion::V0_3.major.to_be_bytes());
+    oversized[6..8].copy_from_slice(&ProtocolVersion::V0_3.minor.to_be_bytes());
+    oversized[8..10].copy_from_slice(&MessageId::TELEMETRY_REPORT.as_u16().to_be_bytes());
+    oversized[12..16].copy_from_slice(&((MAX_TELEMETRY_REPORT_BYTES + 1) as u32).to_be_bytes());
+    assert_eq!(
+        FrameCodec::new(4096).decode_exact(&oversized),
+        Err(FrameError::MessagePayloadTooLarge {
+            message: MessageId::TELEMETRY_REPORT,
+            declared: MAX_TELEMETRY_REPORT_BYTES + 1,
+            max: MAX_TELEMETRY_REPORT_BYTES,
+        })
+    );
 }
 
 #[test]

@@ -1,6 +1,9 @@
 use std::{collections::BTreeSet, fs, path::PathBuf};
 
-use rustgo_protocol::{FrameCodec, MAX_UDP_PAYLOAD_BYTES, MessageId, UDP_METADATA_LEN};
+use rustgo_protocol::{
+    FrameCodec, MAX_TELEMETRY_REPORT_BYTES, MAX_UDP_PAYLOAD_BYTES, Message, MessageId,
+    ProtocolVersion, TelemetryReport, UDP_METADATA_LEN,
+};
 
 const PRODUCTION_MAX_PAYLOAD: usize = UDP_METADATA_LEN + MAX_UDP_PAYLOAD_BYTES;
 
@@ -44,4 +47,24 @@ fn checked_in_fuzz_corpus_contains_one_valid_frame_per_message_family() {
     .collect::<BTreeSet<_>>();
 
     assert_eq!(decoded_ids, expected);
+}
+
+#[test]
+fn telemetry_seed_shape_is_accepted_by_the_frame_decoder() {
+    let codec = FrameCodec::new(PRODUCTION_MAX_PAYLOAD);
+    let report = Message::TelemetryReport(TelemetryReport {
+        sampled_unix_millis: u64::MAX,
+        sequence: u64::MAX,
+        cpu_basis_points: u16::MAX,
+        memory_used_bytes: u64::MAX,
+        memory_total_bytes: u64::MAX,
+        disk_used_bytes: u64::MAX,
+        disk_total_bytes: u64::MAX,
+        tx_bytes_per_sec: u64::MAX,
+        rx_bytes_per_sec: u64::MAX,
+    });
+
+    let encoded = codec.encode(ProtocolVersion::V0_3, 0, &report).unwrap();
+    assert_eq!(encoded.len(), 16 + MAX_TELEMETRY_REPORT_BYTES);
+    assert_eq!(codec.decode_exact(&encoded).unwrap().message, report);
 }

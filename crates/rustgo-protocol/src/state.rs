@@ -1,6 +1,13 @@
 use thiserror::Error;
 
-use crate::{BoundedBytes, MAX_SESSION_ID_BYTES, Message, ProtocolErrorCode};
+use crate::{BoundedBytes, MAX_SESSION_ID_BYTES, Message, ProtocolErrorCode, ProtocolVersion};
+
+/// Direction of a control message relative to the Rustgo control connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlMessageDirection {
+    ClientToServer,
+    ServerToClient,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientHandshakeState {
@@ -84,6 +91,28 @@ impl ClientHandshakeState {
                 | Message::PunchGrant(_),
             ) => Ok(self.clone()),
             _ => Err(StateError::invalid_state()),
+        }
+    }
+
+    /// Validates a control message with its negotiated protocol version and
+    /// direction. The legacy [`Self::transition`] API intentionally rejects
+    /// telemetry because it has neither of those security-relevant inputs.
+    pub fn transition_control(
+        &self,
+        negotiated_version: ProtocolVersion,
+        direction: ControlMessageDirection,
+        message: &Message,
+    ) -> Result<Self, StateError> {
+        match message {
+            Message::TelemetryReport(_)
+                if matches!(self, Self::Active { .. })
+                    && direction == ControlMessageDirection::ClientToServer
+                    && negotiated_version.supports_telemetry() =>
+            {
+                Ok(self.clone())
+            }
+            Message::TelemetryReport(_) => Err(StateError::invalid_state()),
+            _ => self.transition(message),
         }
     }
 

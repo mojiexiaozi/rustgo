@@ -1,9 +1,9 @@
 use rustgo_protocol::{
     AuthResult, BoundedBytes, BoundedString, BoundedVec, ClientAuthenticate, ClientHandshakeState,
-    ClientHello, Heartbeat, MAX_BINDING_TOKEN_BYTES, MAX_OBSERVATION_GRANT_BYTES, Message,
-    ObservationGrantRequest, OpenTcpStream, OpenUdpChannel, ProtocolErrorCode, ProtocolVersion,
-    RegisterTunnels, ServerChallenge, ServerNotice, SocketAddress, StateError, TunnelProtocol,
-    TunnelRegistration,
+    ClientHello, ControlMessageDirection, Heartbeat, MAX_BINDING_TOKEN_BYTES,
+    MAX_OBSERVATION_GRANT_BYTES, Message, ObservationGrantRequest, OpenTcpStream, OpenUdpChannel,
+    ProtocolErrorCode, ProtocolVersion, RegisterTunnels, ServerChallenge, ServerNotice,
+    SocketAddress, StateError, TelemetryReport, TunnelProtocol, TunnelRegistration,
 };
 
 fn text<const MAX: usize>(value: &str) -> BoundedString<MAX> {
@@ -52,6 +52,34 @@ fn registration() -> Message {
             remote_port: 2222,
         }])
         .unwrap(),
+    })
+}
+
+fn active_state() -> ClientHandshakeState {
+    ClientHandshakeState::new()
+        .transition(&hello())
+        .unwrap()
+        .transition(&challenge())
+        .unwrap()
+        .transition(&authenticate())
+        .unwrap()
+        .transition(&auth_result(true))
+        .unwrap()
+        .transition(&registration())
+        .unwrap()
+}
+
+fn telemetry() -> Message {
+    Message::TelemetryReport(TelemetryReport {
+        sampled_unix_millis: 1_725_000_000_000,
+        sequence: 1,
+        cpu_basis_points: 5_000,
+        memory_used_bytes: 4,
+        memory_total_bytes: 8,
+        disk_used_bytes: 16,
+        disk_total_bytes: 32,
+        tx_bytes_per_sec: 64,
+        rx_bytes_per_sec: 128,
     })
 }
 
@@ -161,6 +189,53 @@ fn version_negotiation_requires_equal_major_and_uses_lower_minor() {
     assert_eq!(
         ProtocolVersion::new(1, 0).negotiate(ProtocolVersion::new(2, 0)),
         Err(ProtocolErrorCode::UNSUPPORTED_VERSION)
+    );
+    assert_eq!(
+        ProtocolVersion::V0_3.negotiate(ProtocolVersion::V0_2),
+        Ok(ProtocolVersion::V0_2)
+    );
+    assert_eq!(
+        ProtocolVersion::V0_3.negotiate(ProtocolVersion::V0_3),
+        Ok(ProtocolVersion::V0_3)
+    );
+}
+
+#[test]
+fn telemetry_requires_active_v03_client_to_server_control_direction() {
+    let active = active_state();
+    let report = telemetry();
+
+    assert_eq!(
+        active.transition_control(
+            ProtocolVersion::V0_3,
+            ControlMessageDirection::ClientToServer,
+            &report,
+        ),
+        Ok(active.clone())
+    );
+    assert_eq!(
+        ClientHandshakeState::new().transition_control(
+            ProtocolVersion::V0_3,
+            ControlMessageDirection::ClientToServer,
+            &report,
+        ),
+        Err(StateError::invalid_state())
+    );
+    assert_eq!(
+        active.transition_control(
+            ProtocolVersion::V0_3,
+            ControlMessageDirection::ServerToClient,
+            &report,
+        ),
+        Err(StateError::invalid_state())
+    );
+    assert_eq!(
+        active.transition_control(
+            ProtocolVersion::V0_2,
+            ControlMessageDirection::ClientToServer,
+            &report,
+        ),
+        Err(StateError::invalid_state())
     );
 }
 

@@ -8,7 +8,7 @@ use crate::message::{
     AuthResult, BoundedBytes, ClientAuthenticate, ClientHello, DataChannelBind, ErrorMessage,
     Heartbeat, MAX_UDP_PAYLOAD_BYTES, Message, MessageId, ObservationGrantRequest, OpenTcpStream,
     OpenUdpChannel, RegisterTunnels, ServerChallenge, ServerNotice, SocketAddress, TcpStreamReady,
-    TunnelResults, UDP_METADATA_LEN, UdpDatagram, UdpSessionRetired,
+    TelemetryReport, TunnelResults, UDP_METADATA_LEN, UdpDatagram, UdpSessionRetired,
 };
 
 pub const MAGIC: [u8; 4] = *b"RSGO";
@@ -230,6 +230,7 @@ fn encode_payload(message: &Message) -> Result<Vec<u8>, FrameError> {
         Message::PeerIdentityBinding(value) => serialize(value),
         Message::PeerIdentityLookup(value) => serialize(value),
         Message::PunchGrant(value) => serialize(value),
+        Message::TelemetryReport(value) => serialize(value),
     }
 }
 
@@ -317,6 +318,9 @@ fn decode_payload(message: MessageId, payload: &[u8]) -> Result<Message, FrameEr
         }
         MessageId::PUNCH_GRANT => {
             deserialize::<crate::PunchGrant>(message, payload).map(Message::PunchGrant)
+        }
+        MessageId::TELEMETRY_REPORT => {
+            deserialize::<TelemetryReport>(message, payload).map(Message::TelemetryReport)
         }
         _ => unreachable!("MessageId values are validated before payload dispatch"),
     }
