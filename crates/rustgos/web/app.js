@@ -17,8 +17,8 @@
     pollInFlight: false,
     pollQueued: false,
     pollGeneration: 0,
-    serverHistory: { key: "", expiresAt: 0, retryAfter: 0, generation: 0 },
-    clientHistory: { key: "", expiresAt: 0, retryAfter: 0, generation: 0 },
+    serverHistory: { key: "", expiresAt: 0, retryAfter: 0, failed: false, generation: 0 },
+    clientHistory: { key: "", expiresAt: 0, retryAfter: 0, failed: false, generation: 0 },
   };
   const $ = (id) => document.getElementById(id);
   const text = (id, value) => { const node = $(id); if (node) node.textContent = value; };
@@ -300,19 +300,21 @@
     cache.key = key;
     cache.expiresAt = Date.now() + HISTORY_REFRESH_MILLIS;
     cache.retryAfter = 0;
+    cache.failed = false;
   }
 
   function markHistoryFailure(cache, key) {
     cache.key = key;
     cache.expiresAt = 0;
     cache.retryAfter = Date.now() + HISTORY_REFRESH_MILLIS;
+    cache.failed = true;
   }
 
   async function refreshServerHistory() {
     if (!state.overview) return;
     const range = Number($("history-range")?.value || 86400000);
     const key = `${range}`;
-    if (!historyDue(state.serverHistory, key)) return true;
+    if (!historyDue(state.serverHistory, key)) return !state.serverHistory.failed;
     const generation = state.serverHistory.generation;
     try {
       const [cpu, memory, received, sent, trafficReceived, trafficSent] = await Promise.all([
@@ -372,7 +374,7 @@
   async function refreshClientHistory(name) {
     const range = Number($("history-range")?.value || 86400000);
     const key = `${name}\u0000${range}`;
-    if (!historyDue(state.clientHistory, key)) return true;
+    if (!historyDue(state.clientHistory, key)) return !state.clientHistory.failed;
     const generation = state.clientHistory.generation;
     try {
       const [cpu, received, sent] = await Promise.all([
@@ -498,6 +500,7 @@
       cache.key = "";
       cache.expiresAt = 0;
       cache.retryAfter = 0;
+      cache.failed = false;
       cache.generation += 1;
     }
   }

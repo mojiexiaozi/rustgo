@@ -112,6 +112,11 @@ fn checked_in_dashboard_uses_only_relative_allowlisted_resources() {
     assert!(script.contains("AbortController"));
     assert!(script.contains("visibilitychange"));
     assert!(script.contains("HISTORY_REFRESH_MILLIS = 30000"));
+    assert!(script.contains("failed: false"));
+    assert!(script.contains("cache.failed = true"));
+    assert!(script.contains("cache.failed = false"));
+    assert!(script.contains("return !state.serverHistory.failed"));
+    assert!(script.contains("return !state.clientHistory.failed"));
     assert!(script.contains("pollInFlight"));
     assert!(script.contains("pollQueued"));
     assert!(script.contains("requestPoll"));
