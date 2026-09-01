@@ -1,12 +1,9 @@
-use std::{
-    collections::HashSet,
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
-};
+use std::{collections::HashSet, net::SocketAddr};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use http::uri::Authority;
 use rustgo_protocol::{MAX_CLIENT_NAME_BYTES, MAX_TUNNEL_NAME_BYTES, MAX_TUNNELS};
 use thiserror::Error;
+use url::{Host, Url};
 
 use crate::{
     ClientConfig, ConfigWarning, MAX_ALLOWED_PEERS_PER_EXPORT, MAX_EXPORTS, MAX_FORWARDS,
@@ -15,6 +12,7 @@ use crate::{
 
 const MAX_LIMIT: u32 = 1_000_000;
 const MAX_UDP_PAYLOAD_BYTES: u32 = 65_507;
+pub const MAX_WEB_AUTHORITY_BYTES: usize = 128;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 #[error("invalid configuration: {message}")]
@@ -59,50 +57,65 @@ impl WebOrigin {
                 let bind = web.bind.parse::<SocketAddr>().map_err(|_| {
                     ValidationError::new("web.bind must be an IP address with a port")
                 })?;
-                Ok(Self {
+                let origin = Self {
                     scheme: "http",
                     host: bind.ip().to_string(),
                     ipv6: bind.is_ipv6(),
                     port: bind.port(),
-                })
+                };
+                origin.ensure_authority_limit()?;
+                Ok(origin)
             }
         }
     }
 
     pub fn parse(value: &str) -> Result<Self, ValidationError> {
-        if value.is_empty()
-            || value.len() > 256
-            || value.bytes().any(|byte| byte.is_ascii_whitespace())
-        {
+        if value.is_empty() || value.bytes().any(|byte| byte.is_ascii_whitespace()) {
             return Err(invalid_external_origin());
         }
-        let (raw_scheme, raw_authority) = value
+        let (_, raw_authority) = value
             .split_once("://")
             .ok_or_else(invalid_external_origin)?;
-        let scheme = if raw_scheme.eq_ignore_ascii_case("http") {
-            "http"
-        } else if raw_scheme.eq_ignore_ascii_case("https") {
-            "https"
-        } else {
-            return Err(invalid_external_origin());
-        };
         if raw_authority.is_empty()
             || raw_authority
                 .bytes()
-                .any(|byte| matches!(byte, b'/' | b'?' | b'#' | b'@'))
+                .any(|byte| matches!(byte, b'/' | b'\\' | b'?' | b'#'))
         {
             return Err(invalid_external_origin());
         }
-        let authority = raw_authority
-            .parse::<Authority>()
-            .map_err(|_| invalid_external_origin())?;
-        let (host, ipv6, port) = canonical_authority(&authority, default_port(scheme))?;
-        Ok(Self {
+
+        let parsed = Url::parse(value).map_err(|_| invalid_external_origin())?;
+        let scheme = match parsed.scheme() {
+            "http" => "http",
+            "https" => "https",
+            _ => return Err(invalid_external_origin()),
+        };
+        if !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+            || parsed.path() != "/"
+        {
+            return Err(invalid_external_origin());
+        }
+
+        let (host, ipv6) = match parsed.host().ok_or_else(invalid_external_origin)? {
+            Host::Domain(domain) => (validate_canonical_dns_name(domain)?, false),
+            Host::Ipv4(address) => (address.to_string(), false),
+            Host::Ipv6(address) => (address.to_string(), true),
+        };
+        let port = parsed
+            .port_or_known_default()
+            .filter(|port| *port != 0)
+            .ok_or_else(invalid_external_origin)?;
+        let origin = Self {
             scheme,
             host,
             ipv6,
             port,
-        })
+        };
+        origin.ensure_authority_limit()?;
+        Ok(origin)
     }
 
     pub const fn scheme(&self) -> &'static str {
@@ -131,62 +144,25 @@ impl WebOrigin {
     }
 
     pub fn matches_authority(&self, value: &str) -> bool {
-        if value.is_empty() || value.len() > 128 || value.contains('@') {
+        if value.is_empty()
+            || value.len() > MAX_WEB_AUTHORITY_BYTES
+            || value.bytes().any(|byte| byte.is_ascii_whitespace())
+        {
             return false;
         }
-        let Ok(authority) = value.parse::<Authority>() else {
-            return false;
-        };
-        canonical_authority(&authority, default_port(self.scheme)).is_ok_and(
-            |(host, ipv6, port)| host == self.host && ipv6 == self.ipv6 && port == self.port,
-        )
+        Self::parse(&format!("{}://{value}", self.scheme)).is_ok_and(|origin| origin == *self)
+    }
+
+    fn ensure_authority_limit(&self) -> Result<(), ValidationError> {
+        if self.authority().len() > MAX_WEB_AUTHORITY_BYTES {
+            return Err(invalid_external_origin());
+        }
+        Ok(())
     }
 }
 
-fn canonical_authority(
-    authority: &Authority,
-    default_port: u16,
-) -> Result<(String, bool, u16), ValidationError> {
-    if authority.as_str().contains('@') {
-        return Err(invalid_external_origin());
-    }
-    let raw_host = authority.host();
-    let (host, ipv6) = if let Some(address) = raw_host
-        .strip_prefix('[')
-        .and_then(|host| host.strip_suffix(']'))
-    {
-        (
-            address
-                .parse::<Ipv6Addr>()
-                .map_err(|_| invalid_external_origin())?
-                .to_string(),
-            true,
-        )
-    } else if let Ok(address) = raw_host.parse::<Ipv4Addr>() {
-        (address.to_string(), false)
-    } else {
-        (canonical_dns_name(raw_host)?, false)
-    };
-
-    let suffix = authority
-        .as_str()
-        .strip_prefix(raw_host)
-        .ok_or_else(invalid_external_origin)?;
-    let port = if suffix.is_empty() {
-        default_port
-    } else {
-        suffix
-            .strip_prefix(':')
-            .filter(|port| !port.is_empty())
-            .and_then(|port| port.parse::<u16>().ok())
-            .filter(|port| *port != 0)
-            .ok_or_else(invalid_external_origin)?
-    };
-    Ok((host, ipv6, port))
-}
-
-fn canonical_dns_name(host: &str) -> Result<String, ValidationError> {
-    if host.is_empty() || host.len() > 253 || host.ends_with('.') {
+fn validate_canonical_dns_name(host: &str) -> Result<String, ValidationError> {
+    if host.is_empty() || host.ends_with('.') {
         return Err(invalid_external_origin());
     }
     for label in host.split('.') {
@@ -207,7 +183,7 @@ fn canonical_dns_name(host: &str) -> Result<String, ValidationError> {
             return Err(invalid_external_origin());
         }
     }
-    Ok(host.to_ascii_lowercase())
+    Ok(host.to_owned())
 }
 
 fn default_port(scheme: &str) -> u16 {
@@ -215,9 +191,9 @@ fn default_port(scheme: &str) -> u16 {
 }
 
 fn invalid_external_origin() -> ValidationError {
-    ValidationError::new(
-        "web.external_origin must be an absolute HTTP(S) origin without userinfo, path, query, or fragment",
-    )
+    ValidationError::new(format!(
+        "web.external_origin must be an absolute HTTP(S) origin with a canonical authority of at most {MAX_WEB_AUTHORITY_BYTES} bytes and without userinfo, path, query, or fragment"
+    ))
 }
 
 pub(crate) fn validate_server(config: &ServerConfig) -> Result<(), ValidationError> {

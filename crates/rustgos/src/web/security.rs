@@ -9,12 +9,11 @@ use axum::{
     middleware::Next,
     response::Response,
 };
-use rustgo_config::WebOrigin;
+use rustgo_config::{MAX_WEB_AUTHORITY_BYTES, WebOrigin};
 
 const X_CONTENT_TYPE_OPTIONS: HeaderName = HeaderName::from_static("x-content-type-options");
 const X_FRAME_OPTIONS: HeaderName = HeaderName::from_static("x-frame-options");
 const MAX_ORIGIN_HEADER_BYTES: usize = 256;
-const MAX_HOST_HEADER_BYTES: usize = 128;
 
 pub(super) async fn response_security_headers(request: Request, next: Next) -> Response {
     let path = request.uri().path().to_owned();
@@ -48,7 +47,7 @@ pub(super) fn apply_response_security_headers(path: &str, response: &mut Respons
 }
 
 pub(super) fn same_origin(headers: &HeaderMap, expected: &WebOrigin) -> bool {
-    let Some(host) = single_header(headers, HOST, MAX_HOST_HEADER_BYTES) else {
+    let Some(host) = single_header(headers, HOST, MAX_WEB_AUTHORITY_BYTES) else {
         return false;
     };
     if !expected.matches_authority(host) {

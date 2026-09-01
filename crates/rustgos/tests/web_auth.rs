@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use rustgo_config::{Limits, ServerConfig, ServerSection, WebConfig};
+use rustgo_config::{Limits, MAX_WEB_AUTHORITY_BYTES, ServerConfig, ServerSection, WebConfig};
 use rustgos::web::{WebRuntimeLimits, WebServer};
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
@@ -480,6 +480,111 @@ async fn external_https_origin_works_through_a_loopback_reverse_proxy_without_pr
         )
         .await?;
     assert_eq!(forged_proxy_headers.status, 400);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn browser_host_canonicalization_and_authority_limit_match_runtime_requests()
+-> Result<(), Box<dyn Error>> {
+    let numeric = RunningWebServer::start_with_origin(
+        WebRuntimeLimits::default(),
+        true,
+        Some("https://127.1".to_owned()),
+    )
+    .await?;
+    let numeric_proxy = RunningProxy::start(numeric.address).await?;
+    let body = format!("username={USERNAME}&password={PASSWORD}");
+    assert_eq!(
+        numeric
+            .request_via(
+                numeric_proxy.address,
+                "POST",
+                "/login",
+                "127.0.0.1",
+                &[
+                    ("Content-Type", "application/x-www-form-urlencoded"),
+                    ("Origin", "https://0x7f000001"),
+                ],
+                &body,
+            )
+            .await?
+            .status,
+        200
+    );
+
+    let unicode = RunningWebServer::start_with_origin(
+        WebRuntimeLimits::default(),
+        true,
+        Some("https://BÜCHER.Example".to_owned()),
+    )
+    .await?;
+    let unicode_proxy = RunningProxy::start(unicode.address).await?;
+    assert_eq!(
+        unicode
+            .request_via(
+                unicode_proxy.address,
+                "POST",
+                "/login",
+                "XN--BCHER-KVA.EXAMPLE:443",
+                &[
+                    ("Content-Type", "application/x-www-form-urlencoded"),
+                    ("Origin", "https://xn--bcher-kva.example"),
+                ],
+                &body,
+            )
+            .await?
+            .status,
+        200
+    );
+
+    let authority = format!("{}.{}:1", "a".repeat(63), "b".repeat(62));
+    assert_eq!(authority.len(), MAX_WEB_AUTHORITY_BYTES);
+    let boundary = RunningWebServer::start_with_origin(
+        WebRuntimeLimits::default(),
+        true,
+        Some(format!("https://{authority}")),
+    )
+    .await?;
+    let boundary_proxy = RunningProxy::start(boundary.address).await?;
+    let origin = format!("https://{authority}");
+    assert_eq!(
+        boundary
+            .request_via(
+                boundary_proxy.address,
+                "POST",
+                "/login",
+                &authority,
+                &[
+                    ("Content-Type", "application/x-www-form-urlencoded"),
+                    ("Origin", &origin),
+                ],
+                &body,
+            )
+            .await?
+            .status,
+        200
+    );
+
+    let too_long_but_equivalent = authority.replacen(":1", ":01", 1);
+    assert_eq!(too_long_but_equivalent.len(), MAX_WEB_AUTHORITY_BYTES + 1);
+    assert_eq!(
+        boundary
+            .request_via(
+                boundary_proxy.address,
+                "POST",
+                "/login",
+                &too_long_but_equivalent,
+                &[
+                    ("Content-Type", "application/x-www-form-urlencoded"),
+                    ("Origin", &origin),
+                ],
+                &body,
+            )
+            .await?
+            .status,
+        400
+    );
 
     Ok(())
 }

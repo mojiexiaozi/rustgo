@@ -43,5 +43,6 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
 time = { version = "0.3.55", features = ["formatting", "macros"] }
 tower = { version = "0.5.3", features = ["util"] }
+url = "2.5.8"
 x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
 zeroize = "1.8.1"

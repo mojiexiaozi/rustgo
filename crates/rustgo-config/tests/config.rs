@@ -8,9 +8,9 @@ use std::{
 };
 
 use rustgo_config::{
-    ClientConfig, ServerConfig, TelemetryConfig, TunnelProtocol, WebConfig, WebOrigin,
-    check_client_references, check_server_references, load_client, load_client_with_lookup,
-    load_server,
+    ClientConfig, MAX_WEB_AUTHORITY_BYTES, ServerConfig, TelemetryConfig, TunnelProtocol,
+    WebConfig, WebOrigin, check_client_references, check_server_references, load_client,
+    load_client_with_lookup, load_server,
 };
 
 static NEXT_TEMP_DIR: AtomicUsize = AtomicUsize::new(0);
@@ -339,6 +339,42 @@ fn enabled_web_origin_policy_is_canonical_and_scheme_bound() {
     let ipv6 = WebOrigin::parse("http://[0:0:0:0:0:0:0:1]:80").unwrap();
     assert_eq!(ipv6.as_str(), "http://[::1]");
     assert!(ipv6.matches_authority("[::1]:80"));
+
+    let legacy_ipv4 = WebOrigin::parse("https://127.1").unwrap();
+    assert_eq!(legacy_ipv4.as_str(), "https://127.0.0.1");
+    assert!(legacy_ipv4.matches_authority("0x7f000001:443"));
+
+    let unicode = WebOrigin::parse("https://BÜCHER.Example:443").unwrap();
+    assert_eq!(unicode.as_str(), "https://xn--bcher-kva.example");
+    assert!(unicode.matches_authority("XN--BCHER-KVA.EXAMPLE"));
+}
+
+#[test]
+fn enabled_web_origin_policy_uses_one_canonical_authority_limit() {
+    let dir = TempDir::new();
+    let accepted_authority = format!("{}.{}:1", "a".repeat(63), "b".repeat(62));
+    let rejected_authority = format!("{}.{}:1", "a".repeat(63), "b".repeat(63));
+    assert_eq!(accepted_authority.len(), MAX_WEB_AUTHORITY_BYTES);
+    assert_eq!(rejected_authority.len(), MAX_WEB_AUTHORITY_BYTES + 1);
+
+    let accepted = load_server_text(
+        &dir,
+        &format!(
+            "{}\n[web]\nenabled = true\nexternal_origin = \"https://{accepted_authority}\"\nadmin_password = \"a-password-that-is-at-least-sixteen-bytes\"\n",
+            valid_server()
+        ),
+    )
+    .unwrap();
+    let origin = WebOrigin::from_config(accepted.web.as_ref().unwrap()).unwrap();
+    assert_eq!(origin.authority(), accepted_authority);
+    assert!(origin.matches_authority(&accepted_authority));
+
+    let rejected = format!(
+        "{}\n[web]\nenabled = true\nexternal_origin = \"https://{rejected_authority}\"\nadmin_password = \"a-password-that-is-at-least-sixteen-bytes\"\n",
+        valid_server()
+    );
+    let error = load_server_text(&dir, &rejected).unwrap_err();
+    assert!(error.to_string().contains("external_origin"), "{error}");
 }
 
 #[test]
@@ -359,6 +395,7 @@ fn enabled_web_origin_policy_rejects_missing_mismatched_or_non_origin_values() {
         "https://dashboard.example#fragment",
         "https://dashboard.example:0",
         "https://-bad.example",
+        "https://xn--a",
     ] {
         let config = format!("{prefix}external_origin = \"{origin}\"\n");
         let error = load_server_text(&dir, &config).unwrap_err();
