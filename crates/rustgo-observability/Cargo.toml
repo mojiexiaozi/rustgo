@@ -5,7 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+rand.workspace = true
 rusqlite.workspace = true
+same-file = "1.0.6"
 serde.workspace = true
 sha2.workspace = true
 sysinfo.workspace = true

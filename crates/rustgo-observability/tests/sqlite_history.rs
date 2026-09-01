@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::Connection;
 use rustgo_observability::{
@@ -16,6 +16,7 @@ const MINUTE_MILLIS: u64 = 60_000;
 const FIVE_MINUTE_BUCKET_MILLIS: u64 = 5 * MINUTE_MILLIS;
 const HOUR_MILLIS: u64 = 60 * MINUTE_MILLIS;
 const DAY_MILLIS: u64 = 24 * HOUR_MILLIS;
+const RUSTGO_APPLICATION_ID: i64 = 0x5253_474f;
 
 struct TestDirectory(PathBuf);
 
@@ -50,6 +51,18 @@ fn config(path: PathBuf) -> HistoryConfig {
         history_days: 7,
         database_max_mib: 16,
     }
+}
+
+fn unix_millis_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+fn recent_base() -> u64 {
+    let now = unix_millis_now();
+    (now / FIVE_MINUTE_BUCKET_MILLIS) * FIVE_MINUTE_BUCKET_MILLIS
 }
 
 fn host_metrics(timestamp: u64, cpu: u16) -> HostMetrics {
@@ -170,24 +183,21 @@ async fn wait_until(mut predicate: impl FnMut() -> bool, timeout: Duration) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn migrates_to_wal_and_persists_points_across_restart() {
+async fn bootstraps_owned_wal_schema_and_persists_points_across_restart() {
     let directory = TestDirectory::new("restart");
     let database = directory.database();
-    {
-        let connection = Connection::open(&database).unwrap();
-        connection.pragma_update(None, "user_version", 0).unwrap();
-    }
+    let now = unix_millis_now();
 
     let (service, worker) = HistoryService::new(config(database.clone())).unwrap();
     let task = worker.start().unwrap();
     let persisted_client = client("restart-client", 3);
     service
         .try_publish(HistoryBatch {
-            server_points: vec![server_sample(1_000, 2_500)],
+            server_points: vec![server_sample(now, 2_500)],
             client_lifecycle: vec![ClientLifecycleRecord {
                 client: persisted_client.clone(),
                 kind: ClientLifecycleKind::Authenticated,
-                timestamp_unix_millis: 900,
+                timestamp_unix_millis: now - 100,
                 version: Some(BoundedLabel::try_from("0.3.0").unwrap()),
             }],
             session_summaries: vec![SessionSnapshot {
@@ -202,8 +212,8 @@ async fn migrates_to_wal_and_persists_points_across_restart() {
                     received_bytes: 10,
                     sent_bytes: 20,
                 },
-                opened_unix_millis: 950,
-                closed_unix_millis: Some(1_050),
+                opened_unix_millis: now - 50,
+                closed_unix_millis: Some(now + 50),
                 terminal_reason: Some(BoundedLabel::try_from("complete").unwrap()),
             }],
             ..HistoryBatch::default()
@@ -213,8 +223,8 @@ async fn migrates_to_wal_and_persists_points_across_restart() {
         .query(query(
             HistoryScope::Server,
             HistoryMetric::CpuBasisPoints,
-            0,
-            2_000,
+            now - 1_000,
+            now + 1_000,
             HistoryResolution::Raw,
         ))
         .await
@@ -242,6 +252,27 @@ async fn migrates_to_wal_and_persists_points_across_restart() {
         .unwrap();
     assert_eq!(version, HISTORY_SCHEMA_VERSION);
     assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+    let application_id: i64 = connection
+        .pragma_query_value(None, "application_id", |row| row.get(0))
+        .unwrap();
+    let auto_vacuum: i64 = connection
+        .pragma_query_value(None, "auto_vacuum", |row| row.get(0))
+        .unwrap();
+    let owner_nonce: String = connection
+        .query_row(
+            "SELECT owner_nonce FROM history_health WHERE id=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(application_id, RUSTGO_APPLICATION_ID);
+    assert_eq!(auto_vacuum, 2);
+    assert_eq!(owner_nonce.len(), 64);
+    assert!(
+        String::from_utf8(fs::read(sidecar(&database, ".rustgo-owner")).unwrap())
+            .unwrap()
+            .contains(&format!("nonce={owner_nonce}\n"))
+    );
     assert_eq!(lifecycle_rows, 1);
     assert_eq!(session_rows, 1);
     drop(connection);
@@ -252,8 +283,8 @@ async fn migrates_to_wal_and_persists_points_across_restart() {
         .query(query(
             HistoryScope::Server,
             HistoryMetric::CpuBasisPoints,
-            0,
-            2_000,
+            now - 1_000,
+            now + 1_000,
             HistoryResolution::Raw,
         ))
         .await
@@ -265,13 +296,12 @@ async fn migrates_to_wal_and_persists_points_across_restart() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn aggregation_is_idempotent_and_retention_keeps_the_expected_tiers() {
     let directory = TestDirectory::new("aggregation");
-    let now = 10 * DAY_MILLIS;
+    let now = recent_base();
     let (service, worker) = HistoryService::new(config(directory.database())).unwrap();
     let task = worker.start().unwrap();
 
-    let minute_bucket = now - (2 * HOUR_MILLIS);
-    let five_minute_bucket = now - (2 * DAY_MILLIS);
-    let expired = now - (8 * DAY_MILLIS);
+    let minute_bucket = now - (2 * MINUTE_MILLIS);
+    let five_minute_bucket = now - (15 * MINUTE_MILLIS);
     service
         .try_publish(HistoryBatch {
             server_points: vec![
@@ -279,15 +309,15 @@ async fn aggregation_is_idempotent_and_retention_keeps_the_expected_tiers() {
                 server_sample(minute_bucket + 2_000, 3_000),
                 server_sample(five_minute_bucket + 1_000, 2_000),
                 server_sample(five_minute_bucket + 2_000, 4_000),
-                server_sample(expired, 9_000),
-                server_sample(now - 1_000, 5_000),
+                server_sample(now + 1_000, 5_000),
             ],
             ..HistoryBatch::default()
         })
         .unwrap();
 
-    service.maintain(now).await.unwrap();
-    service.maintain(now).await.unwrap();
+    let retention_now = now + (2 * HOUR_MILLIS);
+    service.maintain(retention_now).await.unwrap();
+    service.maintain(retention_now).await.unwrap();
 
     let minute = service
         .query(query(
@@ -315,12 +345,18 @@ async fn aggregation_is_idempotent_and_retention_keeps_the_expected_tiers() {
     assert_eq!(five_minute.points.len(), 1);
     assert_eq!(five_minute.points[0].value, 3_000.0);
 
+    service
+        .try_publish(HistoryBatch {
+            server_points: vec![server_sample(now + 2_000, 5_000)],
+            ..HistoryBatch::default()
+        })
+        .unwrap();
     let raw = service
         .query(query(
             HistoryScope::Server,
             HistoryMetric::CpuBasisPoints,
-            0,
-            now,
+            now + 2_000,
+            now + 2_000,
             HistoryResolution::Raw,
         ))
         .await
@@ -328,12 +364,13 @@ async fn aggregation_is_idempotent_and_retention_keeps_the_expected_tiers() {
     assert_eq!(raw.points.len(), 1);
     assert_eq!(raw.points[0].value, 5_000.0);
 
+    service.maintain(now + (8 * DAY_MILLIS)).await.unwrap();
     let expired = service
         .query(query(
             HistoryScope::Server,
             HistoryMetric::CpuBasisPoints,
-            0,
-            now - (7 * DAY_MILLIS),
+            now - HOUR_MILLIS,
+            now + HOUR_MILLIS,
             HistoryResolution::FiveMinutes,
         ))
         .await
@@ -347,13 +384,14 @@ async fn concurrent_queries_observe_ordered_writes_and_point_limits_are_hard() {
     let directory = TestDirectory::new("concurrent");
     let (service, worker) = HistoryService::new(config(directory.database())).unwrap();
     let task = worker.start().unwrap();
+    let now = unix_millis_now();
     let writer = {
         let service = service.clone();
         tokio::spawn(async move {
             for index in 0..2_100_u64 {
                 service
                     .try_publish(HistoryBatch {
-                        server_points: vec![server_sample(index, (index % 10_000) as u16)],
+                        server_points: vec![server_sample(now + index, (index % 10_000) as u16)],
                         ..HistoryBatch::default()
                     })
                     .unwrap();
@@ -372,8 +410,8 @@ async fn concurrent_queries_observe_ordered_writes_and_point_limits_are_hard() {
                         .query(query(
                             HistoryScope::Server,
                             HistoryMetric::CpuBasisPoints,
-                            0,
-                            3_000,
+                            now,
+                            now + 3_000,
                             HistoryResolution::Raw,
                         ))
                         .await
@@ -394,8 +432,8 @@ async fn concurrent_queries_observe_ordered_writes_and_point_limits_are_hard() {
             ..query(
                 HistoryScope::Server,
                 HistoryMetric::CpuBasisPoints,
-                0,
-                3_000,
+                now,
+                now + 3_000,
                 HistoryResolution::Raw,
             )
         })
@@ -409,8 +447,8 @@ async fn concurrent_queries_observe_ordered_writes_and_point_limits_are_hard() {
                 ..query(
                     HistoryScope::Server,
                     HistoryMetric::CpuBasisPoints,
-                    0,
-                    3_000,
+                    now,
+                    now + 3_000,
                     HistoryResolution::Raw,
                 )
             })
@@ -430,13 +468,14 @@ async fn size_cap_counts_database_wal_and_shm_and_prunes_oldest_history_first() 
     let task = worker.start().unwrap();
     let identity = client(&"x".repeat(128), 1);
     let long_reason = BoundedLabel::try_from("r".repeat(128)).unwrap();
-    let now = 20 * DAY_MILLIS;
+    let now = unix_millis_now();
+    let oldest = now - (30 * MINUTE_MILLIS);
 
     for chunk in 0..24_u64 {
         let mut batch = HistoryBatch::default();
         for index in 0..400_u64 {
             let sequence = (chunk * 400) + index;
-            let timestamp = now - (2 * DAY_MILLIS) + sequence;
+            let timestamp = oldest + sequence;
             batch.server_points.push(server_sample(timestamp, 1_000));
             batch.client_lifecycle.push(ClientLifecycleRecord {
                 client: identity.clone(),
@@ -472,7 +511,7 @@ async fn size_cap_counts_database_wal_and_shm_and_prunes_oldest_history_first() 
         .query(query(
             HistoryScope::Server,
             HistoryMetric::CpuBasisPoints,
-            now - (3 * DAY_MILLIS),
+            oldest - MINUTE_MILLIS,
             now,
             HistoryResolution::FiveMinutes,
         ))
@@ -483,14 +522,15 @@ async fn size_cap_counts_database_wal_and_shm_and_prunes_oldest_history_first() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn corrupt_database_is_quarantined_and_history_recovers_without_losing_live_ownership() {
+async fn owned_schema_corruption_is_quarantined_and_history_recovers() {
     let directory = TestDirectory::new("corrupt");
     let database = directory.database();
     let (service, worker) = HistoryService::new(config(database.clone())).unwrap();
     let task = worker.start().unwrap();
+    let now = unix_millis_now();
     service
         .try_publish(HistoryBatch {
-            server_points: vec![server_sample(1_000, 123)],
+            server_points: vec![server_sample(now, 123)],
             ..HistoryBatch::default()
         })
         .unwrap();
@@ -498,7 +538,12 @@ async fn corrupt_database_is_quarantined_and_history_recovers_without_losing_liv
     stop(service, task).await;
     assert!(sidecar(&database, ".rustgo-owner").is_file());
 
-    fs::write(&database, b"this is not a sqlite database").unwrap();
+    {
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute("DROP TABLE server_metric_points", [])
+            .unwrap();
+    }
     let (service, worker) = HistoryService::new(config(database.clone())).unwrap();
     assert!(!service.health().history_available);
     let task = worker.start().unwrap();
@@ -517,7 +562,7 @@ async fn corrupt_database_is_quarantined_and_history_recovers_without_losing_liv
 
     service
         .try_publish(HistoryBatch {
-            server_points: vec![server_sample(9_000, 777)],
+            server_points: vec![server_sample(now + 1_000, 777)],
             ..HistoryBatch::default()
         })
         .unwrap();
@@ -525,8 +570,8 @@ async fn corrupt_database_is_quarantined_and_history_recovers_without_losing_liv
         .query(query(
             HistoryScope::Server,
             HistoryMetric::CpuBasisPoints,
-            0,
-            10_000,
+            now,
+            now + 2_000,
             HistoryResolution::Raw,
         ))
         .await
@@ -546,10 +591,11 @@ async fn corrupt_database_is_quarantined_and_history_recovers_without_losing_liv
 async fn bounded_batch_queue_drops_the_oldest_pending_batch() {
     let directory = TestDirectory::new("queue");
     let (service, worker) = HistoryService::new(config(directory.database())).unwrap();
+    let now = unix_millis_now();
     for timestamp in 0..=HISTORY_BATCH_QUEUE_CAPACITY as u64 {
         service
             .try_publish(HistoryBatch {
-                server_points: vec![server_sample(timestamp, timestamp as u16)],
+                server_points: vec![server_sample(now + timestamp, timestamp as u16)],
                 ..HistoryBatch::default()
             })
             .unwrap();
@@ -565,14 +611,14 @@ async fn bounded_batch_queue_drops_the_oldest_pending_batch() {
         .query(query(
             HistoryScope::Server,
             HistoryMetric::CpuBasisPoints,
-            0,
-            HISTORY_BATCH_QUEUE_CAPACITY as u64,
+            now,
+            now + HISTORY_BATCH_QUEUE_CAPACITY as u64,
             HistoryResolution::Raw,
         ))
         .await
         .unwrap();
     assert_eq!(series.points.len(), HISTORY_BATCH_QUEUE_CAPACITY);
-    assert_eq!(series.points[0].timestamp_unix_millis, 1);
+    assert_eq!(series.points[0].timestamp_unix_millis, now + 1);
     stop(service, task).await;
 }
 
@@ -581,19 +627,20 @@ async fn client_history_is_scoped_to_the_authenticated_name() {
     let directory = TestDirectory::new("client-scope");
     let (service, worker) = HistoryService::new(config(directory.database())).unwrap();
     let task = worker.start().unwrap();
+    let now = unix_millis_now();
     service
         .try_publish(HistoryBatch {
             client_points: vec![
                 ClientHistorySample {
                     client: client("alpha", 1),
-                    timestamp_unix_millis: 1_000,
-                    metrics: host_metrics(1_000, 111),
+                    timestamp_unix_millis: now,
+                    metrics: host_metrics(now, 111),
                     traffic: TrafficCounters::default(),
                 },
                 ClientHistorySample {
                     client: client("beta", 1),
-                    timestamp_unix_millis: 1_000,
-                    metrics: host_metrics(1_000, 222),
+                    timestamp_unix_millis: now,
+                    metrics: host_metrics(now, 222),
                     traffic: TrafficCounters::default(),
                 },
             ],
@@ -604,8 +651,8 @@ async fn client_history_is_scoped_to_the_authenticated_name() {
         .query(query(
             HistoryScope::Client(BoundedLabel::try_from("alpha").unwrap()),
             HistoryMetric::CpuBasisPoints,
-            0,
-            2_000,
+            now - 1_000,
+            now + 1_000,
             HistoryResolution::Raw,
         ))
         .await
@@ -680,6 +727,51 @@ async fn automatic_cap_enforcement_runs_after_writes_without_manual_maintenance(
     stop(service, worker).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn publish_then_query_visibility_is_preserved_while_open_cap_runs() {
+    let directory = TestDirectory::new("cap-command-order");
+    let database = directory.database();
+    let now = unix_millis_now();
+    let (service, worker) = HistoryService::new(config(database.clone())).unwrap();
+    let worker = worker.start().unwrap();
+    service
+        .try_publish(large_session_batch(0, 2_000, now))
+        .unwrap();
+    service.checkpoint().await.unwrap();
+    assert!(total_database_bytes(&database) > 1024 * 1024);
+    stop(service, worker).await;
+
+    let mut cap_config = config(database);
+    cap_config.database_max_mib = 1;
+    let (service, worker) = HistoryService::new(cap_config).unwrap();
+    service
+        .try_publish(HistoryBatch {
+            server_points: vec![server_sample(now + 1_000, 7_777)],
+            ..HistoryBatch::default()
+        })
+        .unwrap();
+    let queued_query = {
+        let service = service.clone();
+        tokio::spawn(async move {
+            service
+                .query(query(
+                    HistoryScope::Server,
+                    HistoryMetric::CpuBasisPoints,
+                    now,
+                    now + 2_000,
+                    HistoryResolution::Raw,
+                ))
+                .await
+        })
+    };
+    tokio::task::yield_now().await;
+    let worker = worker.start().unwrap();
+    let visible = queued_query.await.unwrap().unwrap();
+    assert_eq!(visible.points.len(), 1);
+    assert_eq!(visible.points[0].value, 7_777.0);
+    stop(service, worker).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn large_maintenance_yields_to_queries_and_shutdown_is_bounded() {
     let directory = TestDirectory::new("maintenance-yield");
@@ -743,12 +835,104 @@ async fn large_maintenance_yields_to_queries_and_shutdown_is_bounded() {
     let _ = maintenance.await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn large_metric_tier_maintenance_is_index_ordered_and_shutdown_bounded() {
+    let directory = TestDirectory::new("metric-maintenance-yield");
+    let database = directory.database();
+    let now = unix_millis_now();
+    let start = now - (2 * HOUR_MILLIS);
+    let (service, worker) = HistoryService::new(config(database.clone())).unwrap();
+    let worker = worker.start().unwrap();
+    wait_until(
+        || service.health().history_available,
+        Duration::from_secs(2),
+    )
+    .await;
+    stop(service, worker).await;
+
+    let mut connection = Connection::open(&database).unwrap();
+    let transaction = connection.transaction().unwrap();
+    {
+        let mut insert = transaction
+            .prepare(
+                "INSERT INTO client_metric_points
+                 (client_name, resolution, timestamp_ms, metric, value, sample_count)
+                 VALUES ('metric-maintenance-client', 0, ?1, 'cpu_basis_points', 123.0, 1)",
+            )
+            .unwrap();
+        for offset in 0..5_000_u64 {
+            insert
+                .execute([i64::try_from(start + offset).unwrap()])
+                .unwrap();
+        }
+    }
+    transaction.commit().unwrap();
+    for sql in [
+        "EXPLAIN QUERY PLAN
+         SELECT client_name, timestamp_ms FROM client_metric_points
+         WHERE resolution = 0 AND timestamp_ms < ?1
+         GROUP BY timestamp_ms, client_name
+         ORDER BY timestamp_ms ASC, client_name ASC LIMIT 64",
+        "EXPLAIN QUERY PLAN
+         SELECT candidate.client_name, candidate.timestamp_ms
+         FROM client_metric_points AS candidate
+         WHERE candidate.resolution = 0
+           AND ?1 >= 0
+           AND EXISTS (
+               SELECT 1 FROM client_metric_points AS newer
+               WHERE newer.client_name = candidate.client_name
+                 AND newer.resolution = 0
+                 AND newer.timestamp_ms > candidate.timestamp_ms
+           )
+         GROUP BY candidate.timestamp_ms, candidate.client_name
+         ORDER BY candidate.timestamp_ms ASC, candidate.client_name ASC LIMIT 39",
+    ] {
+        let mut statement = connection.prepare(sql).unwrap();
+        let details = statement
+            .query_map([now as i64], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            details.iter().all(|detail| !detail.contains("TEMP B-TREE")),
+            "maintenance plan used a full-tier temporary sort: {details:?}"
+        );
+    }
+    drop(connection);
+
+    let (service, worker) = HistoryService::new(config(database)).unwrap();
+    let worker = worker.start().unwrap();
+    let maintenance = {
+        let service = service.clone();
+        tokio::spawn(async move { service.maintain(now).await })
+    };
+    tokio::task::yield_now().await;
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        service.query(query(
+            HistoryScope::Client(BoundedLabel::try_from("metric-maintenance-client").unwrap()),
+            HistoryMetric::CpuBasisPoints,
+            start,
+            now,
+            HistoryResolution::Raw,
+        )),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    service.close();
+    tokio::time::timeout(Duration::from_secs(2), worker.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+    let _ = maintenance.await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cancelled_queued_maintenance_command_is_never_executed_later() {
     let directory = TestDirectory::new("cancelled-maintenance");
     let database = directory.database();
     let now = 20 * DAY_MILLIS;
-    let old_timestamp = now - (2 * DAY_MILLIS);
     let (service, worker) = HistoryService::new(config(database.clone())).unwrap();
     let cancelled = {
         let service = service.clone();
@@ -759,23 +943,7 @@ async fn a_cancelled_queued_maintenance_command_is_never_executed_later() {
     let _ = cancelled.await;
 
     let worker = worker.start().unwrap();
-    service
-        .try_publish(HistoryBatch {
-            server_points: vec![server_sample(old_timestamp, 444)],
-            ..HistoryBatch::default()
-        })
-        .unwrap();
-    let raw = service
-        .query(query(
-            HistoryScope::Server,
-            HistoryMetric::CpuBasisPoints,
-            old_timestamp,
-            old_timestamp,
-            HistoryResolution::Raw,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(raw.points.len(), 1);
+    service.checkpoint().await.unwrap();
     stop(service, worker).await;
 
     let connection = Connection::open(&database).unwrap();
@@ -797,6 +965,35 @@ async fn dropping_worker_guard_signals_the_dedicated_thread_to_exit() {
     wait_until(|| service.health().worker_running, Duration::from_secs(2)).await;
     drop(worker);
     wait_until(|| !service.health().worker_running, Duration::from_secs(2)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_a_busy_worker_returns_promptly_and_reaper_observes_exit() {
+    let directory = TestDirectory::new("busy-worker-drop");
+    let database = directory.database();
+    let (service, worker) = HistoryService::new(config(database.clone())).unwrap();
+    let worker = worker.start().unwrap();
+    wait_until(
+        || service.health().history_available,
+        Duration::from_secs(2),
+    )
+    .await;
+    stop(service, worker).await;
+
+    let blocker = Connection::open(&database).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let (service, worker) = HistoryService::new(config(database)).unwrap();
+    let worker = worker.start().unwrap();
+    wait_until(|| service.health().worker_running, Duration::from_secs(2)).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let started = Instant::now();
+    drop(worker);
+    assert!(
+        started.elapsed() < Duration::from_millis(250),
+        "Drop synchronously waited for the busy SQLite worker"
+    );
+    blocker.execute_batch("ROLLBACK").unwrap();
+    wait_until(|| !service.health().worker_running, Duration::from_secs(3)).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -880,6 +1077,63 @@ async fn unowned_and_protected_files_are_never_quarantined_or_overwritten() {
     assert_eq!(fs::read(&unrelated).unwrap(), b"not owned by Rustgo");
     assert!(!sidecar(&unrelated, ".rustgo-owner").exists());
     assert!(!directory.0.join("unrelated.db.quarantine-0").exists());
+
+    let valid = directory.0.join("personal.db");
+    {
+        let connection = Connection::open(&valid).unwrap();
+        connection
+            .execute("CREATE TABLE personal_notes (body TEXT NOT NULL)", [])
+            .unwrap();
+        connection
+            .execute("INSERT INTO personal_notes VALUES ('keep me')", [])
+            .unwrap();
+    }
+    fs::write(
+        sidecar(&valid, ".rustgo-owner"),
+        b"rustgo-observability-history-v2\napplication_id=5253474f\nnonce=0000000000000000000000000000000000000000000000000000000000000000\n",
+    )
+    .unwrap();
+    let (service, worker) = HistoryService::new(config(valid.clone())).unwrap();
+    let worker = worker.start().unwrap();
+    wait_until(
+        || service.health().history_failures > 0,
+        Duration::from_secs(2),
+    )
+    .await;
+    stop(service, worker).await;
+    let connection = Connection::open(&valid).unwrap();
+    let note: String = connection
+        .query_row("SELECT body FROM personal_notes", [], |row| row.get(0))
+        .unwrap();
+    let application_id: i64 = connection
+        .pragma_query_value(None, "application_id", |row| row.get(0))
+        .unwrap();
+    assert_eq!(note, "keep me");
+    assert_eq!(application_id, 0);
+    assert!(!directory.0.join("personal.db.quarantine-0").exists());
+
+    let empty = directory.0.join("empty-user-version-zero.db");
+    {
+        let connection = Connection::open(&empty).unwrap();
+        connection.pragma_update(None, "user_version", 0).unwrap();
+    }
+    let before = fs::read(&empty).unwrap();
+    let (service, worker) = HistoryService::new(config(empty.clone())).unwrap();
+    let worker = worker.start().unwrap();
+    wait_until(
+        || service.health().history_failures > 0,
+        Duration::from_secs(2),
+    )
+    .await;
+    stop(service, worker).await;
+    assert_eq!(fs::read(&empty).unwrap(), before);
+    assert!(!sidecar(&empty, ".rustgo-owner").exists());
+    assert!(
+        !directory
+            .0
+            .join("empty-user-version-zero.db.quarantine-0")
+            .exists()
+    );
 }
 
 #[cfg(any(unix, windows))]
@@ -889,6 +1143,7 @@ async fn symlink_database_path_is_not_followed_or_quarantined() {
     let target = directory.0.join("target.db");
     let database = directory.database();
     fs::write(&target, b"unrelated target").unwrap();
+    let (service, worker) = HistoryService::new(config(database.clone())).unwrap();
     #[cfg(unix)]
     let linked = std::os::unix::fs::symlink(&target, &database);
     #[cfg(windows)]
@@ -897,7 +1152,6 @@ async fn symlink_database_path_is_not_followed_or_quarantined() {
         return;
     }
 
-    let (service, worker) = HistoryService::new(config(database.clone())).unwrap();
     let worker = worker.start().unwrap();
     wait_until(
         || service.health().history_failures > 0,
@@ -930,7 +1184,12 @@ async fn quarantine_directory_collision_never_overwrites_existing_content() {
     let occupied = directory.0.join("metrics.db.quarantine-0");
     fs::create_dir(&occupied).unwrap();
     fs::write(occupied.join("sentinel"), b"keep me").unwrap();
-    fs::write(&database, b"owned but now corrupt").unwrap();
+    {
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute("DROP INDEX server_metric_query", [])
+            .unwrap();
+    }
     let (service, worker) = HistoryService::new(config(database.clone())).unwrap();
     let worker = worker.start().unwrap();
     wait_until(
@@ -941,6 +1200,86 @@ async fn quarantine_directory_collision_never_overwrites_existing_content() {
     stop(service, worker).await;
     assert_eq!(fs::read(occupied.join("sentinel")).unwrap(), b"keep me");
     assert!(directory.0.join("metrics.db.quarantine-1").is_dir());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interrupted_quarantine_resumes_from_matching_dual_ownership() {
+    let directory = TestDirectory::new("quarantine-resume");
+    let database = directory.database();
+    let marker = sidecar(&database, ".rustgo-owner");
+    let (service, worker) = HistoryService::new(config(database.clone())).unwrap();
+    let worker = worker.start().unwrap();
+    wait_until(
+        || service.health().history_available,
+        Duration::from_secs(2),
+    )
+    .await;
+    stop(service, worker).await;
+
+    let quarantine = directory.0.join("metrics.db.quarantine-0");
+    fs::create_dir(&quarantine).unwrap();
+    fs::hard_link(&database, quarantine.join("metrics.db")).unwrap();
+    fs::hard_link(&marker, quarantine.join("metrics.db.rustgo-owner")).unwrap();
+    for suffix in ["-wal", "-shm"] {
+        let source = sidecar(&database, suffix);
+        if source.exists() {
+            fs::hard_link(&source, quarantine.join(source.file_name().unwrap())).unwrap();
+        }
+    }
+    fs::remove_file(&database).unwrap();
+
+    let (service, worker) = HistoryService::new(config(database.clone())).unwrap();
+    let worker = worker.start().unwrap();
+    wait_until(
+        || service.health().history_available && service.health().recoveries == 1,
+        Duration::from_secs(5),
+    )
+    .await;
+    stop(service, worker).await;
+    assert!(database.is_file());
+    assert!(marker.is_file());
+    assert!(quarantine.join("metrics.db").is_file());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_or_spoofed_owner_marker_never_authorizes_quarantine() {
+    let directory = TestDirectory::new("stale-marker");
+    let database = directory.database();
+    let marker = sidecar(&database, ".rustgo-owner");
+    let (service, worker) = HistoryService::new(config(database.clone())).unwrap();
+    let worker = worker.start().unwrap();
+    wait_until(
+        || service.health().history_available,
+        Duration::from_secs(2),
+    )
+    .await;
+    stop(service, worker).await;
+    let valid_marker = fs::read(&marker).unwrap();
+    let mut stale_marker = valid_marker.clone();
+    let last = stale_marker.len() - 2;
+    stale_marker[last] = if stale_marker[last] == b'0' {
+        b'1'
+    } else {
+        b'0'
+    };
+    fs::write(&marker, &stale_marker).unwrap();
+
+    let (service, worker) = HistoryService::new(config(database.clone())).unwrap();
+    let worker = worker.start().unwrap();
+    wait_until(
+        || service.health().history_failures > 0,
+        Duration::from_secs(2),
+    )
+    .await;
+    assert!(!service.health().history_available);
+    assert!(!directory.0.join("metrics.db.quarantine-0").exists());
+    fs::write(&marker, valid_marker).unwrap();
+    wait_until(
+        || service.health().history_available,
+        Duration::from_secs(8),
+    )
+    .await;
+    stop(service, worker).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -984,7 +1323,10 @@ async fn marker_owned_supported_version_with_missing_table_or_column_is_recreate
     {
         let connection = Connection::open(&database).unwrap();
         connection
-            .execute("ALTER TABLE history_health DROP COLUMN probe_nonce", [])
+            .execute(
+                "ALTER TABLE session_summaries DROP COLUMN terminal_reason",
+                [],
+            )
             .unwrap();
     }
     let (service, worker) = HistoryService::new(config(database.clone())).unwrap();
@@ -998,21 +1340,162 @@ async fn marker_owned_supported_version_with_missing_table_or_column_is_recreate
     let connection = Connection::open(&database).unwrap();
     let probe_columns: usize = connection
         .query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('history_health') WHERE name='probe_nonce'",
+            "SELECT COUNT(*) FROM pragma_table_info('session_summaries') WHERE name='terminal_reason'",
             [],
             |row| row.get(0),
         )
         .unwrap();
     assert_eq!(probe_columns, 1);
+    drop(connection);
+
+    {
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE client_lifecycle RENAME TO damaged_client_lifecycle;
+                 DROP TABLE damaged_client_lifecycle;
+                 CREATE TABLE client_lifecycle (
+                     id INTEGER PRIMARY KEY,
+                     client_name TEXT NOT NULL,
+                     generation TEXT NOT NULL,
+                     event_kind TEXT NOT NULL,
+                     timestamp_ms INTEGER NOT NULL CHECK (timestamp_ms >= 0),
+                     version TEXT
+                 );
+                 CREATE INDEX client_lifecycle_time
+                     ON client_lifecycle (timestamp_ms, id);
+                 CREATE INDEX client_lifecycle_latest
+                     ON client_lifecycle (client_name, timestamp_ms DESC, id DESC);",
+            )
+            .unwrap();
+    }
+    let (service, worker) = HistoryService::new(config(database.clone())).unwrap();
+    let worker = worker.start().unwrap();
+    wait_until(
+        || service.health().history_available && service.health().recoveries > 0,
+        Duration::from_secs(5),
+    )
+    .await;
+    stop(service, worker).await;
+    let connection = Connection::open(&database).unwrap();
+    let unique_targets: usize = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_index_list('client_lifecycle') WHERE origin='u' AND \"unique\"=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(unique_targets, 1);
+    drop(connection);
+
+    {
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "DROP INDEX client_lifecycle_latest;
+                 CREATE INDEX client_lifecycle_latest
+                     ON client_lifecycle (client_name, timestamp_ms ASC, id ASC);",
+            )
+            .unwrap();
+    }
+    let (service, worker) = HistoryService::new(config(database.clone())).unwrap();
+    let worker = worker.start().unwrap();
+    wait_until(
+        || service.health().history_available && service.health().recoveries > 0,
+        Duration::from_secs(5),
+    )
+    .await;
+    stop(service, worker).await;
+    let connection = Connection::open(&database).unwrap();
+    let descending_keys: usize = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_index_xinfo('client_lifecycle_latest')
+             WHERE key=1 AND desc=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(descending_keys, 2);
+    drop(connection);
+
+    {
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "DROP INDEX server_metric_query;
+                 CREATE UNIQUE INDEX server_metric_query
+                     ON server_metric_points
+                        (resolution, metric COLLATE NOCASE, timestamp_ms)
+                     WHERE resolution >= 0;",
+            )
+            .unwrap();
+    }
+    let (service, worker) = HistoryService::new(config(database.clone())).unwrap();
+    let worker = worker.start().unwrap();
+    wait_until(
+        || service.health().history_available && service.health().recoveries > 0,
+        Duration::from_secs(5),
+    )
+    .await;
+    stop(service, worker).await;
+    let connection = Connection::open(&database).unwrap();
+    let restored_index: (i64, String, i64) = connection
+        .query_row(
+            "SELECT \"unique\", origin, partial
+             FROM pragma_index_list('server_metric_points')
+             WHERE name='server_metric_query'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(restored_index, (0, "c".to_owned(), 0));
+    drop(connection);
+
+    {
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE server_metric_points;
+                 CREATE TABLE server_metric_points (
+                     resolution INTEGER NOT NULL,
+                     timestamp_ms INTEGER NOT NULL CHECK (timestamp_ms >= 0),
+                     metric TEXT NOT NULL,
+                     value REAL NOT NULL,
+                     sample_count INTEGER NOT NULL CHECK (sample_count > 0),
+                     PRIMARY KEY (resolution, timestamp_ms, metric)
+                 ) WITHOUT ROWID;
+                 CREATE INDEX server_metric_query
+                     ON server_metric_points (resolution, metric, timestamp_ms);",
+            )
+            .unwrap();
+    }
+    let (service, worker) = HistoryService::new(config(database.clone())).unwrap();
+    let worker = worker.start().unwrap();
+    wait_until(
+        || service.health().history_available && service.health().recoveries > 0,
+        Duration::from_secs(5),
+    )
+    .await;
+    stop(service, worker).await;
+    let connection = Connection::open(&database).unwrap();
+    let server_sql: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='server_metric_points'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(server_sql.contains("CHECK (resolution BETWEEN 0 AND 2)"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_bad_batch_is_isolated_without_discarding_healthy_neighbors() {
     let directory = TestDirectory::new("isolated-batch-failure");
     let (service, worker) = HistoryService::new(config(directory.database())).unwrap();
+    let now = unix_millis_now();
     service
         .try_publish(HistoryBatch {
-            server_points: vec![server_sample(1_000, 100)],
+            server_points: vec![server_sample(now, 100)],
             ..HistoryBatch::default()
         })
         .unwrap();
@@ -1024,7 +1507,7 @@ async fn a_bad_batch_is_isolated_without_discarding_healthy_neighbors() {
         .unwrap();
     service
         .try_publish(HistoryBatch {
-            server_points: vec![server_sample(2_000, 300)],
+            server_points: vec![server_sample(now + 1_000, 300)],
             ..HistoryBatch::default()
         })
         .unwrap();
@@ -1038,8 +1521,8 @@ async fn a_bad_batch_is_isolated_without_discarding_healthy_neighbors() {
         .query(query(
             HistoryScope::Server,
             HistoryMetric::CpuBasisPoints,
-            0,
-            3_000,
+            now,
+            now + 2_000,
             HistoryResolution::Raw,
         ))
         .await
@@ -1051,22 +1534,121 @@ async fn a_bad_batch_is_isolated_without_discarding_healthy_neighbors() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn late_raw_replay_after_rollup_retention_never_replaces_complete_bucket() {
-    let directory = TestDirectory::new("late-replay");
-    let now = 10 * DAY_MILLIS;
-    let bucket = now - (2 * DAY_MILLIS);
+async fn failed_coalesced_batches_remain_in_the_shared_queue_budget_during_retry() {
+    let directory = TestDirectory::new("retry-budget");
     let (service, worker) = HistoryService::new(config(directory.database())).unwrap();
+    for _ in 0..64 {
+        service
+            .try_publish(HistoryBatch {
+                server_points: vec![server_sample(i64::MAX as u64 + 1, 1)],
+                ..HistoryBatch::default()
+            })
+            .unwrap();
+    }
     let worker = worker.start().unwrap();
-    service
-        .try_publish(HistoryBatch {
-            server_points: vec![
-                server_sample(bucket + 1_000, 1_000),
-                server_sample(bucket + 2_000, 3_000),
-            ],
-            ..HistoryBatch::default()
-        })
+    wait_until(
+        || service.health().history_failures > 0,
+        Duration::from_secs(2),
+    )
+    .await;
+    let retry_health = service.health();
+    assert_eq!(retry_health.pending_batches, 64);
+    assert!(retry_health.pending_batch_bytes > 0);
+    let blocker = Connection::open(directory.database()).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+    let now = unix_millis_now();
+    for offset in 0..1_000_u64 {
+        service
+            .try_publish(HistoryBatch {
+                server_points: vec![server_sample(now + offset, 2)],
+                ..HistoryBatch::default()
+            })
+            .unwrap();
+    }
+    let filled = service.health();
+    assert_eq!(filled.pending_batches, HISTORY_BATCH_QUEUE_CAPACITY);
+    assert!(filled.pending_batch_bytes <= MAX_HISTORY_QUEUE_BYTES);
+    assert_eq!(filled.dropped_batches, 40);
+    blocker.execute_batch("ROLLBACK").unwrap();
+    stop(service, worker).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_clock_admission_rejects_late_raw_during_concurrent_retention() {
+    let directory = TestDirectory::new("late-retention-race");
+    let database = directory.database();
+    let now = unix_millis_now();
+    let bucket =
+        ((now - (2 * HOUR_MILLIS)) / FIVE_MINUTE_BUCKET_MILLIS) * FIVE_MINUTE_BUCKET_MILLIS;
+    let (service, worker) = HistoryService::new(config(database.clone())).unwrap();
+    let worker = worker.start().unwrap();
+    wait_until(
+        || service.health().history_available,
+        Duration::from_secs(2),
+    )
+    .await;
+    stop(service, worker).await;
+    {
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute(
+                "INSERT INTO server_metric_points
+                 (resolution, timestamp_ms, metric, value, sample_count)
+                 VALUES (2, ?1, 'cpu_basis_points', 2000.0, 2)",
+                [bucket],
+            )
+            .unwrap();
+    }
+
+    let (service, worker) = HistoryService::new(config(database)).unwrap();
+    let worker = worker.start().unwrap();
+    let maintenance = {
+        let service = service.clone();
+        tokio::spawn(async move { service.maintain(now).await })
+    };
+    for _ in 0..2 {
+        service
+            .try_publish(HistoryBatch {
+                server_points: vec![server_sample(bucket + 3_000, 9_000)],
+                ..HistoryBatch::default()
+            })
+            .unwrap();
+    }
+    let _ = maintenance.await.unwrap();
+    let retained = service
+        .query(query(
+            HistoryScope::Server,
+            HistoryMetric::CpuBasisPoints,
+            bucket,
+            bucket + FIVE_MINUTE_BUCKET_MILLIS,
+            HistoryResolution::FiveMinutes,
+        ))
+        .await
         .unwrap();
-    service.maintain(now).await.unwrap();
+    assert_eq!(retained.points.len(), 1);
+    assert_eq!(retained.points[0].value, 2_000.0);
+    assert_eq!(service.health().dropped_late_points, 2);
+    stop(service, worker).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cap_pruned_raw_replay_cannot_replace_the_protected_rollup() {
+    let directory = TestDirectory::new("cap-late-replay");
+    let database = directory.database();
+    let bucket = recent_base();
+    let (service, worker) = HistoryService::new(config(database.clone())).unwrap();
+    let worker = worker.start().unwrap();
+    let mut active = large_session_batch(0, 2_000, bucket);
+    for session in &mut active.session_summaries {
+        session.closed_unix_millis = None;
+        session.terminal_reason = None;
+    }
+    active.server_points = vec![
+        server_sample(bucket + 1_000, 1_000),
+        server_sample(bucket + 2_000, 3_000),
+    ];
+    service.try_publish(active).unwrap();
     let before = service
         .query(query(
             HistoryScope::Server,
@@ -1078,11 +1660,18 @@ async fn late_raw_replay_after_rollup_retention_never_replaces_complete_bucket()
         .await
         .unwrap();
     assert_eq!(before.points[0].value, 2_000.0);
+    service.checkpoint().await.unwrap();
+    assert!(total_database_bytes(&database) > 1024 * 1024);
+    stop(service, worker).await;
 
+    let mut cap_config = config(database.clone());
+    cap_config.database_max_mib = 1;
+    let (service, worker) = HistoryService::new(cap_config).unwrap();
+    let worker = worker.start().unwrap();
     for _ in 0..2 {
         service
             .try_publish(HistoryBatch {
-                server_points: vec![server_sample(bucket + 3_000, 9_000)],
+                server_points: vec![server_sample(bucket + 1_000, 9_000)],
                 ..HistoryBatch::default()
             })
             .unwrap();
@@ -1100,6 +1689,118 @@ async fn late_raw_replay_after_rollup_retention_never_replaces_complete_bucket()
     assert_eq!(after.points, before.points);
     assert_eq!(service.health().dropped_late_points, 2);
     stop(service, worker).await;
+    let connection = Connection::open(&database).unwrap();
+    let active_sessions: usize = connection
+        .query_row(
+            "SELECT COUNT(*) FROM session_summaries WHERE closed_ms IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(active_sessions, 2_000);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cap_prunes_older_client_buckets_before_newer_server_buckets() {
+    let directory = TestDirectory::new("cap-global-oldest");
+    let database = directory.database();
+    let bucket = recent_base();
+    let identity = client(&"x".repeat(128), 1);
+    let (service, worker) = HistoryService::new(config(database.clone())).unwrap();
+    let worker = worker.start().unwrap();
+
+    let mut point_seed = 0_u64;
+    while total_database_bytes(&database) < 2_050 * 1024 {
+        let client_points = (0..10_u64)
+            .map(|offset| {
+                let timestamp = bucket + 1_000 + point_seed + offset;
+                ClientHistorySample {
+                    client: identity.clone(),
+                    timestamp_unix_millis: timestamp,
+                    metrics: host_metrics(timestamp, 111),
+                    traffic: TrafficCounters::default(),
+                }
+            })
+            .collect();
+        service
+            .try_publish(HistoryBatch {
+                client_points,
+                ..HistoryBatch::default()
+            })
+            .unwrap();
+        service.checkpoint().await.unwrap();
+        point_seed += 10;
+    }
+    service
+        .try_publish(HistoryBatch {
+            client_points: vec![ClientHistorySample {
+                client: identity,
+                timestamp_unix_millis: bucket + 240_000,
+                metrics: host_metrics(bucket + 240_000, 222),
+                traffic: TrafficCounters::default(),
+            }],
+            server_points: vec![
+                server_sample(bucket + 120_000, 3_333),
+                server_sample(bucket + 240_001, 4_444),
+            ],
+            ..HistoryBatch::default()
+        })
+        .unwrap();
+    service.checkpoint().await.unwrap();
+    stop(service, worker).await;
+
+    let raw_client_before = {
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute("DELETE FROM server_metric_points WHERE resolution > 0", [])
+            .unwrap();
+        connection
+            .execute("DELETE FROM client_metric_points WHERE resolution > 0", [])
+            .unwrap();
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM client_metric_points WHERE resolution=0",
+                [],
+                |row| row.get::<_, usize>(0),
+            )
+            .unwrap()
+    };
+
+    let mut cap_config = config(database);
+    cap_config.database_max_mib = 2;
+    let (service, worker) = HistoryService::new(cap_config).unwrap();
+    let worker = worker.start().unwrap();
+    wait_until(
+        || {
+            let health = service.health();
+            health.total_database_bytes > 0
+                && (health.total_database_bytes <= 2 * 1024 * 1024 || health.size_floor_reached)
+        },
+        Duration::from_secs(15),
+    )
+    .await;
+    let server = service
+        .query(query(
+            HistoryScope::Server,
+            HistoryMetric::CpuBasisPoints,
+            bucket + 120_000,
+            bucket + 120_000,
+            HistoryResolution::Raw,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(server.points.len(), 1);
+    assert_eq!(server.points[0].value, 3_333.0);
+    stop(service, worker).await;
+    let connection = Connection::open(directory.database()).unwrap();
+    let raw_client_after: usize = connection
+        .query_row(
+            "SELECT COUNT(*) FROM client_metric_points WHERE resolution=0",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(raw_client_after < raw_client_before);
 }
 
 #[test]
