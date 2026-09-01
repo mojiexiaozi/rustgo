@@ -2,15 +2,20 @@ use std::{future::Future, pin::Pin, sync::Arc};
 
 use rustgo_config::TunnelProtocol as ConfigTunnelProtocol;
 use rustgo_protocol::{Heartbeat, Message, OpenTcpStream, OpenUdpChannel, ProtocolVersion};
-use tokio::{sync::mpsc, task::JoinSet, time::MissedTickBehavior};
+use tokio::{
+    sync::{mpsc, watch},
+    task::JoinSet,
+    time::MissedTickBehavior,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     ClientError, ControlEvent, ControlSession,
-    telemetry::{GenerationTelemetry, LatestTelemetryReceiver, latest_telemetry_channel},
+    telemetry::{GenerationTelemetry, TelemetryRuntimeHook, latest_telemetry_channel},
 };
 
 const CHILD_CONTROL_CAPACITY: usize = 1024;
+const TELEMETRY_WRITE_BUDGET: std::time::Duration = std::time::Duration::from_millis(25);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SessionGeneration(u64);
@@ -97,7 +102,7 @@ pub trait PeerGenerationHandler: Send + Sync + 'static {
 
 struct ChildSignals<'a> {
     control: &'a mut mpsc::Receiver<Message>,
-    telemetry: &'a mut LatestTelemetryReceiver,
+    telemetry: &'a mut watch::Receiver<Option<rustgo_protocol::TelemetryReport>>,
 }
 
 impl std::fmt::Debug for ChildSessionContext {
@@ -176,6 +181,7 @@ impl ControlSession {
         let mut children = JoinSet::new();
         let (control_outbound, mut child_control) = mpsc::channel(CHILD_CONTROL_CAPACITY);
         let (telemetry_outbound, mut telemetry_control) = latest_telemetry_channel();
+        let telemetry_hook = telemetry.as_ref().and_then(GenerationTelemetry::hook);
         let child_context = ChildSessionContext {
             generation,
             session_id: Arc::from(self.session_id.clone()),
@@ -206,6 +212,7 @@ impl ControlSession {
                 &mut peer_owner,
                 &mut children,
                 &mut child_signals,
+                telemetry_hook.as_ref(),
             )
             .await;
 
@@ -246,6 +253,7 @@ impl ControlSession {
         peer_owner: &mut Option<tokio::task::JoinHandle<Result<(), ClientError>>>,
         children: &mut JoinSet<()>,
         child_signals: &mut ChildSignals<'_>,
+        telemetry_hook: Option<&Arc<dyn TelemetryRuntimeHook>>,
     ) -> Result<(), ClientError> {
         let heartbeat_timeout = self
             .heartbeat_interval
@@ -264,6 +272,8 @@ impl ControlSession {
         tokio::pin!(heartbeat_deadline);
         let mut last_sent_sequence = 0_u64;
         let mut last_acknowledged_sequence = 0_u64;
+        let mut telemetry_pending = false;
+        let mut telemetry_closed = false;
 
         loop {
             tokio::select! {
@@ -376,20 +386,39 @@ impl ControlSession {
                         _ => return Err(ClientError::InvalidState),
                     }
                 }
-                telemetry = child_signals.telemetry.recv(), if !child_signals.telemetry.is_closed() => {
-                    let Some(report) = telemetry else {
-                        continue;
-                    };
-                    let write = self.framed.send(self.version, Message::TelemetryReport(report));
-                    let result = tokio::select! {
-                        biased;
-                        () = shutdown.cancelled() => return Ok(()),
-                        () = &mut heartbeat_deadline => {
-                            return Err(ClientError::HeartbeatTimeout);
+                changed = child_signals.telemetry.changed(), if !telemetry_pending && !telemetry_closed => {
+                    match changed {
+                        Ok(()) => telemetry_pending = true,
+                        Err(_) => telemetry_closed = true,
+                    }
+                }
+                // Readiness and execution are deliberately split across loop iterations.
+                // This final ready branch is selected only after every high-priority branch
+                // has been polled immediately before the telemetry write begins.
+                () = std::future::ready(()), if telemetry_pending => {
+                    if let Some(hook) = telemetry_hook {
+                        hook.before_read_latest().await;
+                    }
+                    let report = child_signals
+                        .telemetry
+                        .borrow_and_update()
+                        .clone()
+                        .ok_or(ClientError::InvalidState)?;
+                    telemetry_pending = false;
+                    let write = async {
+                        if let Some(hook) = telemetry_hook {
+                            hook.before_write().await;
                         }
-                        result = tokio::time::timeout(self.heartbeat_interval, write) => result,
+                        self.framed
+                            .send(self.version, Message::TelemetryReport(report))
+                            .await
                     };
-                    result.map_err(|_| ClientError::ControlWriteTimeout)??;
+                    match tokio::time::timeout(TELEMETRY_WRITE_BUDGET, write).await {
+                        Ok(result) => result?,
+                        // `write_all` may have emitted a partial frame. Never resume this
+                        // stream: fail the generation so teardown drops it and reconnects.
+                        Err(_) => return Err(ClientError::TelemetryWriteTimeout),
+                    }
                 }
             }
         }

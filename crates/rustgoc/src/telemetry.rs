@@ -1,30 +1,49 @@
-use std::time::Duration;
+use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use rustgo_config::TelemetryConfig;
 use rustgo_observability::{HostMetrics, HostSampler};
 use rustgo_protocol::TelemetryReport;
-use tokio::{
-    sync::{mpsc, watch},
-    task::JoinHandle,
-    time::MissedTickBehavior,
-};
+use tokio::{sync::watch, task::JoinHandle, time::MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 
 use crate::ClientError;
+
+/// Internal integration seam for deterministically exercising telemetry
+/// coalescing and write backpressure without depending on kernel socket sizes.
+#[doc(hidden)]
+pub trait TelemetryRuntimeHook: Send + Sync + 'static {
+    fn after_publish(&self, _sequence: u64) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async {})
+    }
+
+    fn before_read_latest(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async {})
+    }
+
+    fn before_write(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async {})
+    }
+}
 
 /// Process-lifetime owner for the stateful host sampler.
 pub(crate) struct TelemetryRuntime {
     samples: watch::Receiver<Option<HostMetrics>>,
     report_interval: Duration,
+    hook: Option<Arc<dyn TelemetryRuntimeHook>>,
     shutdown: CancellationToken,
     owner: JoinHandle<()>,
 }
 
 impl TelemetryRuntime {
-    pub(crate) fn start(config: Option<TelemetryConfig>) -> Option<Self> {
+    pub(crate) fn start(
+        config: Option<TelemetryConfig>,
+        report_interval_override: Option<Duration>,
+        hook: Option<Arc<dyn TelemetryRuntimeHook>>,
+    ) -> Option<Self> {
         let config = config.filter(|config| config.enabled)?;
         let sample_interval = Duration::from_secs(config.sample_interval_secs);
-        let report_interval = Duration::from_secs(config.report_interval_secs);
+        let report_interval = report_interval_override
+            .unwrap_or_else(|| Duration::from_secs(config.report_interval_secs));
         let shutdown = CancellationToken::new();
         let owner_shutdown = shutdown.clone();
         let (samples, receiver) = watch::channel(None);
@@ -47,6 +66,7 @@ impl TelemetryRuntime {
         Some(Self {
             samples: receiver,
             report_interval,
+            hook,
             shutdown,
             owner,
         })
@@ -56,6 +76,7 @@ impl TelemetryRuntime {
         GenerationTelemetry {
             samples: self.samples.clone(),
             report_interval: self.report_interval,
+            hook: self.hook.clone(),
         }
     }
 
@@ -70,10 +91,19 @@ impl TelemetryRuntime {
 pub(crate) struct GenerationTelemetry {
     samples: watch::Receiver<Option<HostMetrics>>,
     report_interval: Duration,
+    hook: Option<Arc<dyn TelemetryRuntimeHook>>,
 }
 
 impl GenerationTelemetry {
-    pub(crate) async fn run(mut self, reports: LatestTelemetrySender, shutdown: CancellationToken) {
+    pub(crate) fn hook(&self) -> Option<Arc<dyn TelemetryRuntimeHook>> {
+        self.hook.clone()
+    }
+
+    pub(crate) async fn run(
+        mut self,
+        reports: watch::Sender<Option<TelemetryReport>>,
+        shutdown: CancellationToken,
+    ) {
         let first_tick = tokio::time::Instant::now() + self.report_interval;
         let mut ticks = tokio::time::interval_at(first_tick, self.report_interval);
         ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -91,11 +121,12 @@ impl GenerationTelemetry {
                         return;
                     };
                     sequence = next_sequence;
-                    if reports
-                        .try_send(report_from_sample(sample, sequence))
-                        .is_err()
-                    {
+                    if reports.is_closed() {
                         return;
+                    }
+                    reports.send_replace(Some(report_from_sample(sample, sequence)));
+                    if let Some(hook) = &self.hook {
+                        hook.after_publish(sequence).await;
                     }
                 }
             }
@@ -103,50 +134,11 @@ impl GenerationTelemetry {
     }
 }
 
-/// A capacity-one wakeup paired with a watch value. Replacing the watch value
-/// before `try_send` means a full wakeup slot still points at the newest report
-/// rather than retaining an older queued payload.
-pub(crate) struct LatestTelemetrySender {
-    latest: watch::Sender<Option<TelemetryReport>>,
-    pending: mpsc::Sender<()>,
-}
-
-impl LatestTelemetrySender {
-    fn try_send(&self, report: TelemetryReport) -> Result<(), ()> {
-        self.latest.send_replace(Some(report));
-        match self.pending.try_send(()) {
-            Ok(()) | Err(mpsc::error::TrySendError::Full(())) => Ok(()),
-            Err(mpsc::error::TrySendError::Closed(())) => Err(()),
-        }
-    }
-}
-
-pub(crate) struct LatestTelemetryReceiver {
-    latest: watch::Receiver<Option<TelemetryReport>>,
-    pending: mpsc::Receiver<()>,
-}
-
-impl LatestTelemetryReceiver {
-    pub(crate) async fn recv(&mut self) -> Option<TelemetryReport> {
-        self.pending.recv().await?;
-        self.latest.borrow_and_update().clone()
-    }
-
-    pub(crate) fn is_closed(&self) -> bool {
-        self.pending.is_closed()
-    }
-}
-
-pub(crate) fn latest_telemetry_channel() -> (LatestTelemetrySender, LatestTelemetryReceiver) {
-    let (latest, receiver) = watch::channel(None);
-    let (pending, notifications) = mpsc::channel(1);
-    (
-        LatestTelemetrySender { latest, pending },
-        LatestTelemetryReceiver {
-            latest: receiver,
-            pending: notifications,
-        },
-    )
+pub(crate) fn latest_telemetry_channel() -> (
+    watch::Sender<Option<TelemetryReport>>,
+    watch::Receiver<Option<TelemetryReport>>,
+) {
+    watch::channel(None)
 }
 
 fn report_from_sample(sample: HostMetrics, sequence: u64) -> TelemetryReport {

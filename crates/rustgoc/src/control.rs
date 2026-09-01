@@ -607,4 +607,6 @@ pub enum ClientError {
     HandshakeTimeout,
     #[error("active control write timed out")]
     ControlWriteTimeout,
+    #[error("low-priority telemetry write timed out; control generation must reconnect")]
+    TelemetryWriteTimeout,
 }

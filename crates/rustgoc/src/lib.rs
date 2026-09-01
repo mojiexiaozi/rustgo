@@ -30,3 +30,5 @@ pub use session::{
     ChildSessionContext, ChildSessionRequest, ChildSessionSupervisor, NoopChildSessionSupervisor,
     PeerGenerationHandler, SessionGeneration,
 };
+#[doc(hidden)]
+pub use telemetry::TelemetryRuntimeHook;

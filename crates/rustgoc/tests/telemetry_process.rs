@@ -1,6 +1,17 @@
 #![forbid(unsafe_code)]
 
-use std::{error::Error, fs, path::PathBuf, time::Duration};
+use std::{
+    error::Error,
+    fs,
+    future::Future,
+    path::PathBuf,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use bytes::BytesMut;
 use rcgen::{
@@ -14,11 +25,12 @@ use rustgo_protocol::{
     ServerChallenge, TelemetryReport, TunnelResults,
 };
 use rustgo_transport::TlsServer;
-use rustgoc::ClientApp;
+use rustgoc::{ClientApp, TelemetryRuntimeHook};
 use tempfile::TempDir;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
+    sync::{Notify, Semaphore},
 };
 use tokio_rustls::server::TlsStream;
 use tokio_util::sync::CancellationToken;
@@ -261,6 +273,149 @@ async fn older_negotiation_and_disabled_v03_emit_no_telemetry() -> Result<(), An
         }),
     )
     .await
+}
+
+struct CoalescingHook {
+    first_read_waiting: Notify,
+    allow_first_read: Semaphore,
+    second_publish_waiting: Notify,
+    allow_second_publish: Semaphore,
+    first_read: AtomicBool,
+}
+
+impl Default for CoalescingHook {
+    fn default() -> Self {
+        Self {
+            first_read_waiting: Notify::new(),
+            allow_first_read: Semaphore::new(0),
+            second_publish_waiting: Notify::new(),
+            allow_second_publish: Semaphore::new(0),
+            first_read: AtomicBool::new(false),
+        }
+    }
+}
+
+impl TelemetryRuntimeHook for CoalescingHook {
+    fn after_publish(&self, sequence: u64) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            if sequence == 2 {
+                self.second_publish_waiting.notify_one();
+                self.allow_second_publish.acquire().await.unwrap().forget();
+            }
+        })
+    }
+
+    fn before_read_latest(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            if !self.first_read.swap(true, Ordering::SeqCst) {
+                self.first_read_waiting.notify_one();
+                self.allow_first_read.acquire().await.unwrap().forget();
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn saturated_watch_coalesces_to_newest_without_duplicate_sequence() -> Result<(), AnyError> {
+    let pki = TestPki::generate()?;
+    let tls_server =
+        TlsServer::bind("127.0.0.1:0", &pki.certificate_file, &pki.private_key_file).await?;
+    let fixture = client_fixture(
+        &pki,
+        tls_server.local_addr()?.to_string(),
+        Some(enabled_telemetry()),
+    )?;
+    let hook = Arc::new(CoalescingHook::default());
+    let shutdown = CancellationToken::new();
+    let app = ClientApp::from_config(fixture.config)?
+        .with_telemetry_test_runtime(Duration::from_millis(10), hook.clone())?;
+    let app_task = tokio::spawn(app.run_until(shutdown.clone()));
+    let mut server = accept_registered_session(&tls_server, ProtocolVersion::V0_3).await?;
+
+    tokio::time::timeout(Duration::from_secs(1), hook.first_read_waiting.notified())
+        .await
+        .expect("control loop must observe the first watch version");
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        hook.second_publish_waiting.notified(),
+    )
+    .await
+    .expect("publisher must replace the unread value with sequence two");
+    hook.allow_first_read.add_permits(1);
+
+    let coalesced = receive_report_and_ack_heartbeats(&mut server).await?;
+    assert_eq!(
+        coalesced.sequence, 2,
+        "the unread first value must be replaced"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), server.receive())
+            .await
+            .is_err(),
+        "consuming sequence two must also mark its watch version seen"
+    );
+
+    hook.allow_second_publish.add_permits(1);
+    let next = receive_report_and_ack_heartbeats(&mut server).await?;
+    assert!(next.sequence > coalesced.sequence);
+
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(1), app_task)
+        .await
+        .expect("coalescing scenario must join every client task")??;
+    Ok(())
+}
+
+#[derive(Default)]
+struct BlockingWriteHook {
+    started: Notify,
+}
+
+impl TelemetryRuntimeHook for BlockingWriteHook {
+    fn before_write(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            self.started.notify_one();
+            std::future::pending::<()>().await;
+        })
+    }
+}
+
+#[tokio::test]
+async fn blocked_telemetry_write_fail_stops_before_heartbeat_deadline() -> Result<(), AnyError> {
+    let pki = TestPki::generate()?;
+    let tls_server =
+        TlsServer::bind("127.0.0.1:0", &pki.certificate_file, &pki.private_key_file).await?;
+    let mut fixture = client_fixture(
+        &pki,
+        tls_server.local_addr()?.to_string(),
+        Some(enabled_telemetry()),
+    )?;
+    fixture.config.client.heartbeat_interval_secs = 2;
+    let hook = Arc::new(BlockingWriteHook::default());
+    let shutdown = CancellationToken::new();
+    let app = ClientApp::from_config(fixture.config)?
+        .with_telemetry_test_runtime(Duration::from_millis(10), hook.clone())?;
+    let app_task = tokio::spawn(app.run_until(shutdown.clone()));
+    let mut server = accept_registered_session(&tls_server, ProtocolVersion::V0_3).await?;
+
+    tokio::time::timeout(Duration::from_secs(1), hook.started.notified())
+        .await
+        .expect("test hook must enter the telemetry write path");
+    let blocked_at = tokio::time::Instant::now();
+    let closed = tokio::time::timeout(Duration::from_millis(500), server.receive())
+        .await
+        .expect("telemetry write budget must expire well before heartbeat deadline");
+    assert!(
+        closed.is_err(),
+        "timed-out telemetry framing must close the generation"
+    );
+    assert!(blocked_at.elapsed() < Duration::from_millis(500));
+
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(1), app_task)
+        .await
+        .expect("reconnect wait and all telemetry children must cancel")??;
+    Ok(())
 }
 
 async fn receive_report_and_ack_heartbeats(

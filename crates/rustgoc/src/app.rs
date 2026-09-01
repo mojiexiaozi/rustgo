@@ -10,8 +10,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     ChildSessionSupervisor, ClientError, ControlClient, ExportRegistry, PeerGenerationHandler,
-    RegisteredTunnel, SessionGeneration, orchestration::ProductionPeerRuntime,
-    telemetry::TelemetryRuntime, udp::RelaySessionSupervisor,
+    RegisteredTunnel, SessionGeneration,
+    orchestration::ProductionPeerRuntime,
+    telemetry::{TelemetryRuntime, TelemetryRuntimeHook},
+    udp::RelaySessionSupervisor,
 };
 
 const INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(1);
@@ -78,6 +80,8 @@ pub struct ClientApp {
     exports: ExportRegistry,
     peer_handler: Option<Arc<dyn PeerGenerationHandler>>,
     telemetry: Option<TelemetryConfig>,
+    telemetry_report_interval_override: Option<Duration>,
+    telemetry_hook: Option<Arc<dyn TelemetryRuntimeHook>>,
     last_generation: u64,
 }
 
@@ -133,6 +137,8 @@ impl ClientApp {
             exports,
             peer_handler: None,
             telemetry,
+            telemetry_report_interval_override: None,
+            telemetry_hook: None,
             last_generation: 0,
         }
     }
@@ -142,6 +148,21 @@ impl ClientApp {
     pub fn with_peer_handler(mut self, handler: Arc<dyn PeerGenerationHandler>) -> Self {
         self.peer_handler = Some(handler);
         self
+    }
+
+    /// Overrides telemetry scheduling and I/O only for deterministic integration tests.
+    #[doc(hidden)]
+    pub fn with_telemetry_test_runtime(
+        mut self,
+        report_interval: Duration,
+        hook: Arc<dyn TelemetryRuntimeHook>,
+    ) -> Result<Self, ClientError> {
+        if report_interval.is_zero() {
+            return Err(ClientError::InvalidConfiguration);
+        }
+        self.telemetry_report_interval_override = Some(report_interval);
+        self.telemetry_hook = Some(hook);
+        Ok(self)
     }
 
     pub fn subscribe(&self) -> watch::Receiver<ClientStatus> {
@@ -167,7 +188,11 @@ impl ClientApp {
 
     pub async fn run_until(mut self, shutdown: CancellationToken) -> Result<(), ClientError> {
         self.status.send_replace(ClientStatus::default());
-        let telemetry = TelemetryRuntime::start(self.telemetry.take());
+        let telemetry = TelemetryRuntime::start(
+            self.telemetry.take(),
+            self.telemetry_report_interval_override.take(),
+            self.telemetry_hook.take(),
+        );
         let peer_runtime = self.peer_handler.clone().unwrap_or_else(|| {
             Arc::new(ProductionPeerRuntime::new(
                 Arc::new(self.control.config().clone()),
