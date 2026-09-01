@@ -99,7 +99,7 @@ pub(crate) struct RelaySessionSupervisor {
 }
 
 impl RelaySessionSupervisor {
-    pub(crate) fn new(control: &ControlClient, traffic: Arc<LogicalTraffic>) -> Self {
+    pub(crate) fn new(control: &ControlClient, traffic: Option<Arc<LogicalTraffic>>) -> Self {
         Self {
             tcp: TcpSessionSupervisor::new(control, traffic.clone()),
             udp: UdpSessionSupervisor::new(control, traffic),
@@ -133,7 +133,7 @@ struct UdpSessionSupervisor {
     tls_client: TlsClient,
     local_targets: Arc<HashMap<u32, UdpTunnelTarget>>,
     permits: Arc<Semaphore>,
-    traffic: Arc<LogicalTraffic>,
+    traffic: Option<Arc<LogicalTraffic>>,
 }
 
 #[derive(Clone)]
@@ -143,7 +143,7 @@ struct UdpTunnelTarget {
 }
 
 impl UdpSessionSupervisor {
-    fn new(control: &ControlClient, traffic: Arc<LogicalTraffic>) -> Self {
+    fn new(control: &ControlClient, traffic: Option<Arc<LogicalTraffic>>) -> Self {
         let local_targets = control
             .config()
             .tunnels
@@ -188,7 +188,11 @@ impl ChildSessionSupervisor for UdpSessionSupervisor {
         let tls_client = self.tls_client.clone();
         let local_targets = self.local_targets.clone();
         let permits = self.permits.clone();
-        let traffic = self.traffic.clone();
+        let traffic = context
+            .protocol_version()
+            .supports_telemetry()
+            .then(|| self.traffic.clone())
+            .flatten();
         Box::pin(async move {
             let ChildSessionRequest::Udp(request) = request else {
                 return;
@@ -531,7 +535,7 @@ async fn relay_local_datagrams(
     tunnel_id: u32,
     generation: u64,
     limits: NegotiatedUdpLimits,
-    traffic: Arc<LogicalTraffic>,
+    traffic: Option<Arc<LogicalTraffic>>,
     shutdown: CancellationToken,
 ) -> Result<(), UdpClientError> {
     let UdpTunnelTarget {
@@ -765,7 +769,7 @@ async fn run_local_session(
     metrics: Arc<UdpMetrics>,
     last_activity: Arc<Mutex<tokio::time::Instant>>,
     max_payload: usize,
-    traffic: Arc<LogicalTraffic>,
+    traffic: Option<Arc<LogicalTraffic>>,
     cancellation: CancellationToken,
 ) -> Result<(), UdpClientError> {
     let setup = async {
@@ -807,7 +811,9 @@ async fn run_local_session(
                 if sent != request.len() {
                     return Err(UdpClientError::ShortDatagramWrite);
                 }
-                traffic.record_received(sent);
+                if let Some(traffic) = &traffic {
+                    traffic.record_received(sent);
+                }
             }
             received = socket.recv(&mut response) => {
                 let received = match received {
@@ -857,7 +863,7 @@ async fn write_frames<W>(
     metrics: Arc<UdpMetrics>,
     cancellation: CancellationToken,
     protocol_version: ProtocolVersion,
-    traffic: Arc<LogicalTraffic>,
+    traffic: Option<Arc<LogicalTraffic>>,
 ) -> Result<(), UdpClientError>
 where
     W: AsyncWrite + Unpin,
@@ -884,7 +890,9 @@ where
             () = cancellation.cancelled() => break Ok(()),
             result = write => result?,
         }
-        traffic.record_sent(logical_bytes);
+        if let Some(traffic) = &traffic {
+            traffic.record_sent(logical_bytes);
+        }
     };
     while receiver.try_recv().is_ok() {
         metrics.data_queued.fetch_sub(1, Ordering::AcqRel);

@@ -38,7 +38,7 @@ pub(crate) struct TcpSessionSupervisor {
     permits: Arc<Semaphore>,
     local_connect_permits: Arc<Semaphore>,
     handshake_permits: Arc<Semaphore>,
-    traffic: Arc<LogicalTraffic>,
+    traffic: Option<Arc<LogicalTraffic>>,
 }
 
 #[derive(Clone)]
@@ -48,7 +48,7 @@ struct TcpTunnelTarget {
 }
 
 impl TcpSessionSupervisor {
-    pub(crate) fn new(control: &ControlClient, traffic: Arc<LogicalTraffic>) -> Self {
+    pub(crate) fn new(control: &ControlClient, traffic: Option<Arc<LogicalTraffic>>) -> Self {
         let local_targets = control
             .config()
             .tunnels
@@ -96,7 +96,11 @@ impl ChildSessionSupervisor for TcpSessionSupervisor {
         let permits = self.permits.clone();
         let local_connect_permits = self.local_connect_permits.clone();
         let handshake_permits = self.handshake_permits.clone();
-        let traffic = self.traffic.clone();
+        let traffic = context
+            .protocol_version()
+            .supports_telemetry()
+            .then(|| self.traffic.clone())
+            .flatten();
         Box::pin(async move {
             match request {
                 ChildSessionRequest::Tcp(request) => {
@@ -130,7 +134,7 @@ async fn run_tcp(
     permits: Arc<Semaphore>,
     local_connect_permits: Arc<Semaphore>,
     handshake_permits: Arc<Semaphore>,
-    traffic: Arc<LogicalTraffic>,
+    traffic: Option<Arc<LogicalTraffic>>,
     context: ChildSessionContext,
     request: rustgo_protocol::OpenTcpStream,
     shutdown: CancellationToken,
@@ -168,7 +172,7 @@ async fn run_tcp(
         () = shutdown.cancelled() => return,
         result = tokio::time::timeout(TCP_SETUP_TIMEOUT, setup) => result,
     };
-    let (mut local, mut data) = match setup {
+    let (local, data) = match setup {
         Ok(Ok(streams)) => streams,
         Ok(Err(error)) => {
             tracing::warn!(connection_id = request.connection_id, error = %safe_display(&error), "TCP data setup failed");
@@ -193,16 +197,28 @@ async fn run_tcp(
         "TCP local relay connected"
     );
 
-    let mut local = MeteredIo::new(local, traffic.clone(), TrafficDirection::Received);
-    let mut data = MeteredIo::new(data, traffic, TrafficDirection::Sent);
-    relay_local_connection(
-        &mut local,
-        &mut data,
-        request.connection_id,
-        shutdown,
-        permit,
-    )
-    .await;
+    if let Some(traffic) = traffic {
+        let mut local = MeteredIo::new(local, traffic.clone(), TrafficDirection::Received);
+        let mut data = MeteredIo::new(data, traffic, TrafficDirection::Sent);
+        relay_local_connection(
+            &mut local,
+            &mut data,
+            request.connection_id,
+            shutdown,
+            permit,
+        )
+        .await;
+    } else {
+        let (mut local, mut data) = (local, data);
+        relay_local_connection(
+            &mut local,
+            &mut data,
+            request.connection_id,
+            shutdown,
+            permit,
+        )
+        .await;
+    }
 }
 
 async fn setup_with_admission<T, U, LocalFuture, DataFactory, DataFuture>(

@@ -82,7 +82,7 @@ pub struct ClientApp {
     telemetry: Option<TelemetryConfig>,
     telemetry_report_interval_override: Option<Duration>,
     telemetry_hook: Option<Arc<dyn TelemetryRuntimeHook>>,
-    logical_traffic: Arc<LogicalTraffic>,
+    logical_traffic: Option<Arc<LogicalTraffic>>,
     last_generation: u64,
 }
 
@@ -99,7 +99,10 @@ impl ClientApp {
             stable_connection_reset_after: STABLE_CONNECTION_RESET_AFTER,
         })
         .map_err(|_| ClientError::InvalidConfiguration)?;
-        let logical_traffic = Arc::new(LogicalTraffic::default());
+        let logical_traffic = telemetry
+            .as_ref()
+            .is_none_or(|telemetry| telemetry.enabled)
+            .then(|| Arc::new(LogicalTraffic::default()));
         let supervisor = Arc::new(RelaySessionSupervisor::new(
             &control,
             logical_traffic.clone(),
@@ -125,13 +128,17 @@ impl ClientApp {
         let exports = ExportRegistry::new(control.config().exports.clone())
             .expect("validated client configuration has valid exports");
         let telemetry = control.config().telemetry.clone();
+        let logical_traffic = telemetry
+            .as_ref()
+            .is_none_or(|telemetry| telemetry.enabled)
+            .then(|| Arc::new(LogicalTraffic::default()));
         Self::with_runtime_and_exports(
             control,
             backoff,
             supervisor,
             exports,
             telemetry,
-            Arc::new(LogicalTraffic::default()),
+            logical_traffic,
         )
     }
 
@@ -141,7 +148,7 @@ impl ClientApp {
         supervisor: Arc<dyn ChildSessionSupervisor>,
         exports: ExportRegistry,
         telemetry: Option<TelemetryConfig>,
-        logical_traffic: Arc<LogicalTraffic>,
+        logical_traffic: Option<Arc<LogicalTraffic>>,
     ) -> Self
     where
         B: ReconnectBackoff,
@@ -207,12 +214,14 @@ impl ClientApp {
 
     pub async fn run_until(mut self, shutdown: CancellationToken) -> Result<(), ClientError> {
         self.status.send_replace(ClientStatus::default());
-        let telemetry = TelemetryRuntime::start(
-            self.telemetry.take(),
-            self.telemetry_report_interval_override.take(),
-            self.telemetry_hook.take(),
-            self.logical_traffic.clone(),
-        );
+        let telemetry = self.logical_traffic.clone().and_then(|traffic| {
+            TelemetryRuntime::start(
+                self.telemetry.take(),
+                self.telemetry_report_interval_override.take(),
+                self.telemetry_hook.take(),
+                traffic,
+            )
+        });
         let peer_runtime = self.peer_handler.clone().unwrap_or_else(|| {
             Arc::new(ProductionPeerRuntime::new(
                 Arc::new(self.control.config().clone()),

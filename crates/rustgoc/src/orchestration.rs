@@ -68,7 +68,7 @@ pub(crate) struct ProductionPeerRuntime {
     config: Arc<ClientConfig>,
     keypair: Arc<DeviceKeypair>,
     exports: ExportRegistry,
-    traffic: Arc<LogicalTraffic>,
+    traffic: Option<Arc<LogicalTraffic>>,
     owner: Arc<tokio::sync::Mutex<Option<PeerRuntimeOwner>>>,
     lifetime: CancellationToken,
 }
@@ -83,7 +83,7 @@ impl ProductionPeerRuntime {
         config: Arc<ClientConfig>,
         keypair: Arc<DeviceKeypair>,
         exports: ExportRegistry,
-        traffic: Arc<LogicalTraffic>,
+        traffic: Option<Arc<LogicalTraffic>>,
     ) -> Self {
         let (commands, receiver) = mpsc::channel(ACTOR_CAPACITY);
         Self {
@@ -1697,17 +1697,22 @@ impl Actor {
                     tracing::info!(generation = session.generation.get(), path = ?kind, "fresh direct path promoted for subsequent service opens; existing relay I/O remains on its generation");
                     return Ok(());
                 }
-                self.send_payload(
-                    id,
-                    RendezvousPayload::ConnectivityResult(ConnectivityResult {
-                        connected: true,
-                        transport: Some(candidate_transport(kind)),
-                        detail: None,
-                    }),
-                )
-                .await?;
+                let role = self.sessions.get(&id).ok_or_else(invalid)?.role;
+                // Selection happens independently at both endpoints. The initiator is the
+                // authoritative reporter so concurrent equal-step results cannot replay the
+                // session-global rendezvous sequence.
+                if role == PeerRole::Initiator {
+                    self.send_payload(
+                        id,
+                        RendezvousPayload::ConnectivityResult(ConnectivityResult {
+                            connected: true,
+                            transport: Some(candidate_transport(kind)),
+                            detail: None,
+                        }),
+                    )
+                    .await?;
+                }
                 let session = self.sessions.get_mut(&id).ok_or_else(invalid)?;
-                let role = session.role;
                 let protocol = session.protocol.ok_or_else(invalid)?;
                 let peer = session.peer.clone();
                 let export = session.export.clone();
@@ -1718,7 +1723,12 @@ impl Actor {
                 };
                 let cancellation = session.cancellation.child_token();
                 let exports = self.runtime.exports.clone();
-                let traffic = self.runtime.traffic.clone();
+                let traffic = self
+                    .context
+                    .protocol_version()
+                    .supports_telemetry()
+                    .then(|| self.runtime.traffic.clone())
+                    .flatten();
                 let meta = FlowMeta {
                     session_id: session_log_id(id),
                     open_id: CHANNEL_ID,
@@ -1752,16 +1762,16 @@ impl Actor {
                     let flow = meta.clone();
                     self.tasks.spawn(async move {
                         flow.log("io_start");
-                        run_direct_tcp(
+                        run_direct_tcp(DirectTcpRun {
                             role,
                             peer,
                             export,
-                            tcp,
+                            transport: tcp,
                             exports,
                             reply,
                             traffic,
                             cancellation,
-                        )
+                        })
                         .await;
                         flow.log("io_finished");
                         let _ = sender.send(ActorInput::SessionFinished(id)).await;
@@ -1895,7 +1905,12 @@ impl Actor {
         let cancellation = session.cancellation.child_token();
         let context = self.context.clone();
         let exports = self.runtime.exports.clone();
-        let traffic = self.runtime.traffic.clone();
+        let traffic = self
+            .context
+            .protocol_version()
+            .supports_telemetry()
+            .then(|| self.runtime.traffic.clone())
+            .flatten();
         let sender = self.runtime.commands.clone();
         let worker_sender = sender.clone();
         let flow = FlowMeta {
@@ -2127,7 +2142,7 @@ struct RelayWorker {
     frames: mpsc::Receiver<PeerRelayFrame>,
     context: ChildSessionContext,
     exports: ExportRegistry,
-    traffic: Arc<LogicalTraffic>,
+    traffic: Option<Arc<LogicalTraffic>>,
     reply: Option<oneshot::Sender<io::Result<OpenedIo>>>,
     selection_reply: Option<oneshot::Receiver<Option<OpenReply>>>,
     cancellation: CancellationToken,
@@ -2403,7 +2418,7 @@ where
             read = reader.read(&mut buffer) => {
                 let length = read?;
                 send_plain(worker, &buffer[..length], length == 0).await?;
-                worker.traffic.record_sent(length);
+                record_sent(&worker.traffic, length);
                 if length == 0 { return Ok(()); }
             }
             frame = worker.frames.recv() => {
@@ -2412,7 +2427,7 @@ where
                 let payload = worker.relay.open(&frame).map_err(|_| invalid())?;
                 if !payload.is_empty() {
                     writer.write_all(&payload).await?;
-                    worker.traffic.record_received(payload.len());
+                    record_received(&worker.traffic, payload.len());
                 }
                 if fin { writer.shutdown().await?; return Ok(()); }
             }
@@ -2432,13 +2447,13 @@ async fn pump_datagram(
             payload = outbound.recv() => {
                 let payload = payload.ok_or_else(closed)?;
                 send_plain(worker, &payload, false).await?;
-                worker.traffic.record_sent(payload.len());
+                record_sent(&worker.traffic, payload.len());
             }
             frame = worker.frames.recv() => {
                 let payload = worker.relay.open(&frame.ok_or_else(closed)?).map_err(|_| invalid())?;
                 let length = payload.len();
                 inbound.send(payload).await.map_err(|_| closed())?;
-                worker.traffic.record_received(length);
+                record_received(&worker.traffic, length);
             }
         }
     }
@@ -2453,12 +2468,12 @@ async fn pump_udp_target(worker: &mut RelayWorker, socket: UdpSocket) -> io::Res
             received = socket.recv(&mut buffer) => {
                 let length = received?;
                 send_plain(worker, &buffer[..length], false).await?;
-                worker.traffic.record_sent(length);
+                record_sent(&worker.traffic, length);
             }
             frame = worker.frames.recv() => {
                 let payload = worker.relay.open(&frame.ok_or_else(closed)?).map_err(|_| invalid())?;
                 let sent = socket.send(&payload).await?;
-                worker.traffic.record_received(sent);
+                record_received(&worker.traffic, sent);
             }
         }
     }
@@ -2504,16 +2519,28 @@ impl PeerTcpAuthenticationFactory for OneTcpAuth {
     }
 }
 
-async fn run_direct_tcp(
+struct DirectTcpRun {
     role: PeerRole,
     peer: String,
     export: String,
     transport: Arc<EncryptedPeerTcp>,
     exports: ExportRegistry,
-    mut reply: Option<oneshot::Sender<io::Result<OpenedIo>>>,
-    traffic: Arc<LogicalTraffic>,
+    reply: Option<oneshot::Sender<io::Result<OpenedIo>>>,
+    traffic: Option<Arc<LogicalTraffic>>,
     cancellation: CancellationToken,
-) {
+}
+
+async fn run_direct_tcp(run: DirectTcpRun) {
+    let DirectTcpRun {
+        role,
+        peer,
+        export,
+        transport,
+        exports,
+        mut reply,
+        traffic,
+        cancellation,
+    } = run;
     let result = async {
         match role {
             PeerRole::Initiator => {
@@ -2559,7 +2586,7 @@ async fn run_direct_tcp(
 async fn pump_encrypted_tcp<S>(
     transport: Arc<EncryptedPeerTcp>,
     stream: S,
-    traffic: Arc<LogicalTraffic>,
+    traffic: Option<Arc<LogicalTraffic>>,
     cancellation: CancellationToken,
 ) -> io::Result<()>
 where
@@ -2575,12 +2602,12 @@ where
                 let length = read?;
                 if length == 0 { transport.shutdown().await.map_err(|_| closed())?; return Ok(()); }
                 transport.send(&buffer[..length]).await.map_err(|_| closed())?;
-                traffic.record_sent(length);
+                record_sent(&traffic, length);
             }
             payload = transport.receive() => match payload.map_err(|_| closed())? {
                 Some(payload) => {
                     writer.write_all(&payload).await?;
-                    traffic.record_received(payload.len());
+                    record_received(&traffic, payload.len());
                 }
                 None => { writer.shutdown().await?; return Ok(()); }
             }
@@ -2597,7 +2624,7 @@ async fn run_direct_quic(
     handle: Arc<QuicPeerPathHandle>,
     exports: ExportRegistry,
     mut reply: Option<oneshot::Sender<io::Result<OpenedIo>>>,
-    traffic: Arc<LogicalTraffic>,
+    traffic: Option<Arc<LogicalTraffic>>,
     cancellation: CancellationToken,
 ) {
     let result = async {
@@ -2645,12 +2672,12 @@ async fn run_direct_quic(
                         received = socket.recv(&mut buffer) => {
                             let length = received?;
                             datagram.send(&buffer[..length]).map_err(|_| closed())?;
-                            traffic.record_sent(length);
+                            record_sent(&traffic, length);
                         }
                         payload = datagram.receive(cancellation.child_token()) => {
                             let payload = payload.map_err(|_| closed())?;
                             let sent = socket.send(&payload).await?;
-                            traffic.record_received(sent);
+                            record_received(&traffic, sent);
                         }
                     }
                 }
@@ -2666,13 +2693,13 @@ async fn run_direct_quic(
 struct QuicDatagramSession {
     datagram: PeerDatagram,
     cancellation: CancellationToken,
-    traffic: Arc<LogicalTraffic>,
+    traffic: Option<Arc<LogicalTraffic>>,
 }
 impl PeerDatagramSession for QuicDatagramSession {
     fn send<'a>(&'a mut self, payload: &'a [u8]) -> PeerFuture<'a, ()> {
         Box::pin(async move {
             self.datagram.send(payload).map_err(|_| closed())?;
-            self.traffic.record_sent(payload.len());
+            record_sent(&self.traffic, payload.len());
             Ok(())
         })
     }
@@ -2683,9 +2710,21 @@ impl PeerDatagramSession for QuicDatagramSession {
                 .receive(self.cancellation.child_token())
                 .await
                 .map_err(|_| closed())?;
-            self.traffic.record_received(payload.len());
+            record_received(&self.traffic, payload.len());
             Ok(payload)
         })
+    }
+}
+
+fn record_sent(traffic: &Option<Arc<LogicalTraffic>>, bytes: usize) {
+    if let Some(traffic) = traffic {
+        traffic.record_sent(bytes);
+    }
+}
+
+fn record_received(traffic: &Option<Arc<LogicalTraffic>>, bytes: usize) {
+    if let Some(traffic) = traffic {
+        traffic.record_received(bytes);
     }
 }
 

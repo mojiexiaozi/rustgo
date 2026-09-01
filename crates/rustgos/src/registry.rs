@@ -1,7 +1,10 @@
 use std::{
     collections::{HashMap, HashSet},
     net::{IpAddr, SocketAddr},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -168,7 +171,18 @@ impl ClientRegistry {
     }
 
     pub fn active_count(&self) -> usize {
-        self.inner.lock().map_or(0, |state| state.active.len())
+        self.inner.lock().map_or(0, |state| {
+            state
+                .active
+                .values()
+                .filter(|active| {
+                    state
+                        .by_name
+                        .get(&active.name)
+                        .is_some_and(|runtime| runtime.is_available())
+                })
+                .count()
+        })
     }
 
     pub(crate) fn install_observability_sink(
@@ -191,9 +205,13 @@ impl ClientRegistry {
     }
 
     pub fn is_active(&self, fingerprint: &str) -> bool {
-        self.inner
-            .lock()
-            .is_ok_and(|state| state.active.contains_key(fingerprint))
+        self.inner.lock().is_ok_and(|state| {
+            state
+                .active
+                .get(fingerprint)
+                .and_then(|active| state.by_name.get(&active.name))
+                .is_some_and(|runtime| runtime.is_available())
+        })
     }
 
     pub(crate) fn is_active_session(&self, identity: &AuthenticatedClient) -> bool {
@@ -202,7 +220,12 @@ impl ClientRegistry {
                 .active
                 .get(identity.fingerprint())
                 .is_some_and(|active| {
-                    active.name == identity.name() && active.session_id == identity.session_id()
+                    active.name == identity.name()
+                        && active.session_id == identity.session_id()
+                        && state
+                            .by_name
+                            .get(&active.name)
+                            .is_some_and(|runtime| runtime.is_available())
                 })
         })
     }
@@ -261,6 +284,7 @@ impl ClientRegistry {
                 }),
                 outbound,
                 cancellation: CancellationToken::new(),
+                available: AtomicBool::new(true),
                 binding_ttl: self.binding_ttl,
                 protocol_version,
                 #[cfg(test)]
@@ -320,6 +344,9 @@ impl ClientRegistry {
         if runtime.session_id() != request.session_id.as_slice() {
             return Err(RegistryError::Binding(BindingError::Rejected));
         }
+        if !runtime.is_available() {
+            return Err(RegistryError::Binding(BindingError::Rejected));
+        }
         let (binding, destination) = runtime
             .redeem_if_present(request, protocol_version)
             .ok_or(RegistryError::Binding(BindingError::Rejected))??;
@@ -352,6 +379,9 @@ impl ClientRegistry {
     pub(crate) fn active_control_session(&self, name: &str) -> Option<ActiveControlSession> {
         let state = self.inner.lock().ok()?;
         let runtime = state.by_name.get(name)?;
+        if !runtime.is_available() {
+            return None;
+        }
         Some(ActiveControlSession {
             identity: AuthenticatedClient::verified(
                 runtime.client.clone(),
@@ -420,6 +450,7 @@ pub(crate) struct SessionRuntime {
     bindings: Mutex<SessionBindings>,
     outbound: mpsc::Sender<Message>,
     cancellation: CancellationToken,
+    available: AtomicBool,
     binding_ttl: Duration,
     protocol_version: ProtocolVersion,
     #[cfg(test)]
@@ -477,6 +508,10 @@ impl SessionRuntime {
 
     pub(crate) fn cancellation(&self) -> CancellationToken {
         self.cancellation.clone()
+    }
+
+    fn is_available(&self) -> bool {
+        self.available.load(Ordering::Acquire)
     }
 
     pub(crate) const fn binding_ttl(&self) -> Duration {
@@ -677,6 +712,7 @@ impl SessionRuntime {
     }
 
     fn cancel(&self) {
+        self.available.store(false, Ordering::Release);
         self.cancellation.cancel();
         if let Ok(mut bindings) = self.bindings.lock() {
             let pending = std::mem::take(&mut bindings.pending_tcp);
@@ -747,13 +783,20 @@ impl ControlSessionGuard {
             return;
         }
         self.runtime.cancel();
+        self.unavailable = true;
+    }
+
+    fn finalize_disconnect(&mut self) {
+        if self.released {
+            return;
+        }
         self.registry.release(&self.identity);
         self.runtime
             .try_observe(ObservationEvent::ClientDisconnected {
                 client: self.runtime.observability_identity().clone(),
                 disconnected_unix_millis: now_unix_millis(),
             });
-        self.unavailable = true;
+        self.released = true;
     }
 
     pub async fn register_tunnels(&mut self, request: RegisterTunnels) -> TunnelResults {
@@ -878,7 +921,7 @@ impl ControlSessionGuard {
         }
         self.listeners.clear();
         self.data_channels.clear();
-        self.released = true;
+        self.finalize_disconnect();
     }
 
     async fn bind_listener(
@@ -927,8 +970,36 @@ impl Drop for ControlSessionGuard {
         }
         self.mark_unavailable();
         self.data_channels.clear();
-        self.listeners.clear();
+        let mut listeners = std::mem::take(&mut self.listeners);
+        let registry = self.registry.clone();
+        let identity = self.identity.clone();
+        let runtime = self.runtime.clone();
         self.released = true;
+        if listeners.is_empty() {
+            registry.release(&identity);
+            runtime.try_observe(ObservationEvent::ClientDisconnected {
+                client: runtime.observability_identity().clone(),
+                disconnected_unix_millis: now_unix_millis(),
+            });
+        } else if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                for listener in &mut listeners {
+                    listener.shutdown().await;
+                }
+                registry.release(&identity);
+                runtime.try_observe(ObservationEvent::ClientDisconnected {
+                    client: runtime.observability_identity().clone(),
+                    disconnected_unix_millis: now_unix_millis(),
+                });
+            });
+        } else {
+            drop(listeners);
+            registry.release(&identity);
+            runtime.try_observe(ObservationEvent::ClientDisconnected {
+                client: runtime.observability_identity().clone(),
+                disconnected_unix_millis: now_unix_millis(),
+            });
+        }
     }
 }
 

@@ -173,6 +173,7 @@ struct StoredSession {
     candidate_digests: [Option<[u8; 32]>; 2],
     generation_started: Instant,
     observed_path: Option<SessionPath>,
+    fallback_provider_internal_frames_remaining: u8,
     pending_relay_traffic: TrafficCounters,
     last_observability_flush: Instant,
 }
@@ -555,19 +556,28 @@ impl RendezvousCoordinator {
                     "peer relay frame rejected"
                 );
             })?;
-            if session.observed_path == Some(SessionPath::P2pFallback) {
-                let logical_bytes =
-                    frame.ciphertext().len().saturating_sub(PEER_AEAD_TAG_BYTES) as u64;
-                if session.consumer.matches(authenticated.identity()) {
-                    session.pending_relay_traffic.sent_bytes = session
-                        .pending_relay_traffic
-                        .sent_bytes
-                        .saturating_add(logical_bytes);
-                } else {
-                    session.pending_relay_traffic.received_bytes = session
-                        .pending_relay_traffic
-                        .received_bytes
-                        .saturating_add(logical_bytes);
+            if self.registry.observability_enabled() {
+                if session.provider.matches(authenticated.identity())
+                    && session.fallback_provider_internal_frames_remaining > 0
+                {
+                    // Relay authorization precedes I/O. The responder then emits exactly
+                    // AUTH_RECORD and OPEN_OK/OPEN_REJECTED before any application payload;
+                    // either may arrive before the initiator reports the selected path.
+                    session.fallback_provider_internal_frames_remaining -= 1;
+                } else if session.observed_path == Some(SessionPath::P2pFallback) {
+                    let logical_bytes =
+                        frame.ciphertext().len().saturating_sub(PEER_AEAD_TAG_BYTES) as u64;
+                    if session.consumer.matches(authenticated.identity()) {
+                        session.pending_relay_traffic.sent_bytes = session
+                            .pending_relay_traffic
+                            .sent_bytes
+                            .saturating_add(logical_bytes);
+                    } else {
+                        session.pending_relay_traffic.received_bytes = session
+                            .pending_relay_traffic
+                            .received_bytes
+                            .saturating_add(logical_bytes);
+                    }
                 }
             }
             (permit, message)
@@ -709,6 +719,14 @@ impl RendezvousCoordinator {
                 candidate_digests: [None, None],
                 generation_started: Instant::now(),
                 observed_path: None,
+                fallback_provider_internal_frames_remaining: if self
+                    .registry
+                    .observability_enabled()
+                {
+                    2
+                } else {
+                    0
+                },
                 pending_relay_traffic: TrafficCounters::default(),
                 last_observability_flush: Instant::now(),
             })),
@@ -886,13 +904,17 @@ impl RendezvousCoordinator {
             let observed_path = match &envelope.payload {
                 RendezvousPayload::ConnectivityResult(result) if result.connected => {
                     let transport = result.transport.ok_or(RendezvousErrorCode::INVALID_STATE)?;
-                    Some(match transport {
-                        rustgo_rendezvous::CandidateTransport::Relay => SessionPath::P2pFallback,
-                        rustgo_rendezvous::CandidateTransport::QuicUdp
-                        | rustgo_rendezvous::CandidateTransport::NativeTcp => {
-                            SessionPath::P2pDirect
-                        }
-                    })
+                    self.registry
+                        .observability_enabled()
+                        .then_some(match transport {
+                            rustgo_rendezvous::CandidateTransport::Relay => {
+                                SessionPath::P2pFallback
+                            }
+                            rustgo_rendezvous::CandidateTransport::QuicUdp
+                            | rustgo_rendezvous::CandidateTransport::NativeTcp => {
+                                SessionPath::P2pDirect
+                            }
+                        })
                 }
                 RendezvousPayload::ConnectivityResult(result) if result.transport.is_some() => {
                     return Err(RendezvousErrorCode::INVALID_STATE.into());

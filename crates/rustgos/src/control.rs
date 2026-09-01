@@ -558,14 +558,17 @@ impl TelemetryAdmission {
             || self
                 .last_sampled_unix_millis
                 .is_some_and(|sampled| report.sampled_unix_millis < sampled)
-            || self
-                .last_accepted
-                .is_some_and(|accepted| accepted.elapsed() < MIN_TELEMETRY_INTERVAL)
         {
             return false;
         }
         self.last_sequence = Some(report.sequence);
         self.last_sampled_unix_millis = Some(report.sampled_unix_millis);
+        if self
+            .last_accepted
+            .is_some_and(|accepted| accepted.elapsed() < MIN_TELEMETRY_INTERVAL)
+        {
+            return false;
+        }
         self.last_accepted = Some(tokio::time::Instant::now());
         true
     }

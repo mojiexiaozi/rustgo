@@ -345,20 +345,28 @@ struct FlowEntry {
     last_activity: tokio::time::Instant,
     previous: Option<u64>,
     next: Option<u64>,
+    observed_traffic: Option<Arc<ObservedUdpTraffic>>,
 }
 
 struct FlowTable {
     capacity: usize,
+    observe_traffic: bool,
     by_flow: HashMap<FlowKey, u64>,
     by_id: HashMap<u64, FlowEntry>,
     sweep_head: Option<u64>,
     sweep_tail: Option<u64>,
 }
 
+struct ExpiredFlow {
+    session_id: u64,
+    observed_traffic: Option<Arc<ObservedUdpTraffic>>,
+}
+
 impl FlowTable {
-    fn new(capacity: usize) -> Self {
+    fn new(capacity: usize, observe_traffic: bool) -> Self {
         Self {
             capacity,
+            observe_traffic,
             by_flow: HashMap::with_capacity(capacity.min(4096)),
             by_id: HashMap::with_capacity(capacity.min(4096)),
             sweep_head: None,
@@ -391,6 +399,9 @@ impl FlowTable {
                 last_activity: now,
                 previous,
                 next: None,
+                observed_traffic: self
+                    .observe_traffic
+                    .then(|| Arc::new(ObservedUdpTraffic::default())),
             },
         );
         if let Some(previous) = previous {
@@ -488,12 +499,31 @@ impl FlowTable {
         true
     }
 
+    fn observed_traffic(&self, session_id: u64) -> Option<Arc<ObservedUdpTraffic>> {
+        self.by_id
+            .get(&session_id)
+            .and_then(|entry| entry.observed_traffic.clone())
+    }
+
+    fn take_observed_traffic(&self) -> Vec<(u64, TrafficCounters)> {
+        self.by_id
+            .iter()
+            .filter_map(|(session_id, entry)| {
+                entry
+                    .observed_traffic
+                    .as_ref()
+                    .map(|traffic| (*session_id, traffic.take()))
+                    .filter(|(_, counters)| *counters != TrafficCounters::default())
+            })
+            .collect()
+    }
+
     fn sweep_expired(
         &mut self,
         now: tokio::time::Instant,
         idle_timeout: Duration,
         maximum: usize,
-    ) -> Result<Vec<u64>, FlowError> {
+    ) -> Result<Vec<ExpiredFlow>, FlowError> {
         let mut expired = Vec::with_capacity(maximum.min(self.by_id.len()));
         let inspected = maximum.min(self.by_id.len());
         for _ in 0..inspected {
@@ -504,8 +534,12 @@ impl FlowTable {
                 now.saturating_duration_since(entry.last_activity) >= idle_timeout
             });
             if is_expired {
+                let observed_traffic = self.observed_traffic(session_id);
                 if self.remove(session_id) {
-                    expired.push(session_id);
+                    expired.push(ExpiredFlow {
+                        session_id,
+                        observed_traffic,
+                    });
                 }
             } else {
                 self.rotate_sweep_head(session_id)?;
@@ -547,6 +581,46 @@ struct UdpMetrics {
     invalid_drops: AtomicU64,
 }
 
+#[derive(Debug, Default)]
+struct ObservedUdpTraffic {
+    sent_bytes: AtomicU64,
+    received_bytes: AtomicU64,
+}
+
+impl ObservedUdpTraffic {
+    fn record_sent(&self, bytes: usize) {
+        saturating_add(&self.sent_bytes, bytes as u64);
+    }
+
+    fn record_received(&self, bytes: usize) {
+        saturating_add(&self.received_bytes, bytes as u64);
+    }
+
+    fn take(&self) -> TrafficCounters {
+        TrafficCounters {
+            sent_bytes: self.sent_bytes.swap(0, Ordering::AcqRel),
+            received_bytes: self.received_bytes.swap(0, Ordering::AcqRel),
+        }
+    }
+}
+
+fn saturating_add(counter: &AtomicU64, delta: u64) {
+    let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        Some(current.saturating_add(delta))
+    });
+}
+
+struct QueuedUdpMessage {
+    message: Message,
+    delivered: Option<(Arc<ObservedUdpTraffic>, usize)>,
+    retired_session: Option<u64>,
+}
+
+struct RetiredObservedTraffic {
+    traffic: Arc<ObservedUdpTraffic>,
+    reason: &'static str,
+}
+
 impl UdpMetrics {
     fn set_sessions(&self, sessions: usize) {
         self.sessions.store(sessions, Ordering::Release);
@@ -567,12 +641,18 @@ enum EnqueueResult {
 }
 
 fn try_enqueue(
-    outbound: &mpsc::Sender<Message>,
+    outbound: &mpsc::Sender<QueuedUdpMessage>,
     message: Message,
+    delivered: Option<(Arc<ObservedUdpTraffic>, usize)>,
+    retired_session: Option<u64>,
     metrics: &UdpMetrics,
 ) -> EnqueueResult {
     metrics.queued.fetch_add(1, Ordering::AcqRel);
-    match outbound.try_send(message) {
+    match outbound.try_send(QueuedUdpMessage {
+        message,
+        delivered,
+        retired_session,
+    }) {
         Ok(()) => EnqueueResult::Queued,
         Err(mpsc::error::TrySendError::Full(_)) => {
             metrics.queued.fetch_sub(1, Ordering::AcqRel);
@@ -604,6 +684,7 @@ async fn relay_datagrams(
     let (outbound, receiver) = mpsc::channel(limits.queue_capacity);
     let metrics = Arc::new(UdpMetrics::default());
     let relay_shutdown = CancellationToken::new();
+    let (retirement_ack, mut retirement_acks) = mpsc::unbounded_channel();
     let mut writer_task = tokio::spawn(write_frames(
         writer,
         receiver,
@@ -611,11 +692,14 @@ async fn relay_datagrams(
         relay_shutdown.clone(),
         limits.writer_delay,
         protocol_version,
+        retirement_ack,
     ));
     let mut writer_finished = false;
-    let mut flows = FlowTable::new(max_sessions);
+    let mut flows = FlowTable::new(max_sessions, runtime.observability_enabled());
+    let mut retired_traffic = runtime
+        .observability_enabled()
+        .then(HashMap::<u64, RetiredObservedTraffic>::new);
     let mut forwarded_replies = 0_u64;
-    let mut pending_traffic = HashMap::<u64, TrafficCounters>::new();
     let mut observability_flush = tokio::time::interval(OBSERVABILITY_FLUSH_INTERVAL);
     observability_flush.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut receive_buffer = vec![0_u8; max_payload.saturating_add(1)];
@@ -637,8 +721,23 @@ async fn relay_datagrams(
                     Err(_) => Err(UdpRelayError::TaskJoin),
                 };
             }
+            retired = retirement_acks.recv(), if retired_traffic.is_some() => {
+                if let Some(retired) = retired
+                    && let Some(observed) = retired_traffic
+                        .as_mut()
+                        .and_then(|traffic| traffic.remove(&retired))
+                {
+                    flush_udp_traffic_entry(&runtime, retired, observed.traffic.take());
+                    observe_udp_close(&runtime, retired, observed.reason);
+                }
+            }
             _ = observability_flush.tick(), if runtime.observability_enabled() => {
-                flush_udp_traffic(&runtime, &mut pending_traffic, None);
+                flush_udp_traffic(&runtime, flows.take_observed_traffic());
+                if let Some(retired) = retired_traffic.as_ref() {
+                    for (session_id, observed) in retired {
+                        flush_udp_traffic_entry(&runtime, *session_id, observed.traffic.take());
+                    }
+                }
             }
             _ = sweep.tick() => {
                 let expired = flows.sweep_expired(
@@ -649,14 +748,30 @@ async fn relay_datagrams(
                 if !expired.is_empty() {
                     metrics.set_sessions(flows.len());
                     let expired_count = expired.len();
-                    for session_id in expired {
-                        flush_udp_traffic(&runtime, &mut pending_traffic, Some(session_id));
-                        observe_udp_close(&runtime, session_id, "idle-timeout");
+                    for expired in expired {
+                        let session_id = expired.session_id;
+                        if let (Some(retired), Some(traffic)) =
+                            (retired_traffic.as_mut(), expired.observed_traffic)
+                        {
+                            retired.insert(
+                                session_id,
+                                RetiredObservedTraffic {
+                                    traffic,
+                                    reason: "idle-timeout",
+                                },
+                            );
+                        }
                         let retirement = Message::UdpSessionRetired(UdpSessionRetired {
                             tunnel_id,
                             session_id,
                         });
-                        match try_enqueue(&outbound, retirement, &metrics) {
+                        match try_enqueue(
+                            &outbound,
+                            retirement,
+                            None,
+                            retired_traffic.as_ref().map(|_| session_id),
+                            &metrics,
+                        ) {
                             EnqueueResult::Queued => {}
                             EnqueueResult::Full => {
                                 UdpMetrics::record_drop(
@@ -711,7 +826,10 @@ async fn relay_datagrams(
                     source: wire_socket_addr(key.source),
                     payload,
                 });
-                match try_enqueue(&outbound, message, &metrics) {
+                let delivered = flows
+                    .observed_traffic(session_id)
+                    .map(|traffic| (traffic, length));
+                match try_enqueue(&outbound, message, delivered, None, &metrics) {
                     EnqueueResult::Queued => {
                         if inserted {
                             metrics.set_sessions(flows.len());
@@ -721,20 +839,18 @@ async fn relay_datagrams(
                                 event = %"udp_session_open"
                             );
                             tracing::info!(parent: &session, "UDP relay session opened");
-                            runtime.try_observe(ObservationEvent::UdpSessionOpened {
-                                client: runtime.observability_identity().clone(),
-                                session_id: observed_udp_session_id(session_id),
-                                tunnel: Some(
-                                    BoundedLabel::try_from(tunnel_name)
-                                        .expect("registered tunnel names are bounded"),
-                                ),
-                                opened_unix_millis: now_unix_millis(),
-                            });
+                            if runtime.observability_enabled() {
+                                runtime.try_observe(ObservationEvent::UdpSessionOpened {
+                                    client: runtime.observability_identity().clone(),
+                                    session_id: observed_udp_session_id(session_id),
+                                    tunnel: Some(
+                                        BoundedLabel::try_from(tunnel_name)
+                                            .expect("registered tunnel names are bounded"),
+                                    ),
+                                    opened_unix_millis: now_unix_millis(),
+                                });
+                            }
                         }
-                        let counters = pending_traffic.entry(session_id).or_default();
-                        counters.received_bytes = counters
-                            .received_bytes
-                            .saturating_add(length as u64);
                     }
                     EnqueueResult::Full => {
                         if inserted {
@@ -786,10 +902,9 @@ async fn relay_datagrams(
                     break Err(UdpRelayError::ShortDatagramWrite);
                 }
                 forwarded_replies = forwarded_replies.saturating_add(1);
-                let counters = pending_traffic.entry(datagram.session_id).or_default();
-                counters.sent_bytes = counters
-                    .sent_bytes
-                    .saturating_add(sent as u64);
+                if let Some(traffic) = flows.observed_traffic(datagram.session_id) {
+                    traffic.record_sent(sent);
+                }
                 if limits.test_disconnect_after_replies == Some(forwarded_replies) {
                     tracing::warn!(
                         tunnel = %safe_display(tunnel_name),
@@ -807,11 +922,16 @@ async fn relay_datagrams(
     if !writer_finished {
         let _ = writer_task.await;
     }
+    flush_udp_traffic(&runtime, flows.take_observed_traffic());
     for session_id in flows.session_ids() {
-        flush_udp_traffic(&runtime, &mut pending_traffic, Some(session_id));
         observe_udp_close(&runtime, session_id, "channel-ended");
     }
-    flush_udp_traffic(&runtime, &mut pending_traffic, None);
+    if let Some(retired) = retired_traffic {
+        for (session_id, observed) in retired {
+            flush_udp_traffic_entry(&runtime, session_id, observed.traffic.take());
+            observe_udp_close(&runtime, session_id, observed.reason);
+        }
+    }
     flows.clear();
     metrics.set_sessions(0);
     metrics.queued.store(0, Ordering::Release);
@@ -832,35 +952,26 @@ fn observed_udp_session_id(session_id: u64) -> ShortSessionId {
     ShortSessionId::from_bytes(&session_id.to_be_bytes())
 }
 
-fn flush_udp_traffic(
-    runtime: &SessionRuntime,
-    pending: &mut HashMap<u64, TrafficCounters>,
-    session_id: Option<u64>,
-) {
-    if let Some(session_id) = session_id {
-        if let Some(counters) = pending.remove(&session_id)
-            && counters != TrafficCounters::default()
-        {
-            runtime.try_observe(ObservationEvent::ByteCounterDelta {
-                client: runtime.observability_identity().clone(),
-                session_id: Some(observed_udp_session_id(session_id)),
-                counters,
-            });
-        }
-        return;
+fn flush_udp_traffic(runtime: &SessionRuntime, pending: Vec<(u64, TrafficCounters)>) {
+    for (session_id, counters) in pending {
+        flush_udp_traffic_entry(runtime, session_id, counters);
     }
-    for (session_id, counters) in std::mem::take(pending) {
-        if counters != TrafficCounters::default() {
-            runtime.try_observe(ObservationEvent::ByteCounterDelta {
-                client: runtime.observability_identity().clone(),
-                session_id: Some(observed_udp_session_id(session_id)),
-                counters,
-            });
-        }
+}
+
+fn flush_udp_traffic_entry(runtime: &SessionRuntime, session_id: u64, counters: TrafficCounters) {
+    if counters != TrafficCounters::default() {
+        runtime.try_observe(ObservationEvent::ByteCounterDelta {
+            client: runtime.observability_identity().clone(),
+            session_id: Some(observed_udp_session_id(session_id)),
+            counters,
+        });
     }
 }
 
 fn observe_udp_close(runtime: &SessionRuntime, session_id: u64, reason: &'static str) {
+    if !runtime.observability_enabled() {
+        return;
+    }
     runtime.try_observe(ObservationEvent::UdpSessionClosed {
         client: runtime.observability_identity().clone(),
         session_id: observed_udp_session_id(session_id),
@@ -873,18 +984,19 @@ fn observe_udp_close(runtime: &SessionRuntime, session_id: u64, reason: &'static
 
 async fn write_frames<W>(
     mut writer: W,
-    mut receiver: mpsc::Receiver<Message>,
+    mut receiver: mpsc::Receiver<QueuedUdpMessage>,
     metrics: Arc<UdpMetrics>,
     cancellation: CancellationToken,
     writer_delay: Duration,
     protocol_version: ProtocolVersion,
+    retirement_ack: mpsc::UnboundedSender<u64>,
 ) -> Result<(), UdpRelayError>
 where
     W: AsyncWrite + Unpin,
 {
     let codec = FrameCodec::new(UDP_METADATA_LEN + MAX_UDP_PAYLOAD_BYTES);
     let result = loop {
-        let message = tokio::select! {
+        let queued = tokio::select! {
             biased;
             () = cancellation.cancelled() => break Ok(()),
             message = receiver.recv() => match message {
@@ -893,7 +1005,7 @@ where
             },
         };
         metrics.queued.fetch_sub(1, Ordering::AcqRel);
-        let encoded = codec.encode(protocol_version, 0, &message)?;
+        let encoded = codec.encode(protocol_version, 0, &queued.message)?;
         if !writer_delay.is_zero() {
             tokio::select! {
                 biased;
@@ -906,6 +1018,12 @@ where
             biased;
             () = cancellation.cancelled() => break Ok(()),
             write = write => write?,
+        }
+        if let Some((traffic, bytes)) = queued.delivered {
+            traffic.record_received(bytes);
+        }
+        if let Some(session_id) = queued.retired_session {
+            let _ = retirement_ack.send(session_id);
         }
     };
     while receiver.try_recv().is_ok() {
@@ -1109,7 +1227,7 @@ mod tests {
 
     #[test]
     fn rolled_back_sessions_do_not_grow_the_bounded_sweep_ring() {
-        let mut flows = FlowTable::new(1);
+        let mut flows = FlowTable::new(1, false);
         let destination = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7000);
         for port in 10_000..10_128 {
             let key = FlowKey {
@@ -1142,7 +1260,7 @@ mod tests {
 
     #[test]
     fn session_ids_are_nonzero_and_unique_until_the_configured_limit() {
-        let mut flows = FlowTable::new(128);
+        let mut flows = FlowTable::new(128, false);
         let now = tokio::time::Instant::now();
         let destination = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7000);
         let mut identifiers = HashSet::new();
@@ -1177,7 +1295,7 @@ mod tests {
 
     #[test]
     fn one_idle_sweep_inspects_at_most_the_configured_batch() {
-        let mut flows = FlowTable::new(3);
+        let mut flows = FlowTable::new(3, false);
         let started = tokio::time::Instant::now();
         let destination = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7000);
         for port in 31_000..31_003 {
@@ -1204,7 +1322,7 @@ mod tests {
 
     #[test]
     fn removing_a_middle_flow_keeps_constant_time_sweep_links_consistent() {
-        let mut flows = FlowTable::new(3);
+        let mut flows = FlowTable::new(3, false);
         let now = tokio::time::Instant::now();
         let destination = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7000);
         let mut identifiers = Vec::new();

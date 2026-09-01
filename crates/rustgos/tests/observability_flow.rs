@@ -27,8 +27,9 @@ use rustgo_protocol::{
     RegisterTunnels, TelemetryReport, TunnelProtocol, TunnelRegistration, UdpDatagram,
 };
 use rustgo_rendezvous::{
-    CandidateGeneration, CandidateTransport, ConnectivityResult, ProviderDecision, RendezvousClose,
-    RendezvousEnvelope, RendezvousPayload, RendezvousRequest, SessionId,
+    CandidateGeneration, CandidateTransport, ConnectivityResult, PeerRelayFlags, PeerRelayFrame,
+    ProviderDecision, RelayRequest, RendezvousClose, RendezvousEnvelope, RendezvousPayload,
+    RendezvousRequest, SessionId,
 };
 use rustgo_transport::TlsClient;
 use rustgos::{ServerApp, ServerRuntimeLimits};
@@ -240,6 +241,91 @@ fn envelope(
     }
 }
 
+async fn open_fallback(
+    consumer: &mut Client,
+    provider: &mut Client,
+    marker: u8,
+    expiry: u64,
+) -> Result<(), AnyError> {
+    let messages = [
+        (
+            true,
+            1,
+            RendezvousPayload::Request(RendezvousRequest {
+                export: BoundedString::try_from("fallback")?,
+            }),
+        ),
+        (
+            false,
+            2,
+            RendezvousPayload::ProviderDecision(ProviderDecision::accepted(TunnelProtocol::TCP)),
+        ),
+        (
+            true,
+            3,
+            RendezvousPayload::RelayRequest(RelayRequest { datagram: false }),
+        ),
+        (
+            false,
+            4,
+            RendezvousPayload::RelayRequest(RelayRequest { datagram: false }),
+        ),
+        (
+            true,
+            5,
+            RendezvousPayload::ConnectivityResult(ConnectivityResult {
+                connected: true,
+                transport: Some(CandidateTransport::Relay),
+                detail: None,
+            }),
+        ),
+    ];
+    for (from_consumer, step, payload) in messages {
+        let message = if from_consumer {
+            envelope(marker, "alpha", "beta", step, expiry, payload)
+        } else {
+            envelope(marker, "beta", "alpha", step, expiry, payload)
+        };
+        if from_consumer {
+            consumer.send_envelope(&message).await?;
+            assert_eq!(provider.receive_envelope().await?, message);
+        } else {
+            provider.send_envelope(&message).await?;
+            assert_eq!(consumer.receive_envelope().await?, message);
+        }
+        if step == 4 {
+            // AUTH_RECORD is sent once by each endpoint after relay authorization. The
+            // provider then sends OPEN_OK before the initiator reports fallback selection.
+            relay_frame(consumer, provider, marker, 1, 21).await?;
+            relay_frame(provider, consumer, marker, 1, 21).await?;
+            relay_frame(provider, consumer, marker, 2, 21).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn relay_frame(
+    sender: &mut Client,
+    receiver: &mut Client,
+    marker: u8,
+    sequence: u64,
+    logical_bytes: usize,
+) -> Result<(), AnyError> {
+    let frame = PeerRelayFrame::new(
+        SessionId::from([marker; 32]),
+        1,
+        sequence,
+        PeerRelayFlags::RELIABLE,
+        vec![marker; logical_bytes + 16],
+    )?;
+    sender.send(frame.to_protocol_message()?).await?;
+    assert_eq!(
+        PeerRelayFrame::from_protocol_message(receiver.receive().await?)?,
+        frame
+    );
+    Ok(())
+}
+
 fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -393,8 +479,9 @@ async fn authenticated_runtime_activity_projects_without_trusting_client_identit
             .any(|client| client.name.as_str() == "alpha" && client.telemetry_sequence == Some(7))
     })
     .await?;
+    let early_report = telemetry(8, 9_999, 99, 99);
     alpha
-        .send(Message::TelemetryReport(telemetry(8, 9_999, 99, 99)))
+        .send(Message::TelemetryReport(early_report.clone()))
         .await?;
     let attempted_cross_client_report = telemetry(7, 2_222, 21, 22);
     beta.send(Message::TelemetryReport(attempted_cross_client_report))
@@ -407,9 +494,7 @@ async fn authenticated_runtime_activity_projects_without_trusting_client_identit
     })
     .await?;
     tokio::time::sleep(Duration::from_millis(1_050)).await;
-    alpha
-        .send(Message::TelemetryReport(telemetry(6, 8_888, 88, 88)))
-        .await?;
+    alpha.send(Message::TelemetryReport(early_report)).await?;
     let mut invalid = telemetry(9, 10_001, 77, 77);
     invalid.memory_used_bytes = invalid.memory_total_bytes + 1;
     alpha.send(Message::TelemetryReport(invalid)).await?;
@@ -492,9 +577,6 @@ async fn authenticated_runtime_activity_projects_without_trusting_client_identit
     let mut tcp_sent = [0_u8; 14];
     public_tcp.read_exact(&mut tcp_sent).await?;
     assert_eq!(&tcp_sent, b"tcp-from-alpha");
-    drop(tcp_data);
-    drop(public_tcp);
-
     let public_udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     public_udp
         .send_to(b"udp-to-alpha", (Ipv4Addr::LOCALHOST, udp_port))
@@ -583,32 +665,83 @@ async fn authenticated_runtime_activity_projects_without_trusting_client_identit
     alpha.send_envelope(&close).await?;
     assert_eq!(beta.receive_envelope().await?, close);
 
-    drop(udp_data);
+    open_fallback(&mut alpha, &mut beta, 0x72, expiry).await?;
+    let zero_fallback_id = ShortSessionId::from_bytes(&[0x72; 32]);
+    let zero_close = envelope(
+        0x72,
+        "alpha",
+        "beta",
+        6,
+        expiry,
+        RendezvousPayload::Close(RendezvousClose { detail: None }),
+    );
+    alpha.send_envelope(&zero_close).await?;
+    assert_eq!(beta.receive_envelope().await?, zero_close);
+
+    open_fallback(&mut alpha, &mut beta, 0x73, expiry).await?;
+    relay_frame(&mut alpha, &mut beta, 0x73, 2, 5).await?;
+    relay_frame(&mut beta, &mut alpha, 0x73, 3, 7).await?;
+    let data_fallback_id = ShortSessionId::from_bytes(&[0x73; 32]);
+    let data_close = envelope(
+        0x73,
+        "alpha",
+        "beta",
+        6,
+        expiry,
+        RendezvousPayload::Close(RendezvousClose { detail: None }),
+    );
+    alpha.send_envelope(&data_close).await?;
+    assert_eq!(beta.receive_envelope().await?, data_close);
+
     drop(beta);
-    let snapshot = wait_for(&store, "sessions-closed", |snapshot| {
+    wait_for(&store, "beta-and-p2p-closed", |snapshot| {
         let beta_offline = snapshot
             .clients
             .iter()
             .any(|client| client.name.as_str() == "beta" && !client.online);
+        let p2p = snapshot
+            .sessions
+            .iter()
+            .any(|session| session.id == p2p_id && session.closed_unix_millis.is_some());
+        let zero_fallback = snapshot.sessions.iter().any(|session| {
+            session.id == zero_fallback_id
+                && session.traffic.received_bytes == 0
+                && session.traffic.sent_bytes == 0
+                && session.closed_unix_millis.is_some()
+        });
+        let data_fallback = snapshot.sessions.iter().any(|session| {
+            session.id == data_fallback_id
+                && session.traffic.received_bytes == 7
+                && session.traffic.sent_bytes == 5
+                && session.closed_unix_millis.is_some()
+        });
+        beta_offline && p2p && zero_fallback && data_fallback
+    })
+    .await?;
+
+    // Drop the authenticated control owner while both TCP and UDP children are
+    // still live. Their final traffic deltas must be projected before offline.
+    drop(alpha);
+    let snapshot = wait_for(&store, "live-session-disconnect-finalized", |snapshot| {
+        let alpha_offline = snapshot
+            .clients
+            .iter()
+            .any(|client| client.name.as_str() == "alpha" && !client.online);
         let tcp = snapshot.sessions.iter().any(|session| {
             session.kind == SessionKind::Tcp
                 && session.client.as_str() == "alpha"
-                && session.traffic.received_bytes >= 12
-                && session.traffic.sent_bytes >= 14
+                && session.traffic.received_bytes == 12
+                && session.traffic.sent_bytes == 14
                 && session.closed_unix_millis.is_some()
         });
         let udp = snapshot.sessions.iter().any(|session| {
             session.kind == SessionKind::Udp
                 && session.client.as_str() == "alpha"
-                && session.traffic.received_bytes >= 12
-                && session.traffic.sent_bytes >= 14
+                && session.traffic.received_bytes == 12
+                && session.traffic.sent_bytes == 14
                 && session.closed_unix_millis.is_some()
         });
-        let p2p = snapshot
-            .sessions
-            .iter()
-            .any(|session| session.id == p2p_id && session.closed_unix_millis.is_some());
-        beta_offline && tcp && udp && p2p
+        alpha_offline && tcp && udp
     })
     .await?;
     assert!(snapshot.sessions.iter().all(|session| {
@@ -618,11 +751,94 @@ async fn authenticated_runtime_activity_projects_without_trusting_client_identit
     }));
     assert_eq!(snapshot.dropped_events, 0);
 
-    drop(alpha);
-    wait_for(&store, "clients-offline", |snapshot| {
-        snapshot.server.online_clients == 0
+    drop(tcp_data);
+    drop(public_tcp);
+    drop(udp_data);
+    shutdown.cancel();
+    server_task.await??;
+    drop(sink);
+    worker_task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn queued_udp_receive_is_not_counted_when_writer_is_cancelled() -> Result<(), AnyError> {
+    let pki = TestPki::generate()?;
+    let key = DeviceKeypair::from_secret_bytes([63; 32]);
+    let udp_port = free_udp_port()?;
+    let (store, sink, worker) = ObservabilityStore::new();
+    let worker_task = tokio::spawn(worker.run());
+    let limits = ServerRuntimeLimits {
+        udp_writer_delay: Duration::from_secs(2),
+        ..ServerRuntimeLimits::default()
+    };
+    let app = ServerApp::bind_with_runtime_limits(
+        server_config(&pki, vec![authorized("alpha", &key)])?,
+        limits,
+    )
+    .await?
+    .with_observability_sink(sink.clone())?;
+    let address = app.local_addr()?;
+    let shutdown = CancellationToken::new();
+    let server_task = tokio::spawn(app.run_until(shutdown.clone()));
+
+    let mut client = Client::connect(
+        &pki,
+        address,
+        "alpha",
+        &key,
+        vec![tunnel(1, "delayed-udp", TunnelProtocol::UDP, udp_port)],
+    )
+    .await?;
+    let Message::OpenUdpChannel(OpenUdpChannel {
+        channel_id,
+        binding_token,
+        ..
+    }) = client.receive().await?
+    else {
+        return Err("server did not request delayed UDP channel".into());
+    };
+    let mut data = connect_data_channel(
+        &pki,
+        address,
+        &client,
+        DataChannelKind::UDP,
+        1,
+        channel_id,
+        binding_token,
+    )
+    .await?;
+    assert!(matches!(
+        read_frame_exact(&mut data).await?.message,
+        Message::OpenUdpChannel(_)
+    ));
+
+    let public = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    public
+        .send_to(b"queued-but-never-written", (Ipv4Addr::LOCALHOST, udp_port))
+        .await?;
+    wait_for(&store, "udp-queued", |snapshot| {
+        snapshot.sessions.iter().any(|session| {
+            session.kind == SessionKind::Udp
+                && session.client.as_str() == "alpha"
+                && session.traffic == Default::default()
+                && session.closed_unix_millis.is_none()
+        })
     })
     .await?;
+    drop(client);
+    let snapshot = wait_for(&store, "udp-writer-cancelled", |snapshot| {
+        snapshot.clients.iter().any(|client| !client.online)
+            && snapshot.sessions.iter().any(|session| {
+                session.kind == SessionKind::Udp
+                    && session.traffic == Default::default()
+                    && session.closed_unix_millis.is_some()
+            })
+    })
+    .await?;
+    assert_eq!(snapshot.dropped_events, 0);
+
+    drop(data);
     shutdown.cancel();
     server_task.await??;
     drop(sink);

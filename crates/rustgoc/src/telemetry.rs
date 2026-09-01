@@ -3,7 +3,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     task::{Context, Poll},
     time::{Duration, Instant},
@@ -24,17 +24,27 @@ use crate::ClientError;
 
 #[derive(Debug, Default)]
 pub(crate) struct LogicalTraffic {
+    active: AtomicBool,
     sent: AtomicU64,
     received: AtomicU64,
 }
 
 impl LogicalTraffic {
     pub(crate) fn record_sent(&self, bytes: usize) {
-        saturating_add(&self.sent, bytes as u64);
+        if self.active.load(Ordering::Acquire) {
+            saturating_add(&self.sent, bytes as u64);
+        }
     }
 
     pub(crate) fn record_received(&self, bytes: usize) {
-        saturating_add(&self.received, bytes as u64);
+        if self.active.load(Ordering::Acquire) {
+            saturating_add(&self.received, bytes as u64);
+        }
+    }
+
+    fn activate(self: &Arc<Self>) -> LogicalTrafficActivation {
+        self.active.store(true, Ordering::Release);
+        LogicalTrafficActivation(self.clone())
     }
 
     fn totals(&self) -> (u64, u64) {
@@ -42,6 +52,14 @@ impl LogicalTraffic {
             self.sent.load(Ordering::Acquire),
             self.received.load(Ordering::Acquire),
         )
+    }
+}
+
+struct LogicalTrafficActivation(Arc<LogicalTraffic>);
+
+impl Drop for LogicalTrafficActivation {
+    fn drop(&mut self) {
+        self.0.active.store(false, Ordering::Release);
     }
 }
 
@@ -134,6 +152,11 @@ pub trait TelemetryRuntimeHook: Send + Sync + 'static {
     fn control_write_gate(&self) -> Option<Arc<dyn TelemetryControlWriteGate>> {
         None
     }
+
+    /// Test-only batch observation of the process logical-traffic totals used
+    /// to derive the next wire rate. Production data paths never call hooks.
+    #[doc(hidden)]
+    fn after_traffic_snapshot(&self, _sent: u64, _received: u64) {}
 }
 
 /// Process-lifetime owner for the stateful host sampler.
@@ -153,7 +176,10 @@ impl TelemetryRuntime {
         hook: Option<Arc<dyn TelemetryRuntimeHook>>,
         traffic: Arc<LogicalTraffic>,
     ) -> Option<Self> {
-        let config = config.filter(|config| config.enabled)?;
+        let config = config.unwrap_or_default();
+        if !config.enabled {
+            return None;
+        }
         let sample_interval = Duration::from_secs(config.sample_interval_secs);
         let report_interval = report_interval_override
             .unwrap_or_else(|| Duration::from_secs(config.report_interval_secs));
@@ -227,6 +253,7 @@ impl GenerationTelemetry {
         reports: watch::Sender<Option<TelemetryReport>>,
         shutdown: CancellationToken,
     ) {
+        let _activation = self.traffic.activate();
         let first_tick = tokio::time::Instant::now() + self.report_interval;
         let mut ticks = tokio::time::interval_at(first_tick, self.report_interval);
         ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -249,6 +276,9 @@ impl GenerationTelemetry {
                     }
                     let now = Instant::now();
                     let (sent, received) = self.traffic.totals();
+                    if let Some(hook) = &self.hook {
+                        hook.after_traffic_snapshot(sent, received);
+                    }
                     let elapsed = now.saturating_duration_since(self.last_rate_sample);
                     let tx_bytes_per_sec = rate_per_second(sent.saturating_sub(self.last_sent), elapsed);
                     let rx_bytes_per_sec = rate_per_second(received.saturating_sub(self.last_received), elapsed);
