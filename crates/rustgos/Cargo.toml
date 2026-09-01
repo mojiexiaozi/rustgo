@@ -5,10 +5,14 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+axum.workspace = true
+base64.workspace = true
 bytes.workspace = true
 clap.workspace = true
+hmac.workspace = true
 rand.workspace = true
 postcard.workspace = true
+serde.workspace = true
 sha2.workspace = true
 rustgo-config = { path = "../rustgo-config" }
 rustgo-crypto = { path = "../rustgo-crypto" }
@@ -17,6 +21,7 @@ rustgo-protocol = { path = "../rustgo-protocol" }
 rustgo-rendezvous = { path = "../rustgo-rendezvous" }
 rustgo-transport = { path = "../rustgo-transport" }
 thiserror.workspace = true
+subtle = "2.6.1"
 tokio.workspace = true
 tokio-rustls.workspace = true
 tokio-util = { version = "0.7.19", features = ["rt"] }

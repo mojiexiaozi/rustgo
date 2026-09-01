@@ -10,6 +10,7 @@ mod registry;
 mod rendezvous;
 mod tcp;
 mod udp;
+pub mod web;
 
 pub use app::{ServerApp, ServerError, ServerRuntimeLimits};
 pub use auth::AuthenticatedClient;
