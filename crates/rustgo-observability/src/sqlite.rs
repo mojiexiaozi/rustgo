@@ -4,7 +4,7 @@ use std::fmt;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io;
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -16,6 +16,7 @@ use rand::{TryRngCore as _, rngs::OsRng};
 use rusqlite::{Connection, OpenFlags, Transaction, params};
 use same_file::Handle as SameFileHandle;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use tokio::sync::oneshot;
 
 use crate::{
@@ -44,18 +45,27 @@ const WARNING_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_BATCH_WRITE_ATTEMPTS: usize = 3;
 const MAX_BATCHES_PER_TRANSACTION: usize = 64;
 const MAX_TRANSACTION_BYTES: usize = 4 * 1024 * 1024;
-const RETENTION_DELETE_LIMIT: usize = 1024;
-const CAP_DELETE_LIMIT: usize = 4096;
+const RETENTION_DELETE_LIMIT: usize = 256;
+const CAP_DELETE_LIMIT: usize = 256;
 const VACUUM_PAGE_LIMIT: usize = 64;
 const MIB: u64 = 1024 * 1024;
 const OWNERSHIP_MARKER_SUFFIX: &str = ".rustgo-owner";
+const OWNERSHIP_PENDING_MARKER_SUFFIX: &str = ".rustgo-pending";
 const OWNERSHIP_MARKER_HEADER: &str = "rustgo-observability-history-v2";
+const OWNERSHIP_PENDING_MARKER_HEADER: &str = "rustgo-observability-history-pending-v1";
+const STORE_PROOF_HEADER: &str = "rustgo-observability-private-store-v1";
+const STORE_PROOF_FILE_NAME: &str = "rustgo-owner-proof";
 const LEGACY_OWNERSHIP_MARKER_CONTENT: &[u8] = b"rustgo-observability-history-v1\n";
 const RUSTGO_APPLICATION_ID: i64 = 0x5253_474f;
 const OWNER_NONCE_BYTES: usize = 32;
 const MAINTENANCE_BUCKET_LIMIT: usize = 64;
-const CAP_SCAN_ROW_LIMIT: usize = 8192;
+const CAP_CANDIDATE_PAGE_LIMIT: usize = 64;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
+const WAL_AUTOCHECKPOINT_PAGES: i64 = 64;
+const WAL_JOURNAL_SIZE_LIMIT_BYTES: i64 = 256 * 1024;
+const MAINTENANCE_PROGRESS_GRANULARITY: i32 = 1_000;
+const MAX_MAINTENANCE_VM_STEPS: u64 = 250_000;
+const MAX_MAINTENANCE_TURN: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryConfig {
@@ -396,6 +406,7 @@ pub struct HistoryHealth {
     pub history_failures: u64,
     pub worker_running: bool,
     pub maximum_maintenance_scan_rows: u64,
+    pub maximum_maintenance_vm_steps: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -547,6 +558,7 @@ struct Shared {
     history_failures: AtomicU64,
     worker_running: AtomicBool,
     maximum_maintenance_scan_rows: AtomicU64,
+    maximum_maintenance_vm_steps: AtomicU64,
     maximum_database_bytes: u64,
 }
 
@@ -566,6 +578,7 @@ impl Shared {
             history_failures: AtomicU64::new(0),
             worker_running: AtomicBool::new(false),
             maximum_maintenance_scan_rows: AtomicU64::new(0),
+            maximum_maintenance_vm_steps: AtomicU64::new(0),
             maximum_database_bytes,
         }
     }
@@ -1014,6 +1027,10 @@ impl HistoryService {
                 .shared
                 .maximum_maintenance_scan_rows
                 .load(Ordering::Relaxed),
+            maximum_maintenance_vm_steps: self
+                .shared
+                .maximum_maintenance_vm_steps
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -1044,6 +1061,7 @@ impl HistoryWorker {
 
     fn run_blocking(&mut self) {
         let mut connection = None;
+        let mut active_database_path: Option<PathBuf> = None;
         let mut retry_backoff = INITIAL_RETRY_BACKOFF;
         let mut next_open_attempt = Instant::now();
         let mut retry_batches: VecDeque<(QueuedBatch, usize)> = VecDeque::new();
@@ -1064,8 +1082,10 @@ impl HistoryWorker {
                 }
                 self.shared.fail_pending_controls();
                 self.shared.discard_batches_when_closed();
-                if let Some(database) = connection.as_ref() {
-                    let _ = checkpoint_database(database, &self.config, &self.shared);
+                if let (Some(database), Some(database_path)) =
+                    (connection.as_ref(), active_database_path.as_ref())
+                {
+                    let _ = checkpoint_database(database, database_path, &self.shared);
                 }
                 return;
             }
@@ -1097,6 +1117,7 @@ impl HistoryWorker {
                                 .history_available
                                 .store(false, Ordering::Release);
                         }
+                        active_database_path = Some(opened.database_path);
                         connection = Some(opened.connection);
                         cap.get_or_insert_default();
                         if retry_batches.is_empty() {
@@ -1106,6 +1127,7 @@ impl HistoryWorker {
                     }
                     Err(error) => {
                         self.database_failed(&error, &mut warning_limiter);
+                        active_database_path = None;
                         if error.should_quarantine()
                             && quarantine_database(&self.config.database_path).unwrap_or(false)
                         {
@@ -1131,7 +1153,9 @@ impl HistoryWorker {
                 match persist_batches(
                     database,
                     std::slice::from_ref(&batch),
-                    &self.config.database_path,
+                    active_database_path
+                        .as_deref()
+                        .expect("open history database has a stable private path"),
                     &self.shared,
                 ) {
                     Ok(()) => {
@@ -1146,6 +1170,7 @@ impl HistoryWorker {
                     Err(error) => {
                         self.database_failed(&error, &mut warning_limiter);
                         connection = None;
+                        active_database_path = None;
                         self.quarantine_after_failure(&error);
                         if attempts + 1 < MAX_BATCH_WRITE_ATTEMPTS {
                             retry_batches.push_front((batch, attempts + 1));
@@ -1170,12 +1195,24 @@ impl HistoryWorker {
 
             if background_turn {
                 if let Some(state) = cap.as_mut() {
-                    match enforce_size_cap_step(database, &self.config, &self.shared, state) {
-                        Ok(true) => cap = None,
-                        Ok(false) => {}
+                    let database_path = active_database_path
+                        .as_deref()
+                        .expect("open history database has a stable private path");
+                    match bounded_maintenance_turn(database, &self.shared, |database| {
+                        enforce_size_cap_step(
+                            database,
+                            database_path,
+                            &self.config,
+                            &self.shared,
+                            state,
+                        )
+                    }) {
+                        Ok(Some(true)) => cap = None,
+                        Ok(Some(false) | None) => {}
                         Err(error) => {
                             self.database_failed(&error, &mut warning_limiter);
                             connection = None;
+                            active_database_path = None;
                             self.quarantine_after_failure(&error);
                             next_open_attempt = Instant::now() + retry_backoff;
                             retry_backoff = doubled_backoff(retry_backoff);
@@ -1186,21 +1223,27 @@ impl HistoryWorker {
                     continue;
                 }
                 if let Some(job) = maintenance.as_mut() {
-                    match maintenance_step(database, &self.config, job, &self.shared) {
-                        Ok(true) => {
+                    let database_path = active_database_path
+                        .as_deref()
+                        .expect("open history database has a stable private path");
+                    match bounded_maintenance_turn(database, &self.shared, |database| {
+                        maintenance_step(database, database_path, &self.config, job, &self.shared)
+                    }) {
+                        Ok(Some(true)) => {
                             let completed = maintenance
                                 .take()
                                 .expect("completed maintenance job remains owned");
                             completed.finish(Ok(()));
                             next_maintenance = Instant::now() + MAINTENANCE_INTERVAL;
                         }
-                        Ok(false) => {}
+                        Ok(Some(false) | None) => {}
                         Err(error) => {
                             if let Some(failed) = maintenance.take() {
                                 failed.finish(Err(HistoryQueryError::Unavailable));
                             }
                             self.database_failed(&error, &mut warning_limiter);
                             connection = None;
+                            active_database_path = None;
                             self.quarantine_after_failure(&error);
                             next_open_attempt = Instant::now() + retry_backoff;
                             retry_backoff = doubled_backoff(retry_backoff);
@@ -1242,7 +1285,9 @@ impl HistoryWorker {
                     match persist_batches(
                         database,
                         &batches,
-                        &self.config.database_path,
+                        active_database_path
+                            .as_deref()
+                            .expect("open history database has a stable private path"),
                         &self.shared,
                     ) {
                         Ok(()) => {
@@ -1257,6 +1302,7 @@ impl HistoryWorker {
                             self.database_failed(&error, &mut warning_limiter);
                             retry_batches.extend(batches.into_iter().map(|batch| (batch, 1)));
                             connection = None;
+                            active_database_path = None;
                             self.quarantine_after_failure(&error);
                             next_open_attempt = Instant::now() + retry_backoff;
                             retry_backoff = doubled_backoff(retry_backoff);
@@ -1275,6 +1321,7 @@ impl HistoryWorker {
                             self.database_failed(&error, &mut warning_limiter);
                             let _ = response.send(Err(HistoryQueryError::Unavailable));
                             connection = None;
+                            active_database_path = None;
                             self.quarantine_after_failure(&error);
                             next_open_attempt = Instant::now() + retry_backoff;
                             retry_backoff = doubled_backoff(retry_backoff);
@@ -1295,7 +1342,13 @@ impl HistoryWorker {
                     if response.is_closed() {
                         continue;
                     }
-                    match checkpoint_database(database, &self.config, &self.shared) {
+                    match checkpoint_database(
+                        database,
+                        active_database_path
+                            .as_deref()
+                            .expect("open history database has a stable private path"),
+                        &self.shared,
+                    ) {
                         Ok(()) => {
                             let _ = response.send(Ok(()));
                         }
@@ -1303,6 +1356,7 @@ impl HistoryWorker {
                             self.database_failed(&error, &mut warning_limiter);
                             let _ = response.send(Err(HistoryQueryError::Unavailable));
                             connection = None;
+                            active_database_path = None;
                             self.quarantine_after_failure(&error);
                             next_open_attempt = Instant::now() + retry_backoff;
                             retry_backoff = doubled_backoff(retry_backoff);
@@ -1431,12 +1485,8 @@ impl From<io::Error> for DatabaseError {
 
 struct OpenedDatabase {
     connection: Connection,
+    database_path: PathBuf,
     recovered_interrupted_quarantine: bool,
-}
-
-enum ExistingDatabaseIdentity {
-    Current(String),
-    LegacyV4,
 }
 
 fn open_database(config: &HistoryConfig) -> Result<OpenedDatabase, DatabaseError> {
@@ -1447,151 +1497,499 @@ fn open_database(config: &HistoryConfig) -> Result<OpenedDatabase, DatabaseError
     }
     let recovered_interrupted_quarantine = resume_interrupted_quarantine(&config.database_path)?;
     validate_database_path(&config.database_path)?;
-    let existed = fs::symlink_metadata(&config.database_path).is_ok();
-    if !existed && fs::symlink_metadata(ownership_marker_path(&config.database_path)).is_ok() {
+    let legacy_marker = has_legacy_ownership_marker(&config.database_path)?;
+    let ready = if legacy_marker {
+        None
+    } else {
+        read_marker_file_with_handle(&ownership_marker_path(&config.database_path))?
+    };
+    let pending = read_pending_marker(&config.database_path)?;
+    let opened = if let Some((marker, held_marker)) = ready {
+        if pending
+            .as_ref()
+            .is_some_and(|pending| pending.nonce != marker.nonce)
+        {
+            return Err(DatabaseError::Ownership(
+                "ready and pending ownership markers disagree".to_owned(),
+            ));
+        }
+        let opened = open_ready_database(&config.database_path, &marker.nonce, &held_marker)?;
+        if let Some(pending) = pending {
+            retire_pending_marker(&config.database_path, &pending)?;
+        }
+        opened
+    } else if let Some(pending) = pending {
+        resume_pending_database(&config.database_path, &pending)?
+    } else if legacy_marker {
+        start_legacy_migration(&config.database_path)?
+    } else if fs::symlink_metadata(&config.database_path).is_ok() {
         return Err(DatabaseError::Ownership(
-            "an owner marker exists without a matching history database".to_owned(),
+            "existing path has no verifiable Rustgo ownership marker".to_owned(),
         ));
-    }
-    let reserved_database = if existed {
-        None
     } else {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&config.database_path)
-            .map_err(|error| {
-                if error.kind() == io::ErrorKind::AlreadyExists {
-                    DatabaseError::Ownership(
-                        "database path appeared during safe bootstrap".to_owned(),
-                    )
-                } else {
-                    error.into()
-                }
-            })?;
-        Some(file)
+        start_private_bootstrap(&config.database_path)?
     };
-    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
-        | OpenFlags::SQLITE_OPEN_NO_MUTEX
-        | OpenFlags::SQLITE_OPEN_NOFOLLOW;
-    let existing_identity = if existed {
-        Some(validate_existing_database_read_only(&config.database_path)?)
-    } else {
-        None
-    };
-    let held_identity = if existed {
-        Some(SameFileHandle::from_path(&config.database_path)?)
-    } else {
-        None
-    };
-    let connection = Connection::open_with_flags(&config.database_path, flags)?;
-    if let Some(reserved) = &reserved_database {
-        let reserved_handle = SameFileHandle::from_file(reserved.try_clone()?)?;
-        let path_handle = SameFileHandle::from_path(&config.database_path)?;
-        if reserved_handle != path_handle {
-            return Err(DatabaseError::Ownership(
-                "database path changed during safe bootstrap".to_owned(),
-            ));
-        }
-    }
-    connection.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
-    if let Some(held) = held_identity {
-        if held != SameFileHandle::from_path(&config.database_path)? {
-            return Err(DatabaseError::Ownership(
-                "database path changed between ownership proof and writable open".to_owned(),
-            ));
-        }
-    }
-    if let Some(identity) = existing_identity {
-        match identity {
-            ExistingDatabaseIdentity::Current(expected_nonce) => {
-                let nonce = verify_internal_ownership(&connection)?;
-                if nonce != expected_nonce {
-                    return Err(DatabaseError::Ownership(
-                        "database owner nonce changed before writable open".to_owned(),
-                    ));
-                }
-                quick_check(&connection)?;
-                validate_schema(&connection)?;
-            }
-            ExistingDatabaseIdentity::LegacyV4 => {
-                migrate_legacy_v4(&connection, &config.database_path)?
-            }
-        }
-    } else {
-        let objects: i64 = connection.query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'",
-            [],
-            |row| row.get(0),
-        )?;
-        if objects != 0 {
-            return Err(DatabaseError::Ownership(
-                "safe bootstrap requires a newly created empty SQLite database".to_owned(),
-            ));
-        }
-        connection.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
-        configure_database(&connection)?;
-        let nonce = generate_owner_nonce()?;
-        initialize_schema(&connection, &nonce)?;
-        quick_check(&connection)?;
-        validate_schema(&connection)?;
-        checkpoint_truncate(&connection)?;
-        sync_regular_file(&config.database_path)?;
-        sync_parent_directory(&config.database_path)?;
-        write_ownership_marker(&config.database_path, &nonce)?;
-    }
-    configure_database(&connection)?;
-    write_probe(&connection)?;
     Ok(OpenedDatabase {
-        connection,
+        connection: opened.0,
+        database_path: opened.1,
         recovered_interrupted_quarantine,
     })
 }
 
-fn validate_existing_database_read_only(
+fn open_ready_database(
     path: &Path,
-) -> Result<ExistingDatabaseIdentity, DatabaseError> {
+    nonce: &str,
+    held_marker: &HeldPath,
+) -> Result<(Connection, PathBuf), DatabaseError> {
+    validate_owner_nonce(nonce)?;
+    let store = private_store_path(path, nonce)?;
+    if fs::symlink_metadata(&store).is_err() && fs::symlink_metadata(path).is_ok() {
+        validate_current_database_immutable(path, nonce)?;
+        ensure_private_store(path, nonce)?;
+    } else {
+        verify_store_proof(&store, nonce)?;
+    }
+    let database_path = store_database_path(path, &store)?;
+    if fs::symlink_metadata(&database_path).is_err() {
+        relocate_ready_family(path, nonce, &store)?;
+    }
+    let held_database = validate_current_database_immutable(&database_path, nonce)?;
+    verify_held_path(
+        &ownership_marker_path(path),
+        held_marker,
+        "ready ownership marker",
+    )?;
+    let connection = open_private_database_read_write(&database_path, nonce, &held_database)?;
+    Ok((connection, database_path))
+}
+
+fn open_private_database_read_write(
+    database_path: &Path,
+    expected_nonce: &str,
+    held_database: &HeldPath,
+) -> Result<Connection, DatabaseError> {
+    run_debug_preflight_replacement_seam(database_path, held_database)?;
     let connection = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY
+        database_path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
+    verify_held_path(
+        database_path,
+        held_database,
+        "private database during writable open",
+    )?;
     connection.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
+    let nonce = verify_internal_ownership(&connection)?;
+    if nonce != expected_nonce {
+        return Err(DatabaseError::Ownership(
+            "private database nonce changed before writable open".to_owned(),
+        ));
+    }
+    quick_check(&connection)?;
+    validate_schema(&connection)?;
+    configure_database(&connection)?;
+    write_probe(&connection)?;
+    Ok(connection)
+}
+
+#[cfg(debug_assertions)]
+fn run_debug_preflight_replacement_seam(
+    database_path: &Path,
+    held_database: &HeldPath,
+) -> Result<(), DatabaseError> {
+    let directive = sidecar_path(database_path, ".rustgo-test-replace-after-preflight");
+    let Some((content, held_directive)) = read_exact_regular_text_with_handle(&directive)? else {
+        return Ok(());
+    };
+    let mut lines = content.lines();
+    if lines.next() != Some("rustgo-observability-test-replacement-v1") {
+        return Err(DatabaseError::Ownership(
+            "replacement seam directive header is invalid".to_owned(),
+        ));
+    }
+    let replacement_name = lines
+        .next()
+        .and_then(|line| line.strip_prefix("replacement="))
+        .ok_or_else(|| DatabaseError::Ownership("replacement seam source is missing".to_owned()))?;
+    let backup_name = lines
+        .next()
+        .and_then(|line| line.strip_prefix("backup="))
+        .ok_or_else(|| DatabaseError::Ownership("replacement seam backup is missing".to_owned()))?;
+    if lines.next().is_some()
+        || !is_literal_file_name(replacement_name)
+        || !is_literal_file_name(backup_name)
+    {
+        return Err(DatabaseError::Ownership(
+            "replacement seam paths are not literal file names".to_owned(),
+        ));
+    }
+    let replacement = database_path.with_file_name(replacement_name);
+    let backup = database_path.with_file_name(backup_name);
+    move_exact_with_held(
+        &directive,
+        &sidecar_path(&backup, ".seam-consumed"),
+        &held_directive,
+        "replacement seam directive",
+    )?;
+
+    for suffix in ["-journal", "-wal", "-shm"] {
+        let source = sidecar_path(database_path, suffix);
+        if fs::symlink_metadata(&source).is_ok() {
+            move_exact_no_replace(
+                &source,
+                &sidecar_path(&backup, suffix),
+                "owned seam sidecar",
+            )?;
+        }
+    }
+    move_exact_with_held(
+        database_path,
+        &backup,
+        held_database,
+        "owned database at the deterministic replacement seam",
+    )?;
+    for suffix in ["-journal", "-wal", "-shm"] {
+        let source = sidecar_path(&replacement, suffix);
+        if fs::symlink_metadata(&source).is_ok() {
+            move_exact_no_replace(
+                &source,
+                &sidecar_path(database_path, suffix),
+                "replacement seam sidecar",
+            )?;
+        }
+    }
+    move_exact_no_replace(&replacement, database_path, "replacement seam database")
+}
+
+#[cfg(debug_assertions)]
+fn is_literal_file_name(value: &str) -> bool {
+    let path = Path::new(value);
+    !value.is_empty()
+        && path
+            .file_name()
+            .is_some_and(|name| name == path.as_os_str())
+}
+
+#[cfg(not(debug_assertions))]
+fn run_debug_preflight_replacement_seam(
+    _database_path: &Path,
+    _held_database: &HeldPath,
+) -> Result<(), DatabaseError> {
+    Ok(())
+}
+
+fn validate_current_database_immutable(
+    path: &Path,
+    expected_nonce: &str,
+) -> Result<HeldPath, DatabaseError> {
+    let held = hold_exact_file(path, "private database immutable preflight")?;
+    let connection = open_immutable_database(path)?;
+    let nonce = verify_internal_ownership(&connection)?;
+    if nonce != expected_nonce {
+        return Err(DatabaseError::Ownership(
+            "private database nonce does not match the external marker".to_owned(),
+        ));
+    }
+    quick_check(&connection)?;
+    validate_schema(&connection)?;
+    verify_held_path(path, &held, "private database immutable preflight")?;
+    Ok(held)
+}
+
+fn validate_legacy_database_immutable(path: &Path) -> Result<HeldPath, DatabaseError> {
+    let held = hold_exact_file(path, "legacy database immutable preflight")?;
+    let connection = open_immutable_database(path)?;
     let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     let application_id: i64 =
         connection.pragma_query_value(None, "application_id", |row| row.get(0))?;
-    if version == HISTORY_SCHEMA_VERSION && application_id == RUSTGO_APPLICATION_ID {
-        let nonce = verify_internal_ownership(&connection)?;
-        quick_check(&connection)?;
-        validate_schema(&connection)?;
-        match read_ownership_marker(path)? {
-            Some(marker) if marker.nonce == nonce => Ok(ExistingDatabaseIdentity::Current(nonce)),
-            Some(_) => Err(DatabaseError::Ownership(
-                "external marker nonce does not match the database".to_owned(),
-            )),
-            None => Err(DatabaseError::Ownership(
-                "owned history database is missing its external marker".to_owned(),
-            )),
-        }
-    } else if version == 4 && application_id == 0 && has_legacy_ownership_marker(path)? {
-        quick_check(&connection)?;
-        validate_legacy_v4_schema(&connection)?;
-        Ok(ExistingDatabaseIdentity::LegacyV4)
-    } else if version > HISTORY_SCHEMA_VERSION {
-        Err(DatabaseError::IncompatibleSchema(version))
-    } else {
-        Err(DatabaseError::Ownership(
-            "existing SQLite file lacks verifiable Rustgo history ownership".to_owned(),
-        ))
+    if version != 4 || application_id != 0 {
+        return Err(DatabaseError::Ownership(
+            "legacy marker does not name the exact released v4 database".to_owned(),
+        ));
     }
+    quick_check(&connection)?;
+    validate_legacy_v4_schema(&connection)?;
+    verify_held_path(path, &held, "legacy database immutable preflight")?;
+    Ok(held)
+}
+
+fn open_immutable_database(path: &Path) -> Result<Connection, DatabaseError> {
+    let uri = immutable_database_uri(path)?;
+    let connection = Connection::open_with_flags(
+        uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
+    connection.busy_timeout(Duration::ZERO)?;
+    Ok(connection)
+}
+
+fn immutable_database_uri(path: &Path) -> Result<String, DatabaseError> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let text = absolute.to_str().ok_or(DatabaseError::UnsafePath(
+        "immutable SQLite preflight requires a Unicode path",
+    ))?;
+    let normalized = text.replace('\\', "/");
+    let mut uri = String::from("file:");
+    if cfg!(windows) && !normalized.starts_with('/') {
+        uri.push('/');
+    }
+    for byte in normalized.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b':' | b'-' | b'_' | b'.' | b'~') {
+            uri.push(char::from(byte));
+        } else {
+            use std::fmt::Write as _;
+            write!(&mut uri, "%{byte:02X}")
+                .expect("writing one percent-encoded path byte cannot fail");
+        }
+    }
+    uri.push_str("?mode=ro&immutable=1");
+    Ok(uri)
+}
+
+fn start_private_bootstrap(path: &Path) -> Result<(Connection, PathBuf), DatabaseError> {
+    let nonce = generate_owner_nonce()?;
+    let pending = PendingMarker {
+        nonce,
+        kind: PendingKind::Bootstrap,
+    };
+    ensure_private_store(path, &pending.nonce)?;
+    write_pending_marker(path, &pending)?;
+    resume_pending_database(path, &pending)
+}
+
+fn resume_pending_database(
+    path: &Path,
+    pending: &PendingMarker,
+) -> Result<(Connection, PathBuf), DatabaseError> {
+    validate_owner_nonce(&pending.nonce)?;
+    verify_pending_marker(path, pending)?;
+    let store = ensure_private_store(path, &pending.nonce)?;
+    match &pending.kind {
+        PendingKind::Bootstrap => finish_private_bootstrap(path, pending, &store),
+        PendingKind::Migration { legacy_sha256 } => {
+            finish_legacy_migration(path, pending, &store, legacy_sha256)
+        }
+    }
+}
+
+fn finish_private_bootstrap(
+    path: &Path,
+    pending: &PendingMarker,
+    store: &Path,
+) -> Result<(Connection, PathBuf), DatabaseError> {
+    verify_pending_marker(path, pending)?;
+    if fs::symlink_metadata(path).is_ok() {
+        return Err(DatabaseError::Ownership(
+            "configured database path appeared during private bootstrap".to_owned(),
+        ));
+    }
+    let database_path = store_database_path(path, store)?;
+    let connection = match fs::symlink_metadata(&database_path) {
+        Ok(metadata) if metadata.file_type().is_file() && metadata.len() == 0 => {
+            initialize_private_database(&database_path, &pending.nonce)?
+        }
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.file_type().is_file() => {
+            return Err(DatabaseError::UnsafePath(
+                "private bootstrap database is not an exact regular file",
+            ));
+        }
+        Ok(_) => {
+            let held_database =
+                validate_current_database_immutable(&database_path, &pending.nonce)?;
+            open_private_database_read_write(&database_path, &pending.nonce, &held_database)?
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            initialize_private_database(&database_path, &pending.nonce)?
+        }
+        Err(error) => return Err(error.into()),
+    };
+    write_ready_marker(path, &pending.nonce)?;
+    retire_pending_marker(path, pending)?;
+    Ok((connection, database_path))
+}
+
+fn initialize_private_database(
+    database_path: &Path,
+    nonce: &str,
+) -> Result<Connection, DatabaseError> {
+    let reserved = match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(database_path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let metadata = fs::symlink_metadata(database_path)?;
+            if metadata.file_type().is_symlink()
+                || !metadata.file_type().is_file()
+                || metadata.len() != 0
+            {
+                return Err(DatabaseError::Ownership(
+                    "private bootstrap file changed before initialization".to_owned(),
+                ));
+            }
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(database_path)?
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let held = HeldPath {
+        handle: SameFileHandle::from_file(reserved.try_clone()?)?,
+        kind: ExactPathKind::File,
+    };
+    let connection = Connection::open_with_flags(
+        database_path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
+    verify_held_path(
+        database_path,
+        &held,
+        "private bootstrap file during SQLite open",
+    )?;
+    connection.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
+    let objects: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'",
+        [],
+        |row| row.get(0),
+    )?;
+    if objects != 0 {
+        return Err(DatabaseError::Ownership(
+            "private bootstrap requires an empty reserved database".to_owned(),
+        ));
+    }
+    connection.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
+    configure_database(&connection)?;
+    initialize_schema(&connection, nonce)?;
+    quick_check(&connection)?;
+    validate_schema(&connection)?;
+    checkpoint_bounded(&connection)?;
+    sync_regular_file(database_path)?;
+    write_probe(&connection)?;
+    Ok(connection)
+}
+
+fn start_legacy_migration(path: &Path) -> Result<(Connection, PathBuf), DatabaseError> {
+    for member in [
+        sidecar_path(path, "-journal"),
+        sidecar_path(path, "-wal"),
+        sidecar_path(path, "-shm"),
+    ] {
+        if fs::symlink_metadata(&member).is_ok() {
+            return Err(DatabaseError::Ownership(
+                "the exact v4 migration fixture must be cleanly closed without sidecars".to_owned(),
+            ));
+        }
+    }
+    let held_source = validate_legacy_database_immutable(path)?;
+    let legacy_sha256 = sha256_regular_file_with_held(path, &held_source)?;
+    let pending = PendingMarker {
+        nonce: generate_owner_nonce()?,
+        kind: PendingKind::Migration { legacy_sha256 },
+    };
+    ensure_private_store(path, &pending.nonce)?;
+    write_pending_marker(path, &pending)?;
+    resume_pending_database(path, &pending)
+}
+
+fn finish_legacy_migration(
+    path: &Path,
+    pending: &PendingMarker,
+    store: &Path,
+    legacy_sha256: &str,
+) -> Result<(Connection, PathBuf), DatabaseError> {
+    validate_sha256(legacy_sha256)?;
+    verify_pending_marker(path, pending)?;
+    let database_path = store_database_path(path, store)?;
+    let already_current = match fs::symlink_metadata(&database_path) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            validate_current_database_immutable(&database_path, &pending.nonce).is_ok()
+        }
+        Ok(_) => {
+            return Err(DatabaseError::UnsafePath(
+                "migration destination is not an exact regular file",
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error.into()),
+    };
+    if !already_current {
+        if fs::symlink_metadata(&database_path).is_err() {
+            let held_source = validate_legacy_migration_source(path, legacy_sha256)?;
+            verify_pending_marker(path, pending)?;
+            move_exact_with_held(path, &database_path, &held_source, "legacy database")?;
+        }
+        let held_database = validate_legacy_database_immutable(&database_path)?;
+        if sha256_regular_file_with_held(&database_path, &held_database)? != legacy_sha256 {
+            return Err(DatabaseError::Ownership(
+                "moved legacy database does not match the durable migration proof".to_owned(),
+            ));
+        }
+        verify_pending_marker(path, pending)?;
+        let connection = Connection::open_with_flags(
+            &database_path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
+        verify_held_path(
+            &database_path,
+            &held_database,
+            "private migration database during writable open",
+        )?;
+        connection.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
+        migrate_legacy_v4(&connection, &pending.nonce)?;
+        configure_database(&connection)?;
+        checkpoint_bounded(&connection)?;
+        sync_regular_file(&database_path)?;
+        drop(connection);
+    }
+    validate_current_database_immutable(&database_path, &pending.nonce)?;
+    retire_legacy_marker(path, store)?;
+    write_ready_marker(path, &pending.nonce)?;
+    retire_pending_marker(path, pending)?;
+    let held_database = validate_current_database_immutable(&database_path, &pending.nonce)?;
+    let connection =
+        open_private_database_read_write(&database_path, &pending.nonce, &held_database)?;
+    Ok((connection, database_path))
+}
+
+fn validate_legacy_migration_source(
+    path: &Path,
+    expected_sha256: &str,
+) -> Result<HeldPath, DatabaseError> {
+    if !has_legacy_ownership_marker(path)? {
+        return Err(DatabaseError::Ownership(
+            "legacy owner marker disappeared before migration relocation".to_owned(),
+        ));
+    }
+    let held = validate_legacy_database_immutable(path)?;
+    if sha256_regular_file_with_held(path, &held)? != expected_sha256 {
+        return Err(DatabaseError::Ownership(
+            "legacy database changed after the durable migration proof".to_owned(),
+        ));
+    }
+    verify_held_path(path, &held, "legacy migration source")?;
+    Ok(held)
 }
 
 fn configure_database(connection: &Connection) -> Result<(), DatabaseError> {
     connection.pragma_update(None, "foreign_keys", "ON")?;
     connection.pragma_update(None, "synchronous", "NORMAL")?;
-    connection.pragma_update(None, "wal_autocheckpoint", 1000)?;
+    connection.pragma_update(None, "wal_autocheckpoint", WAL_AUTOCHECKPOINT_PAGES)?;
     let journal_mode: String =
         connection.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
     if !journal_mode.eq_ignore_ascii_case("wal") {
@@ -1599,6 +1997,7 @@ fn configure_database(connection: &Connection) -> Result<(), DatabaseError> {
             "journal mode is {journal_mode}, not WAL"
         )));
     }
+    connection.pragma_update(None, "journal_size_limit", WAL_JOURNAL_SIZE_LIMIT_BYTES)?;
     Ok(())
 }
 
@@ -1617,6 +2016,7 @@ const SERVER_METRIC_TABLE_SQL: &str = "CREATE TABLE server_metric_points (
                 metric TEXT NOT NULL,
                 value REAL NOT NULL,
                 sample_count INTEGER NOT NULL CHECK (sample_count > 0),
+                is_latest INTEGER NOT NULL CHECK (is_latest BETWEEN 0 AND 1),
                 PRIMARY KEY (resolution, timestamp_ms, metric)
             ) WITHOUT ROWID";
 const CLIENT_METRIC_TABLE_SQL: &str = "CREATE TABLE client_metric_points (
@@ -1626,6 +2026,7 @@ const CLIENT_METRIC_TABLE_SQL: &str = "CREATE TABLE client_metric_points (
                 metric TEXT NOT NULL,
                 value REAL NOT NULL,
                 sample_count INTEGER NOT NULL CHECK (sample_count > 0),
+                is_latest INTEGER NOT NULL CHECK (is_latest BETWEEN 0 AND 1),
                 PRIMARY KEY (client_name, resolution, timestamp_ms, metric)
             ) WITHOUT ROWID";
 const CLIENT_LIFECYCLE_TABLE_SQL: &str = "CREATE TABLE client_lifecycle (
@@ -1635,9 +2036,52 @@ const CLIENT_LIFECYCLE_TABLE_SQL: &str = "CREATE TABLE client_lifecycle (
                 event_kind TEXT NOT NULL,
                 timestamp_ms INTEGER NOT NULL CHECK (timestamp_ms >= 0),
                 version TEXT,
+                is_latest INTEGER NOT NULL CHECK (is_latest BETWEEN 0 AND 1),
                 UNIQUE (client_name, generation, event_kind, timestamp_ms)
             )";
 const SESSION_SUMMARIES_TABLE_SQL: &str = "CREATE TABLE session_summaries (
+                session_id TEXT NOT NULL,
+                client_name TEXT NOT NULL,
+                peer TEXT,
+                tunnel TEXT,
+                export_name TEXT,
+                kind TEXT NOT NULL,
+                path TEXT NOT NULL,
+                received_bytes TEXT NOT NULL,
+                sent_bytes TEXT NOT NULL,
+                opened_ms INTEGER NOT NULL CHECK (opened_ms >= 0),
+                closed_ms INTEGER CHECK (closed_ms IS NULL OR closed_ms >= 0),
+                terminal_reason TEXT,
+                is_latest_closed INTEGER NOT NULL CHECK (is_latest_closed BETWEEN 0 AND 1),
+                PRIMARY KEY (session_id, opened_ms)
+            )";
+const LEGACY_SERVER_METRIC_TABLE_SQL: &str = "CREATE TABLE server_metric_points (
+                resolution INTEGER NOT NULL CHECK (resolution BETWEEN 0 AND 2),
+                timestamp_ms INTEGER NOT NULL CHECK (timestamp_ms >= 0),
+                metric TEXT NOT NULL,
+                value REAL NOT NULL,
+                sample_count INTEGER NOT NULL CHECK (sample_count > 0),
+                PRIMARY KEY (resolution, timestamp_ms, metric)
+            ) WITHOUT ROWID";
+const LEGACY_CLIENT_METRIC_TABLE_SQL: &str = "CREATE TABLE client_metric_points (
+                client_name TEXT NOT NULL,
+                resolution INTEGER NOT NULL CHECK (resolution BETWEEN 0 AND 2),
+                timestamp_ms INTEGER NOT NULL CHECK (timestamp_ms >= 0),
+                metric TEXT NOT NULL,
+                value REAL NOT NULL,
+                sample_count INTEGER NOT NULL CHECK (sample_count > 0),
+                PRIMARY KEY (client_name, resolution, timestamp_ms, metric)
+            ) WITHOUT ROWID";
+const LEGACY_CLIENT_LIFECYCLE_TABLE_SQL: &str = "CREATE TABLE client_lifecycle (
+                id INTEGER PRIMARY KEY,
+                client_name TEXT NOT NULL,
+                generation TEXT NOT NULL,
+                event_kind TEXT NOT NULL,
+                timestamp_ms INTEGER NOT NULL CHECK (timestamp_ms >= 0),
+                version TEXT,
+                UNIQUE (client_name, generation, event_kind, timestamp_ms)
+            )";
+const LEGACY_SESSION_SUMMARIES_TABLE_SQL: &str = "CREATE TABLE session_summaries (
                 session_id TEXT NOT NULL,
                 client_name TEXT NOT NULL,
                 peer TEXT,
@@ -1691,14 +2135,22 @@ fn initialize_schema(connection: &Connection, owner_nonce: &str) -> Result<(), D
              ON client_metric_points (resolution, metric, timestamp_ms, client_name);
          CREATE INDEX client_metric_retention
              ON client_metric_points (resolution, timestamp_ms, client_name, metric);
+         CREATE INDEX server_metric_cap
+             ON server_metric_points (resolution, is_latest, timestamp_ms, metric);
+         CREATE INDEX client_metric_cap
+             ON client_metric_points (resolution, is_latest, timestamp_ms, client_name, metric);
          CREATE INDEX metric_tombstones_retention
              ON metric_deletion_tombstones (deleted_ms, timestamp_ms, resolution, scope, client_name);
          CREATE INDEX client_lifecycle_time
              ON client_lifecycle (timestamp_ms, id);
          CREATE INDEX client_lifecycle_latest
              ON client_lifecycle (client_name, timestamp_ms DESC, id DESC);
+         CREATE INDEX client_lifecycle_cap
+             ON client_lifecycle (is_latest, timestamp_ms, id);
          CREATE INDEX session_summaries_time
-             ON session_summaries (closed_ms, opened_ms, session_id);"
+             ON session_summaries (closed_ms, opened_ms, session_id);
+         CREATE INDEX session_summaries_cap
+             ON session_summaries (is_latest_closed, closed_ms, opened_ms, session_id);"
     ))?;
     transaction.execute(
         "INSERT INTO history_health
@@ -1712,39 +2164,121 @@ fn initialize_schema(connection: &Connection, owner_nonce: &str) -> Result<(), D
     Ok(())
 }
 
-fn migrate_legacy_v4(connection: &Connection, path: &Path) -> Result<(), DatabaseError> {
+fn migrate_legacy_v4(connection: &Connection, nonce: &str) -> Result<(), DatabaseError> {
     validate_legacy_v4_schema(connection)?;
-    if !has_legacy_ownership_marker(path)? {
-        return Err(DatabaseError::Ownership(
-            "legacy Rustgo ownership marker changed before migration".to_owned(),
-        ));
-    }
-    let nonce = generate_owner_nonce()?;
+    validate_owner_nonce(nonce)?;
     let transaction = connection.unchecked_transaction()?;
     transaction.execute_batch(&format!(
-        "ALTER TABLE history_health RENAME TO legacy_history_health;
+        "ALTER TABLE server_metric_points RENAME TO legacy_server_metric_points;
+         ALTER TABLE client_metric_points RENAME TO legacy_client_metric_points;
+         ALTER TABLE client_lifecycle RENAME TO legacy_client_lifecycle;
+         ALTER TABLE session_summaries RENAME TO legacy_session_summaries;
+         ALTER TABLE history_health RENAME TO legacy_history_health;
+         {SERVER_METRIC_TABLE_SQL};
+         {CLIENT_METRIC_TABLE_SQL};
+         {CLIENT_LIFECYCLE_TABLE_SQL};
+         {SESSION_SUMMARIES_TABLE_SQL};
          {HISTORY_HEALTH_TABLE_SQL};
+         INSERT INTO server_metric_points
+             (resolution, timestamp_ms, metric, value, sample_count, is_latest)
+             SELECT resolution, timestamp_ms, metric, value, sample_count, 0
+             FROM legacy_server_metric_points;
+         INSERT INTO client_metric_points
+             (client_name, resolution, timestamp_ms, metric, value, sample_count, is_latest)
+             SELECT client_name, resolution, timestamp_ms, metric, value, sample_count, 0
+             FROM legacy_client_metric_points;
+         INSERT INTO client_lifecycle
+             (id, client_name, generation, event_kind, timestamp_ms, version, is_latest)
+             SELECT id, client_name, generation, event_kind, timestamp_ms, version, 0
+             FROM legacy_client_lifecycle;
+         INSERT INTO session_summaries
+             (session_id, client_name, peer, tunnel, export_name, kind, path,
+              received_bytes, sent_bytes, opened_ms, closed_ms, terminal_reason,
+              is_latest_closed)
+             SELECT session_id, client_name, peer, tunnel, export_name, kind, path,
+                    received_bytes, sent_bytes, opened_ms, closed_ms, terminal_reason, 0
+             FROM legacy_session_summaries;
          INSERT INTO history_health (id, owner_nonce, last_maintenance_ms, probe_nonce)
              SELECT id, '{nonce}', last_maintenance_ms, probe_nonce
              FROM legacy_history_health;
+         DROP TABLE legacy_server_metric_points;
+         DROP TABLE legacy_client_metric_points;
+         DROP TABLE legacy_client_lifecycle;
+         DROP TABLE legacy_session_summaries;
          DROP TABLE legacy_history_health;
          {METRIC_TOMBSTONES_TABLE_SQL};
-         DROP INDEX client_metric_retention;
+         CREATE INDEX server_metric_query
+             ON server_metric_points (resolution, metric, timestamp_ms);
+         CREATE INDEX client_metric_query
+             ON client_metric_points (resolution, metric, timestamp_ms, client_name);
          CREATE INDEX client_metric_retention
              ON client_metric_points (resolution, timestamp_ms, client_name, metric);
+         CREATE INDEX server_metric_cap
+             ON server_metric_points (resolution, is_latest, timestamp_ms, metric);
+         CREATE INDEX client_metric_cap
+             ON client_metric_points (resolution, is_latest, timestamp_ms, client_name, metric);
          CREATE INDEX metric_tombstones_retention
-             ON metric_deletion_tombstones (deleted_ms, timestamp_ms, resolution, scope, client_name);"
+             ON metric_deletion_tombstones (deleted_ms, timestamp_ms, resolution, scope, client_name);
+         CREATE INDEX client_lifecycle_time ON client_lifecycle (timestamp_ms, id);
+         CREATE INDEX client_lifecycle_latest
+             ON client_lifecycle (client_name, timestamp_ms DESC, id DESC);
+         CREATE INDEX client_lifecycle_cap
+             ON client_lifecycle (is_latest, timestamp_ms, id);
+         CREATE INDEX session_summaries_time
+             ON session_summaries (closed_ms, opened_ms, session_id);
+         CREATE INDEX session_summaries_cap
+             ON session_summaries (is_latest_closed, closed_ms, opened_ms, session_id);
+         UPDATE server_metric_points SET is_latest = 1
+          WHERE (resolution, timestamp_ms) IN (
+              SELECT resolution, MAX(timestamp_ms)
+              FROM server_metric_points GROUP BY resolution
+          );
+         UPDATE client_metric_points SET is_latest = 1
+          WHERE (client_name, resolution, timestamp_ms) IN (
+              SELECT client_name, resolution, MAX(timestamp_ms)
+              FROM client_metric_points GROUP BY client_name, resolution
+          );
+         UPDATE client_lifecycle SET is_latest = 1
+          WHERE id IN (
+              SELECT candidate.id FROM client_lifecycle AS candidate
+              WHERE NOT EXISTS (
+                  SELECT 1 FROM client_lifecycle AS newer
+                  WHERE newer.client_name = candidate.client_name
+                    AND (newer.timestamp_ms > candidate.timestamp_ms OR
+                         (newer.timestamp_ms = candidate.timestamp_ms AND newer.id > candidate.id))
+              )
+          );
+         UPDATE session_summaries SET is_latest_closed = 1
+          WHERE rowid = (
+              SELECT rowid FROM session_summaries WHERE closed_ms IS NOT NULL
+              ORDER BY closed_ms DESC, opened_ms DESC, session_id DESC LIMIT 1
+          );"
     ))?;
     transaction.pragma_update(None, "application_id", RUSTGO_APPLICATION_ID)?;
     transaction.pragma_update(None, "user_version", HISTORY_SCHEMA_VERSION)?;
     transaction.commit()?;
     quick_check(connection)?;
     validate_schema(connection)?;
-    replace_legacy_ownership_marker(path, &nonce)?;
     Ok(())
 }
 
 fn validate_legacy_v4_schema(connection: &Connection) -> Result<(), DatabaseError> {
+    validate_exact_schema_objects(
+        connection,
+        &[
+            ("table", "server_metric_points", "server_metric_points"),
+            ("table", "client_metric_points", "client_metric_points"),
+            ("table", "client_lifecycle", "client_lifecycle"),
+            ("table", "session_summaries", "session_summaries"),
+            ("table", "history_health", "history_health"),
+            ("index", "server_metric_query", "server_metric_points"),
+            ("index", "client_metric_query", "client_metric_points"),
+            ("index", "client_metric_retention", "client_metric_points"),
+            ("index", "client_lifecycle_time", "client_lifecycle"),
+            ("index", "client_lifecycle_latest", "client_lifecycle"),
+            ("index", "session_summaries_time", "session_summaries"),
+        ],
+    )?;
     let auto_vacuum: i64 = connection.pragma_query_value(None, "auto_vacuum", |row| row.get(0))?;
     if auto_vacuum != 2 {
         return Err(DatabaseError::SchemaDamage(
@@ -1754,7 +2288,7 @@ fn validate_legacy_v4_schema(connection: &Connection) -> Result<(), DatabaseErro
     validate_table(
         connection,
         "server_metric_points",
-        SERVER_METRIC_TABLE_SQL,
+        LEGACY_SERVER_METRIC_TABLE_SQL,
         &[
             column("resolution", "INTEGER", true, 1),
             column("timestamp_ms", "INTEGER", true, 2),
@@ -1766,7 +2300,7 @@ fn validate_legacy_v4_schema(connection: &Connection) -> Result<(), DatabaseErro
     validate_table(
         connection,
         "client_metric_points",
-        CLIENT_METRIC_TABLE_SQL,
+        LEGACY_CLIENT_METRIC_TABLE_SQL,
         &[
             column("client_name", "TEXT", true, 1),
             column("resolution", "INTEGER", true, 2),
@@ -1779,7 +2313,7 @@ fn validate_legacy_v4_schema(connection: &Connection) -> Result<(), DatabaseErro
     validate_table(
         connection,
         "client_lifecycle",
-        CLIENT_LIFECYCLE_TABLE_SQL,
+        LEGACY_CLIENT_LIFECYCLE_TABLE_SQL,
         &[
             column("id", "INTEGER", false, 1),
             column("client_name", "TEXT", true, 0),
@@ -1792,7 +2326,7 @@ fn validate_legacy_v4_schema(connection: &Connection) -> Result<(), DatabaseErro
     validate_table(
         connection,
         "session_summaries",
-        SESSION_SUMMARIES_TABLE_SQL,
+        LEGACY_SESSION_SUMMARIES_TABLE_SQL,
         &[
             column("session_id", "TEXT", true, 1),
             column("client_name", "TEXT", true, 0),
@@ -1927,9 +2461,11 @@ fn validate_database_path(path: &Path) -> Result<(), DatabaseError> {
         Err(error) => return Err(error.into()),
     }
     for member in [
+        sidecar_path(path, "-journal"),
         sidecar_path(path, "-wal"),
         sidecar_path(path, "-shm"),
         ownership_marker_path(path),
+        ownership_pending_marker_path(path),
     ] {
         match fs::symlink_metadata(member) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
@@ -1977,6 +2513,36 @@ struct IndexColumnSpec {
 }
 
 fn validate_schema(connection: &Connection) -> Result<(), DatabaseError> {
+    validate_exact_schema_objects(
+        connection,
+        &[
+            ("table", "server_metric_points", "server_metric_points"),
+            ("table", "client_metric_points", "client_metric_points"),
+            ("table", "client_lifecycle", "client_lifecycle"),
+            ("table", "session_summaries", "session_summaries"),
+            ("table", "history_health", "history_health"),
+            (
+                "table",
+                "metric_deletion_tombstones",
+                "metric_deletion_tombstones",
+            ),
+            ("index", "server_metric_query", "server_metric_points"),
+            ("index", "client_metric_query", "client_metric_points"),
+            ("index", "client_metric_retention", "client_metric_points"),
+            ("index", "server_metric_cap", "server_metric_points"),
+            ("index", "client_metric_cap", "client_metric_points"),
+            (
+                "index",
+                "metric_tombstones_retention",
+                "metric_deletion_tombstones",
+            ),
+            ("index", "client_lifecycle_time", "client_lifecycle"),
+            ("index", "client_lifecycle_latest", "client_lifecycle"),
+            ("index", "client_lifecycle_cap", "client_lifecycle"),
+            ("index", "session_summaries_time", "session_summaries"),
+            ("index", "session_summaries_cap", "session_summaries"),
+        ],
+    )?;
     let auto_vacuum: i64 = connection.pragma_query_value(None, "auto_vacuum", |row| row.get(0))?;
     if auto_vacuum != 2 {
         return Err(DatabaseError::SchemaDamage(
@@ -1993,6 +2559,7 @@ fn validate_schema(connection: &Connection) -> Result<(), DatabaseError> {
             column("metric", "TEXT", true, 3),
             column("value", "REAL", true, 0),
             column("sample_count", "INTEGER", true, 0),
+            column("is_latest", "INTEGER", true, 0),
         ],
     )?;
     validate_table(
@@ -2006,6 +2573,7 @@ fn validate_schema(connection: &Connection) -> Result<(), DatabaseError> {
             column("metric", "TEXT", true, 4),
             column("value", "REAL", true, 0),
             column("sample_count", "INTEGER", true, 0),
+            column("is_latest", "INTEGER", true, 0),
         ],
     )?;
     validate_table(
@@ -2019,6 +2587,7 @@ fn validate_schema(connection: &Connection) -> Result<(), DatabaseError> {
             column("event_kind", "TEXT", true, 0),
             column("timestamp_ms", "INTEGER", true, 0),
             column("version", "TEXT", false, 0),
+            column("is_latest", "INTEGER", true, 0),
         ],
     )?;
     validate_table(
@@ -2038,6 +2607,7 @@ fn validate_schema(connection: &Connection) -> Result<(), DatabaseError> {
             column("opened_ms", "INTEGER", true, 2),
             column("closed_ms", "INTEGER", false, 0),
             column("terminal_reason", "TEXT", false, 0),
+            column("is_latest_closed", "INTEGER", true, 0),
         ],
     )?;
     validate_table(
@@ -2098,6 +2668,29 @@ fn validate_schema(connection: &Connection) -> Result<(), DatabaseError> {
     )?;
     validate_named_index(
         connection,
+        "server_metric_points",
+        "server_metric_cap",
+        &[
+            index_column("resolution", false),
+            index_column("is_latest", false),
+            index_column("timestamp_ms", false),
+            index_column("metric", false),
+        ],
+    )?;
+    validate_named_index(
+        connection,
+        "client_metric_points",
+        "client_metric_cap",
+        &[
+            index_column("resolution", false),
+            index_column("is_latest", false),
+            index_column("timestamp_ms", false),
+            index_column("client_name", false),
+            index_column("metric", false),
+        ],
+    )?;
+    validate_named_index(
+        connection,
         "metric_deletion_tombstones",
         "metric_tombstones_retention",
         &[
@@ -2129,9 +2722,30 @@ fn validate_schema(connection: &Connection) -> Result<(), DatabaseError> {
     )?;
     validate_named_index(
         connection,
+        "client_lifecycle",
+        "client_lifecycle_cap",
+        &[
+            index_column("is_latest", false),
+            index_column("timestamp_ms", false),
+            index_column("id", false),
+        ],
+    )?;
+    validate_named_index(
+        connection,
         "session_summaries",
         "session_summaries_time",
         &[
+            index_column("closed_ms", false),
+            index_column("opened_ms", false),
+            index_column("session_id", false),
+        ],
+    )?;
+    validate_named_index(
+        connection,
+        "session_summaries",
+        "session_summaries_cap",
+        &[
+            index_column("is_latest_closed", false),
             index_column("closed_ms", false),
             index_column("opened_ms", false),
             index_column("session_id", false),
@@ -2162,6 +2776,36 @@ fn validate_schema(connection: &Connection) -> Result<(), DatabaseError> {
         &["session_id", "opened_ms"],
     )?;
     Ok(())
+}
+
+fn validate_exact_schema_objects(
+    connection: &Connection,
+    expected: &[(&str, &str, &str)],
+) -> Result<(), DatabaseError> {
+    let mut statement = connection.prepare(
+        "SELECT type, name, tbl_name FROM sqlite_master
+         WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name, tbl_name",
+    )?;
+    let actual = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let expected = expected
+        .iter()
+        .map(|(kind, name, table)| ((*kind).to_owned(), (*name).to_owned(), (*table).to_owned()))
+        .collect::<BTreeSet<_>>();
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(DatabaseError::SchemaDamage(format!(
+            "schema object whitelist mismatch: expected {expected:?}, found {actual:?}"
+        )))
+    }
 }
 
 const fn column(
@@ -2365,8 +3009,21 @@ fn ownership_marker_path(path: &Path) -> PathBuf {
     sidecar_path(path, OWNERSHIP_MARKER_SUFFIX)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct OwnershipMarker {
     nonce: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingMarker {
+    nonce: String,
+    kind: PendingKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PendingKind {
+    Bootstrap,
+    Migration { legacy_sha256: String },
 }
 
 fn generate_owner_nonce() -> Result<String, DatabaseError> {
@@ -2403,122 +3060,477 @@ fn marker_content(nonce: &str) -> String {
     )
 }
 
+fn pending_marker_content(marker: &PendingMarker) -> String {
+    let mut content = format!(
+        "{OWNERSHIP_PENDING_MARKER_HEADER}\napplication_id={RUSTGO_APPLICATION_ID:08x}\nnonce={}\n",
+        marker.nonce
+    );
+    match &marker.kind {
+        PendingKind::Bootstrap => content.push_str("state=bootstrap\n"),
+        PendingKind::Migration { legacy_sha256 } => {
+            content.push_str("state=migration\n");
+            content.push_str(&format!("legacy_sha256={legacy_sha256}\n"));
+        }
+    }
+    content
+}
+
 fn read_ownership_marker(path: &Path) -> Result<Option<OwnershipMarker>, DatabaseError> {
     read_marker_file(&ownership_marker_path(path))
 }
 
-fn read_marker_file(marker: &Path) -> Result<Option<OwnershipMarker>, DatabaseError> {
-    match fs::symlink_metadata(marker) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            return Err(DatabaseError::Ownership(
-                "ownership marker is a symbolic link".to_owned(),
-            ));
-        }
-        Ok(metadata) if !metadata.file_type().is_file() => {
-            return Err(DatabaseError::Ownership(
-                "ownership marker is not a regular file".to_owned(),
-            ));
-        }
-        Ok(_) => {
-            let content = fs::read_to_string(marker)?;
-            let mut lines = content.lines();
-            let expected_application = format!("application_id={RUSTGO_APPLICATION_ID:08x}");
-            if lines.next() != Some(OWNERSHIP_MARKER_HEADER)
-                || lines.next() != Some(expected_application.as_str())
-            {
-                return Err(DatabaseError::Ownership(
-                    "ownership marker header or application_id is invalid".to_owned(),
-                ));
-            }
-            let nonce = lines
-                .next()
-                .and_then(|line| line.strip_prefix("nonce="))
-                .ok_or_else(|| {
-                    DatabaseError::Ownership("ownership marker nonce is missing".to_owned())
-                })?
-                .to_owned();
-            if lines.next().is_some() {
-                return Err(DatabaseError::Ownership(
-                    "ownership marker has unexpected trailing fields".to_owned(),
-                ));
-            }
-            validate_owner_nonce(&nonce)?;
-            return Ok(Some(OwnershipMarker { nonce }));
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    }
+fn ownership_pending_marker_path(path: &Path) -> PathBuf {
+    sidecar_path(path, OWNERSHIP_PENDING_MARKER_SUFFIX)
 }
 
-fn write_ownership_marker(path: &Path, nonce: &str) -> Result<(), DatabaseError> {
+fn read_pending_marker(path: &Path) -> Result<Option<PendingMarker>, DatabaseError> {
+    Ok(read_pending_marker_with_handle(path)?.map(|(marker, _)| marker))
+}
+
+fn read_pending_marker_with_handle(
+    path: &Path,
+) -> Result<Option<(PendingMarker, HeldPath)>, DatabaseError> {
+    read_pending_marker_file_with_handle(&ownership_pending_marker_path(path))
+}
+
+fn verify_pending_marker(path: &Path, expected: &PendingMarker) -> Result<HeldPath, DatabaseError> {
+    let Some((actual, held)) = read_pending_marker_with_handle(path)? else {
+        return Err(DatabaseError::Ownership(
+            "durable pending marker is missing".to_owned(),
+        ));
+    };
+    if actual != *expected {
+        return Err(DatabaseError::Ownership(
+            "durable pending marker changed during recovery".to_owned(),
+        ));
+    }
+    Ok(held)
+}
+
+fn parse_pending_marker_content(content: &str) -> Result<PendingMarker, DatabaseError> {
+    let mut lines = content.lines();
+    let expected_application = format!("application_id={RUSTGO_APPLICATION_ID:08x}");
+    if lines.next() != Some(OWNERSHIP_PENDING_MARKER_HEADER)
+        || lines.next() != Some(expected_application.as_str())
+    {
+        return Err(DatabaseError::Ownership(
+            "pending marker header or application_id is invalid".to_owned(),
+        ));
+    }
+    let nonce = lines
+        .next()
+        .and_then(|line| line.strip_prefix("nonce="))
+        .ok_or_else(|| DatabaseError::Ownership("pending marker nonce is missing".to_owned()))?
+        .to_owned();
+    validate_owner_nonce(&nonce)?;
+    let state = lines
+        .next()
+        .and_then(|line| line.strip_prefix("state="))
+        .ok_or_else(|| DatabaseError::Ownership("pending marker state is missing".to_owned()))?;
+    let kind = match state {
+        "bootstrap" if lines.next().is_none() => PendingKind::Bootstrap,
+        "migration" => {
+            let legacy_sha256 = lines
+                .next()
+                .and_then(|line| line.strip_prefix("legacy_sha256="))
+                .ok_or_else(|| DatabaseError::Ownership("migration proof is missing".to_owned()))?
+                .to_owned();
+            validate_sha256(&legacy_sha256)?;
+            if lines.next().is_some() {
+                return Err(DatabaseError::Ownership(
+                    "pending migration marker has trailing fields".to_owned(),
+                ));
+            }
+            PendingKind::Migration { legacy_sha256 }
+        }
+        _ => {
+            return Err(DatabaseError::Ownership(
+                "pending marker state is invalid".to_owned(),
+            ));
+        }
+    };
+    Ok(PendingMarker { nonce, kind })
+}
+
+fn read_marker_file(marker: &Path) -> Result<Option<OwnershipMarker>, DatabaseError> {
+    Ok(read_marker_file_with_handle(marker)?.map(|(marker, _)| marker))
+}
+
+fn read_marker_file_with_handle(
+    marker: &Path,
+) -> Result<Option<(OwnershipMarker, HeldPath)>, DatabaseError> {
+    let Some((content, held)) = read_exact_regular_text_with_handle(marker)? else {
+        return Ok(None);
+    };
+    let mut lines = content.lines();
+    let expected_application = format!("application_id={RUSTGO_APPLICATION_ID:08x}");
+    if lines.next() != Some(OWNERSHIP_MARKER_HEADER)
+        || lines.next() != Some(expected_application.as_str())
+    {
+        return Err(DatabaseError::Ownership(
+            "ownership marker header or application_id is invalid".to_owned(),
+        ));
+    }
+    let nonce = lines
+        .next()
+        .and_then(|line| line.strip_prefix("nonce="))
+        .ok_or_else(|| DatabaseError::Ownership("ownership marker nonce is missing".to_owned()))?
+        .to_owned();
+    if lines.next().is_some() {
+        return Err(DatabaseError::Ownership(
+            "ownership marker has unexpected trailing fields".to_owned(),
+        ));
+    }
+    validate_owner_nonce(&nonce)?;
+    Ok(Some((OwnershipMarker { nonce }, held)))
+}
+
+fn write_ready_marker(path: &Path, nonce: &str) -> Result<(), DatabaseError> {
     validate_owner_nonce(nonce)?;
     let marker = ownership_marker_path(path);
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&marker)?;
-    file.write_all(marker_content(nonce).as_bytes())?;
-    file.flush()?;
-    file.sync_all()?;
-    sync_parent_directory(&marker)?;
-    Ok(())
+    if let Some(existing) = read_ownership_marker(path)? {
+        return if existing.nonce == nonce {
+            Ok(())
+        } else {
+            Err(DatabaseError::Ownership(
+                "ready owner marker already belongs to another database".to_owned(),
+            ))
+        };
+    }
+    write_new_durable_file(&marker, marker_content(nonce).as_bytes())
+}
+
+fn write_pending_marker(path: &Path, marker: &PendingMarker) -> Result<(), DatabaseError> {
+    validate_owner_nonce(&marker.nonce)?;
+    if let PendingKind::Migration { legacy_sha256 } = &marker.kind {
+        validate_sha256(legacy_sha256)?;
+    }
+    if let Some(existing) = read_pending_marker(path)? {
+        return if existing == *marker {
+            Ok(())
+        } else {
+            Err(DatabaseError::Ownership(
+                "another pending history operation already exists".to_owned(),
+            ))
+        };
+    }
+    write_new_durable_file(
+        &ownership_pending_marker_path(path),
+        pending_marker_content(marker).as_bytes(),
+    )
 }
 
 fn has_legacy_ownership_marker(path: &Path) -> Result<bool, DatabaseError> {
+    Ok(read_legacy_marker_with_handle(path)?.is_some())
+}
+
+fn read_legacy_marker_with_handle(path: &Path) -> Result<Option<HeldPath>, DatabaseError> {
     let marker = ownership_marker_path(path);
-    match fs::symlink_metadata(&marker) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.file_type().is_file() => {
-            Ok(false)
+    let Some((content, held)) = read_exact_regular_text_with_handle(&marker)? else {
+        return Ok(None);
+    };
+    if content.as_bytes() == LEGACY_OWNERSHIP_MARKER_CONTENT {
+        Ok(Some(held))
+    } else {
+        Ok(None)
+    }
+}
+
+fn retire_legacy_marker(path: &Path, store: &Path) -> Result<(), DatabaseError> {
+    let marker = ownership_marker_path(path);
+    let retired = store.join("legacy-owner-marker");
+    if fs::symlink_metadata(&marker).is_err() {
+        return if fs::read(&retired).ok().as_deref() == Some(LEGACY_OWNERSHIP_MARKER_CONTENT) {
+            Ok(())
+        } else {
+            Err(DatabaseError::Ownership(
+                "legacy owner marker disappeared before finalization".to_owned(),
+            ))
+        };
+    }
+    let Some(held_marker) = read_legacy_marker_with_handle(path)? else {
+        return Err(DatabaseError::Ownership(
+            "legacy Rustgo ownership marker changed during migration".to_owned(),
+        ));
+    };
+    move_exact_with_held(&marker, &retired, &held_marker, "legacy owner marker")?;
+    Ok(())
+}
+
+fn retire_pending_marker(path: &Path, pending: &PendingMarker) -> Result<(), DatabaseError> {
+    let source = ownership_pending_marker_path(path);
+    let store = private_store_path(path, &pending.nonce)?;
+    let target = store.join("completed-pending-marker");
+    if fs::symlink_metadata(&source).is_err() {
+        return if read_pending_marker_file(&target)?.as_ref() == Some(pending) {
+            Ok(())
+        } else {
+            Err(DatabaseError::Ownership(
+                "pending marker disappeared before durable retirement".to_owned(),
+            ))
+        };
+    }
+    let Some((current, held_pending)) = read_pending_marker_with_handle(path)? else {
+        return Err(DatabaseError::Ownership(
+            "pending marker disappeared before durable retirement".to_owned(),
+        ));
+    };
+    if current != *pending {
+        return Err(DatabaseError::Ownership(
+            "pending marker changed before durable retirement".to_owned(),
+        ));
+    }
+    move_exact_with_held(&source, &target, &held_pending, "pending owner marker")
+}
+
+fn read_pending_marker_file(path: &Path) -> Result<Option<PendingMarker>, DatabaseError> {
+    Ok(read_pending_marker_file_with_handle(path)?.map(|(marker, _)| marker))
+}
+
+fn read_pending_marker_file_with_handle(
+    path: &Path,
+) -> Result<Option<(PendingMarker, HeldPath)>, DatabaseError> {
+    let Some((content, held)) = read_exact_regular_text_with_handle(path)? else {
+        return Ok(None);
+    };
+    Ok(Some((parse_pending_marker_content(&content)?, held)))
+}
+
+fn private_store_path(path: &Path, nonce: &str) -> Result<PathBuf, DatabaseError> {
+    validate_owner_nonce(nonce)?;
+    let file_name = path.file_name().ok_or(DatabaseError::UnsafePath(
+        "history database path has no literal file name",
+    ))?;
+    let mut store_name = file_name.to_os_string();
+    store_name.push(".rustgo-store-");
+    store_name.push(nonce);
+    Ok(path.with_file_name(store_name))
+}
+
+fn store_database_path(path: &Path, store: &Path) -> Result<PathBuf, DatabaseError> {
+    Ok(store.join(path.file_name().ok_or(DatabaseError::UnsafePath(
+        "history database path has no literal file name",
+    ))?))
+}
+
+fn ensure_private_store(path: &Path, nonce: &str) -> Result<PathBuf, DatabaseError> {
+    let store = private_store_path(path, nonce)?;
+    match fs::symlink_metadata(&store) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() => {
+            return Err(DatabaseError::UnsafePath(
+                "private history store is not an exact directory",
+            ));
         }
-        Ok(_) => Ok(fs::read(marker)? == LEGACY_OWNERSHIP_MARKER_CONTENT),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Ok(_) => verify_store_proof(&store, nonce)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir(&store)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                fs::set_permissions(&store, fs::Permissions::from_mode(0o700))?;
+            }
+            write_new_durable_file(
+                &store.join(STORE_PROOF_FILE_NAME),
+                store_proof_content(nonce).as_bytes(),
+            )?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(store)
+}
+
+fn store_proof_content(nonce: &str) -> String {
+    format!("{STORE_PROOF_HEADER}\nnonce={nonce}\n")
+}
+
+fn verify_store_proof(store: &Path, nonce: &str) -> Result<(), DatabaseError> {
+    let proof = store.join(STORE_PROOF_FILE_NAME);
+    let content = read_exact_regular_text(&proof)?.ok_or_else(|| {
+        DatabaseError::Ownership("private store ownership proof is missing".to_owned())
+    })?;
+    if content == store_proof_content(nonce) {
+        Ok(())
+    } else {
+        Err(DatabaseError::Ownership(
+            "private store ownership proof does not match the external marker".to_owned(),
+        ))
+    }
+}
+
+fn relocate_ready_family(path: &Path, nonce: &str, store: &Path) -> Result<(), DatabaseError> {
+    for sidecar in [
+        sidecar_path(path, "-journal"),
+        sidecar_path(path, "-wal"),
+        sidecar_path(path, "-shm"),
+    ] {
+        if fs::symlink_metadata(&sidecar).is_ok() {
+            return Err(DatabaseError::Ownership(
+                "legacy direct-layout v5 relocation requires a cleanly closed database".to_owned(),
+            ));
+        }
+    }
+    let held_database = validate_current_database_immutable(path, nonce)?;
+    let target = store_database_path(path, store)?;
+    move_exact_with_held(
+        path,
+        &target,
+        &held_database,
+        "owned direct-layout database",
+    )?;
+    validate_current_database_immutable(&target, nonce)?;
+    Ok(())
+}
+
+fn write_new_durable_file(path: &Path, bytes: &[u8]) -> Result<(), DatabaseError> {
+    let mut temporary_name = path
+        .file_name()
+        .ok_or(DatabaseError::UnsafePath(
+            "durable file has no literal file name",
+        ))?
+        .to_os_string();
+    temporary_name.push(".write-");
+    temporary_name.push(generate_owner_nonce()?);
+    let temporary = path.with_file_name(temporary_name);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    file.write_all(bytes)?;
+    file.flush()?;
+    file.sync_all()?;
+    drop(file);
+    atomicwrites::move_atomic(&temporary, path).map_err(DatabaseError::Io)
+}
+
+fn read_exact_regular_text(path: &Path) -> Result<Option<String>, DatabaseError> {
+    Ok(read_exact_regular_text_with_handle(path)?.map(|(content, _)| content))
+}
+
+fn read_exact_regular_text_with_handle(
+    path: &Path,
+) -> Result<Option<(String, HeldPath)>, DatabaseError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.file_type().is_file() => {
+            Err(DatabaseError::Ownership(
+                "ownership metadata is not an exact regular file".to_owned(),
+            ))
+        }
+        Ok(_) => {
+            let held = hold_exact_file(path, "ownership metadata")?;
+            let content = fs::read_to_string(path)?;
+            verify_held_path(path, &held, "ownership metadata")?;
+            Ok(Some((content, held)))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
     }
 }
 
-fn replace_legacy_ownership_marker(path: &Path, nonce: &str) -> Result<(), DatabaseError> {
-    if !has_legacy_ownership_marker(path)? {
-        return Err(DatabaseError::Ownership(
-            "legacy Rustgo ownership marker changed during migration".to_owned(),
-        ));
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExactPathKind {
+    File,
+    Directory,
+}
+
+struct HeldPath {
+    handle: SameFileHandle,
+    kind: ExactPathKind,
+}
+
+fn hold_exact_path(path: &Path, label: &str) -> Result<HeldPath, DatabaseError> {
+    let metadata = fs::symlink_metadata(path)?;
+    let kind = if metadata.file_type().is_symlink() {
+        return Err(DatabaseError::Ownership(format!(
+            "{label} is a symbolic link"
+        )));
+    } else if metadata.file_type().is_file() {
+        ExactPathKind::File
+    } else if metadata.file_type().is_dir() {
+        ExactPathKind::Directory
+    } else {
+        return Err(DatabaseError::Ownership(format!(
+            "{label} is neither an exact file nor an exact directory"
+        )));
+    };
+    let held = HeldPath {
+        handle: SameFileHandle::from_path(path)?,
+        kind,
+    };
+    verify_held_path(path, &held, label)?;
+    Ok(held)
+}
+
+fn hold_exact_file(path: &Path, label: &str) -> Result<HeldPath, DatabaseError> {
+    let held = hold_exact_path(path, label)?;
+    if held.kind != ExactPathKind::File {
+        return Err(DatabaseError::Ownership(format!(
+            "{label} is not an exact regular file"
+        )));
     }
-    let marker = ownership_marker_path(path);
-    let held = SameFileHandle::from_path(&marker)?;
-    if held != SameFileHandle::from_path(&marker)? {
-        return Err(DatabaseError::Ownership(
-            "legacy Rustgo ownership marker was replaced during migration".to_owned(),
-        ));
+    Ok(held)
+}
+
+fn hold_exact_directory(path: &Path, label: &str) -> Result<HeldPath, DatabaseError> {
+    let held = hold_exact_path(path, label)?;
+    if held.kind != ExactPathKind::Directory {
+        return Err(DatabaseError::Ownership(format!(
+            "{label} is not an exact directory"
+        )));
     }
-    let mut file = OpenOptions::new().write(true).open(&marker)?;
-    if held != SameFileHandle::from_file(file.try_clone()?)? {
-        return Err(DatabaseError::Ownership(
-            "legacy Rustgo ownership marker was replaced before rewrite".to_owned(),
-        ));
+    Ok(held)
+}
+
+fn verify_held_path(path: &Path, held: &HeldPath, label: &str) -> Result<(), DatabaseError> {
+    let metadata = fs::symlink_metadata(path)?;
+    let kind_matches = !metadata.file_type().is_symlink()
+        && match held.kind {
+            ExactPathKind::File => metadata.file_type().is_file(),
+            ExactPathKind::Directory => metadata.file_type().is_dir(),
+        };
+    if !kind_matches || held.handle != SameFileHandle::from_path(path)? {
+        return Err(DatabaseError::Ownership(format!(
+            "{label} changed identity"
+        )));
     }
-    file.set_len(0)?;
-    file.write_all(marker_content(nonce).as_bytes())?;
-    file.flush()?;
-    file.sync_all()?;
-    sync_parent_directory(&marker)?;
     Ok(())
 }
 
-fn verify_ownership_pair(path: &Path, marker: &Path) -> Result<bool, DatabaseError> {
-    let Some(marker) = read_marker_file(marker)? else {
-        return Ok(false);
-    };
-    let connection = match Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY
-            | OpenFlags::SQLITE_OPEN_NO_MUTEX
-            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-    ) {
-        Ok(connection) => connection,
-        Err(_) => return Ok(false),
-    };
-    match verify_internal_ownership(&connection) {
-        Ok(nonce) => Ok(nonce == marker.nonce),
-        Err(_) => Ok(false),
+fn move_exact_no_replace(source: &Path, target: &Path, label: &str) -> Result<(), DatabaseError> {
+    let held = hold_exact_path(source, label)?;
+    move_exact_with_held(source, target, &held, label)
+}
+
+fn sha256_regular_file_with_held(path: &Path, held: &HeldPath) -> Result<String, DatabaseError> {
+    let mut file = OpenOptions::new().read(true).open(path)?;
+    if held.handle != SameFileHandle::from_file(file.try_clone()?)? {
+        return Err(DatabaseError::Ownership(
+            "migration proof source changed before hashing".to_owned(),
+        ));
+    }
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    verify_held_path(path, held, "migration proof source")?;
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn validate_sha256(value: &str) -> Result<(), DatabaseError> {
+    if value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        Ok(())
+    } else {
+        Err(DatabaseError::Ownership(
+            "migration proof is not a lowercase SHA-256 digest".to_owned(),
+        ))
     }
 }
 
@@ -2535,6 +3547,10 @@ fn persist_batches(
     let mut server_five_minutes = BTreeSet::new();
     let mut client_minutes = BTreeSet::new();
     let mut client_five_minutes = BTreeSet::new();
+    let mut server_latest_resolutions = BTreeSet::new();
+    let mut client_latest_scopes = BTreeSet::new();
+    let mut lifecycle_latest_clients = BTreeSet::new();
+    let mut refresh_latest_closed_session = false;
 
     for queued in batches {
         let batch = &queued.batch;
@@ -2546,6 +3562,7 @@ fn persist_batches(
                 continue;
             }
             insert_server_sample(&transaction, sample)?;
+            server_latest_resolutions.insert(0_i64);
             server_minutes.insert(bucket_start(
                 sample.timestamp_unix_millis,
                 MINUTE_BUCKET_MILLIS,
@@ -2568,6 +3585,7 @@ fn persist_batches(
                 continue;
             }
             insert_client_sample(&transaction, sample)?;
+            client_latest_scopes.insert((sample.client.name().to_owned(), 0_i64));
             client_minutes.insert((
                 sample.client.name().to_owned(),
                 bucket_start(sample.timestamp_unix_millis, MINUTE_BUCKET_MILLIS),
@@ -2579,20 +3597,25 @@ fn persist_batches(
         }
         for record in &batch.client_lifecycle {
             insert_client_lifecycle(&transaction, record)?;
+            lifecycle_latest_clients.insert(record.client.name().to_owned());
         }
         for session in &batch.session_summaries {
             upsert_session_summary(&transaction, session)?;
+            refresh_latest_closed_session = true;
         }
     }
 
     for bucket in server_minutes {
         aggregate_server_bucket(&transaction, 0, 1, bucket, MINUTE_BUCKET_MILLIS)?;
+        server_latest_resolutions.insert(1);
     }
     for bucket in server_five_minutes {
         aggregate_server_bucket(&transaction, 0, 2, bucket, FIVE_MINUTE_BUCKET_MILLIS)?;
+        server_latest_resolutions.insert(2);
     }
     for (client, bucket) in client_minutes {
         aggregate_client_bucket(&transaction, &client, 0, 1, bucket, MINUTE_BUCKET_MILLIS)?;
+        client_latest_scopes.insert((client, 1));
     }
     for (client, bucket) in client_five_minutes {
         aggregate_client_bucket(
@@ -2603,6 +3626,19 @@ fn persist_batches(
             bucket,
             FIVE_MINUTE_BUCKET_MILLIS,
         )?;
+        client_latest_scopes.insert((client, 2));
+    }
+    for resolution in server_latest_resolutions {
+        refresh_server_latest(&transaction, resolution)?;
+    }
+    for (client, resolution) in client_latest_scopes {
+        refresh_client_latest(&transaction, &client, resolution)?;
+    }
+    for client in lifecycle_latest_clients {
+        refresh_lifecycle_latest(&transaction, &client)?;
+    }
+    if refresh_latest_closed_session {
+        refresh_session_latest_closed(&transaction)?;
     }
     transaction.commit()?;
     let total = database_family_size(database_path)?;
@@ -2651,8 +3687,8 @@ fn insert_server_sample(
     let timestamp = sqlite_integer(sample.timestamp_unix_millis, "server timestamp")?;
     let mut statement = transaction.prepare_cached(
         "INSERT INTO server_metric_points
-         (resolution, timestamp_ms, metric, value, sample_count)
-         VALUES (0, ?1, ?2, ?3, 1)
+         (resolution, timestamp_ms, metric, value, sample_count, is_latest)
+         VALUES (0, ?1, ?2, ?3, 1, 0)
          ON CONFLICT (resolution, timestamp_ms, metric) DO UPDATE SET
              value = excluded.value,
              sample_count = 1",
@@ -2670,8 +3706,8 @@ fn insert_client_sample(
     let timestamp = sqlite_integer(sample.timestamp_unix_millis, "client timestamp")?;
     let mut statement = transaction.prepare_cached(
         "INSERT INTO client_metric_points
-         (client_name, resolution, timestamp_ms, metric, value, sample_count)
-         VALUES (?1, 0, ?2, ?3, ?4, 1)
+         (client_name, resolution, timestamp_ms, metric, value, sample_count, is_latest)
+         VALUES (?1, 0, ?2, ?3, ?4, 1, 0)
          ON CONFLICT (client_name, resolution, timestamp_ms, metric) DO UPDATE SET
              value = excluded.value,
              sample_count = 1",
@@ -2694,8 +3730,8 @@ fn insert_client_lifecycle(
     let timestamp = sqlite_integer(record.timestamp_unix_millis, "client lifecycle timestamp")?;
     transaction.execute(
         "INSERT OR IGNORE INTO client_lifecycle
-         (client_name, generation, event_kind, timestamp_ms, version)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+         (client_name, generation, event_kind, timestamp_ms, version, is_latest)
+         VALUES (?1, ?2, ?3, ?4, ?5, 0)",
         params![
             record.client.name(),
             record.client.generation().to_string(),
@@ -2719,8 +3755,9 @@ fn upsert_session_summary(
     transaction.execute(
         "INSERT INTO session_summaries
          (session_id, client_name, peer, tunnel, export_name, kind, path,
-          received_bytes, sent_bytes, opened_ms, closed_ms, terminal_reason)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+          received_bytes, sent_bytes, opened_ms, closed_ms, terminal_reason,
+          is_latest_closed)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 0)
          ON CONFLICT (session_id, opened_ms) DO UPDATE SET
              client_name = excluded.client_name,
              peer = excluded.peer,
@@ -2731,7 +3768,8 @@ fn upsert_session_summary(
              received_bytes = excluded.received_bytes,
              sent_bytes = excluded.sent_bytes,
              closed_ms = excluded.closed_ms,
-             terminal_reason = excluded.terminal_reason",
+             terminal_reason = excluded.terminal_reason,
+             is_latest_closed = 0",
         params![
             session.id.as_str(),
             session.client.as_str(),
@@ -2761,10 +3799,10 @@ fn aggregate_server_bucket(
     let end = sqlite_integer(bucket.saturating_add(width), "server bucket end")?;
     transaction.execute(
         "INSERT INTO server_metric_points
-         (resolution, timestamp_ms, metric, value, sample_count)
+         (resolution, timestamp_ms, metric, value, sample_count, is_latest)
          SELECT ?1, ?2, metric,
                 SUM(value * sample_count) / SUM(sample_count),
-                SUM(sample_count)
+                SUM(sample_count), 0
          FROM server_metric_points
          WHERE resolution = ?3 AND timestamp_ms >= ?2 AND timestamp_ms < ?4
          GROUP BY metric
@@ -2788,10 +3826,10 @@ fn aggregate_client_bucket(
     let end = sqlite_integer(bucket.saturating_add(width), "client bucket end")?;
     transaction.execute(
         "INSERT INTO client_metric_points
-         (client_name, resolution, timestamp_ms, metric, value, sample_count)
+         (client_name, resolution, timestamp_ms, metric, value, sample_count, is_latest)
          SELECT ?1, ?2, ?3, metric,
                 SUM(value * sample_count) / SUM(sample_count),
-                SUM(sample_count)
+                SUM(sample_count), 0
          FROM client_metric_points
          WHERE client_name = ?1 AND resolution = ?4
            AND timestamp_ms >= ?3 AND timestamp_ms < ?5
@@ -2800,6 +3838,74 @@ fn aggregate_client_bucket(
              value = excluded.value,
              sample_count = excluded.sample_count",
         params![client, target_resolution, start, source_resolution, end],
+    )?;
+    Ok(())
+}
+
+fn refresh_server_latest(
+    transaction: &Transaction<'_>,
+    resolution: i64,
+) -> Result<(), DatabaseError> {
+    transaction.execute(
+        "WITH newest(timestamp_ms) AS (
+             SELECT MAX(timestamp_ms) FROM server_metric_points WHERE resolution = ?1
+         )
+         UPDATE server_metric_points
+         SET is_latest = (timestamp_ms = (SELECT timestamp_ms FROM newest))
+         WHERE resolution = ?1
+           AND (is_latest = 1 OR timestamp_ms = (SELECT timestamp_ms FROM newest))",
+        [resolution],
+    )?;
+    Ok(())
+}
+
+fn refresh_client_latest(
+    transaction: &Transaction<'_>,
+    client: &str,
+    resolution: i64,
+) -> Result<(), DatabaseError> {
+    transaction.execute(
+        "WITH newest(timestamp_ms) AS (
+             SELECT MAX(timestamp_ms) FROM client_metric_points
+             WHERE client_name = ?1 AND resolution = ?2
+         )
+         UPDATE client_metric_points
+         SET is_latest = (timestamp_ms = (SELECT timestamp_ms FROM newest))
+         WHERE client_name = ?1 AND resolution = ?2
+           AND (is_latest = 1 OR timestamp_ms = (SELECT timestamp_ms FROM newest))",
+        params![client, resolution],
+    )?;
+    Ok(())
+}
+
+fn refresh_lifecycle_latest(
+    transaction: &Transaction<'_>,
+    client: &str,
+) -> Result<(), DatabaseError> {
+    transaction.execute(
+        "WITH newest(id) AS (
+             SELECT id FROM client_lifecycle WHERE client_name = ?1
+             ORDER BY timestamp_ms DESC, id DESC LIMIT 1
+         )
+         UPDATE client_lifecycle
+         SET is_latest = (id = (SELECT id FROM newest))
+         WHERE client_name = ?1
+           AND (is_latest = 1 OR id = (SELECT id FROM newest))",
+        [client],
+    )?;
+    Ok(())
+}
+
+fn refresh_session_latest_closed(transaction: &Transaction<'_>) -> Result<(), DatabaseError> {
+    transaction.execute(
+        "WITH newest(row_id) AS (
+             SELECT rowid FROM session_summaries WHERE closed_ms IS NOT NULL
+             ORDER BY closed_ms DESC, opened_ms DESC, session_id DESC LIMIT 1
+         )
+         UPDATE session_summaries
+         SET is_latest_closed = (rowid = (SELECT row_id FROM newest))
+         WHERE is_latest_closed = 1 OR rowid = (SELECT row_id FROM newest)",
+        [],
     )?;
     Ok(())
 }
@@ -3037,6 +4143,7 @@ impl MaintenanceJob {
 
 fn maintenance_step(
     connection: &mut Connection,
+    database_path: &Path,
     config: &HistoryConfig,
     job: &mut MaintenanceJob,
     shared: &Shared,
@@ -3148,13 +4255,49 @@ fn maintenance_step(
             job.phase = MaintenancePhase::Cap(CapState::default());
         }
         MaintenancePhase::Cap(state) => {
-            if enforce_size_cap_step(connection, config, shared, state)? {
+            if enforce_size_cap_step(connection, database_path, config, shared, state)? {
                 job.phase = MaintenancePhase::Done;
             }
         }
         MaintenancePhase::Done => return Ok(true),
     }
     Ok(matches!(job.phase, MaintenancePhase::Done))
+}
+
+fn bounded_maintenance_turn<T>(
+    connection: &mut Connection,
+    shared: &Shared,
+    operation: impl FnOnce(&mut Connection) -> Result<T, DatabaseError>,
+) -> Result<Option<T>, DatabaseError> {
+    let callbacks = Arc::new(AtomicU64::new(0));
+    let callback_count = Arc::clone(&callbacks);
+    let deadline = Instant::now() + MAX_MAINTENANCE_TURN;
+    connection.progress_handler(
+        MAINTENANCE_PROGRESS_GRANULARITY,
+        Some(move || {
+            let callbacks = callback_count.fetch_add(1, Ordering::Relaxed) + 1;
+            callbacks.saturating_mul(MAINTENANCE_PROGRESS_GRANULARITY as u64)
+                >= MAX_MAINTENANCE_VM_STEPS
+                || Instant::now() >= deadline
+        }),
+    );
+    let result = operation(connection);
+    connection.progress_handler(0, None::<fn() -> bool>);
+    shared.maximum_maintenance_vm_steps.fetch_max(
+        callbacks
+            .load(Ordering::Relaxed)
+            .saturating_mul(MAINTENANCE_PROGRESS_GRANULARITY as u64)
+            .min(MAX_MAINTENANCE_VM_STEPS),
+        Ordering::Relaxed,
+    );
+    match result {
+        Err(DatabaseError::Sqlite(rusqlite::Error::SqliteFailure(code, _)))
+            if code.code == rusqlite::ffi::ErrorCode::OperationInterrupted =>
+        {
+            Ok(None)
+        }
+        result => result.map(Some),
+    }
 }
 
 fn raw_admission_cutoff(worker_clock_unix_millis: u64) -> u64 {
@@ -3203,28 +4346,14 @@ fn delete_metric_bucket_chunk(
     let transaction = connection.transaction()?;
     let deleted_at = sqlite_integer(deleted_at, "metric deletion timestamp")?;
     for timestamp in &server_buckets {
-        transaction.execute(
-            "INSERT OR IGNORE INTO metric_deletion_tombstones
-             (scope, client_name, resolution, timestamp_ms, deleted_ms)
-             SELECT 0, '', ?1, ?2, ?3
-             FROM server_metric_points
-             WHERE resolution = ?1 AND timestamp_ms = ?2 LIMIT 1",
-            params![resolution, timestamp, deleted_at],
-        )?;
+        tombstone_deleted_bucket(&transaction, 0, "", resolution, *timestamp, deleted_at)?;
         transaction.execute(
             "DELETE FROM server_metric_points WHERE resolution = ?1 AND timestamp_ms = ?2",
             params![resolution, timestamp],
         )?;
     }
     for (client, timestamp) in &client_buckets {
-        transaction.execute(
-            "INSERT OR IGNORE INTO metric_deletion_tombstones
-             (scope, client_name, resolution, timestamp_ms, deleted_ms)
-             SELECT 1, ?1, ?2, ?3, ?4
-             FROM client_metric_points
-             WHERE client_name = ?1 AND resolution = ?2 AND timestamp_ms = ?3 LIMIT 1",
-            params![client, resolution, timestamp, deleted_at],
-        )?;
+        tombstone_deleted_bucket(&transaction, 1, client, resolution, *timestamp, deleted_at)?;
         transaction.execute(
             "DELETE FROM client_metric_points
              WHERE client_name = ?1 AND resolution = ?2 AND timestamp_ms = ?3",
@@ -3236,13 +4365,53 @@ fn delete_metric_bucket_chunk(
         && client_buckets.len() < MAINTENANCE_BUCKET_LIMIT)
 }
 
+fn tombstone_deleted_bucket(
+    transaction: &Transaction<'_>,
+    scope: i64,
+    client_name: &str,
+    resolution: i64,
+    timestamp: i64,
+    deleted_at: i64,
+) -> Result<(), DatabaseError> {
+    transaction.execute(
+        "INSERT INTO metric_deletion_tombstones
+         (scope, client_name, resolution, timestamp_ms, deleted_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT (scope, client_name, resolution, timestamp_ms) DO UPDATE SET
+             deleted_ms = MAX(metric_deletion_tombstones.deleted_ms, excluded.deleted_ms)",
+        params![scope, client_name, resolution, timestamp, deleted_at],
+    )?;
+    if resolution == 0 {
+        let minute = timestamp / MINUTE_BUCKET_MILLIS as i64 * MINUTE_BUCKET_MILLIS as i64;
+        let five_minutes =
+            timestamp / FIVE_MINUTE_BUCKET_MILLIS as i64 * FIVE_MINUTE_BUCKET_MILLIS as i64;
+        for (aggregate_resolution, aggregate_timestamp) in [(1_i64, minute), (2, five_minutes)] {
+            transaction.execute(
+                "INSERT INTO metric_deletion_tombstones
+                 (scope, client_name, resolution, timestamp_ms, deleted_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT (scope, client_name, resolution, timestamp_ms) DO UPDATE SET
+                     deleted_ms = MAX(metric_deletion_tombstones.deleted_ms, excluded.deleted_ms)",
+                params![
+                    scope,
+                    client_name,
+                    aggregate_resolution,
+                    aggregate_timestamp,
+                    deleted_at
+                ],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn checkpoint_database(
     connection: &Connection,
-    config: &HistoryConfig,
+    database_path: &Path,
     shared: &Shared,
 ) -> Result<(), DatabaseError> {
-    checkpoint_truncate(connection)?;
-    let total = database_family_size(&config.database_path)?;
+    checkpoint_bounded(connection)?;
+    let total = database_family_size(database_path)?;
     shared.total_database_bytes.store(total, Ordering::Relaxed);
     Ok(())
 }
@@ -3268,6 +4437,7 @@ enum CapPhase {
 
 fn enforce_size_cap_step(
     connection: &mut Connection,
+    database_path: &Path,
     config: &HistoryConfig,
     shared: &Shared,
     state: &mut CapState,
@@ -3275,7 +4445,7 @@ fn enforce_size_cap_step(
     let maximum = config.maximum_bytes();
     match state.phase {
         CapPhase::Measure => {
-            let total = database_family_size(&config.database_path)?;
+            let total = database_family_size(database_path)?;
             shared.total_database_bytes.store(total, Ordering::Relaxed);
             if !state.active && total <= maximum {
                 return Ok(true);
@@ -3287,7 +4457,7 @@ fn enforce_size_cap_step(
             state.phase = CapPhase::Checkpoint;
         }
         CapPhase::Checkpoint => {
-            checkpoint_truncate(connection)?;
+            checkpoint_bounded(connection)?;
             state.phase = CapPhase::Vacuum;
         }
         CapPhase::Vacuum => {
@@ -3295,11 +4465,11 @@ fn enforce_size_cap_step(
             state.phase = CapPhase::VacuumCheckpoint;
         }
         CapPhase::VacuumCheckpoint => {
-            checkpoint_truncate(connection)?;
+            checkpoint_bounded(connection)?;
             state.phase = CapPhase::CheckSize;
         }
         CapPhase::CheckSize => {
-            let total = database_family_size(&config.database_path)?;
+            let total = database_family_size(database_path)?;
             shared.total_database_bytes.store(total, Ordering::Relaxed);
             if total <= maximum {
                 return Ok(true);
@@ -3315,7 +4485,7 @@ fn enforce_size_cap_step(
                 CapPruneResult::Deleted => state.phase = CapPhase::Checkpoint,
                 CapPruneResult::Scanning => {}
                 CapPruneResult::Exhausted => {
-                    let total = database_family_size(&config.database_path)?;
+                    let total = database_family_size(database_path)?;
                     shared.total_database_bytes.store(total, Ordering::Relaxed);
                     shared.size_floor_reached.store(true, Ordering::Relaxed);
                     return Ok(true);
@@ -3348,21 +4518,8 @@ impl PartialOrd for MetricPruneCandidate {
 }
 
 #[derive(Default)]
-struct MetricScanCursor {
-    server_timestamp: i64,
-    server_metric: String,
-    server_done: bool,
-    client_timestamp: i64,
-    client_name: String,
-    client_metric: String,
-    client_done: bool,
-    pending: Vec<MetricPruneCandidate>,
-}
-
-#[derive(Default)]
 struct CapPruneState {
     tier: usize,
-    metric_cursor: MetricScanCursor,
 }
 
 enum CapPruneResult {
@@ -3379,10 +4536,9 @@ fn prune_cap_batch_step(
 ) -> Result<CapPruneResult, DatabaseError> {
     if state.tier < 3 {
         let resolution = [2_i64, 1, 0][state.tier];
-        match prune_metric_tier_step(connection, resolution, shared, &mut state.metric_cursor)? {
+        match prune_metric_tier_step(connection, resolution, shared)? {
             CapPruneResult::Exhausted => {
                 state.tier += 1;
-                state.metric_cursor = MetricScanCursor::default();
                 Ok(CapPruneResult::Scanning)
             }
             result => Ok(result),
@@ -3437,175 +4593,94 @@ fn prune_metric_tier_step(
     connection: &mut Connection,
     resolution: i64,
     shared: &Shared,
-    cursor: &mut MetricScanCursor,
 ) -> Result<CapPruneResult, DatabaseError> {
-    let half = (CAP_SCAN_ROW_LIMIT / 2) as i64;
-    let server_rows = if cursor.server_done {
-        Vec::new()
-    } else {
+    let server_rows = {
         let mut statement = connection.prepare(
-            "SELECT timestamp_ms, metric FROM server_metric_points
-             WHERE resolution = ?1
-               AND (timestamp_ms > ?2 OR (timestamp_ms = ?2 AND metric > ?3))
-             ORDER BY timestamp_ms ASC, metric ASC LIMIT ?4",
+            "SELECT timestamp_ms FROM server_metric_points
+             WHERE resolution = ?1 AND is_latest = 0
+             GROUP BY timestamp_ms ORDER BY timestamp_ms ASC LIMIT ?2",
         )?;
         statement
             .query_map(
-                params![
-                    resolution,
-                    cursor.server_timestamp,
-                    cursor.server_metric,
-                    half
-                ],
+                params![resolution, CAP_CANDIDATE_PAGE_LIMIT as i64],
+                |row| row.get::<_, i64>(0),
+            )?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let client_rows = {
+        let mut statement = connection.prepare(
+            "SELECT timestamp_ms, client_name FROM client_metric_points
+             WHERE resolution = ?1 AND is_latest = 0
+             GROUP BY timestamp_ms, client_name
+             ORDER BY timestamp_ms ASC, client_name ASC LIMIT ?2",
+        )?;
+        statement
+            .query_map(
+                params![resolution, CAP_CANDIDATE_PAGE_LIMIT as i64],
                 |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
             )?
             .collect::<Result<Vec<_>, _>>()?
     };
-    if let Some((timestamp, metric)) = server_rows.last() {
-        cursor.server_timestamp = *timestamp;
-        cursor.server_metric.clone_from(metric);
-    }
-    if server_rows.len() < half as usize {
-        cursor.server_done = true;
-    }
-
-    let client_rows = if cursor.client_done {
-        Vec::new()
-    } else {
-        let mut statement = connection.prepare(
-            "SELECT timestamp_ms, client_name, metric FROM client_metric_points
-             WHERE resolution = ?1 AND (
-                 timestamp_ms > ?2 OR
-                 (timestamp_ms = ?2 AND client_name > ?3) OR
-                 (timestamp_ms = ?2 AND client_name = ?3 AND metric > ?4)
-             )
-             ORDER BY timestamp_ms ASC, client_name ASC, metric ASC LIMIT ?5",
-        )?;
-        statement
-            .query_map(
-                params![
-                    resolution,
-                    cursor.client_timestamp,
-                    cursor.client_name,
-                    cursor.client_metric,
-                    half
-                ],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                },
-            )?
-            .collect::<Result<Vec<_>, _>>()?
-    };
-    if let Some((timestamp, client, metric)) = client_rows.last() {
-        cursor.client_timestamp = *timestamp;
-        cursor.client_name.clone_from(client);
-        cursor.client_metric.clone_from(metric);
-    }
-    if client_rows.len() < half as usize {
-        cursor.client_done = true;
-    }
     let scanned = server_rows.len().saturating_add(client_rows.len()) as u64;
     shared
         .maximum_maintenance_scan_rows
         .fetch_max(scanned, Ordering::Relaxed);
 
-    let server_buckets = server_rows
+    let mut candidates = server_rows
         .into_iter()
-        .map(|(timestamp, _)| timestamp)
-        .collect::<BTreeSet<_>>();
-    for timestamp in server_buckets {
-        let has_newer: i64 = connection.query_row(
-            "SELECT EXISTS (SELECT 1 FROM server_metric_points
-             WHERE resolution = ?1 AND timestamp_ms > ?2 LIMIT 1)",
-            params![resolution, timestamp],
-            |row| row.get(0),
-        )?;
-        if has_newer != 0 {
-            cursor.pending.push(MetricPruneCandidate {
-                timestamp,
-                client: None,
-            });
-        }
-    }
-    let client_buckets = client_rows
+        .map(|timestamp| MetricPruneCandidate {
+            timestamp,
+            client: None,
+        })
+        .chain(
+            client_rows
+                .into_iter()
+                .map(|(timestamp, client)| MetricPruneCandidate {
+                    timestamp,
+                    client: Some(client),
+                }),
+        )
+        .collect::<BTreeSet<_>>()
         .into_iter()
-        .map(|(timestamp, client, _)| (timestamp, client))
-        .collect::<BTreeSet<_>>();
-    for (timestamp, client) in client_buckets {
-        let has_newer: i64 = connection.query_row(
-            "SELECT EXISTS (SELECT 1 FROM client_metric_points
-             WHERE client_name = ?1 AND resolution = ?2 AND timestamp_ms > ?3 LIMIT 1)",
-            params![client, resolution, timestamp],
-            |row| row.get(0),
-        )?;
-        if has_newer != 0 {
-            cursor.pending.push(MetricPruneCandidate {
-                timestamp,
-                client: Some(client),
-            });
-        }
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return Ok(CapPruneResult::Exhausted);
     }
-    cursor.pending.sort();
-    cursor.pending.dedup();
-    let server_frontier = if cursor.server_done {
-        i64::MAX
-    } else {
-        cursor.server_timestamp
-    };
-    let client_frontier = if cursor.client_done {
-        i64::MAX
-    } else {
-        cursor.client_timestamp
-    };
-    let safe_frontier = server_frontier.min(client_frontier);
-    let mut safe_count = cursor
-        .pending
-        .partition_point(|candidate| candidate.timestamp <= safe_frontier)
-        .min((CAP_DELETE_LIMIT / 13).max(1));
+    let mut safe_count = candidates.len().min((CAP_DELETE_LIMIT / 13).max(1));
     if safe_count > 1 {
-        let first_is_client = cursor.pending[0].client.is_some();
-        if let Some(scope_boundary) = cursor.pending[1..safe_count]
+        let first_is_client = candidates[0].client.is_some();
+        if let Some(scope_boundary) = candidates[1..safe_count]
             .iter()
             .position(|candidate| candidate.client.is_some() != first_is_client)
         {
             safe_count = scope_boundary + 1;
         }
     }
-    if safe_count == 0 {
-        return Ok(if cursor.server_done && cursor.client_done {
-            CapPruneResult::Exhausted
-        } else {
-            CapPruneResult::Scanning
-        });
-    }
-    let candidates = cursor.pending.drain(..safe_count).collect::<Vec<_>>();
+    candidates.truncate(safe_count);
     let deleted_at = sqlite_integer(unix_millis_now(), "cap deletion timestamp")?;
     let transaction = connection.transaction()?;
     for candidate in candidates {
         if let Some(client) = candidate.client {
-            transaction.execute(
-                "INSERT OR IGNORE INTO metric_deletion_tombstones
-                 (scope, client_name, resolution, timestamp_ms, deleted_ms)
-                 SELECT 1, ?1, ?2, ?3, ?4
-                 FROM client_metric_points
-                 WHERE client_name = ?1 AND resolution = ?2 AND timestamp_ms = ?3 LIMIT 1",
-                params![client, resolution, candidate.timestamp, deleted_at],
+            tombstone_deleted_bucket(
+                &transaction,
+                1,
+                &client,
+                resolution,
+                candidate.timestamp,
+                deleted_at,
             )?;
             transaction.execute(
                 "DELETE FROM client_metric_points WHERE client_name = ?1 AND resolution = ?2 AND timestamp_ms = ?3",
                 params![client, resolution, candidate.timestamp],
             )?;
         } else {
-            transaction.execute(
-                "INSERT OR IGNORE INTO metric_deletion_tombstones
-                 (scope, client_name, resolution, timestamp_ms, deleted_ms)
-                 SELECT 0, '', ?1, ?2, ?3
-                 FROM server_metric_points WHERE resolution = ?1 AND timestamp_ms = ?2 LIMIT 1",
-                params![resolution, candidate.timestamp, deleted_at],
+            tombstone_deleted_bucket(
+                &transaction,
+                0,
+                "",
+                resolution,
+                candidate.timestamp,
+                deleted_at,
             )?;
             transaction.execute(
                 "DELETE FROM server_metric_points WHERE resolution = ?1 AND timestamp_ms = ?2",
@@ -3621,16 +4696,9 @@ fn prune_lifecycle(connection: &mut Connection) -> Result<bool, DatabaseError> {
     let deleted = connection.execute(
         "DELETE FROM client_lifecycle
          WHERE id IN (
-             SELECT candidate.id
-             FROM client_lifecycle AS candidate
-             WHERE candidate.id <> (
-                 SELECT current.id
-                 FROM client_lifecycle AS current
-                 WHERE current.client_name = candidate.client_name
-                 ORDER BY current.timestamp_ms DESC, current.id DESC
-                 LIMIT 1
-             )
-             ORDER BY candidate.timestamp_ms ASC, candidate.id ASC
+             SELECT id FROM client_lifecycle
+             WHERE is_latest = 0
+             ORDER BY timestamp_ms ASC, id ASC
              LIMIT ?1
          )",
         [CAP_DELETE_LIMIT as i64],
@@ -3643,16 +4711,7 @@ fn prune_sessions(connection: &mut Connection) -> Result<bool, DatabaseError> {
         "DELETE FROM session_summaries
          WHERE rowid IN (
              SELECT rowid FROM session_summaries
-             WHERE closed_ms IS NOT NULL
-               AND rowid <> (
-                   SELECT newest.rowid
-                   FROM session_summaries AS newest
-                   WHERE newest.closed_ms IS NOT NULL
-                   ORDER BY newest.closed_ms DESC,
-                            newest.opened_ms DESC,
-                            newest.session_id DESC
-                   LIMIT 1
-               )
+             WHERE closed_ms IS NOT NULL AND is_latest_closed = 0
              ORDER BY closed_ms ASC, opened_ms ASC, session_id ASC
              LIMIT ?1
          )",
@@ -3661,13 +4720,17 @@ fn prune_sessions(connection: &mut Connection) -> Result<bool, DatabaseError> {
     Ok(deleted > 0)
 }
 
-fn checkpoint_truncate(connection: &Connection) -> Result<(), DatabaseError> {
-    let busy: i64 =
-        connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
-    if busy != 0 {
+fn checkpoint_bounded(connection: &Connection) -> Result<(), DatabaseError> {
+    let (busy, log_frames, checkpointed_frames): (i64, i64, i64) =
+        connection.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+    if busy != 0 || checkpointed_frames < log_frames {
         tracing::warn!(
             busy,
-            "SQLite history checkpoint remained busy; size enforcement will retry"
+            log_frames,
+            checkpointed_frames,
+            "SQLite history passive checkpoint remained busy; size enforcement will retry"
         );
     }
     Ok(())
@@ -3716,221 +4779,71 @@ fn database_family_size(path: &Path) -> Result<u64, DatabaseError> {
 }
 
 fn quarantine_database(path: &Path) -> Result<bool, DatabaseError> {
+    if is_protected_history_path(path) || has_legacy_ownership_marker(path)? {
+        return Ok(false);
+    }
     let marker = ownership_marker_path(path);
-    if is_protected_history_path(path) || !verify_ownership_pair(path, &marker)? {
+    let Some((marker_value, held_marker)) = read_marker_file_with_handle(&marker)? else {
         return Ok(false);
-    }
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error.into()),
     };
-    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+    let store = private_store_path(path, &marker_value.nonce)?;
+    let held_store = hold_exact_directory(&store, "private history store")?;
+    verify_store_proof(&store, &marker_value.nonce)?;
+    verify_held_path(&store, &held_store, "private history store")?;
+    let pending = read_pending_marker_with_handle(path)?;
+    if pending
+        .as_ref()
+        .is_some_and(|(pending, _)| pending.nonce != marker_value.nonce)
+    {
         return Ok(false);
     }
-
-    let mut sources = Vec::new();
-    for source in [
-        path.to_path_buf(),
-        sidecar_path(path, "-wal"),
-        sidecar_path(path, "-shm"),
-        marker.clone(),
-    ] {
-        match fs::symlink_metadata(&source) {
-            Ok(metadata)
-                if !metadata.file_type().is_symlink() && metadata.file_type().is_file() =>
-            {
-                sources.push(source);
-            }
-            Ok(_) => return Ok(false),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
+    let quarantine = allocate_quarantine_destination(path)?;
+    move_exact_with_held(&store, &quarantine, &held_store, "private history store")?;
+    if let Some((pending, held)) = pending.as_ref() {
+        let source = ownership_pending_marker_path(path);
+        let target = quarantine.join(source.file_name().ok_or(DatabaseError::UnsafePath(
+            "pending marker has no literal file name",
+        ))?);
+        move_exact_with_held(&source, &target, held, "pending history marker")?;
+        if read_pending_marker_file(&target)?.as_ref() != Some(pending) {
+            return Err(DatabaseError::Ownership(
+                "moved pending marker failed exact verification".to_owned(),
+            ));
         }
     }
-    let held_sources = sources
-        .iter()
-        .map(|source| Ok((source.clone(), SameFileHandle::from_path(source)?)))
-        .collect::<Result<Vec<_>, DatabaseError>>()?;
-
-    let mut quarantine = None;
-    for counter in 0..1000_u16 {
-        let candidate = path.with_file_name(format!(
-            "{}.quarantine-{counter}",
-            path.file_name().unwrap_or_default().to_string_lossy()
-        ));
-        match fs::create_dir(&candidate) {
-            Ok(()) => {
-                quarantine = Some(candidate);
-                break;
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error.into()),
-        }
-    }
-    let quarantine = quarantine.ok_or_else(|| {
-        DatabaseError::Io(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "could not allocate a unique SQLite quarantine name",
-        ))
+    let quarantined_marker = quarantine.join(marker.file_name().ok_or(
+        DatabaseError::UnsafePath("history marker has no literal file name"),
+    )?);
+    move_exact_with_held(
+        &marker,
+        &quarantined_marker,
+        &held_marker,
+        "ready history marker",
+    )?;
+    let moved_marker = read_marker_file(&quarantined_marker)?.ok_or_else(|| {
+        DatabaseError::Ownership("quarantined owner marker is missing".to_owned())
     })?;
-    let mut linked = Vec::new();
-    for (source, held) in &held_sources {
-        let target = quarantine.join(source.file_name().ok_or_else(|| {
-            DatabaseError::UnsafePath("history family member has no literal file name")
-        })?);
-        if let Err(error) = fs::hard_link(source, &target) {
-            for created in linked {
-                let _ = fs::remove_file(created);
-            }
-            let _ = fs::remove_dir(&quarantine);
-            return Err(error.into());
-        }
-        sync_regular_file(&target)?;
-        if held != &SameFileHandle::from_path(&target)? {
-            return Err(DatabaseError::Ownership(
-                "quarantined history member does not match the held source".to_owned(),
-            ));
-        }
-        linked.push(target);
-    }
-    sync_directory(&quarantine)?;
-    sync_parent_directory(&quarantine)?;
-    let quarantined_database =
-        quarantine.join(path.file_name().ok_or_else(|| {
-            DatabaseError::UnsafePath("history database has no literal file name")
-        })?);
-    let quarantined_marker = quarantine.join(
-        marker
-            .file_name()
-            .ok_or_else(|| DatabaseError::UnsafePath("history marker has no literal file name"))?,
-    );
-    if !verify_ownership_pair(&quarantined_database, &quarantined_marker)?
-        || !verify_ownership_pair(path, &marker)?
-    {
-        for created in linked {
-            let _ = fs::remove_file(created);
-        }
-        let _ = fs::remove_dir(&quarantine);
-        return Ok(false);
-    }
-
-    for (source, held) in &held_sources {
-        let target = quarantine.join(source.file_name().ok_or_else(|| {
-            DatabaseError::UnsafePath("history family member has no literal file name")
-        })?);
-        if held != &SameFileHandle::from_path(source)?
-            || held != &SameFileHandle::from_path(&target)?
-        {
-            return Err(DatabaseError::Ownership(
-                "history family changed during quarantine".to_owned(),
-            ));
-        }
-    }
-    for sidecar in [sidecar_path(path, "-wal"), sidecar_path(path, "-shm")] {
-        if !sources.contains(&sidecar) && fs::symlink_metadata(&sidecar).is_ok() {
-            return Err(DatabaseError::Ownership(
-                "a new history sidecar appeared during quarantine".to_owned(),
-            ));
-        }
-    }
-
-    for (source, held) in held_sources
-        .iter()
-        .filter(|(source, _)| source.as_path() != marker.as_path())
-    {
-        let target = quarantine.join(source.file_name().ok_or_else(|| {
-            DatabaseError::UnsafePath("history family member has no literal file name")
-        })?);
-        if held != &SameFileHandle::from_path(source)?
-            || held != &SameFileHandle::from_path(&target)?
-        {
-            return Err(DatabaseError::Ownership(
-                "history family changed before quarantine cleanup".to_owned(),
-            ));
-        }
-        fs::remove_file(source)?;
-        sync_parent_directory(source)?;
-    }
-    let marker_handle = held_sources
-        .iter()
-        .find(|(source, _)| source == &marker)
-        .map(|(_, handle)| handle)
-        .ok_or_else(|| DatabaseError::Ownership("history marker disappeared".to_owned()))?;
-    if marker_handle != &SameFileHandle::from_path(&marker)?
-        || marker_handle != &SameFileHandle::from_path(&quarantined_marker)?
-    {
+    if moved_marker.nonce != marker_value.nonce {
         return Err(DatabaseError::Ownership(
-            "history owner marker changed before quarantine cleanup".to_owned(),
+            "quarantined owner marker nonce changed".to_owned(),
         ));
     }
-    fs::remove_file(&marker)?;
-    sync_parent_directory(&marker)?;
+    verify_store_proof(&quarantine, &marker_value.nonce)?;
     Ok(true)
 }
 
-fn remove_resumed_sidecar(path: &Path, quarantine: &Path) -> Result<(), DatabaseError> {
-    let target = quarantine
-        .join(path.file_name().ok_or_else(|| {
-            DatabaseError::UnsafePath("history sidecar has no literal file name")
-        })?);
-    let source_metadata = fs::symlink_metadata(path);
-    let target_metadata = fs::symlink_metadata(&target);
-    match (source_metadata, target_metadata) {
-        (Err(source), Err(target))
-            if source.kind() == io::ErrorKind::NotFound
-                && target.kind() == io::ErrorKind::NotFound =>
-        {
-            Ok(())
-        }
-        (Err(source), Ok(_)) if source.kind() == io::ErrorKind::NotFound => Ok(()),
-        (Ok(_), Ok(_)) if same_file_identity(path, &target)? => {
-            fs::remove_file(path)?;
-            sync_parent_directory(path)?;
-            Ok(())
-        }
-        (Ok(_), Err(target)) if target.kind() == io::ErrorKind::NotFound => {
-            Err(DatabaseError::Ownership(
-                "an unrelated sidecar appeared during interrupted quarantine".to_owned(),
-            ))
-        }
-        (Err(error), _) | (_, Err(error)) => Err(error.into()),
-        (Ok(_), Ok(_)) => Err(DatabaseError::Ownership(
-            "history sidecar changed during interrupted quarantine".to_owned(),
-        )),
-    }
-}
-
-fn same_file_identity(left: &Path, right: &Path) -> Result<bool, DatabaseError> {
-    let left_metadata = fs::symlink_metadata(left)?;
-    let right_metadata = fs::symlink_metadata(right)?;
-    if left_metadata.file_type().is_symlink()
-        || right_metadata.file_type().is_symlink()
-        || !left_metadata.file_type().is_file()
-        || !right_metadata.file_type().is_file()
-    {
-        return Ok(false);
-    }
-    same_file::is_same_file(left, right).map_err(DatabaseError::Io)
-}
-
 fn resume_interrupted_quarantine(path: &Path) -> Result<bool, DatabaseError> {
-    if fs::symlink_metadata(path).is_ok() {
+    if is_protected_history_path(path) || has_legacy_ownership_marker(path)? {
         return Ok(false);
     }
     let marker = ownership_marker_path(path);
-    match fs::symlink_metadata(&marker) {
-        Ok(metadata) if metadata.file_type().is_file() => {}
-        Ok(_) => {
-            return Err(DatabaseError::UnsafePath(
-                "interrupted quarantine marker is not a regular file",
-            ));
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error.into()),
-    }
-    let Some(original_marker) = read_marker_file(&marker)? else {
+    let Some((original_marker, held_marker)) = read_marker_file_with_handle(&marker)? else {
         return Ok(false);
     };
+    let store = private_store_path(path, &original_marker.nonce)?;
+    if fs::symlink_metadata(&store).is_ok() {
+        return Ok(false);
+    }
     for counter in 0..1000_u16 {
         let quarantine = path.with_file_name(format!(
             "{}.quarantine-{counter}",
@@ -3944,34 +4857,85 @@ fn resume_interrupted_quarantine(path: &Path) -> Result<bool, DatabaseError> {
         if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
             continue;
         }
-        let quarantined_database = quarantine.join(path.file_name().ok_or_else(|| {
-            DatabaseError::UnsafePath("history database has no literal file name")
-        })?);
-        let quarantined_marker =
-            quarantine.join(marker.file_name().ok_or_else(|| {
-                DatabaseError::UnsafePath("history marker has no literal file name")
-            })?);
-        let Some(candidate_marker) = read_marker_file(&quarantined_marker)? else {
-            continue;
-        };
-        if candidate_marker.nonce != original_marker.nonce
-            || !verify_ownership_pair(&quarantined_database, &quarantined_marker)?
-            || !same_file_identity(&marker, &quarantined_marker)?
-        {
+        let held_quarantine = hold_exact_directory(&quarantine, "interrupted quarantine")?;
+        if verify_store_proof(&quarantine, &original_marker.nonce).is_err() {
             continue;
         }
-        remove_resumed_sidecar(&sidecar_path(path, "-wal"), &quarantine)?;
-        remove_resumed_sidecar(&sidecar_path(path, "-shm"), &quarantine)?;
-        if !same_file_identity(&marker, &quarantined_marker)? {
-            return Err(DatabaseError::Ownership(
-                "interrupted quarantine marker changed during cleanup".to_owned(),
-            ));
+        verify_held_path(&quarantine, &held_quarantine, "interrupted quarantine")?;
+        if let Some((pending, held_pending)) = read_pending_marker_with_handle(path)? {
+            if pending.nonce != original_marker.nonce {
+                return Err(DatabaseError::Ownership(
+                    "interrupted quarantine pending marker has another nonce".to_owned(),
+                ));
+            }
+            let source = ownership_pending_marker_path(path);
+            let target = quarantine.join(source.file_name().ok_or(DatabaseError::UnsafePath(
+                "pending marker has no literal file name",
+            ))?);
+            move_exact_with_held(
+                &source,
+                &target,
+                &held_pending,
+                "resumed pending history marker",
+            )?;
+            verify_held_path(&quarantine, &held_quarantine, "interrupted quarantine")?;
         }
-        fs::remove_file(&marker)?;
-        sync_parent_directory(&marker)?;
+        let target = quarantine.join(marker.file_name().ok_or(DatabaseError::UnsafePath(
+            "history marker has no literal file name",
+        ))?);
+        move_exact_with_held(
+            &marker,
+            &target,
+            &held_marker,
+            "resumed ready history marker",
+        )?;
+        verify_held_path(&quarantine, &held_quarantine, "interrupted quarantine")?;
         return Ok(true);
     }
     Ok(false)
+}
+
+fn allocate_quarantine_destination(path: &Path) -> Result<PathBuf, DatabaseError> {
+    for counter in 0..1000_u16 {
+        let candidate = path.with_file_name(format!(
+            "{}.quarantine-{counter}",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        match fs::symlink_metadata(&candidate) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(candidate),
+            Ok(_) => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(DatabaseError::Io(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a unique SQLite quarantine name",
+    )))
+}
+
+fn move_exact_with_held(
+    source: &Path,
+    target: &Path,
+    held: &HeldPath,
+    label: &str,
+) -> Result<(), DatabaseError> {
+    atomicwrites::move_atomic(source, target)?;
+    if verify_held_path(target, held, label).is_ok() {
+        return Ok(());
+    }
+    let restored = if fs::symlink_metadata(source).is_err() {
+        atomicwrites::move_atomic(target, source).is_ok()
+    } else {
+        false
+    };
+    Err(DatabaseError::Ownership(format!(
+        "{label} was replaced during atomic move; the moved replacement was {}",
+        if restored {
+            "restored without overwrite"
+        } else {
+            "retained safely in quarantine"
+        }
+    )))
 }
 
 fn sync_regular_file(path: &Path) -> Result<(), DatabaseError> {
@@ -3980,24 +4944,6 @@ fn sync_regular_file(path: &Path) -> Result<(), DatabaseError> {
         .write(true)
         .open(path)?
         .sync_all()?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn sync_directory(path: &Path) -> Result<(), DatabaseError> {
-    fs::File::open(path)?.sync_all()?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn sync_directory(_path: &Path) -> Result<(), DatabaseError> {
-    Ok(())
-}
-
-fn sync_parent_directory(path: &Path) -> Result<(), DatabaseError> {
-    if let Some(parent) = path.parent() {
-        sync_directory(parent)?;
-    }
     Ok(())
 }
 

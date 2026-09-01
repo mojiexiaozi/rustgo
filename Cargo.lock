@@ -1534,6 +1534,7 @@ dependencies = [
 name = "rustgo-observability"
 version = "0.1.0"
 dependencies = [
+ "atomicwrites",
  "rand 0.9.5",
  "rusqlite",
  "same-file",
