@@ -295,6 +295,11 @@ fn validate_web(web: &crate::WebConfig) -> Result<(), ValidationError> {
             "web.bind must use a port between 1 and 65535",
         ));
     }
+    if bind.port() == 7443 {
+        return Err(ValidationError::new(
+            "web.bind must not use Rustgo relay port 7443",
+        ));
+    }
     validate_byte_string("web.admin_username", &web.admin_username, 1, 64)?;
     validate_byte_string("web.admin_password", &web.admin_password, 16, 256)?;
     if !(1..=90).contains(&web.history_days) {

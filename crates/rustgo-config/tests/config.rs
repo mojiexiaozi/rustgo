@@ -323,6 +323,23 @@ fn enabled_web_configuration_rejects_non_loopback_and_weak_credentials() {
 }
 
 #[test]
+fn enabled_web_configuration_rejects_the_reserved_relay_port() {
+    let dir = TempDir::new();
+    let config = format!(
+        "{}\n[web]\nenabled = true\nbind = \"127.0.0.1:7443\"\nadmin_password = \"a-password-that-is-at-least-sixteen-bytes\"\n",
+        valid_server()
+    );
+
+    let error = load_server_text(&dir, &config).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("must not use Rustgo relay port 7443")
+    );
+}
+
+#[test]
 fn enabled_telemetry_requires_valid_ordered_intervals() {
     let dir = TempDir::new();
     let valid =
