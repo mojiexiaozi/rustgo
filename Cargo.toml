@@ -10,6 +10,7 @@ version = "0.1.0"
 [workspace.dependencies]
 anyhow = "1.0.100"
 async-trait = "0.1.89"
+axum = "0.8.4"
 base64 = "0.22.1"
 bytes = "1.10.1"
 chacha20poly1305 = "0.10.1"
@@ -22,11 +23,14 @@ proptest = "1.7.0"
 quinn = { version = "0.11.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
 rand = "0.9.2"
 rcgen = "0.14.9"
+rusqlite = { version = "0.37.0", features = ["bundled"] }
 rustls = "0.23.31"
 rustls-pemfile = "2.2.0"
 serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.143"
 sha2 = "0.10.9"
 socket2 = { version = "0.6.1", features = ["all"] }
+sysinfo = "0.37.0"
 thiserror = "2.0.16"
 tokio = { version = "1.47.1", features = ["full"] }
 tokio-util = { version = "0.7.19", features = ["rt"] }

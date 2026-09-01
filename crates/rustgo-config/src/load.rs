@@ -5,7 +5,7 @@ use std::{
 
 use thiserror::Error;
 
-use crate::{ClientConfig, ServerConfig, ValidationError};
+use crate::{ClientConfig, ConfigWarning, ServerConfig, ValidationError};
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -29,6 +29,19 @@ pub enum ConfigError {
         field: &'static str,
         referenced_path: PathBuf,
     },
+    #[error("enabled web configuration file `{path}` must not grant group or other permissions")]
+    InsecureWebConfigurationFile { path: PathBuf },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ServerReferenceCheck {
+    warnings: Vec<ConfigWarning>,
+}
+
+impl ServerReferenceCheck {
+    pub fn warnings(&self) -> &[ConfigWarning] {
+        &self.warnings
+    }
 }
 
 pub fn load_server(path: &Path) -> Result<ServerConfig, ConfigError> {
@@ -42,6 +55,9 @@ where
     let mut config: ServerConfig = load(path, &environment)?;
     resolve_path(path, &mut config.server.certificate_file);
     resolve_path(path, &mut config.server.private_key_file);
+    if let Some(web) = &mut config.web {
+        resolve_path(path, &mut web.database_path);
+    }
     config.validate().map_err(|error| ConfigError::Validation {
         path: path.to_path_buf(),
         error,
@@ -70,9 +86,15 @@ where
 pub fn check_server_references(
     config_path: &Path,
     config: &ServerConfig,
-) -> Result<(), ConfigError> {
+) -> Result<ServerReferenceCheck, ConfigError> {
     check_reference(config_path, "certificate", &config.server.certificate_file)?;
-    check_reference(config_path, "private key", &config.server.private_key_file)
+    check_reference(config_path, "private key", &config.server.private_key_file)?;
+    if config.web.as_ref().is_some_and(|web| web.enabled) {
+        check_web_configuration_permissions(config_path)?;
+    }
+    Ok(ServerReferenceCheck {
+        warnings: config.validation_warnings(),
+    })
 }
 
 pub fn check_client_references(
@@ -123,6 +145,27 @@ fn check_reference(
             referenced_path: reference.to_path_buf(),
         })
     }
+}
+
+#[cfg(unix)]
+fn check_web_configuration_permissions(config_path: &Path) -> Result<(), ConfigError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = fs::metadata(config_path).map_err(|error| ConfigError::Read {
+        path: config_path.to_path_buf(),
+        kind: error.kind(),
+    })?;
+    if metadata.mode() & 0o077 != 0 {
+        return Err(ConfigError::InsecureWebConfigurationFile {
+            path: config_path.to_path_buf(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn check_web_configuration_permissions(_config_path: &Path) -> Result<(), ConfigError> {
+    Ok(())
 }
 
 fn interpolate<F>(path: &Path, source: &str, environment: &F) -> Result<String, ConfigError>

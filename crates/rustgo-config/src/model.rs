@@ -1,4 +1,4 @@
-use std::{net::IpAddr, path::PathBuf};
+use std::{fmt, net::IpAddr, path::PathBuf};
 
 use serde::Deserialize;
 
@@ -11,6 +11,8 @@ pub struct ServerConfig {
     pub limits: Limits,
     #[serde(default)]
     pub clients: Vec<AuthorizedClient>,
+    #[serde(default)]
+    pub web: Option<WebConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -52,6 +54,8 @@ pub struct ClientConfig {
     pub client: ClientSection,
     pub p2p: Option<crate::P2pConfig>,
     #[serde(default)]
+    pub telemetry: Option<TelemetryConfig>,
+    #[serde(default)]
     pub tunnels: Vec<TunnelConfig>,
     #[serde(default)]
     pub exports: Vec<crate::ExportConfig>,
@@ -86,9 +90,75 @@ pub enum TunnelProtocol {
     Udp,
 }
 
+#[derive(Clone, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct WebConfig {
+    pub enabled: bool,
+    pub bind: String,
+    pub admin_username: String,
+    pub admin_password: String,
+    pub cookie_secure: bool,
+    pub history_days: u16,
+    pub database_path: PathBuf,
+    pub database_max_mib: u32,
+}
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: "127.0.0.1:7450".to_owned(),
+            admin_username: "admin".to_owned(),
+            admin_password: "replace-with-at-least-16-characters".to_owned(),
+            cookie_secure: true,
+            history_days: 7,
+            database_path: PathBuf::from("./rustgo-metrics.db"),
+            database_max_mib: 256,
+        }
+    }
+}
+
+impl fmt::Debug for WebConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WebConfig")
+            .field("enabled", &self.enabled)
+            .field("bind", &self.bind)
+            .field("admin_username", &self.admin_username)
+            .field("admin_password", &"[REDACTED]")
+            .field("cookie_secure", &self.cookie_secure)
+            .field("history_days", &self.history_days)
+            .field("database_path", &self.database_path)
+            .field("database_max_mib", &self.database_max_mib)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct TelemetryConfig {
+    pub enabled: bool,
+    pub sample_interval_secs: u64,
+    pub report_interval_secs: u64,
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            sample_interval_secs: 10,
+            report_interval_secs: 30,
+        }
+    }
+}
+
 impl ServerConfig {
     pub fn validate(&self) -> Result<(), ValidationError> {
         crate::validate::validate_server(self)
+    }
+
+    pub fn validation_warnings(&self) -> Vec<crate::ConfigWarning> {
+        crate::validate::server_validation_warnings(self)
     }
 }
 

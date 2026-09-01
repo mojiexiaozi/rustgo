@@ -8,8 +8,9 @@ use std::{
 };
 
 use rustgo_config::{
-    ClientConfig, ServerConfig, TunnelProtocol, check_client_references, load_client,
-    load_client_with_lookup, load_server,
+    ClientConfig, ServerConfig, TelemetryConfig, TunnelProtocol, WebConfig,
+    check_client_references, check_server_references, load_client, load_client_with_lookup,
+    load_server,
 };
 
 static NEXT_TEMP_DIR: AtomicUsize = AtomicUsize::new(0);
@@ -250,6 +251,142 @@ fn relative_file_paths_resolve_from_config_directory() {
         client.client.private_key_file,
         dir.path.join("keys/device.key")
     );
+}
+
+#[test]
+fn observability_sections_are_absent_without_changing_v02_configuration() {
+    let dir = TempDir::new();
+
+    let server = load_server_text(&dir, &valid_server()).unwrap();
+    let client = load_client_text(&dir, &valid_client()).unwrap();
+
+    assert_eq!(server.web, None);
+    assert_eq!(client.telemetry, None);
+}
+
+#[test]
+fn observability_section_defaults_match_the_documented_reference_values() {
+    assert_eq!(
+        WebConfig::default(),
+        WebConfig {
+            enabled: false,
+            bind: "127.0.0.1:7450".to_owned(),
+            admin_username: "admin".to_owned(),
+            admin_password: "replace-with-at-least-16-characters".to_owned(),
+            cookie_secure: true,
+            history_days: 7,
+            database_path: PathBuf::from("./rustgo-metrics.db"),
+            database_max_mib: 256,
+        }
+    );
+    assert_eq!(
+        TelemetryConfig::default(),
+        TelemetryConfig {
+            enabled: true,
+            sample_interval_secs: 10,
+            report_interval_secs: 30,
+        }
+    );
+}
+
+#[test]
+fn enabled_web_configuration_resolves_its_database_relative_to_the_toml_file() {
+    let dir = TempDir::new();
+    let config = format!(
+        "{}\n[web]\nenabled = true\nadmin_password = \"a-password-that-is-at-least-sixteen-bytes\"\ndatabase_path = \"history/metrics.db\"\n",
+        valid_server()
+    );
+
+    let loaded = load_server_text(&dir, &config).unwrap();
+    let web = loaded.web.unwrap();
+
+    assert_eq!(web.bind, "127.0.0.1:7450");
+    assert_eq!(web.database_path, dir.path.join("history/metrics.db"));
+}
+
+#[test]
+fn enabled_web_configuration_rejects_non_loopback_and_weak_credentials() {
+    let dir = TempDir::new();
+    let valid_web = "\n[web]\nenabled = true\nbind = \"127.0.0.1:7450\"\nadmin_username = \"admin\"\nadmin_password = \"a-password-that-is-at-least-sixteen-bytes\"\ncookie_secure = false\nhistory_days = 90\ndatabase_path = \"metrics.db\"\ndatabase_max_mib = 4096\n";
+
+    for invalid in [
+        valid_web.replace("127.0.0.1:7450", "0.0.0.0:7450"),
+        valid_web.replace("admin_username = \"admin\"", "admin_username = \"\""),
+        valid_web.replace(
+            "admin_password = \"a-password-that-is-at-least-sixteen-bytes\"",
+            "admin_password = \"too-short\"",
+        ),
+        valid_web.replace("history_days = 90", "history_days = 91"),
+    ] {
+        assert!(load_server_text(&dir, &format!("{}{}", valid_server(), invalid)).is_err());
+    }
+}
+
+#[test]
+fn enabled_telemetry_requires_valid_ordered_intervals() {
+    let dir = TempDir::new();
+    let valid =
+        "\n[telemetry]\nenabled = true\nsample_interval_secs = 10\nreport_interval_secs = 30\n";
+    assert!(load_client_text(&dir, &format!("{}{}", valid_client(), valid)).is_ok());
+
+    for invalid in [
+        valid.replace("sample_interval_secs = 10", "sample_interval_secs = 0"),
+        valid.replace("report_interval_secs = 30", "report_interval_secs = 3601"),
+        valid.replace("report_interval_secs = 30", "report_interval_secs = 9"),
+    ] {
+        assert!(load_client_text(&dir, &format!("{}{}", valid_client(), invalid)).is_err());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn enabled_web_configuration_rejects_group_or_world_readable_toml() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = TempDir::new();
+    fs::create_dir_all(dir.path.join("certs")).unwrap();
+    fs::write(dir.path.join("certs/server.crt"), "certificate").unwrap();
+    fs::write(dir.path.join("certs/server.key"), "private key").unwrap();
+    let config_path = dir.write(
+        "server.toml",
+        &format!(
+            "{}\n[web]\nenabled = true\nadmin_password = \"a-password-that-is-at-least-sixteen-bytes\"\n",
+            valid_server()
+        ),
+    );
+    fs::set_permissions(&config_path, fs::Permissions::from_mode(0o640)).unwrap();
+    let config = load_server(&config_path).unwrap();
+
+    let error = check_server_references(&config_path, &config).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("must not grant group or other permissions")
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn enabled_web_configuration_reports_a_structured_windows_acl_warning() {
+    let dir = TempDir::new();
+    fs::create_dir_all(dir.path.join("certs")).unwrap();
+    fs::write(dir.path.join("certs/server.crt"), "certificate").unwrap();
+    fs::write(dir.path.join("certs/server.key"), "private key").unwrap();
+    let config_path = dir.write(
+        "server.toml",
+        &format!(
+            "{}\n[web]\nenabled = true\nadmin_password = \"a-password-that-is-at-least-sixteen-bytes\"\n",
+            valid_server()
+        ),
+    );
+    let config = load_server(&config_path).unwrap();
+
+    let check = check_server_references(&config_path, &config).unwrap();
+
+    assert_eq!(check.warnings().len(), 1);
+    assert_eq!(check.warnings()[0].code(), "WEB_CONFIG_ACL_REVIEW_REQUIRED");
+    assert!(check.warnings()[0].message().contains("manual ACL review"));
 }
 
 #[test]

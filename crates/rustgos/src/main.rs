@@ -48,7 +48,14 @@ async fn execute(cli: Cli) -> Result<(), CommandError> {
         Some(Command::Check) => Action::Check,
     };
     let config = load_server(&cli.config)?;
-    check_server_references(&cli.config, &config)?;
+    let reference_check = check_server_references(&cli.config, &config)?;
+    for warning in reference_check.warnings() {
+        tracing::warn!(
+            code = warning.code(),
+            message = warning.message(),
+            "configuration warning"
+        );
+    }
 
     match action {
         Action::Run => {

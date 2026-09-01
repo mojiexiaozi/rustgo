@@ -63,6 +63,11 @@ pub(crate) fn validate_server(config: &ServerConfig) -> Result<(), ValidationErr
         config.server.heartbeat_timeout_secs,
     )?;
     validate_limits(&config.limits)?;
+    if let Some(web) = &config.web
+        && web.enabled
+    {
+        validate_web(web)?;
+    }
 
     let mut names = HashSet::new();
     let mut public_keys = HashSet::new();
@@ -150,6 +155,11 @@ pub(crate) fn validate_client(config: &ClientConfig) -> Result<(), ValidationErr
             }
         }
     }
+    if let Some(telemetry) = &config.telemetry
+        && telemetry.enabled
+    {
+        validate_telemetry(telemetry)?;
+    }
 
     if config.exports.len() > MAX_EXPORTS {
         return Err(ValidationError::new(format!(
@@ -203,6 +213,17 @@ pub(crate) fn validate_client(config: &ClientConfig) -> Result<(), ValidationErr
         }
     }
     Ok(())
+}
+
+pub(crate) fn server_validation_warnings(config: &ServerConfig) -> Vec<ConfigWarning> {
+    let mut warnings = Vec::new();
+    if cfg!(windows) && config.web.as_ref().is_some_and(|web| web.enabled) {
+        warnings.push(ConfigWarning::new(
+            "WEB_CONFIG_ACL_REVIEW_REQUIRED",
+            "enabled web configuration requires a manual ACL review on Windows",
+        ));
+    }
+    warnings
 }
 
 pub(crate) fn client_validation_warnings(config: &ClientConfig) -> Vec<ConfigWarning> {
@@ -259,6 +280,64 @@ fn validate_limits(limits: &crate::Limits) -> Result<(), ValidationError> {
     Ok(())
 }
 
+fn validate_web(web: &crate::WebConfig) -> Result<(), ValidationError> {
+    let bind = web
+        .bind
+        .parse::<SocketAddr>()
+        .map_err(|_| ValidationError::new("web.bind must be an IP address with a port"))?;
+    if !bind.ip().is_loopback() {
+        return Err(ValidationError::new(
+            "web.bind must use a loopback IP address",
+        ));
+    }
+    if bind.port() == 0 {
+        return Err(ValidationError::new(
+            "web.bind must use a port between 1 and 65535",
+        ));
+    }
+    validate_byte_string("web.admin_username", &web.admin_username, 1, 64)?;
+    validate_byte_string("web.admin_password", &web.admin_password, 16, 256)?;
+    if !(1..=90).contains(&web.history_days) {
+        return Err(ValidationError::new(
+            "web.history_days must be between 1 and 90",
+        ));
+    }
+    if !(16..=4096).contains(&web.database_max_mib) {
+        return Err(ValidationError::new(
+            "web.database_max_mib must be between 16 and 4096",
+        ));
+    }
+    // A loopback-only listener may deliberately support direct local HTTP.
+    // Reverse-proxied HTTPS deployments must set cookie_secure = true.
+    let _ = web.cookie_secure;
+    Ok(())
+}
+
+fn validate_telemetry(telemetry: &crate::TelemetryConfig) -> Result<(), ValidationError> {
+    for (field, value) in [
+        (
+            "telemetry.sample_interval_secs",
+            telemetry.sample_interval_secs,
+        ),
+        (
+            "telemetry.report_interval_secs",
+            telemetry.report_interval_secs,
+        ),
+    ] {
+        if !(1..=3600).contains(&value) {
+            return Err(ValidationError::new(format!(
+                "{field} must be between 1 and 3600"
+            )));
+        }
+    }
+    if telemetry.report_interval_secs < telemetry.sample_interval_secs {
+        return Err(ValidationError::new(
+            "telemetry.report_interval_secs must be at least telemetry.sample_interval_secs",
+        ));
+    }
+    Ok(())
+}
+
 fn require_non_empty(field: &str, value: &str) -> Result<(), ValidationError> {
     if value.trim().is_empty() {
         return Err(ValidationError::new(format!("{field} must not be empty")));
@@ -275,6 +354,20 @@ fn validate_wire_string(
     if value.len() > maximum_bytes {
         return Err(ValidationError::new(format!(
             "{field} must be at most {maximum_bytes} UTF-8 bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_byte_string(
+    field: &str,
+    value: &str,
+    minimum_bytes: usize,
+    maximum_bytes: usize,
+) -> Result<(), ValidationError> {
+    if !(minimum_bytes..=maximum_bytes).contains(&value.len()) {
+        return Err(ValidationError::new(format!(
+            "{field} must be between {minimum_bytes} and {maximum_bytes} UTF-8 bytes"
         )));
     }
     Ok(())

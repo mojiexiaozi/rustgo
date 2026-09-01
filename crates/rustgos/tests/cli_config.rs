@@ -46,6 +46,13 @@ impl TestMaterial {
     }
 }
 
+#[cfg(unix)]
+fn restrict_to_owner(path: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+}
+
 fn certificate_authority() -> Result<(String, Issuer<'static, KeyPair>), rcgen::Error> {
     let mut parameters = CertificateParams::new(Vec::<String>::new())?;
     parameters.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
@@ -127,6 +134,62 @@ fn check_parses_real_credentials_without_binding_the_configured_port() {
     let _reserved_port = TcpListener::bind("127.0.0.1:7000").unwrap();
 
     check(&config, material.directory.path()).success();
+}
+
+#[test]
+fn check_accepts_enabled_web_defaults_when_its_toml_is_private() {
+    let material = TestMaterial::generate();
+    let path = material.directory.path().join("web.toml");
+    fs::write(
+        &path,
+        format!(
+            "{}\n[web]\nenabled = true\nadmin_password = \"a-password-that-is-at-least-sixteen-bytes\"\n",
+            valid_config(&material.public_key)
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    restrict_to_owner(&path);
+
+    check(&path, material.directory.path()).success();
+}
+
+#[test]
+fn check_rejects_non_loopback_web_bind_before_starting_a_listener() {
+    let material = TestMaterial::generate();
+    let path = material.directory.path().join("web.toml");
+    fs::write(
+        &path,
+        format!(
+            "{}\n[web]\nenabled = true\nbind = \"0.0.0.0:7450\"\nadmin_password = \"a-password-that-is-at-least-sixteen-bytes\"\n",
+            valid_config(&material.public_key)
+        ),
+    )
+    .unwrap();
+
+    check(&path, material.directory.path())
+        .failure()
+        .stderr(predicates::str::contains("loopback"));
+}
+
+#[cfg(windows)]
+#[test]
+fn check_warns_that_enabled_web_configuration_needs_manual_acl_review() {
+    let material = TestMaterial::generate();
+    let path = material.directory.path().join("web.toml");
+    fs::write(
+        &path,
+        format!(
+            "{}\n[web]\nenabled = true\nadmin_password = \"a-password-that-is-at-least-sixteen-bytes\"\n",
+            valid_config(&material.public_key)
+        ),
+    )
+    .unwrap();
+
+    check(&path, material.directory.path())
+        .success()
+        .stderr(predicates::str::contains("WEB_CONFIG_ACL_REVIEW_REQUIRED"))
+        .stderr(predicates::str::contains("manual ACL review"));
 }
 
 #[test]

@@ -86,10 +86,51 @@ fn default_run_reports_missing_conventional_config_and_override_flag() {
 #[test]
 fn check_parses_real_credentials_without_contacting_the_configured_server() {
     let material = TestMaterial::generate();
-    let config = material.write_config("valid.toml");
-    let _reserved_port = TcpListener::bind("127.0.0.1:7000").unwrap();
+    let reserved_port = TcpListener::bind("127.0.0.1:0").unwrap();
+    let config = material.directory.path().join("valid.toml");
+    fs::write(
+        &config,
+        valid_config().replace(
+            "127.0.0.1:7000",
+            &reserved_port.local_addr().unwrap().to_string(),
+        ),
+    )
+    .unwrap();
 
     check(&config, material.directory.path()).success();
+}
+
+#[test]
+fn check_accepts_enabled_telemetry_defaults_without_contacting_the_server() {
+    let material = TestMaterial::generate();
+    let config = material.directory.path().join("telemetry.toml");
+    fs::write(
+        &config,
+        format!("{}\n[telemetry]\nenabled = true\n", valid_config()),
+    )
+    .unwrap();
+
+    check(&config, material.directory.path()).success();
+}
+
+#[test]
+fn check_rejects_telemetry_report_interval_shorter_than_sample_interval() {
+    let material = TestMaterial::generate();
+    let config = material.directory.path().join("telemetry.toml");
+    fs::write(
+        &config,
+        format!(
+            "{}\n[telemetry]\nenabled = true\nsample_interval_secs = 30\nreport_interval_secs = 10\n",
+            valid_config()
+        ),
+    )
+    .unwrap();
+
+    check(&config, material.directory.path())
+        .failure()
+        .stderr(predicates::str::contains(
+            "at least telemetry.sample_interval_secs",
+        ));
 }
 
 #[test]
