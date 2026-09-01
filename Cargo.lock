@@ -1954,6 +1954,7 @@ dependencies = [
  "rustgo-rendezvous",
  "rustgo-transport",
  "serde",
+ "serde_json",
  "sha2",
  "subtle",
  "tempfile",

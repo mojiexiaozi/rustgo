@@ -1,7 +1,11 @@
-//! Loopback-only HTTP authentication boundary for the Rustgo dashboard.
+//! Loopback-only HTTP authentication and read-only API for the Rustgo dashboard.
 
+mod api;
 mod auth;
+mod dto;
 mod security;
+
+pub use api::MAX_API_RESPONSE_BYTES;
 
 use std::{convert::Infallible, fmt, io, net::SocketAddr, sync::Arc, time::Duration};
 
@@ -11,7 +15,7 @@ use axum::{
     body::{self, Body},
     extract::{ConnectInfo, DefaultBodyLimit, FromRequest, Request, State},
     http::{
-        HeaderMap, HeaderValue, StatusCode,
+        HeaderMap, HeaderValue, Method, StatusCode,
         header::{CONTENT_LENGTH, CONTENT_TYPE, SET_COOKIE},
     },
     middleware,
@@ -21,6 +25,7 @@ use axum::{
 use hyper::{body::Incoming, server::conn::http1, service::service_fn};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use rustgo_config::{ServerConfig, WebOrigin};
+use rustgo_observability::{HistoryService, ObservabilityStore};
 use serde::Deserialize;
 use thiserror::Error;
 use tokio::{
@@ -145,6 +150,15 @@ impl WebServer {
         config: &ServerConfig,
         limits: WebRuntimeLimits,
     ) -> Result<Self, WebError> {
+        Self::bind_with_data_sources(config, limits, DashboardDataSources::unavailable()).await
+    }
+
+    #[doc(hidden)]
+    pub async fn bind_with_data_sources(
+        config: &ServerConfig,
+        limits: WebRuntimeLimits,
+        data_sources: DashboardDataSources,
+    ) -> Result<Self, WebError> {
         config
             .validate()
             .map_err(|error| WebError::InvalidConfiguration(error.to_string()))?;
@@ -178,6 +192,8 @@ impl WebServer {
             expected_origin,
             cookie_secure: web.cookie_secure,
             body_read_timeout: limits.body_read_timeout,
+            observability: data_sources.observability,
+            history: data_sources.history,
         });
         let router = build_router(state);
         Ok(Self {
@@ -252,6 +268,37 @@ impl WebServer {
     }
 }
 
+#[derive(Clone)]
+pub struct DashboardDataSources {
+    observability: ObservabilityStore,
+    history: Option<HistoryService>,
+}
+
+impl DashboardDataSources {
+    pub fn new(observability: ObservabilityStore, history: Option<HistoryService>) -> Self {
+        Self {
+            observability,
+            history,
+        }
+    }
+
+    fn unavailable() -> Self {
+        let (observability, sink, worker) = ObservabilityStore::new();
+        drop(sink);
+        drop(worker);
+        Self::new(observability, None)
+    }
+}
+
+impl fmt::Debug for DashboardDataSources {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DashboardDataSources")
+            .field("history_configured", &self.history.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 impl fmt::Debug for WebServer {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -266,6 +313,8 @@ struct WebState {
     expected_origin: WebOrigin,
     cookie_secure: bool,
     body_read_timeout: Duration,
+    observability: ObservabilityStore,
+    history: Option<HistoryService>,
 }
 
 fn build_router(state: Arc<WebState>) -> Router {
@@ -279,6 +328,7 @@ fn build_router(state: Arc<WebState>) -> Router {
             "/logout",
             post(logout).layer(DefaultBodyLimit::max(MAX_LOGOUT_BODY_BYTES)),
         )
+        .merge(api::routes())
         .route("/api", any(api_boundary))
         .route("/api/{*path}", any(api_boundary))
         .fallback(protected_not_found)
@@ -376,14 +426,21 @@ async fn logout(State(state): State<Arc<WebState>>, request: Request) -> Respons
     response
 }
 
-async fn api_boundary(State(state): State<Arc<WebState>>, headers: HeaderMap) -> Response {
+async fn api_boundary(
+    State(state): State<Arc<WebState>>,
+    method: Method,
+    headers: HeaderMap,
+) -> Response {
     if !state
         .authentication
         .authenticate_cookie(single_cookie_header(&headers))
     {
-        return authentication_failed();
+        return api::authentication_required();
     }
-    plain_response(StatusCode::NOT_FOUND, "not found\n")
+    if method != Method::GET && method != Method::HEAD {
+        return api::method_not_allowed_response();
+    }
+    api::not_found()
 }
 
 async fn protected_not_found(State(state): State<Arc<WebState>>, headers: HeaderMap) -> Response {

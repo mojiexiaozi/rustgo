@@ -55,7 +55,7 @@ async fn login_uses_indistinguishable_digest_checks_and_guards_every_api_route()
     let authenticated_api = server
         .request("GET", "/api/v1/overview", &[("Cookie", &cookie)], "")
         .await?;
-    assert_eq!(authenticated_api.status, 404);
+    assert_eq!(authenticated_api.status, 200);
 
     Ok(())
 }
@@ -86,8 +86,8 @@ async fn sessions_expire_on_idle_and_absolute_deadlines_and_evict_at_capacity()
         .session_cookie()
         .ok_or("third login did not set a cookie")?;
     assert_eq!(capacity_server.api(&first).await?.status, 401);
-    assert_eq!(capacity_server.api(&second).await?.status, 404);
-    assert_eq!(capacity_server.api(&third).await?.status, 404);
+    assert_eq!(capacity_server.api(&second).await?.status, 200);
+    assert_eq!(capacity_server.api(&third).await?.status, 200);
 
     let idle_server = RunningWebServer::start(
         WebRuntimeLimits {
@@ -133,7 +133,7 @@ async fn sessions_expire_on_idle_and_absolute_deadlines_and_evict_at_capacity()
         if status == 401 {
             break;
         }
-        assert_eq!(status, 404);
+        assert_eq!(status, 200);
         successful_refreshes = successful_refreshes.saturating_add(1);
         assert!(successful_refreshes < 20, "absolute expiry did not fire");
     }
@@ -252,7 +252,7 @@ async fn cookies_are_strict_configurable_and_logout_revokes_the_session()
         )
         .await?;
     assert_eq!(missing_origin.status, 400);
-    assert_eq!(server.api(&cookie).await?.status, 404);
+    assert_eq!(server.api(&cookie).await?.status, 200);
 
     let wrong_origin = format!("http://127.0.0.1:{}", server.address.port() + 1);
     let rejected = server
@@ -389,7 +389,7 @@ async fn state_changes_reject_cross_origin_non_form_and_oversized_requests()
             .status,
         400
     );
-    assert_eq!(server.api(&cookie).await?.status, 404);
+    assert_eq!(server.api(&cookie).await?.status, 200);
 
     Ok(())
 }
