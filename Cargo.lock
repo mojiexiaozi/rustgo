@@ -1555,6 +1555,7 @@ dependencies = [
  "rcgen",
  "rustgo-config",
  "rustgo-crypto",
+ "rustgo-observability",
  "rustgo-path",
  "rustgo-protocol",
  "rustgo-rendezvous",

@@ -5,7 +5,10 @@ use rustgo_protocol::{Heartbeat, Message, OpenTcpStream, OpenUdpChannel, Protoco
 use tokio::{sync::mpsc, task::JoinSet, time::MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 
-use crate::{ClientError, ControlEvent, ControlSession};
+use crate::{
+    ClientError, ControlEvent, ControlSession,
+    telemetry::{GenerationTelemetry, LatestTelemetryReceiver, latest_telemetry_channel},
+};
 
 const CHILD_CONTROL_CAPACITY: usize = 1024;
 
@@ -94,6 +97,7 @@ pub trait PeerGenerationHandler: Send + Sync + 'static {
 
 struct ChildSignals<'a> {
     control: &'a mut mpsc::Receiver<Message>,
+    telemetry: &'a mut LatestTelemetryReceiver,
 }
 
 impl std::fmt::Debug for ChildSessionContext {
@@ -142,13 +146,22 @@ impl ControlSession {
     where
         F: FnOnce(),
     {
-        self.run_generation_with_peer(generation, shutdown, supervisor, None, || {}, on_inactive)
-            .await
+        self.run_generation_with_peer(
+            generation,
+            None,
+            shutdown,
+            supervisor,
+            None,
+            || {},
+            on_inactive,
+        )
+        .await
     }
 
     pub(crate) async fn run_generation_with_peer<C, F>(
         mut self,
         generation: SessionGeneration,
+        telemetry: Option<GenerationTelemetry>,
         shutdown: CancellationToken,
         supervisor: Arc<dyn ChildSessionSupervisor>,
         peer_handler: Option<Arc<dyn PeerGenerationHandler>>,
@@ -162,6 +175,7 @@ impl ControlSession {
         let child_shutdown = CancellationToken::new();
         let mut children = JoinSet::new();
         let (control_outbound, mut child_control) = mpsc::channel(CHILD_CONTROL_CAPACITY);
+        let (telemetry_outbound, mut telemetry_control) = latest_telemetry_channel();
         let child_context = ChildSessionContext {
             generation,
             session_id: Arc::from(self.session_id.clone()),
@@ -170,7 +184,13 @@ impl ControlSession {
         };
         let mut child_signals = ChildSignals {
             control: &mut child_control,
+            telemetry: &mut telemetry_control,
         };
+        if let Some(telemetry) = telemetry {
+            children.spawn(telemetry.run(telemetry_outbound, child_shutdown.child_token()));
+        } else {
+            drop(telemetry_outbound);
+        }
         let mut peer_owner = peer_handler.as_ref().map(|handler| {
             tokio::spawn(
                 handler.run_generation(child_context.clone(), child_shutdown.child_token()),
@@ -355,6 +375,21 @@ impl ControlSession {
                         }
                         _ => return Err(ClientError::InvalidState),
                     }
+                }
+                telemetry = child_signals.telemetry.recv(), if !child_signals.telemetry.is_closed() => {
+                    let Some(report) = telemetry else {
+                        continue;
+                    };
+                    let write = self.framed.send(self.version, Message::TelemetryReport(report));
+                    let result = tokio::select! {
+                        biased;
+                        () = shutdown.cancelled() => return Ok(()),
+                        () = &mut heartbeat_deadline => {
+                            return Err(ClientError::HeartbeatTimeout);
+                        }
+                        result = tokio::time::timeout(self.heartbeat_interval, write) => result,
+                    };
+                    result.map_err(|_| ClientError::ControlWriteTimeout)??;
                 }
             }
         }

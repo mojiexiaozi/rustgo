@@ -391,6 +391,10 @@ impl ControlSession {
         self.version
     }
 
+    pub(crate) const fn supports_telemetry(&self) -> bool {
+        self.version.supports_telemetry()
+    }
+
     pub async fn request_observation_grant(&mut self) -> Result<(), ClientError> {
         self.require_v02()?;
         self.framed

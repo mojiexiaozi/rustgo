@@ -1,6 +1,6 @@
 use std::{sync::Arc, time::Duration};
 
-use rustgo_config::ClientConfig;
+use rustgo_config::{ClientConfig, TelemetryConfig};
 use rustgo_transport::{
     Backoff, BackoffClock, BackoffConfig, JitterSource, RandomJitter, SystemBackoffClock,
     safe_display,
@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     ChildSessionSupervisor, ClientError, ControlClient, ExportRegistry, PeerGenerationHandler,
     RegisteredTunnel, SessionGeneration, orchestration::ProductionPeerRuntime,
-    udp::RelaySessionSupervisor,
+    telemetry::TelemetryRuntime, udp::RelaySessionSupervisor,
 };
 
 const INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(1);
@@ -77,11 +77,13 @@ pub struct ClientApp {
     status: watch::Sender<ClientStatus>,
     exports: ExportRegistry,
     peer_handler: Option<Arc<dyn PeerGenerationHandler>>,
+    telemetry: Option<TelemetryConfig>,
     last_generation: u64,
 }
 
 impl ClientApp {
     pub fn from_config(config: ClientConfig) -> Result<Self, ClientError> {
+        let telemetry = config.telemetry.clone();
         let exports = ExportRegistry::new(config.exports.clone())
             .map_err(|_| ClientError::InvalidConfiguration)?;
         let control = ControlClient::from_config(config)?;
@@ -94,7 +96,7 @@ impl ClientApp {
         .map_err(|_| ClientError::InvalidConfiguration)?;
         let supervisor = Arc::new(RelaySessionSupervisor::new(&control));
         Ok(Self::with_runtime_and_exports(
-            control, backoff, supervisor, exports,
+            control, backoff, supervisor, exports, telemetry,
         ))
     }
 
@@ -108,7 +110,8 @@ impl ClientApp {
     {
         let exports = ExportRegistry::new(control.config().exports.clone())
             .expect("validated client configuration has valid exports");
-        Self::with_runtime_and_exports(control, backoff, supervisor, exports)
+        let telemetry = control.config().telemetry.clone();
+        Self::with_runtime_and_exports(control, backoff, supervisor, exports, telemetry)
     }
 
     fn with_runtime_and_exports<B>(
@@ -116,6 +119,7 @@ impl ClientApp {
         backoff: B,
         supervisor: Arc<dyn ChildSessionSupervisor>,
         exports: ExportRegistry,
+        telemetry: Option<TelemetryConfig>,
     ) -> Self
     where
         B: ReconnectBackoff,
@@ -128,6 +132,7 @@ impl ClientApp {
             status,
             exports,
             peer_handler: None,
+            telemetry,
             last_generation: 0,
         }
     }
@@ -162,6 +167,7 @@ impl ClientApp {
 
     pub async fn run_until(mut self, shutdown: CancellationToken) -> Result<(), ClientError> {
         self.status.send_replace(ClientStatus::default());
+        let telemetry = TelemetryRuntime::start(self.telemetry.take());
         let peer_runtime = self.peer_handler.clone().unwrap_or_else(|| {
             Arc::new(ProductionPeerRuntime::new(
                 Arc::new(self.control.config().clone()),
@@ -170,16 +176,21 @@ impl ClientApp {
             ))
         });
         let result = self
-            .run_reconnect_loop(shutdown, peer_runtime.clone())
+            .run_reconnect_loop(shutdown, peer_runtime.clone(), telemetry.as_ref())
             .await;
+        let telemetry_result = match telemetry {
+            Some(telemetry) => telemetry.shutdown().await,
+            None => Ok(()),
+        };
         let shutdown_result = peer_runtime.shutdown().await;
-        shutdown_result.and(result)
+        telemetry_result.and(shutdown_result).and(result)
     }
 
     async fn run_reconnect_loop(
         &mut self,
         shutdown: CancellationToken,
         peer_runtime: Arc<dyn PeerGenerationHandler>,
+        telemetry: Option<&TelemetryRuntime>,
     ) -> Result<(), ClientError> {
         loop {
             let connected = tokio::select! {
@@ -192,6 +203,11 @@ impl ClientApp {
                 Ok(session) => {
                     let generation = SessionGeneration::next(self.last_generation)?;
                     let protocol_version = session.protocol_version();
+                    let generation_telemetry = if session.supports_telemetry() {
+                        telemetry.map(TelemetryRuntime::generation)
+                    } else {
+                        None
+                    };
                     let local_protocol_version = self.control.protocol_version();
                     self.last_generation = generation.get();
                     self.backoff.mark_connected();
@@ -216,6 +232,7 @@ impl ClientApp {
                     let result = session
                         .run_generation_with_peer(
                             generation,
+                            generation_telemetry,
                             shutdown.clone(),
                             supervisor,
                             Some(peer_runtime.clone()),

@@ -10,6 +10,7 @@ mod orchestration;
 mod peer;
 mod session;
 mod tcp;
+mod telemetry;
 mod udp;
 
 pub use app::{ActiveGeneration, ClientApp, ClientStatus, ReconnectBackoff};
