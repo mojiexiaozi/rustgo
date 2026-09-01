@@ -73,6 +73,14 @@ const MAX_MAINTENANCE_TURN: Duration = Duration::from_millis(50);
 const QUERY_PROGRESS_GRANULARITY: i32 = 1_000;
 const MAX_QUERY_VM_STEPS: u64 = 100_000_000;
 const CHECKPOINT_DEADLINE: Duration = Duration::from_millis(100);
+const INITIAL_CAP_CHECKPOINT_RETRY_BACKOFF: Duration = Duration::from_millis(25);
+const MAX_CAP_CHECKPOINT_RETRY_BACKOFF: Duration = Duration::from_millis(500);
+// Schema v6 historically stored an ordinary wall-clock maintenance timestamp in
+// this field. Tag retirement floors so an existing timestamp is never mistaken
+// for an admission cutoff after an in-place upgrade.
+const DURABLE_RETIREMENT_FLOOR_TAG: u64 = 1_u64 << 62;
+#[cfg(debug_assertions)]
+const DEBUG_CHECKPOINT_ATTEMPT_HEADER: &str = "rustgo-observability-test-checkpoint-attempts-v1\n";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryConfig {
@@ -698,20 +706,27 @@ impl Shared {
     }
 
     fn pop_control(&self, wait: Duration) -> Option<Command> {
-        let queue = self
+        let mut queue = self
             .queue
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut queue = if queue.commands.is_empty() && !queue.closed {
-            self.ready
-                .wait_timeout(queue, wait)
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .0
-        } else {
-            queue
-        };
-        if queue.commands.front().is_some_and(Command::is_batch) {
-            return None;
+        let deadline = Instant::now() + wait;
+        loop {
+            match queue.commands.front() {
+                Some(command) if !command.is_batch() => break,
+                Some(_) | None if queue.closed || wait.is_zero() => return None,
+                Some(_) | None => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return None;
+                    }
+                    queue = self
+                        .ready
+                        .wait_timeout(queue, remaining)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .0;
+                }
+            }
         }
         let command = queue.commands.pop_front()?;
         queue.pending_controls -= 1;
@@ -901,6 +916,7 @@ struct WorkerRunningFlag(Arc<Shared>);
 impl Drop for WorkerRunningFlag {
     fn drop(&mut self) {
         self.0.worker_running.store(false, Ordering::Release);
+        self.0.history_available.store(false, Ordering::Release);
     }
 }
 
@@ -917,6 +933,12 @@ impl fmt::Debug for HistoryWorkerHandle {
 }
 
 impl HistoryWorkerHandle {
+    pub fn is_finished(&self) -> bool {
+        self.thread
+            .as_ref()
+            .is_none_or(thread::JoinHandle::is_finished)
+    }
+
     pub async fn shutdown(mut self) -> Result<(), HistoryWorkerError> {
         self.shared.close();
         let Some(thread) = self.thread.take() else {
@@ -1248,63 +1270,78 @@ impl HistoryWorker {
 
             if background_turn {
                 if let Some(state) = cap.as_mut() {
-                    let database_path = active_database_path
-                        .as_deref()
-                        .expect("open history database has a stable private path");
-                    match bounded_maintenance_turn(database, &self.shared, |database| {
-                        enforce_size_cap_step(
-                            database,
-                            database_path,
-                            &self.config,
-                            &self.shared,
-                            state,
-                        )
-                    }) {
-                        Ok(Some(true)) => cap = None,
-                        Ok(Some(false) | None) => {}
-                        Err(error) => {
-                            self.database_failed(&error, &mut warning_limiter);
-                            connection = None;
-                            active_database_path = None;
-                            self.quarantine_after_failure(&error);
-                            next_open_attempt = Instant::now() + retry_backoff;
-                            retry_backoff = doubled_backoff(retry_backoff);
-                            continue;
-                        }
-                    }
-                    background_turn = false;
-                    continue;
-                }
-                if let Some(job) = maintenance.as_mut() {
-                    let database_path = active_database_path
-                        .as_deref()
-                        .expect("open history database has a stable private path");
-                    match bounded_maintenance_turn(database, &self.shared, |database| {
-                        maintenance_step(database, database_path, &self.config, job, &self.shared)
-                    }) {
-                        Ok(Some(true)) => {
-                            let completed = maintenance
-                                .take()
-                                .expect("completed maintenance job remains owned");
-                            completed.finish(Ok(()));
-                            next_maintenance = Instant::now() + MAINTENANCE_INTERVAL;
-                        }
-                        Ok(Some(false) | None) => {}
-                        Err(error) => {
-                            if let Some(failed) = maintenance.take() {
-                                failed.finish(Err(HistoryQueryError::Unavailable));
+                    if state.checkpoint_retry_delay().is_zero() {
+                        let database_path = active_database_path
+                            .as_deref()
+                            .expect("open history database has a stable private path");
+                        match bounded_maintenance_turn(database, &self.shared, |database| {
+                            enforce_size_cap_step(
+                                database,
+                                database_path,
+                                &self.config,
+                                &self.shared,
+                                state,
+                            )
+                        }) {
+                            Ok(Some(true)) => cap = None,
+                            Ok(Some(false) | None) => {}
+                            Err(error) => {
+                                self.database_failed(&error, &mut warning_limiter);
+                                connection = None;
+                                active_database_path = None;
+                                self.quarantine_after_failure(&error);
+                                next_open_attempt = Instant::now() + retry_backoff;
+                                retry_backoff = doubled_backoff(retry_backoff);
+                                continue;
                             }
-                            self.database_failed(&error, &mut warning_limiter);
-                            connection = None;
-                            active_database_path = None;
-                            self.quarantine_after_failure(&error);
-                            next_open_attempt = Instant::now() + retry_backoff;
-                            retry_backoff = doubled_backoff(retry_backoff);
-                            continue;
                         }
                     }
                     background_turn = false;
-                    continue;
+                    if cap.is_none() {
+                        continue;
+                    }
+                }
+                if cap.is_none()
+                    && let Some(job) = maintenance.as_mut()
+                {
+                    if job.checkpoint_retry_delay().is_zero() {
+                        let database_path = active_database_path
+                            .as_deref()
+                            .expect("open history database has a stable private path");
+                        match bounded_maintenance_turn(database, &self.shared, |database| {
+                            maintenance_step(
+                                database,
+                                database_path,
+                                &self.config,
+                                job,
+                                &self.shared,
+                            )
+                        }) {
+                            Ok(Some(true)) => {
+                                let completed = maintenance
+                                    .take()
+                                    .expect("completed maintenance job remains owned");
+                                completed.finish(Ok(()));
+                                next_maintenance = Instant::now() + MAINTENANCE_INTERVAL;
+                            }
+                            Ok(Some(false) | None) => {}
+                            Err(error) => {
+                                if let Some(failed) = maintenance.take() {
+                                    failed.finish(Err(HistoryQueryError::Unavailable));
+                                }
+                                self.database_failed(&error, &mut warning_limiter);
+                                connection = None;
+                                active_database_path = None;
+                                self.quarantine_after_failure(&error);
+                                next_open_attempt = Instant::now() + retry_backoff;
+                                retry_backoff = doubled_backoff(retry_backoff);
+                                continue;
+                            }
+                        }
+                        background_turn = false;
+                        continue;
+                    }
+                    background_turn = false;
                 }
             }
 
@@ -1313,7 +1350,19 @@ impl HistoryWorker {
                     .as_ref()
                     .is_some_and(MaintenanceJob::enforcing_cap);
             let background_pending = cap_pending || maintenance.is_some();
-            let wait = if background_pending {
+            let cap_retry_delay = cap
+                .as_ref()
+                .map(CapState::checkpoint_retry_delay)
+                .unwrap_or(Duration::ZERO)
+                .max(
+                    maintenance
+                        .as_ref()
+                        .map(MaintenanceJob::checkpoint_retry_delay)
+                        .unwrap_or(Duration::ZERO),
+                );
+            let wait = if !cap_retry_delay.is_zero() {
+                cap_retry_delay
+            } else if background_pending {
                 Duration::ZERO
             } else {
                 next_maintenance.saturating_duration_since(Instant::now())
@@ -1616,9 +1665,26 @@ fn open_database(config: &HistoryConfig) -> Result<OpenedDatabase, DatabaseError
         (Some(held_legacy), None, None) => {
             start_legacy_migration(&config.database_path, held_legacy)?
         }
-        (None, Some((marker, held_marker)), pending) if marker.active.is_none() => {
-            start_v5_upgrade(&config.database_path, marker, held_marker, pending.as_ref())?
-        }
+        (None, Some((marker, held_marker)), pending) if marker.active.is_none() => match pending {
+            Some(pending) => {
+                if pending.nonce != marker.nonce {
+                    return Err(DatabaseError::Ownership(
+                        "legacy v5 ready and pending markers disagree".to_owned(),
+                    ));
+                }
+                if matches!(&pending.kind, PendingKind::UpgradeV5 { .. }) {
+                    resume_pending_database(
+                        &config.database_path,
+                        &pending,
+                        None,
+                        Some((marker, held_marker)),
+                    )?
+                } else {
+                    start_v5_upgrade(&config.database_path, marker, held_marker, Some(&pending))?
+                }
+            }
+            None => start_v5_upgrade(&config.database_path, marker, held_marker, None)?,
+        },
         (None, Some((marker, held_marker)), Some(pending)) => {
             if pending.nonce != marker.nonce {
                 return Err(DatabaseError::Ownership(
@@ -2531,6 +2597,7 @@ fn finish_v5_upgrade(
         .expect("validated v5 upgrade active pointer");
     let database_path = active_database_path(path, store, active)?;
     move_database_family(&source, &database_path, store)?;
+    run_debug_v5_upgrade_crash_seam(path, "after-family-move")?;
     let held_database = hold_database_with_identity(&database_path, store)?;
     let connection = Connection::open_with_flags(
         &database_path,
@@ -2574,6 +2641,7 @@ fn finish_v5_upgrade(
     }
     configure_database(&connection)?;
     write_probe(&connection)?;
+    run_debug_v5_upgrade_crash_seam(path, "before-checkpoint")?;
     if !checkpoint_bounded(&connection)? {
         return Err(DatabaseError::CheckpointDeadline);
     }
@@ -2601,6 +2669,23 @@ fn finish_v5_upgrade(
     }
     replace_pending_marker(path, pending, &PendingMarker::idle(&marker))?;
     Ok((connection, database_path))
+}
+
+#[cfg(debug_assertions)]
+fn run_debug_v5_upgrade_crash_seam(path: &Path, phase: &str) -> Result<(), DatabaseError> {
+    let directive = sidecar_path(path, ".rustgo-test-v5-upgrade-crash");
+    let Some(content) = read_exact_regular_text(&directive)? else {
+        return Ok(());
+    };
+    if content == format!("rustgo-observability-test-v5-upgrade-crash-v1\nphase={phase}\n") {
+        std::process::exit(89);
+    }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+fn run_debug_v5_upgrade_crash_seam(_path: &Path, _phase: &str) -> Result<(), DatabaseError> {
+    Ok(())
 }
 
 fn finish_active_transition(
@@ -5031,7 +5116,13 @@ fn persist_batches(
 ) -> Result<(), DatabaseError> {
     let transaction_now_unix_millis = unix_millis_now();
     let transaction = connection.transaction()?;
-    let raw_cutoff_unix_millis = raw_admission_cutoff(transaction_now_unix_millis);
+    let durable_retirement_evidence: u64 = transaction.query_row(
+        "SELECT last_maintenance_ms FROM history_health WHERE id = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    let raw_cutoff_unix_millis = raw_admission_cutoff(transaction_now_unix_millis)
+        .max(decode_durable_retirement_floor(durable_retirement_evidence));
     let mut server_minutes = BTreeSet::new();
     let mut server_five_minutes = BTreeSet::new();
     let mut client_minutes = BTreeSet::new();
@@ -5673,6 +5764,7 @@ enum MaintenancePhase {
 struct MaintenanceJob {
     now_unix_millis: u64,
     raw_cutoff_unix_millis: u64,
+    retirement_cutoff_unix_millis: u64,
     phase: MaintenancePhase,
     response: Option<oneshot::Sender<Result<(), HistoryQueryError>>>,
 }
@@ -5684,7 +5776,11 @@ impl MaintenanceJob {
     ) -> Self {
         Self {
             now_unix_millis,
+            // Retention injection must not make fresh raw points late. The
+            // worker clock remains authoritative for raw deletion, while the
+            // requested clock drives tombstone retirement evidence.
             raw_cutoff_unix_millis: raw_admission_cutoff(unix_millis_now()),
+            retirement_cutoff_unix_millis: raw_admission_cutoff(now_unix_millis),
             phase: MaintenancePhase::Raw,
             response,
         }
@@ -5698,6 +5794,13 @@ impl MaintenanceJob {
 
     fn enforcing_cap(&self) -> bool {
         matches!(self.phase, MaintenancePhase::Cap(_))
+    }
+
+    fn checkpoint_retry_delay(&self) -> Duration {
+        match &self.phase {
+            MaintenancePhase::Cap(state) => state.checkpoint_retry_delay(),
+            _ => Duration::ZERO,
+        }
     }
 
     fn finish(mut self, result: Result<(), HistoryQueryError>) {
@@ -5791,7 +5894,7 @@ fn maintenance_step(
             let deleted = delete_expired_tombstones(
                 connection,
                 job.now_unix_millis,
-                job.raw_cutoff_unix_millis,
+                job.retirement_cutoff_unix_millis,
                 config.retention_millis(),
                 RETENTION_DELETE_LIMIT,
             )?;
@@ -5800,11 +5903,6 @@ fn maintenance_step(
             }
         }
         MaintenancePhase::RecordCompletion => {
-            let now = sqlite_integer(job.now_unix_millis, "maintenance timestamp")?;
-            connection.execute(
-                "UPDATE history_health SET last_maintenance_ms = ?1 WHERE id = 1",
-                [now],
-            )?;
             job.phase = MaintenancePhase::Cap(CapState::default());
         }
         MaintenancePhase::Cap(state) => {
@@ -5970,12 +6068,47 @@ fn checkpoint_database(
     Ok(completed)
 }
 
-#[derive(Default)]
 struct CapState {
     active: bool,
     phase: CapPhase,
     prune: CapPruneState,
     vacuum_pending: bool,
+    checkpoint_retry_at: Option<Instant>,
+    checkpoint_retry_backoff: Duration,
+}
+
+impl Default for CapState {
+    fn default() -> Self {
+        Self {
+            active: false,
+            phase: CapPhase::default(),
+            prune: CapPruneState::default(),
+            vacuum_pending: false,
+            checkpoint_retry_at: None,
+            checkpoint_retry_backoff: INITIAL_CAP_CHECKPOINT_RETRY_BACKOFF,
+        }
+    }
+}
+
+impl CapState {
+    fn checkpoint_retry_delay(&self) -> Duration {
+        self.checkpoint_retry_at
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or(Duration::ZERO)
+    }
+
+    fn checkpoint_completed(&mut self) {
+        self.checkpoint_retry_at = None;
+        self.checkpoint_retry_backoff = INITIAL_CAP_CHECKPOINT_RETRY_BACKOFF;
+    }
+
+    fn checkpoint_deferred(&mut self) {
+        self.checkpoint_retry_at = Some(Instant::now() + self.checkpoint_retry_backoff);
+        self.checkpoint_retry_backoff = self
+            .checkpoint_retry_backoff
+            .saturating_mul(2)
+            .min(MAX_CAP_CHECKPOINT_RETRY_BACKOFF);
+    }
 }
 
 #[derive(Default)]
@@ -6011,8 +6144,12 @@ fn enforce_size_cap_step(
             state.phase = CapPhase::Checkpoint;
         }
         CapPhase::Checkpoint => {
+            record_debug_cap_checkpoint_attempt(&config.database_path)?;
             if checkpoint_bounded(connection)? {
+                state.checkpoint_completed();
                 state.phase = CapPhase::Vacuum;
+            } else {
+                state.checkpoint_deferred();
             }
         }
         CapPhase::Vacuum => {
@@ -6020,8 +6157,12 @@ fn enforce_size_cap_step(
             state.phase = CapPhase::VacuumCheckpoint;
         }
         CapPhase::VacuumCheckpoint => {
+            record_debug_cap_checkpoint_attempt(&config.database_path)?;
             if checkpoint_bounded(connection)? {
+                state.checkpoint_completed();
                 state.phase = CapPhase::CheckSize;
+            } else {
+                state.checkpoint_deferred();
             }
         }
         CapPhase::CheckSize => {
@@ -6178,7 +6319,8 @@ fn delete_expired_tombstone_resolution(
     raw_admission_cutoff_unix_millis: u64,
     limit: usize,
 ) -> Result<usize, DatabaseError> {
-    Ok(connection.execute(
+    let transaction = connection.unchecked_transaction()?;
+    let deleted = transaction.execute(
         "DELETE FROM metric_deletion_tombstones
          WHERE (scope, client_name, resolution, timestamp_ms) IN (
              SELECT scope, client_name, resolution, timestamp_ms
@@ -6194,7 +6336,35 @@ fn delete_expired_tombstone_resolution(
             i64::try_from(limit)
                 .map_err(|_| DatabaseError::ValueOutOfRange("tombstone deletion limit"))?,
         ],
-    )?)
+    )?;
+    if deleted > 0 {
+        transaction.execute(
+            "UPDATE history_health
+             SET last_maintenance_ms = MAX(last_maintenance_ms, ?1)
+             WHERE id = 1",
+            [sqlite_integer(
+                encode_durable_retirement_floor(raw_admission_cutoff_unix_millis)?,
+                "durable raw retirement floor",
+            )?],
+        )?;
+    }
+    transaction.commit()?;
+    Ok(deleted)
+}
+
+fn encode_durable_retirement_floor(cutoff_unix_millis: u64) -> Result<u64, DatabaseError> {
+    DURABLE_RETIREMENT_FLOOR_TAG
+        .checked_add(cutoff_unix_millis)
+        .filter(|encoded| i64::try_from(*encoded).is_ok())
+        .ok_or(DatabaseError::ValueOutOfRange(
+            "durable raw retirement floor",
+        ))
+}
+
+fn decode_durable_retirement_floor(evidence: u64) -> u64 {
+    evidence
+        .checked_sub(DURABLE_RETIREMENT_FLOOR_TAG)
+        .unwrap_or_default()
 }
 
 fn prune_metric_tier_step(
@@ -6326,6 +6496,43 @@ fn prune_sessions(connection: &mut Connection) -> Result<bool, DatabaseError> {
         [CAP_DELETE_LIMIT as i64],
     )?;
     Ok(deleted > 0)
+}
+
+#[cfg(debug_assertions)]
+fn record_debug_cap_checkpoint_attempt(configured_path: &Path) -> Result<(), DatabaseError> {
+    let directive = sidecar_path(configured_path, ".rustgo-test-checkpoint-attempts");
+    let metadata = match fs::symlink_metadata(&directive) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(DatabaseError::UnsafePath(
+            "checkpoint attempt seam is not an exact regular file",
+        ));
+    }
+    if metadata.len() > 64 * 1024 {
+        return Ok(());
+    }
+    let Ok(content) = fs::read_to_string(&directive) else {
+        return Ok(());
+    };
+    let Some(attempts) = content.strip_prefix(DEBUG_CHECKPOINT_ATTEMPT_HEADER) else {
+        return Ok(());
+    };
+    if !attempts.lines().all(|line| line == "attempt") {
+        return Ok(());
+    }
+    OpenOptions::new()
+        .append(true)
+        .open(directive)?
+        .write_all(b"attempt\n")?;
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+fn record_debug_cap_checkpoint_attempt(_configured_path: &Path) -> Result<(), DatabaseError> {
+    Ok(())
 }
 
 fn checkpoint_bounded(connection: &Connection) -> Result<bool, DatabaseError> {
@@ -6465,18 +6672,18 @@ fn quarantine_database(path: &Path) -> Result<bool, DatabaseError> {
     }
     verify_database_identity(&database, &store, &held_database)?;
     let quarantine = allocate_quarantine_destination(path)?;
-    for suffix in ["-shm", "-wal"] {
-        let source = sidecar_path(&database, suffix);
-        if fs::symlink_metadata(&source).is_ok() {
-            move_member_to_quarantine(&source, &quarantine, false, "SQLite quarantine sidecar")?;
-        }
-    }
     move_exact_with_held(
         &database,
         &quarantine_member_path(&database, &quarantine)?,
         &held_database,
         "SQLite quarantine database",
     )?;
+    for suffix in ["-shm", "-wal"] {
+        let source = sidecar_path(&database, suffix);
+        if fs::symlink_metadata(&source).is_ok() {
+            move_member_to_quarantine(&source, &quarantine, false, "SQLite quarantine sidecar")?;
+        }
+    }
     move_member_to_quarantine(
         &database_identity_path(&store),
         &quarantine,

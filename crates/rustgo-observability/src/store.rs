@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     AuthenticatedClientIdentity, BoundedInventory, BoundedLabel, ClientSnapshot, HostMetrics,
@@ -218,12 +219,36 @@ impl ObservabilityStore {
 impl ObservabilityWorker {
     pub async fn run(mut self) {
         while let Some(event) = self.receiver.recv().await {
-            self.stats.depth.fetch_sub(1, Ordering::SeqCst);
-            self.projection
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .apply(event);
+            self.apply(event);
         }
+    }
+
+    pub async fn run_until(mut self, shutdown: CancellationToken) {
+        loop {
+            tokio::select! {
+                biased;
+                () = shutdown.cancelled() => {
+                    while let Ok(event) = self.receiver.try_recv() {
+                        self.apply(event);
+                    }
+                    return;
+                }
+                event = self.receiver.recv() => {
+                    let Some(event) = event else {
+                        return;
+                    };
+                    self.apply(event);
+                }
+            }
+        }
+    }
+
+    fn apply(&mut self, event: ObservationEvent) {
+        self.stats.depth.fetch_sub(1, Ordering::SeqCst);
+        self.projection
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .apply(event);
     }
 }
 

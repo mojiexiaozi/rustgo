@@ -1,11 +1,25 @@
-use std::{io, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    future, io,
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use rustgo_config::ServerConfig;
-use rustgo_observability::{HostSampler, ObservabilitySink, ObservationEvent};
+use rustgo_observability::{
+    AuthenticatedClientIdentity, ClientHistorySample, ClientLifecycleKind, ClientLifecycleRecord,
+    HistoryBatch, HistoryConfig, HistoryConfigError, HistoryService, HistoryWorker,
+    HistoryWorkerError, HistoryWorkerHandle, HostSampler, ObservabilitySink, ObservabilityStore,
+    ObservabilityWorker, ObservationEvent, OverviewSnapshot, ServerHistorySample, SessionSnapshot,
+};
 use rustgo_protocol::ProtocolVersion;
 use rustgo_transport::{TlsError, TlsServer, safe_display};
 use thiserror::Error;
-use tokio::{sync::Semaphore, task::JoinSet};
+use tokio::{
+    sync::Semaphore,
+    task::{JoinHandle, JoinSet},
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -15,6 +29,7 @@ use crate::{
     registry::{ClientRegistry, RegistryError},
     rendezvous::{RendezvousCoordinator, RendezvousLimits},
     udp::UdpRuntimeLimits,
+    web::{DashboardDataSources, WebError, WebRuntimeLimits, WebServer},
 };
 
 const MAX_UNAUTHENTICATED_CONNECTIONS: usize = 1024;
@@ -30,6 +45,12 @@ const MAX_UDP_SWEEP_BATCH: usize = 65_536;
 const MAX_RENDEZVOUS_SESSIONS: usize = 65_536;
 const MAX_RENDEZVOUS_SESSIONS_PER_DEVICE: usize = 1_024;
 const MAX_RENDEZVOUS_SESSION_TTL: Duration = Duration::from_secs(300);
+const SERVER_SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
+const HISTORY_PROJECTION_INTERVAL: Duration = Duration::from_secs(2);
+const WEB_RESTART_INITIAL_BACKOFF: Duration = Duration::from_millis(50);
+const WEB_RESTART_MAX_BACKOFF: Duration = Duration::from_secs(2);
+const TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const PROJECTION_DRAIN_POLL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone)]
 pub struct ServerRuntimeLimits {
@@ -53,6 +74,8 @@ pub struct ServerRuntimeLimits {
     pub rendezvous_session_ttl: Duration,
     #[doc(hidden)]
     pub udp_test_disconnect_after_replies: Option<u64>,
+    #[doc(hidden)]
+    pub web_test_exit_after_accepts: Option<usize>,
 }
 
 impl Default for ServerRuntimeLimits {
@@ -77,6 +100,7 @@ impl Default for ServerRuntimeLimits {
             max_rendezvous_sessions_per_device: 64,
             rendezvous_session_ttl: Duration::from_secs(30),
             udp_test_disconnect_after_replies: None,
+            web_test_exit_after_accepts: None,
         }
     }
 }
@@ -120,6 +144,7 @@ impl ServerRuntimeLimits {
             || self.rendezvous_session_ttl > MAX_RENDEZVOUS_SESSION_TTL
             || self.udp_writer_delay > Duration::from_secs(60)
             || self.udp_test_disconnect_after_replies == Some(0)
+            || self.web_test_exit_after_accepts == Some(0)
             || self.max_failed_auth_attempts_per_peer > self.max_auth_attempt_records
             || self.max_tracked_auth_peers > self.max_auth_attempt_records
             || tokio::time::Instant::now()
@@ -164,6 +189,19 @@ pub struct ServerApp {
     observation_token_issuer: Option<ObservationTokenIssuer>,
     rendezvous: RendezvousCoordinator,
     observability_sink: Option<ObservabilitySink>,
+    dashboard: Option<DashboardRuntime>,
+}
+
+struct DashboardRuntime {
+    store: ObservabilityStore,
+    projection_worker: ObservabilityWorker,
+    history: HistoryService,
+    history_worker: HistoryWorker,
+    web_server: WebServer,
+    web_restart_config: ServerConfig,
+    web_restart_limits: WebRuntimeLimits,
+    web_data_sources: DashboardDataSources,
+    web_local_addr: SocketAddr,
 }
 
 impl ServerApp {
@@ -175,6 +213,21 @@ impl ServerApp {
             &config.server.certificate_file,
             &config.server.private_key_file,
         )?;
+        Ok(())
+    }
+
+    /// Validates every runtime-only Web/history rule without binding a socket
+    /// or starting the SQLite worker.
+    pub fn validate_configuration(config: &ServerConfig) -> Result<(), ServerError> {
+        Self::validate_credentials(config)?;
+        if let Some(web) = config.web.as_ref().filter(|web| web.enabled) {
+            WebServer::validate_configuration(config, &WebRuntimeLimits::default())?;
+            let (_service, _worker) = HistoryService::new(HistoryConfig {
+                database_path: web.database_path.clone(),
+                history_days: web.history_days,
+                database_max_mib: web.database_max_mib,
+            })?;
+        }
         Ok(())
     }
 
@@ -299,6 +352,53 @@ impl ServerApp {
         ));
         let tls_handshakes =
             TlsHandshakeLimiter::new(runtime_limits.max_unauthenticated_connections_per_peer);
+        let (observability_sink, dashboard) = if let Some(web) =
+            config.web.as_ref().filter(|web| web.enabled)
+        {
+            let (store, sink, projection_worker) = ObservabilityStore::new();
+            registry.install_observability_sink(sink.clone())?;
+            let (history, history_worker) = HistoryService::new(HistoryConfig {
+                database_path: web.database_path.clone(),
+                history_days: web.history_days,
+                database_max_mib: web.database_max_mib,
+            })?;
+            let web_data_sources = DashboardDataSources::new(store.clone(), Some(history.clone()));
+            let web_limits = WebRuntimeLimits {
+                test_exit_after_accepts: runtime_limits.web_test_exit_after_accepts,
+                ..WebRuntimeLimits::default()
+            };
+            let web_server = WebServer::bind_with_data_sources(
+                &config,
+                web_limits.clone(),
+                web_data_sources.clone(),
+            )
+            .await?;
+            let web_local_addr = web_server.local_addr()?;
+            let mut web_restart_config = config.clone();
+            web_restart_config
+                .web
+                .as_mut()
+                .expect("enabled Web configuration remains present")
+                .bind = web_local_addr.to_string();
+            let mut web_restart_limits = web_limits;
+            web_restart_limits.test_exit_after_accepts = None;
+            (
+                Some(sink),
+                Some(DashboardRuntime {
+                    store,
+                    projection_worker,
+                    history,
+                    history_worker,
+                    web_server,
+                    web_restart_config,
+                    web_restart_limits,
+                    web_data_sources,
+                    web_local_addr,
+                }),
+            )
+        } else {
+            (None, None)
+        };
         Ok(Self {
             tls_server,
             authenticator,
@@ -312,7 +412,8 @@ impl ServerApp {
             observation,
             observation_token_issuer,
             rendezvous,
-            observability_sink: None,
+            observability_sink,
+            dashboard,
         })
     }
 
@@ -325,6 +426,12 @@ impl ServerApp {
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.tls_server.local_addr()
+    }
+
+    pub fn web_local_addr(&self) -> Option<SocketAddr> {
+        self.dashboard
+            .as_ref()
+            .map(|dashboard| dashboard.web_local_addr)
     }
 
     pub fn registry(&self) -> ClientRegistry {
@@ -347,16 +454,85 @@ impl ServerApp {
     }
 
     pub async fn run(self) -> Result<(), ServerError> {
-        self.run_until(CancellationToken::new()).await
+        let shutdown = CancellationToken::new();
+        let test_shutdown_delay = internal_test_shutdown_delay()?;
+        let mut runtime = Box::pin(self.run_until(shutdown.clone()));
+        tokio::select! {
+            result = &mut runtime => result,
+            signal = tokio::signal::ctrl_c() => {
+                signal?;
+                shutdown.cancel();
+                runtime.await
+            }
+            () = async {
+                match test_shutdown_delay {
+                    Some(delay) => tokio::time::sleep(delay).await,
+                    None => future::pending().await,
+                }
+            } => {
+                shutdown.cancel();
+                runtime.await
+            }
+        }
     }
 
-    pub async fn run_until(self, shutdown: CancellationToken) -> Result<(), ServerError> {
-        let session_shutdown = CancellationToken::new();
+    pub async fn run_until(mut self, shutdown: CancellationToken) -> Result<(), ServerError> {
+        let runtime_root = CancellationToken::new();
+        let sampler_shutdown = runtime_root.child_token();
+        let projection_shutdown = runtime_root.child_token();
+        let history_projection_shutdown = runtime_root.child_token();
+        let history_worker_shutdown = runtime_root.child_token();
+        let web_shutdown = runtime_root.child_token();
+        let session_shutdown = runtime_root.child_token();
         let mut rendezvous_expiry = tokio::time::interval(Duration::from_millis(250));
         rendezvous_expiry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut server_sampler = self.observability_sink.as_ref().map(|_| HostSampler::new());
-        let mut server_sample_ticks = tokio::time::interval(Duration::from_secs(2));
-        server_sample_ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let sampler_task = self
+            .observability_sink
+            .clone()
+            .map(|sink| tokio::spawn(run_server_sampler(sink, sampler_shutdown.child_token())));
+
+        let mut projection_task = None;
+        let mut history_projection_task = None;
+        let mut history_worker_task = None;
+        let mut web_task = None;
+        let mut dashboard_store = None;
+        let mut history_service = None;
+        if let Some(dashboard) = self.dashboard.take() {
+            dashboard_store = Some(dashboard.store.clone());
+            history_service = Some(dashboard.history.clone());
+            projection_task = Some(tokio::spawn(
+                dashboard
+                    .projection_worker
+                    .run_until(projection_shutdown.child_token()),
+            ));
+            history_projection_task = Some(tokio::spawn(run_history_projection(
+                dashboard.store,
+                dashboard.history.clone(),
+                history_projection_shutdown.child_token(),
+            )));
+            match dashboard.history_worker.start() {
+                Ok(worker) => {
+                    history_worker_task = Some(tokio::spawn(run_history_worker(
+                        worker,
+                        history_worker_shutdown.child_token(),
+                    )));
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        error = %safe_display(&error),
+                        "SQLite history worker could not start; live observability remains active"
+                    );
+                }
+            }
+            web_task = Some(tokio::spawn(run_web_supervisor(
+                dashboard.web_server,
+                dashboard.web_restart_config,
+                dashboard.web_restart_limits,
+                dashboard.web_data_sources,
+                web_shutdown.child_token(),
+            )));
+        }
+
         let mut observation = self
             .observation
             .map(|service| Box::pin(service.run(session_shutdown.child_token())));
@@ -365,15 +541,6 @@ impl ServerApp {
             tokio::select! {
                 () = shutdown.cancelled() => break Ok(()),
                 _ = rendezvous_expiry.tick() => self.rendezvous.expire_now(),
-                _ = server_sample_ticks.tick(), if server_sampler.is_some() => {
-                    let metrics = server_sampler
-                        .as_mut()
-                        .expect("the guarded server sampler exists")
-                        .sample();
-                    if let Some(sink) = &self.observability_sink {
-                        let _ = sink.try_publish(ObservationEvent::ServerSample { metrics });
-                    }
-                }
                 observation_result = async {
                     match observation.as_mut() {
                         Some(service) => Some(service.await),
@@ -436,12 +603,386 @@ impl ServerApp {
             }
             while sessions.try_join_next().is_some() {}
         };
+
+        web_shutdown.cancel();
+        sampler_shutdown.cancel();
         session_shutdown.cancel();
+        join_task_bounded("Web server", web_task).await;
         if let Some(observation) = observation {
-            observation.await?;
+            match tokio::time::timeout(TASK_SHUTDOWN_TIMEOUT, observation).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!(
+                    error = %safe_display(&error),
+                    "observation listener degraded during shutdown"
+                ),
+                Err(_) => tracing::warn!(
+                    "observation listener shutdown timed out; process exit will continue"
+                ),
+            }
         }
-        while sessions.join_next().await.is_some() {}
+
+        if tokio::time::timeout(TASK_SHUTDOWN_TIMEOUT, async {
+            while sessions.join_next().await.is_some() {}
+        })
+        .await
+        .is_err()
+        {
+            tracing::warn!("relay session shutdown timed out; remaining sessions will be aborted");
+            sessions.abort_all();
+            while sessions.join_next().await.is_some() {}
+        }
+
+        join_task_bounded("server sampler", sampler_task).await;
+
+        if let Some(store) = dashboard_store.as_ref()
+            && tokio::time::timeout(TASK_SHUTDOWN_TIMEOUT, async {
+                while store.snapshot().event_queue_depth != 0 {
+                    tokio::time::sleep(PROJECTION_DRAIN_POLL).await;
+                }
+            })
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                "observability projection drain timed out; final history will use the latest available snapshot"
+            );
+        }
+
+        history_projection_shutdown.cancel();
+        join_task_bounded("history projection", history_projection_task).await;
+        if let Some(history) = history_service.as_ref() {
+            match tokio::time::timeout(TASK_SHUTDOWN_TIMEOUT, history.checkpoint()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!(
+                    error = %safe_display(&error),
+                    "SQLite history checkpoint degraded during shutdown"
+                ),
+                Err(_) => tracing::warn!("SQLite history checkpoint timed out during shutdown"),
+            }
+        }
+        if let Some(history) = history_service.as_ref() {
+            history.close();
+        }
+        history_worker_shutdown.cancel();
+        join_result_task_bounded("SQLite history worker", history_worker_task).await;
+        projection_shutdown.cancel();
+        join_task_bounded("observability projection", projection_task).await;
+        runtime_root.cancel();
         result
+    }
+}
+
+async fn run_server_sampler(sink: ObservabilitySink, shutdown: CancellationToken) {
+    let mut sampler = HostSampler::new();
+    let mut ticks = tokio::time::interval(SERVER_SAMPLE_INTERVAL);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            biased;
+            () = shutdown.cancelled() => {
+                let _ = sink.try_publish(ObservationEvent::ServerSample {
+                    metrics: sampler.sample(),
+                });
+                return;
+            },
+            _ = ticks.tick() => {
+                let _ = sink.try_publish(ObservationEvent::ServerSample {
+                    metrics: sampler.sample(),
+                });
+            }
+        }
+    }
+}
+
+async fn run_history_projection(
+    store: ObservabilityStore,
+    history: HistoryService,
+    shutdown: CancellationToken,
+) {
+    let mut projector = HistoryProjector::default();
+    let mut ticks = tokio::time::interval(HISTORY_PROJECTION_INTERVAL);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            biased;
+            () = shutdown.cancelled() => {
+                publish_history_snapshot(&mut projector, &store, &history);
+                return;
+            }
+            _ = ticks.tick() => publish_history_snapshot(&mut projector, &store, &history),
+        }
+    }
+}
+
+fn publish_history_snapshot(
+    projector: &mut HistoryProjector,
+    store: &ObservabilityStore,
+    history: &HistoryService,
+) {
+    for batch in projector.project(store.snapshot()) {
+        let _ = history.try_publish(batch);
+    }
+}
+
+#[derive(Default)]
+struct HistoryProjector {
+    server_sampled_unix_millis: Option<u64>,
+    clients: BTreeMap<String, ProjectedClientHistory>,
+    sessions: BTreeMap<String, SessionSnapshot>,
+}
+
+#[derive(Default)]
+struct ProjectedClientHistory {
+    generation: u64,
+    authenticated_recorded: bool,
+    disconnected_unix_millis: Option<u64>,
+    sampled_unix_millis: Option<u64>,
+}
+
+impl HistoryProjector {
+    fn project(&mut self, snapshot: OverviewSnapshot) -> Vec<HistoryBatch> {
+        let mut batches = HistoryBatchBuilder::default();
+        if let Some(metrics) = snapshot.server.metrics
+            && self
+                .server_sampled_unix_millis
+                .is_none_or(|current| metrics.sampled_unix_millis > current)
+        {
+            self.server_sampled_unix_millis = Some(metrics.sampled_unix_millis);
+            batches.server(ServerHistorySample::from_metrics(
+                metrics,
+                snapshot.server.traffic,
+            ));
+        }
+
+        for client in snapshot.clients {
+            let Ok(identity) = AuthenticatedClientIdentity::from_server_authentication(
+                client.name.as_str().to_owned(),
+                client.generation,
+            ) else {
+                continue;
+            };
+            let projected = self.clients.entry(identity.name().to_owned()).or_default();
+            if projected.generation != identity.generation() {
+                *projected = ProjectedClientHistory {
+                    generation: identity.generation(),
+                    ..ProjectedClientHistory::default()
+                };
+            }
+            if !projected.authenticated_recorded {
+                projected.authenticated_recorded = true;
+                batches.lifecycle(ClientLifecycleRecord {
+                    client: identity.clone(),
+                    kind: ClientLifecycleKind::Authenticated,
+                    timestamp_unix_millis: client.authenticated_unix_millis,
+                    version: Some(client.version.clone()),
+                });
+            }
+            if let Some(disconnected_unix_millis) = client.disconnected_unix_millis
+                && projected.disconnected_unix_millis != Some(disconnected_unix_millis)
+            {
+                projected.disconnected_unix_millis = Some(disconnected_unix_millis);
+                batches.lifecycle(ClientLifecycleRecord {
+                    client: identity.clone(),
+                    kind: ClientLifecycleKind::Disconnected,
+                    timestamp_unix_millis: disconnected_unix_millis,
+                    version: None,
+                });
+            }
+            if let Some(metrics) = client.metrics
+                && projected
+                    .sampled_unix_millis
+                    .is_none_or(|current| metrics.sampled_unix_millis > current)
+            {
+                projected.sampled_unix_millis = Some(metrics.sampled_unix_millis);
+                batches.client(ClientHistorySample::from_metrics(
+                    identity,
+                    metrics,
+                    client.traffic,
+                ));
+            }
+        }
+
+        let mut current_sessions = BTreeMap::new();
+        for session in snapshot.sessions {
+            let key = format!("{}:{}", session.id.as_str(), session.opened_unix_millis);
+            if self.sessions.get(&key) != Some(&session) {
+                batches.session(session.clone());
+            }
+            current_sessions.insert(key, session);
+        }
+        self.sessions = current_sessions;
+        batches.finish()
+    }
+}
+
+const HISTORY_RECORDS_PER_PUBLISH: usize = 1_024;
+
+#[derive(Default)]
+struct HistoryBatchBuilder {
+    current: HistoryBatch,
+    complete: Vec<HistoryBatch>,
+}
+
+impl HistoryBatchBuilder {
+    fn server(&mut self, sample: ServerHistorySample) {
+        self.flush_if_full();
+        self.current.server_points.push(sample);
+    }
+
+    fn client(&mut self, sample: ClientHistorySample) {
+        self.flush_if_full();
+        self.current.client_points.push(sample);
+    }
+
+    fn lifecycle(&mut self, record: ClientLifecycleRecord) {
+        self.flush_if_full();
+        self.current.client_lifecycle.push(record);
+    }
+
+    fn session(&mut self, session: SessionSnapshot) {
+        self.flush_if_full();
+        self.current.session_summaries.push(session);
+    }
+
+    fn flush_if_full(&mut self) {
+        if self.current.record_count() >= HISTORY_RECORDS_PER_PUBLISH {
+            self.complete.push(std::mem::take(&mut self.current));
+        }
+    }
+
+    fn finish(mut self) -> Vec<HistoryBatch> {
+        if !self.current.is_empty() {
+            self.complete.push(self.current);
+        }
+        self.complete
+    }
+}
+
+async fn run_history_worker(
+    worker: HistoryWorkerHandle,
+    shutdown: CancellationToken,
+) -> Result<(), HistoryWorkerError> {
+    let worker = worker;
+    loop {
+        tokio::select! {
+            biased;
+            () = shutdown.cancelled() => return worker.shutdown().await,
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                if worker.is_finished() {
+                    return worker.shutdown().await;
+                }
+            }
+        }
+    }
+}
+
+async fn run_web_supervisor(
+    initial: WebServer,
+    config: ServerConfig,
+    limits: WebRuntimeLimits,
+    data_sources: DashboardDataSources,
+    shutdown: CancellationToken,
+) {
+    let mut server = Some(initial);
+    let mut backoff = WEB_RESTART_INITIAL_BACKOFF;
+    loop {
+        let running = server
+            .take()
+            .expect("Web supervisor always binds before entering the run phase");
+        let started = Instant::now();
+        let outcome = running.run_until(shutdown.child_token()).await;
+        if shutdown.is_cancelled() {
+            return;
+        }
+        match outcome {
+            Ok(()) => tracing::warn!("Web server exited unexpectedly; it will be restarted"),
+            Err(error) => tracing::warn!(
+                error = %safe_display(&error),
+                "Web server failed; relay remains active and Web will be restarted"
+            ),
+        }
+        if started.elapsed() >= Duration::from_secs(30) {
+            backoff = WEB_RESTART_INITIAL_BACKOFF;
+        }
+        loop {
+            tokio::select! {
+                biased;
+                () = shutdown.cancelled() => return,
+                _ = tokio::time::sleep(backoff) => {}
+            }
+            match WebServer::bind_with_data_sources(&config, limits.clone(), data_sources.clone())
+                .await
+            {
+                Ok(restarted) => {
+                    match restarted.local_addr() {
+                        Ok(address) => tracing::info!(
+                            address = %safe_display(address),
+                            "Web server restarted"
+                        ),
+                        Err(error) => tracing::info!(
+                            error = %safe_display(&error),
+                            "Web server restarted"
+                        ),
+                    }
+                    server = Some(restarted);
+                    backoff = backoff.saturating_mul(2).min(WEB_RESTART_MAX_BACKOFF);
+                    break;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        error = %safe_display(&error),
+                        "Web server restart bind failed; relay remains active"
+                    );
+                    backoff = backoff.saturating_mul(2).min(WEB_RESTART_MAX_BACKOFF);
+                }
+            }
+        }
+    }
+}
+
+async fn join_task_bounded(name: &'static str, task: Option<JoinHandle<()>>) {
+    let Some(mut task) = task else {
+        return;
+    };
+    match tokio::time::timeout(TASK_SHUTDOWN_TIMEOUT, &mut task).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(
+            task = name,
+            error = %safe_display(&error),
+            "subordinate server task failed"
+        ),
+        Err(_) => {
+            tracing::warn!(task = name, "subordinate server task shutdown timed out");
+            task.abort();
+            let _ = task.await;
+        }
+    }
+}
+
+async fn join_result_task_bounded(
+    name: &'static str,
+    task: Option<JoinHandle<Result<(), HistoryWorkerError>>>,
+) {
+    let Some(mut task) = task else {
+        return;
+    };
+    match tokio::time::timeout(TASK_SHUTDOWN_TIMEOUT, &mut task).await {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(error))) => tracing::warn!(
+            task = name,
+            error = %safe_display(&error),
+            "subordinate server task degraded"
+        ),
+        Ok(Err(error)) => tracing::warn!(
+            task = name,
+            error = %safe_display(&error),
+            "subordinate server task failed"
+        ),
+        Err(_) => {
+            tracing::warn!(task = name, "subordinate server task shutdown timed out");
+            task.abort();
+            let _ = task.await;
+        }
     }
 }
 
@@ -459,6 +1000,24 @@ fn internal_test_protocol_version() -> Result<ProtocolVersion, ServerError> {
         .transpose()?
         .unwrap_or(control::SERVER_VERSION.minor);
     Ok(ProtocolVersion::new(control::SERVER_VERSION.major, minor))
+}
+
+fn internal_test_shutdown_delay() -> Result<Option<Duration>, ServerError> {
+    if std::env::var("RUSTGO_INTERNAL_TESTING").as_deref() != Ok("1") {
+        return Ok(None);
+    }
+    std::env::var("RUSTGO_TEST_SHUTDOWN_AFTER_MS")
+        .ok()
+        .map(|value| {
+            let millis = value
+                .parse::<u64>()
+                .map_err(|_| ServerError::InvalidRuntimeLimits)?;
+            if millis == 0 {
+                return Err(ServerError::InvalidRuntimeLimits);
+            }
+            Ok(Duration::from_millis(millis))
+        })
+        .transpose()
 }
 
 fn load_authenticator(config: &ServerConfig) -> Result<Authenticator, ServerError> {
@@ -506,6 +1065,10 @@ impl ServerRuntimeLimits {
             self.max_pending_data_channel_tokens_per_client =
                 usize::try_from(value).map_err(|_| ServerError::InvalidRuntimeLimits)?;
         }
+        if let Some(value) = parse("RUSTGO_TEST_WEB_EXIT_AFTER_ACCEPTS")? {
+            self.web_test_exit_after_accepts =
+                Some(usize::try_from(value).map_err(|_| ServerError::InvalidRuntimeLimits)?);
+        }
         Ok(())
     }
 }
@@ -530,6 +1093,10 @@ pub enum ServerError {
     AuthenticationSetup,
     #[error("server registry setup failed: {0}")]
     Registry(#[from] RegistryError),
+    #[error("Web dashboard setup failed: {0}")]
+    Web(#[from] WebError),
+    #[error("SQLite history setup failed: {0}")]
+    HistoryConfiguration(#[from] HistoryConfigError),
     #[error("invalid server runtime limits")]
     InvalidRuntimeLimits,
     #[error("invalid paired observation bind configuration")]

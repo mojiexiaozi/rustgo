@@ -71,6 +71,8 @@ pub struct WebRuntimeLimits {
     pub request_timeout: Duration,
     pub body_read_timeout: Duration,
     pub graceful_drain_timeout: Duration,
+    #[doc(hidden)]
+    pub test_exit_after_accepts: Option<usize>,
 }
 
 impl Default for WebRuntimeLimits {
@@ -89,6 +91,7 @@ impl Default for WebRuntimeLimits {
             request_timeout: Duration::from_secs(10),
             body_read_timeout: Duration::from_secs(3),
             graceful_drain_timeout: Duration::from_secs(5),
+            test_exit_after_accepts: None,
         }
     }
 }
@@ -121,6 +124,7 @@ impl WebRuntimeLimits {
             || self.body_read_timeout > self.request_timeout
             || self.graceful_drain_timeout.is_zero()
             || self.graceful_drain_timeout > MAX_GRACEFUL_DRAIN_TIMEOUT
+            || self.test_exit_after_accepts == Some(0)
             || now.checked_add(self.session_idle_timeout).is_none()
             || now.checked_add(self.session_absolute_timeout).is_none()
             || now.checked_add(self.login_window).is_none()
@@ -142,6 +146,31 @@ pub struct WebServer {
 }
 
 impl WebServer {
+    pub fn validate_configuration(
+        config: &ServerConfig,
+        limits: &WebRuntimeLimits,
+    ) -> Result<SocketAddr, WebError> {
+        config
+            .validate()
+            .map_err(|error| WebError::InvalidConfiguration(error.to_string()))?;
+        limits.validate()?;
+        let web = config
+            .web
+            .as_ref()
+            .filter(|web| web.enabled)
+            .ok_or(WebError::Disabled)?;
+        WebOrigin::from_config(web)
+            .map_err(|error| WebError::InvalidConfiguration(error.to_string()))?;
+        let configured_address = web
+            .bind
+            .parse::<SocketAddr>()
+            .map_err(|_| WebError::InvalidBindAddress)?;
+        if !configured_address.ip().is_loopback() {
+            return Err(WebError::NonLoopbackBind);
+        }
+        Ok(configured_address)
+    }
+
     pub async fn bind(config: &ServerConfig) -> Result<Self, WebError> {
         Self::bind_with_runtime_limits(config, WebRuntimeLimits::default()).await
     }
@@ -160,10 +189,7 @@ impl WebServer {
         limits: WebRuntimeLimits,
         data_sources: DashboardDataSources,
     ) -> Result<Self, WebError> {
-        config
-            .validate()
-            .map_err(|error| WebError::InvalidConfiguration(error.to_string()))?;
-        limits.validate()?;
+        let configured_address = Self::validate_configuration(config, &limits)?;
         let web = config
             .web
             .as_ref()
@@ -171,14 +197,6 @@ impl WebServer {
             .ok_or(WebError::Disabled)?;
         let expected_origin = WebOrigin::from_config(web)
             .map_err(|error| WebError::InvalidConfiguration(error.to_string()))?;
-        let configured_address = web
-            .bind
-            .parse::<SocketAddr>()
-            .map_err(|_| WebError::InvalidBindAddress)?;
-        if !configured_address.ip().is_loopback() {
-            return Err(WebError::NonLoopbackBind);
-        }
-
         let authentication =
             AuthenticationState::new(&web.admin_username, &web.admin_password, &limits)
                 .map_err(|_| WebError::Authentication)?;
@@ -217,6 +235,7 @@ impl WebServer {
         let request_slots = Arc::new(Semaphore::new(self.runtime_limits.max_concurrent_requests));
         let connection_shutdown = CancellationToken::new();
         let mut connections = JoinSet::new();
+        let mut accepted_connections = 0_usize;
 
         let accept_result = 'accept: loop {
             tokio::select! {
@@ -239,6 +258,16 @@ impl WebServer {
                         Ok(accepted) => accepted,
                         Err(error) => break Err(WebError::Io(error)),
                     };
+                    accepted_connections = accepted_connections.saturating_add(1);
+                    if self
+                        .runtime_limits
+                        .test_exit_after_accepts
+                        .is_some_and(|limit| accepted_connections >= limit)
+                    {
+                        drop(stream);
+                        drop(permit);
+                        break Err(WebError::UnexpectedTestExit);
+                    }
                     connections.spawn(run_connection(
                         stream,
                         peer,
@@ -618,4 +647,7 @@ pub enum WebError {
     Authentication,
     #[error("web listener I/O failed: {0}")]
     Io(#[from] io::Error),
+    #[doc(hidden)]
+    #[error("web listener exited at the internal lifecycle test seam")]
+    UnexpectedTestExit,
 }

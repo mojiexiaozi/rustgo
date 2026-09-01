@@ -61,14 +61,23 @@ async fn execute(cli: Cli) -> Result<(), CommandError> {
         Action::Run => {
             let server = ServerApp::bind(config).await?;
             let address = server.local_addr().map_err(ServerError::from)?;
+            let web_address = server.web_local_addr();
             tracing::info!(
                 address = %safe_display(address),
+                web_enabled = web_address.is_some(),
                 event = %"server_listening",
                 "server TLS listener ready"
             );
+            if let Some(address) = web_address {
+                tracing::info!(
+                    address = %safe_display(address),
+                    event = %"web_listening",
+                    "Web dashboard listener ready"
+                );
+            }
             server.run().await.map_err(Into::into)
         }
-        Action::Check => ServerApp::validate_credentials(&config).map_err(Into::into),
+        Action::Check => ServerApp::validate_configuration(&config).map_err(Into::into),
     }
 }
 

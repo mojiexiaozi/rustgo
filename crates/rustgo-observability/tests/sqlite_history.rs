@@ -213,10 +213,34 @@ fn create_bootstrap_crash_prefix(path: &Path, phase: &str) {
     fs::remove_file(directive).unwrap();
 }
 
+fn create_v5_upgrade_crash_prefix(path: &Path, phase: &str) {
+    let directive = sidecar(path, ".rustgo-test-v5-upgrade-crash");
+    fs::write(
+        &directive,
+        format!("rustgo-observability-test-v5-upgrade-crash-v1\nphase={phase}\n"),
+    )
+    .unwrap();
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("v5_upgrade_crash_helper")
+        .arg("--nocapture")
+        .env("RUSTGO_V5_UPGRADE_CRASH_DATABASE", path)
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(89));
+    fs::remove_file(directive).unwrap();
+}
+
 fn sidecar(path: &Path, suffix: &str) -> PathBuf {
     let mut value = path.as_os_str().to_owned();
     value.push(suffix);
     PathBuf::from(value)
+}
+
+fn recorded_checkpoint_attempts(configured_path: &Path) -> usize {
+    fs::read_to_string(sidecar(configured_path, ".rustgo-test-checkpoint-attempts"))
+        .map(|content| content.lines().filter(|line| *line == "attempt").count())
+        .unwrap_or(0)
 }
 
 fn create_exact_v4_history(path: &Path, timestamp: u64) {
@@ -1315,6 +1339,79 @@ async fn pinned_reader_and_large_wal_keep_checkpoint_and_shutdown_wall_time_boun
     reader.execute_batch("ROLLBACK").unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pinned_reader_cap_checkpoint_retries_back_off_and_queued_writes_recover() {
+    let directory = TestDirectory::new("checkpoint-retry-backoff");
+    let database = directory.database();
+    let mut cap_config = config(database.clone());
+    cap_config.database_max_mib = 1;
+    fs::write(
+        sidecar(&database, ".rustgo-test-checkpoint-attempts"),
+        b"rustgo-observability-test-checkpoint-attempts-v1\n",
+    )
+    .unwrap();
+    let (service, worker) = HistoryService::new(cap_config).unwrap();
+    let worker = worker.start().unwrap();
+    wait_until(
+        || service.health().history_available,
+        Duration::from_secs(2),
+    )
+    .await;
+
+    let managed = managed_database_path(&database);
+    let reader = Connection::open(&managed).unwrap();
+    reader.execute_batch("BEGIN").unwrap();
+    let _: usize = reader
+        .query_row("SELECT COUNT(*) FROM history_health", [], |row| row.get(0))
+        .unwrap();
+    let now = recent_base() + 45_000;
+    for chunk in 0..12_u64 {
+        service
+            .try_publish(large_session_batch(chunk * 500, 500, now + chunk))
+            .unwrap();
+    }
+    wait_until(
+        || recorded_checkpoint_attempts(&database) >= 2,
+        Duration::from_secs(3),
+    )
+    .await;
+    let before = recorded_checkpoint_attempts(&database);
+    tokio::time::sleep(Duration::from_millis(650)).await;
+    let after = recorded_checkpoint_attempts(&database);
+    assert!(after > before);
+    assert!(
+        after - before <= 4,
+        "busy checkpoint retried {before}->{after} without bounded exponential yield"
+    );
+
+    service
+        .try_publish(HistoryBatch {
+            server_points: vec![server_sample(now + 1_000, 7_777)],
+            ..HistoryBatch::default()
+        })
+        .unwrap();
+    assert!(service.health().pending_batches > 0);
+    reader.execute_batch("ROLLBACK").unwrap();
+    drop(reader);
+    wait_until(
+        || service.health().pending_batches == 0,
+        Duration::from_secs(5),
+    )
+    .await;
+    let persisted = service
+        .query(query(
+            HistoryScope::Server,
+            HistoryMetric::CpuBasisPoints,
+            now + 1_000,
+            now + 1_000,
+            HistoryResolution::Raw,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(persisted.points[0].value, 7_777.0);
+    stop(service, worker).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn large_metric_tier_maintenance_is_index_ordered_and_shutdown_bounded() {
     let directory = TestDirectory::new("metric-maintenance-yield");
@@ -1705,6 +1802,63 @@ async fn interrupted_quarantine_resumes_from_matching_dual_ownership() {
         fs::read(store.join("collateral.txt")).unwrap(),
         b"preserve collateral"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_main_first_quarantine_prefix_is_safe_to_resume() {
+    let directory = TestDirectory::new("quarantine-main-first-prefixes");
+    for moved_members in 0..=7_usize {
+        let database = directory.0.join(format!("prefix-{moved_members}.db"));
+        let (service, worker) = HistoryService::new(config(database.clone())).unwrap();
+        let worker = worker.start().unwrap();
+        wait_until(
+            || service.health().history_available,
+            Duration::from_secs(2),
+        )
+        .await;
+        stop(service, worker).await;
+
+        let managed = managed_database_path(&database);
+        let store = managed.parent().unwrap().to_path_buf();
+        let quarantine = directory
+            .0
+            .join(format!("prefix-{moved_members}.db.quarantine-0"));
+        fs::create_dir(&quarantine).unwrap();
+        if moved_members > 0 {
+            fs::write(sidecar(&managed, "-shm"), b"crash-prefix-shm").unwrap();
+            fs::write(sidecar(&managed, "-wal"), b"crash-prefix-wal").unwrap();
+        }
+        let members = [
+            managed.clone(),
+            sidecar(&managed, "-shm"),
+            sidecar(&managed, "-wal"),
+            store.join("rustgo-database-identity"),
+            store.join("rustgo-owner-proof"),
+            sidecar(&database, ".rustgo-pending"),
+            sidecar(&database, ".rustgo-owner"),
+        ];
+        for source in members.iter().take(moved_members) {
+            fs::rename(source, quarantine.join(source.file_name().unwrap())).unwrap();
+        }
+
+        let (service, worker) = HistoryService::new(config(database.clone())).unwrap();
+        let worker = worker.start().unwrap();
+        wait_until(
+            || service.health().history_available,
+            Duration::from_secs(5),
+        )
+        .await;
+        stop(service, worker).await;
+
+        assert!(managed_database_path(&database).is_file());
+        if moved_members == 0 {
+            assert!(quarantine.read_dir().unwrap().next().is_none());
+        } else {
+            for source in &members {
+                assert!(quarantine.join(source.file_name().unwrap()).is_file());
+            }
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2742,6 +2896,64 @@ async fn exact_round3_and_round4_v5_layouts_migrate_to_v6_with_data_and_replay_p
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn v5_upgrade_resumes_recorded_active_identity_after_each_crash_prefix() {
+    let directory = TestDirectory::new("v5-upgrade-crash-prefixes");
+    let timestamp = recent_base() + 12_345;
+    for (index, phase) in ["after-family-move", "before-checkpoint"]
+        .into_iter()
+        .enumerate()
+    {
+        let database = directory.0.join(format!("prefix-{index}.db"));
+        let nonce = if index == 0 {
+            "7777777777777777777777777777777777777777777777777777777777777777"
+        } else {
+            "8888888888888888888888888888888888888888888888888888888888888888"
+        };
+        create_exact_v5_history(&database, nonce, timestamp + index as u64, index != 0);
+        fs::write(
+            sidecar(&database, ".rustgo-owner"),
+            format!("rustgo-observability-history-v2\napplication_id=5253474f\nnonce={nonce}\n"),
+        )
+        .unwrap();
+
+        create_v5_upgrade_crash_prefix(&database, phase);
+        let pending = fs::read_to_string(sidecar(&database, ".rustgo-pending")).unwrap();
+        let active = pending
+            .lines()
+            .find_map(|line| line.strip_prefix("active="))
+            .unwrap();
+        let target = pending_database_path(&database);
+        assert!(target.is_file());
+        assert!(
+            target
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains(active)
+        );
+        assert!(!database.exists());
+
+        let (service, worker) = HistoryService::new(config(database.clone())).unwrap();
+        let worker = worker.start().unwrap();
+        let series = service
+            .query(query(
+                HistoryScope::Server,
+                HistoryMetric::CpuBasisPoints,
+                timestamp + index as u64,
+                timestamp + index as u64,
+                HistoryResolution::Raw,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(series.points[0].value, 4_321.0);
+        stop(service, worker).await;
+        assert_eq!(managed_database_path(&database), target);
+        let idle = fs::read_to_string(sidecar(&database, ".rustgo-pending")).unwrap();
+        assert!(idle.contains("state=idle\n"));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn v5_with_any_extra_schema_object_is_rejected_without_claiming_or_rewriting() {
     let directory = TestDirectory::new("v5-extra-object");
     for (name, nonce, round4) in [
@@ -2947,6 +3159,78 @@ async fn forward_clock_without_deletion_does_not_poison_admission_after_correcti
     assert_eq!(series.points.len(), 1);
     assert_eq!(series.points[0].value, 6_789.0);
     assert_eq!(service.health().dropped_late_points, 0);
+    stop(service, worker).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expired_tombstone_records_a_durable_replay_floor_across_clock_rollback() {
+    let directory = TestDirectory::new("tombstone-clock-rollback");
+    let database = directory.database();
+    let (service, worker) = HistoryService::new(config(database.clone())).unwrap();
+    let worker = worker.start().unwrap();
+    wait_until(
+        || service.health().history_available,
+        Duration::from_secs(2),
+    )
+    .await;
+    stop(service, worker).await;
+
+    let forward_now = recent_base() + 30 * DAY_MILLIS;
+    let retired_bucket = ((forward_now - 2 * HOUR_MILLIS) / MINUTE_MILLIS) * MINUTE_MILLIS;
+    let connection = open_history_database(&database);
+    connection
+        .execute(
+            "INSERT INTO metric_deletion_tombstones
+             (scope, client_name, resolution, timestamp_ms, deleted_ms)
+             VALUES (0, '', 1, ?1, ?2)",
+            rusqlite::params![retired_bucket, forward_now - 2 * DAY_MILLIS],
+        )
+        .unwrap();
+    drop(connection);
+
+    let (service, worker) = HistoryService::new(config(database.clone())).unwrap();
+    let worker = worker.start().unwrap();
+    service.maintain(forward_now).await.unwrap();
+    let connection = open_history_database(&database);
+    let tombstones: usize = connection
+        .query_row(
+            "SELECT COUNT(*) FROM metric_deletion_tombstones",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let durable_floor: u64 = connection
+        .query_row(
+            "SELECT last_maintenance_ms FROM history_health WHERE id=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    drop(connection);
+    assert_eq!(tombstones, 0);
+    assert!(durable_floor > retired_bucket);
+    stop(service, worker).await;
+
+    let (service, worker) = HistoryService::new(config(database)).unwrap();
+    let worker = worker.start().unwrap();
+    service
+        .try_publish(HistoryBatch {
+            server_points: vec![server_sample(retired_bucket + 1_000, 9_999)],
+            ..HistoryBatch::default()
+        })
+        .unwrap();
+    let replay = service
+        .query(query(
+            HistoryScope::Server,
+            HistoryMetric::CpuBasisPoints,
+            retired_bucket,
+            retired_bucket + MINUTE_MILLIS - 1,
+            HistoryResolution::Raw,
+        ))
+        .await
+        .unwrap();
+    assert!(replay.points.is_empty());
+    assert_eq!(service.health().dropped_late_points, 1);
     stop(service, worker).await;
 }
 
@@ -3196,6 +3480,23 @@ fn bootstrap_pending_crash_helper() {
     }
     drop(worker);
     panic!("bootstrap crash seam did not terminate the helper process");
+}
+
+#[test]
+fn v5_upgrade_crash_helper() {
+    let Ok(path) = std::env::var("RUSTGO_V5_UPGRADE_CRASH_DATABASE") else {
+        return;
+    };
+    let (service, worker) = HistoryService::new(config(PathBuf::from(path))).unwrap();
+    let worker = worker.start().unwrap();
+    for _ in 0..500 {
+        if service.health().history_failures > 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(worker);
+    panic!("v5 upgrade crash seam did not terminate the helper process");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
