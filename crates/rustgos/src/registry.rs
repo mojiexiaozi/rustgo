@@ -1,11 +1,15 @@
 use std::{
     collections::{HashMap, HashSet},
     net::{IpAddr, SocketAddr},
-    sync::{Arc, Mutex},
-    time::Duration,
+    sync::{Arc, Mutex, OnceLock},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use rand::{TryRngCore, rngs::OsRng};
+use rustgo_observability::{
+    AuthenticatedClientIdentity, BoundedInventory, BoundedLabel, ObservabilitySink,
+    ObservationEvent,
+};
 use rustgo_protocol::{
     BoundedBytes, BoundedVec, DataChannelBind, DataChannelKind, MAX_BINDING_TOKEN_BYTES,
     MAX_TUNNELS, Message, OpenUdpChannel, ProtocolErrorCode, ProtocolVersion, RegisterTunnels,
@@ -34,6 +38,7 @@ type ServerDataStream = TlsStream<TcpStream>;
 #[derive(Clone)]
 pub struct ClientRegistry {
     inner: Arc<Mutex<RegistryState>>,
+    observability: Arc<OnceLock<ObservabilitySink>>,
     max_clients: usize,
     max_tunnels_per_client: usize,
     max_tcp_connections_per_tunnel: usize,
@@ -50,6 +55,7 @@ pub struct ClientRegistry {
 struct RegistryState {
     active: HashMap<String, ActiveSession>,
     by_name: HashMap<String, Arc<SessionRuntime>>,
+    next_observability_generation: u64,
 }
 
 struct ActiveSession {
@@ -147,6 +153,7 @@ impl ClientRegistry {
         }
         Ok(Self {
             inner: Arc::new(Mutex::new(RegistryState::default())),
+            observability: Arc::new(OnceLock::new()),
             max_clients,
             max_tunnels_per_client,
             max_tcp_connections_per_tunnel,
@@ -162,6 +169,25 @@ impl ClientRegistry {
 
     pub fn active_count(&self) -> usize {
         self.inner.lock().map_or(0, |state| state.active.len())
+    }
+
+    pub(crate) fn install_observability_sink(
+        &self,
+        sink: ObservabilitySink,
+    ) -> Result<(), RegistryError> {
+        self.observability
+            .set(sink)
+            .map_err(|_| RegistryError::ObservabilityAlreadyConfigured)
+    }
+
+    pub(crate) fn try_observe(&self, event: ObservationEvent) {
+        if let Some(sink) = self.observability.get() {
+            let _ = sink.try_publish(event);
+        }
+    }
+
+    pub(crate) fn observability_enabled(&self) -> bool {
+        self.observability.get().is_some()
     }
 
     pub fn is_active(&self, fingerprint: &str) -> bool {
@@ -203,23 +229,7 @@ impl ClientRegistry {
             self.binding_capacity,
             self.binding_ttl,
         )?;
-        let runtime = Arc::new(SessionRuntime {
-            client: identity.name().to_owned(),
-            fingerprint: identity.fingerprint().to_owned(),
-            session_id: identity.session_id().to_vec(),
-            bindings: Mutex::new(SessionBindings {
-                store: binding_store,
-                pending_tcp: HashMap::new(),
-                pending_udp: HashMap::new(),
-            }),
-            outbound,
-            cancellation: CancellationToken::new(),
-            binding_ttl: self.binding_ttl,
-            protocol_version,
-            #[cfg(test)]
-            redeem_attempts: std::sync::atomic::AtomicUsize::new(0),
-        });
-        {
+        let (runtime, observability_identity) = {
             let mut state = self.inner.lock().map_err(|_| RegistryError::Internal)?;
             if state.active.contains_key(identity.fingerprint())
                 || state.by_name.contains_key(identity.name())
@@ -229,6 +239,34 @@ impl ClientRegistry {
             if state.active.len() >= self.max_clients {
                 return Err(RegistryError::CapacityReached);
             }
+            let generation = state
+                .next_observability_generation
+                .checked_add(1)
+                .ok_or(RegistryError::GenerationExhausted)?;
+            let observability_identity = AuthenticatedClientIdentity::from_server_authentication(
+                identity.name().to_owned(),
+                generation,
+            )
+            .map_err(|_| RegistryError::InvalidConfiguration)?;
+            let runtime = Arc::new(SessionRuntime {
+                client: identity.name().to_owned(),
+                fingerprint: identity.fingerprint().to_owned(),
+                session_id: identity.session_id().to_vec(),
+                observability_identity: observability_identity.clone(),
+                observability: self.observability.clone(),
+                bindings: Mutex::new(SessionBindings {
+                    store: binding_store,
+                    pending_tcp: HashMap::new(),
+                    pending_udp: HashMap::new(),
+                }),
+                outbound,
+                cancellation: CancellationToken::new(),
+                binding_ttl: self.binding_ttl,
+                protocol_version,
+                #[cfg(test)]
+                redeem_attempts: std::sync::atomic::AtomicUsize::new(0),
+            });
+            state.next_observability_generation = generation;
             state.active.insert(
                 identity.fingerprint().to_owned(),
                 ActiveSession {
@@ -239,7 +277,18 @@ impl ClientRegistry {
             state
                 .by_name
                 .insert(identity.name().to_owned(), runtime.clone());
-        }
+            (runtime, observability_identity)
+        };
+
+        self.try_observe(ObservationEvent::ClientAuthenticated {
+            client: observability_identity,
+            version: BoundedLabel::try_from(format!(
+                "{}.{}",
+                protocol_version.major, protocol_version.minor
+            ))
+            .expect("a protocol version label is bounded"),
+            authenticated_unix_millis: now_unix_millis(),
+        });
 
         Ok(ControlSessionGuard {
             registry: self.clone(),
@@ -311,6 +360,7 @@ impl ClientRegistry {
             ),
             outbound: runtime.outbound(),
             protocol_version: runtime.protocol_version(),
+            observability_identity: runtime.observability_identity().clone(),
         })
     }
 
@@ -365,6 +415,8 @@ pub(crate) struct SessionRuntime {
     client: String,
     fingerprint: String,
     session_id: Vec<u8>,
+    observability_identity: AuthenticatedClientIdentity,
+    observability: Arc<OnceLock<ObservabilitySink>>,
     bindings: Mutex<SessionBindings>,
     outbound: mpsc::Sender<Message>,
     cancellation: CancellationToken,
@@ -379,6 +431,7 @@ pub(crate) struct ActiveControlSession {
     identity: AuthenticatedClient,
     outbound: mpsc::Sender<Message>,
     protocol_version: ProtocolVersion,
+    observability_identity: AuthenticatedClientIdentity,
 }
 
 impl ActiveControlSession {
@@ -393,6 +446,10 @@ impl ActiveControlSession {
     pub(crate) const fn protocol_version(&self) -> ProtocolVersion {
         self.protocol_version
     }
+
+    pub(crate) fn observability_identity(&self) -> &AuthenticatedClientIdentity {
+        &self.observability_identity
+    }
 }
 
 impl SessionRuntime {
@@ -402,6 +459,20 @@ impl SessionRuntime {
 
     pub(crate) fn session_id(&self) -> &[u8] {
         &self.session_id
+    }
+
+    pub(crate) fn observability_identity(&self) -> &AuthenticatedClientIdentity {
+        &self.observability_identity
+    }
+
+    pub(crate) fn try_observe(&self, event: ObservationEvent) {
+        if let Some(sink) = self.observability.get() {
+            let _ = sink.try_publish(event);
+        }
+    }
+
+    pub(crate) fn observability_enabled(&self) -> bool {
+        self.observability.get().is_some()
     }
 
     pub(crate) fn cancellation(&self) -> CancellationToken {
@@ -655,6 +726,14 @@ impl ControlSessionGuard {
         self.listeners.len()
     }
 
+    pub(crate) fn observability_identity(&self) -> &AuthenticatedClientIdentity {
+        self.runtime.observability_identity()
+    }
+
+    pub(crate) fn runtime_observe(&self, event: ObservationEvent) {
+        self.runtime.try_observe(event);
+    }
+
     pub(crate) fn cancellation(&self) -> CancellationToken {
         self.runtime.cancellation()
     }
@@ -669,6 +748,11 @@ impl ControlSessionGuard {
         }
         self.runtime.cancel();
         self.registry.release(&self.identity);
+        self.runtime
+            .try_observe(ObservationEvent::ClientDisconnected {
+                client: self.runtime.observability_identity().clone(),
+                disconnected_unix_millis: now_unix_millis(),
+            });
         self.unavailable = true;
     }
 
@@ -725,6 +809,17 @@ impl ControlSessionGuard {
             results: BoundedVec::<TunnelResult, MAX_TUNNELS>::try_from(results)
                 .expect("wire request already enforces the tunnel count bound"),
         }
+    }
+
+    pub(crate) fn publish_tunnel_inventory(&self) {
+        let mut names = self.tunnel_names.iter().cloned().collect::<Vec<_>>();
+        names.sort_unstable();
+        let names = BoundedInventory::try_from_names(names)
+            .expect("authenticated tunnel names are protocol bounded");
+        self.runtime.try_observe(ObservationEvent::TunnelInventory {
+            client: self.runtime.observability_identity().clone(),
+            names,
+        });
     }
 
     pub fn reject_tcp(&self, connection_id: u64) {
@@ -919,6 +1014,19 @@ pub enum RegistryError {
     EntropyUnavailable,
     #[error("internal registry failure")]
     Internal,
+    #[error("observability sink is already configured")]
+    ObservabilityAlreadyConfigured,
+    #[error("server session generation is exhausted")]
+    GenerationExhausted,
+}
+
+pub(crate) fn now_unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]

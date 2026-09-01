@@ -1,25 +1,37 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    net::SocketAddr,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    task::{Context, Poll},
+    time::Duration,
+};
 
+use rustgo_observability::{BoundedLabel, ObservationEvent, ShortSessionId, TrafficCounters};
 use rustgo_protocol::{
     FrameCodec, Message, OpenTcpStream, ProtocolVersion, SocketAddress, TcpStreamReady,
 };
 use rustgo_transport::{copy_bidirectional_bounded, safe_display, short_id};
 use thiserror::Error;
 use tokio::{
-    io::{AsyncWrite, AsyncWriteExt},
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::{TcpListener, TcpStream},
     sync::{OwnedSemaphorePermit, Semaphore},
     task::{JoinHandle, JoinSet},
 };
+use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
 use crate::{
     control::{ControlError, FramedControl},
-    registry::{ClientRegistry, RegistryError, SessionRuntime},
+    registry::{ClientRegistry, RegistryError, SessionRuntime, now_unix_millis},
 };
 
 const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const DATA_ACKNOWLEDGEMENT_TIMEOUT: Duration = Duration::from_secs(10);
+const OBSERVABILITY_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
 
 pub(crate) struct TcpListenerTask {
     address: SocketAddr,
@@ -177,16 +189,154 @@ async fn relay_public_connection(
         event = %"tcp_open"
     );
     tracing::info!(parent: &connection, peer = %safe_display(peer), "TCP relay connected");
-    if let Err(error) = copy_bidirectional_bounded(
+    let result = if runtime.observability_enabled() {
+        relay_observed_connection(
+            &mut public,
+            &mut data_channel,
+            connection_id,
+            &tunnel_name,
+            &runtime,
+            cancellation,
+        )
+        .await
+    } else {
+        copy_bidirectional_bounded(
+            &mut public,
+            &mut data_channel,
+            TCP_IDLE_TIMEOUT,
+            cancellation,
+        )
+        .await
+    };
+    if let Err(error) = result {
+        tracing::debug!(parent: &connection, peer = %safe_display(peer), error = %safe_display(&error), "TCP relay ended");
+    }
+}
+
+async fn relay_observed_connection<A, B>(
+    public: &mut A,
+    data_channel: &mut B,
+    connection_id: u64,
+    tunnel_name: &str,
+    runtime: &SessionRuntime,
+    cancellation: CancellationToken,
+) -> Result<rustgo_transport::CopyReport, rustgo_transport::CopyError>
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    let session_id = ShortSessionId::from_bytes(&connection_id.to_be_bytes());
+    let traffic = Arc::new(ObservedTraffic::default());
+    runtime.try_observe(ObservationEvent::TcpSessionOpened {
+        client: runtime.observability_identity().clone(),
+        session_id: session_id.clone(),
+        tunnel: Some(
+            BoundedLabel::try_from(tunnel_name).expect("registered tunnel names are bounded"),
+        ),
+        opened_unix_millis: now_unix_millis(),
+    });
+    let mut public = WriteCountedIo::new(public, traffic.sent.clone());
+    let mut data_channel = WriteCountedIo::new(data_channel, traffic.received.clone());
+    let copy = copy_bidirectional_bounded(
         &mut public,
         &mut data_channel,
         TCP_IDLE_TIMEOUT,
         cancellation,
-    )
-    .await
-    {
-        tracing::debug!(parent: &connection, peer = %safe_display(peer), error = %safe_display(&error), "TCP relay ended");
+    );
+    tokio::pin!(copy);
+    let mut flush = tokio::time::interval(OBSERVABILITY_FLUSH_INTERVAL);
+    flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let result = loop {
+        tokio::select! {
+            result = &mut copy => break result,
+            _ = flush.tick() => traffic.flush(runtime, Some(session_id.clone())),
+        }
+    };
+    traffic.flush(runtime, Some(session_id.clone()));
+    runtime.try_observe(ObservationEvent::TcpSessionClosed {
+        client: runtime.observability_identity().clone(),
+        session_id,
+        closed_unix_millis: now_unix_millis(),
+        terminal_reason: Some(
+            BoundedLabel::try_from(if result.is_ok() { "eof" } else { "ended" })
+                .expect("static terminal reasons are bounded"),
+        ),
+    });
+    result
+}
+
+#[derive(Default)]
+struct ObservedTraffic {
+    received: Arc<AtomicU64>,
+    sent: Arc<AtomicU64>,
+}
+
+impl ObservedTraffic {
+    fn flush(&self, runtime: &SessionRuntime, session_id: Option<ShortSessionId>) {
+        let counters = TrafficCounters {
+            received_bytes: self.received.swap(0, Ordering::AcqRel),
+            sent_bytes: self.sent.swap(0, Ordering::AcqRel),
+        };
+        if counters != TrafficCounters::default() {
+            runtime.try_observe(ObservationEvent::ByteCounterDelta {
+                client: runtime.observability_identity().clone(),
+                session_id,
+                counters,
+            });
+        }
     }
+}
+
+struct WriteCountedIo<T> {
+    inner: T,
+    written: Arc<AtomicU64>,
+}
+
+impl<T> WriteCountedIo<T> {
+    fn new(inner: T, written: Arc<AtomicU64>) -> Self {
+        Self { inner, written }
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for WriteCountedIo<T> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_read(context, buffer)
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for WriteCountedIo<T> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_write(context, buffer) {
+            Poll::Ready(Ok(written)) => {
+                saturating_add(&this.written, written as u64);
+                Poll::Ready(Ok(written))
+            }
+            result => result,
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(context)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(context)
+    }
+}
+
+fn saturating_add(counter: &AtomicU64, delta: u64) {
+    let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        Some(current.saturating_add(delta))
+    });
 }
 
 fn socket_address(address: SocketAddr) -> SocketAddress {

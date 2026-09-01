@@ -6,6 +6,10 @@ use std::{
 };
 
 use rustgo_config::AuthorizedClient;
+use rustgo_observability::{
+    AuthenticatedClientIdentity, BoundedLabel, ObservationEvent, SessionPath, ShortSessionId,
+    TrafficCounters,
+};
 use rustgo_protocol::{
     BoundedString, Message, PeerIdentityBinding, PeerIdentityLookup, ProtocolVersion, PunchGrant,
     ServerNotice, TunnelProtocol,
@@ -24,6 +28,8 @@ use crate::{
 };
 
 const EXPIRY_MAINTENANCE_BATCH: usize = 1024;
+const OBSERVABILITY_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
+const PEER_AEAD_TAG_BYTES: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RendezvousErrorCode(u16);
@@ -166,6 +172,9 @@ struct StoredSession {
     candidate_generation_announced_by: u8,
     candidate_digests: [Option<[u8; 32]>; 2],
     generation_started: Instant,
+    observed_path: Option<SessionPath>,
+    pending_relay_traffic: TrafficCounters,
+    last_observability_flush: Instant,
 }
 
 struct RelayAdmission {
@@ -282,14 +291,25 @@ struct SessionOwner {
     name: String,
     fingerprint: String,
     control_session_id: Vec<u8>,
+    observability_identity: AuthenticatedClientIdentity,
 }
 
 impl SessionOwner {
-    fn from_identity(identity: &AuthenticatedClient) -> Self {
+    fn from_control(control: &ControlSessionGuard) -> Self {
         Self {
-            name: identity.name().to_owned(),
-            fingerprint: identity.fingerprint().to_owned(),
-            control_session_id: identity.session_id().to_vec(),
+            name: control.identity().name().to_owned(),
+            fingerprint: control.identity().fingerprint().to_owned(),
+            control_session_id: control.identity().session_id().to_vec(),
+            observability_identity: control.observability_identity().clone(),
+        }
+    }
+
+    fn from_active(control: &crate::registry::ActiveControlSession) -> Self {
+        Self {
+            name: control.identity().name().to_owned(),
+            fingerprint: control.identity().fingerprint().to_owned(),
+            control_session_id: control.identity().session_id().to_vec(),
+            observability_identity: control.observability_identity().clone(),
         }
     }
 
@@ -535,6 +555,21 @@ impl RendezvousCoordinator {
                     "peer relay frame rejected"
                 );
             })?;
+            if session.observed_path == Some(SessionPath::P2pFallback) {
+                let logical_bytes =
+                    frame.ciphertext().len().saturating_sub(PEER_AEAD_TAG_BYTES) as u64;
+                if session.consumer.matches(authenticated.identity()) {
+                    session.pending_relay_traffic.sent_bytes = session
+                        .pending_relay_traffic
+                        .sent_bytes
+                        .saturating_add(logical_bytes);
+                } else {
+                    session.pending_relay_traffic.received_bytes = session
+                        .pending_relay_traffic
+                        .received_bytes
+                        .saturating_add(logical_bytes);
+                }
+            }
             (permit, message)
         };
         permit.send(message);
@@ -578,6 +613,7 @@ impl RendezvousCoordinator {
 
     pub(crate) fn expire_now(&self) {
         self.expire_sessions_batch(now_unix_secs());
+        self.flush_observability_due();
     }
 
     pub async fn request(
@@ -619,8 +655,8 @@ impl RendezvousCoordinator {
         rendezvous_state
             .request(envelope.step, envelope.generation)
             .map_err(|_| RendezvousErrorCode::INVALID_STATE)?;
-        let consumer_owner = SessionOwner::from_identity(authenticated.identity());
-        let provider_owner = SessionOwner::from_identity(provider.identity());
+        let consumer_owner = SessionOwner::from_control(authenticated);
+        let provider_owner = SessionOwner::from_active(&provider);
         let message = envelope
             .to_protocol_message()
             .map_err(|_| RendezvousErrorCode::INVALID_STATE)?;
@@ -672,6 +708,9 @@ impl RendezvousCoordinator {
                 candidate_generation_announced_by: 0,
                 candidate_digests: [None, None],
                 generation_started: Instant::now(),
+                observed_path: None,
+                pending_relay_traffic: TrafficCounters::default(),
+                last_observability_flush: Instant::now(),
             })),
         );
         drop(state);
@@ -766,7 +805,7 @@ impl RendezvousCoordinator {
             .state
             .lock()
             .map_err(|_| RendezvousErrorCode::DELIVERY_UNAVAILABLE)?;
-        let (target, next_session_state, relay_update, generation_update) = {
+        let (target, next_session_state, relay_update, generation_update, observed_path) = {
             let record = state
                 .sessions
                 .get(&envelope.session_id)
@@ -844,7 +883,28 @@ impl RendezvousCoordinator {
             } else {
                 None
             };
-            (target, next, relay_update, generation_update)
+            let observed_path = match &envelope.payload {
+                RendezvousPayload::ConnectivityResult(result) if result.connected => {
+                    let transport = result.transport.ok_or(RendezvousErrorCode::INVALID_STATE)?;
+                    Some(match transport {
+                        rustgo_rendezvous::CandidateTransport::Relay => SessionPath::P2pFallback,
+                        rustgo_rendezvous::CandidateTransport::QuicUdp
+                        | rustgo_rendezvous::CandidateTransport::NativeTcp => {
+                            SessionPath::P2pDirect
+                        }
+                    })
+                }
+                RendezvousPayload::ConnectivityResult(result) if result.transport.is_some() => {
+                    return Err(RendezvousErrorCode::INVALID_STATE.into());
+                }
+                _ => None,
+            };
+            if let Some(path) = observed_path
+                && session.observed_path.is_some_and(|current| current != path)
+            {
+                return Err(RendezvousErrorCode::INVALID_STATE.into());
+            }
+            (target, next, relay_update, generation_update, observed_path)
         };
         let permit = self.reserve_to(&target)?;
         let session = state
@@ -917,7 +977,18 @@ impl RendezvousCoordinator {
                 "peer relay request admitted"
             );
         }
+        let opened = if let Some(path) = observed_path
+            && session.observed_path.is_none()
+        {
+            session.observed_path = Some(path);
+            Some(observe_p2p_open(session, path))
+        } else {
+            None
+        };
         drop(state);
+        if let Some(opened) = opened {
+            self.registry.try_observe(opened);
+        }
         permit.send(message);
         if let Some((consumer, provider, grant)) = punch {
             let consumer_permit = self.reserve_to(&consumer)?;
@@ -980,14 +1051,16 @@ impl RendezvousCoordinator {
             .and_then(SessionRecord::active_mut)
             .expect("coordinator lock serializes the validated session")
             .state = next_session_state;
-        tombstone_session(&mut state, envelope.session_id);
+        let removed = tombstone_session(&mut state, envelope.session_id);
         drop(state);
+        if let Some(session) = &removed {
+            self.observe_p2p_close(session, "closed");
+        }
         permit.send(message);
         Ok(())
     }
 
     pub async fn remove_device(&self, authenticated: &AuthenticatedClient) {
-        let owner = SessionOwner::from_identity(authenticated);
         let removed = {
             let Ok(mut state) = self.state.lock() else {
                 return;
@@ -997,8 +1070,9 @@ impl RendezvousCoordinator {
                 .iter()
                 .filter_map(|(session_id, record)| {
                     record.active().and_then(|session| {
-                        (session.consumer == owner || session.provider == owner)
-                            .then_some(*session_id)
+                        (session.consumer.matches(authenticated)
+                            || session.provider.matches(authenticated))
+                        .then_some(*session_id)
                     })
                 })
                 .collect();
@@ -1008,11 +1082,12 @@ impl RendezvousCoordinator {
                 .collect::<Vec<_>>()
         };
         for session in removed {
-            let survivor = if session.consumer == owner {
+            let survivor = if session.consumer.matches(authenticated) {
                 session.provider.clone()
             } else {
                 session.consumer.clone()
             };
+            self.observe_p2p_close(&session, "peer-disconnected");
             self.send_server_notice(&session, &survivor, RendezvousErrorCode::PEER_DISCONNECTED);
         }
     }
@@ -1113,8 +1188,54 @@ impl RendezvousCoordinator {
             active
         };
         for session in removed {
+            self.observe_p2p_close(&session, "expired");
             self.send_server_notice(&session, &session.consumer, RendezvousErrorCode::EXPIRED);
             self.send_server_notice(&session, &session.provider, RendezvousErrorCode::EXPIRED);
+        }
+    }
+
+    fn flush_observability_due(&self) {
+        if !self.registry.observability_enabled() {
+            return;
+        }
+        let events = {
+            let Ok(mut state) = self.state.lock() else {
+                return;
+            };
+            let mut events = Vec::new();
+            for record in state.sessions.values_mut() {
+                let Some(session) = record.active_mut() else {
+                    continue;
+                };
+                if session.last_observability_flush.elapsed() >= OBSERVABILITY_FLUSH_INTERVAL {
+                    if let Some(event) = take_p2p_traffic(session) {
+                        events.push(event);
+                    }
+                    session.last_observability_flush = Instant::now();
+                }
+            }
+            events
+        };
+        for event in events {
+            self.registry.try_observe(event);
+        }
+    }
+
+    fn observe_p2p_close(&self, session: &StoredSession, reason: &'static str) {
+        if let Some(event) = p2p_traffic_event(session, session.pending_relay_traffic) {
+            self.registry.try_observe(event);
+        }
+        if session.observed_path.is_some() {
+            self.registry
+                .try_observe(ObservationEvent::P2pSessionClosed {
+                    client: session.consumer.observability_identity.clone(),
+                    session_id: observed_p2p_session_id(session.metadata.session_id),
+                    closed_unix_millis: now_unix_millis(),
+                    terminal_reason: Some(
+                        BoundedLabel::try_from(reason)
+                            .expect("static terminal reasons are bounded"),
+                    ),
+                });
         }
     }
 
@@ -1153,6 +1274,41 @@ fn other_participant<'a>(
         return Err(RendezvousErrorCode::IDENTITY_MISMATCH.into());
     }
     Ok(target)
+}
+
+fn observed_p2p_session_id(session_id: SessionId) -> ShortSessionId {
+    ShortSessionId::from_bytes(session_id.as_bytes())
+}
+
+fn observe_p2p_open(session: &StoredSession, path: SessionPath) -> ObservationEvent {
+    ObservationEvent::P2pSessionOpened {
+        client: session.consumer.observability_identity.clone(),
+        session_id: observed_p2p_session_id(session.metadata.session_id),
+        peer: BoundedLabel::try_from(session.provider.name.as_str())
+            .expect("authenticated client names are bounded"),
+        export: Some(
+            BoundedLabel::try_from(session.metadata.export.as_str())
+                .expect("rendezvous export names are bounded"),
+        ),
+        path,
+        opened_unix_millis: now_unix_millis(),
+    }
+}
+
+fn take_p2p_traffic(session: &mut StoredSession) -> Option<ObservationEvent> {
+    let counters = std::mem::take(&mut session.pending_relay_traffic);
+    p2p_traffic_event(session, counters)
+}
+
+fn p2p_traffic_event(
+    session: &StoredSession,
+    counters: TrafficCounters,
+) -> Option<ObservationEvent> {
+    (counters != TrafficCounters::default()).then(|| ObservationEvent::ByteCounterDelta {
+        client: session.consumer.observability_identity.clone(),
+        session_id: Some(observed_p2p_session_id(session.metadata.session_id)),
+        counters,
+    })
 }
 
 fn tombstone_session(state: &mut CoordinatorState, session_id: SessionId) -> Option<StoredSession> {

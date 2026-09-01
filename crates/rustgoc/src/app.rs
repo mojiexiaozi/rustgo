@@ -12,7 +12,7 @@ use crate::{
     ChildSessionSupervisor, ClientError, ControlClient, ExportRegistry, PeerGenerationHandler,
     RegisteredTunnel, SessionGeneration,
     orchestration::ProductionPeerRuntime,
-    telemetry::{TelemetryRuntime, TelemetryRuntimeHook},
+    telemetry::{LogicalTraffic, TelemetryRuntime, TelemetryRuntimeHook},
     udp::RelaySessionSupervisor,
 };
 
@@ -82,6 +82,7 @@ pub struct ClientApp {
     telemetry: Option<TelemetryConfig>,
     telemetry_report_interval_override: Option<Duration>,
     telemetry_hook: Option<Arc<dyn TelemetryRuntimeHook>>,
+    logical_traffic: Arc<LogicalTraffic>,
     last_generation: u64,
 }
 
@@ -98,9 +99,18 @@ impl ClientApp {
             stable_connection_reset_after: STABLE_CONNECTION_RESET_AFTER,
         })
         .map_err(|_| ClientError::InvalidConfiguration)?;
-        let supervisor = Arc::new(RelaySessionSupervisor::new(&control));
+        let logical_traffic = Arc::new(LogicalTraffic::default());
+        let supervisor = Arc::new(RelaySessionSupervisor::new(
+            &control,
+            logical_traffic.clone(),
+        ));
         Ok(Self::with_runtime_and_exports(
-            control, backoff, supervisor, exports, telemetry,
+            control,
+            backoff,
+            supervisor,
+            exports,
+            telemetry,
+            logical_traffic,
         ))
     }
 
@@ -115,7 +125,14 @@ impl ClientApp {
         let exports = ExportRegistry::new(control.config().exports.clone())
             .expect("validated client configuration has valid exports");
         let telemetry = control.config().telemetry.clone();
-        Self::with_runtime_and_exports(control, backoff, supervisor, exports, telemetry)
+        Self::with_runtime_and_exports(
+            control,
+            backoff,
+            supervisor,
+            exports,
+            telemetry,
+            Arc::new(LogicalTraffic::default()),
+        )
     }
 
     fn with_runtime_and_exports<B>(
@@ -124,6 +141,7 @@ impl ClientApp {
         supervisor: Arc<dyn ChildSessionSupervisor>,
         exports: ExportRegistry,
         telemetry: Option<TelemetryConfig>,
+        logical_traffic: Arc<LogicalTraffic>,
     ) -> Self
     where
         B: ReconnectBackoff,
@@ -139,6 +157,7 @@ impl ClientApp {
             telemetry,
             telemetry_report_interval_override: None,
             telemetry_hook: None,
+            logical_traffic,
             last_generation: 0,
         }
     }
@@ -192,12 +211,14 @@ impl ClientApp {
             self.telemetry.take(),
             self.telemetry_report_interval_override.take(),
             self.telemetry_hook.take(),
+            self.logical_traffic.clone(),
         );
         let peer_runtime = self.peer_handler.clone().unwrap_or_else(|| {
             Arc::new(ProductionPeerRuntime::new(
                 Arc::new(self.control.config().clone()),
                 self.control.keypair(),
                 self.exports.clone(),
+                self.logical_traffic.clone(),
             ))
         });
         let result = self

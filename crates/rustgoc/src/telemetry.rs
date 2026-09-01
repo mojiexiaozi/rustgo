@@ -1,18 +1,115 @@
 use std::{
     future::Future,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use rustgo_config::TelemetryConfig;
 use rustgo_observability::{HostMetrics, HostSampler};
 use rustgo_protocol::TelemetryReport;
-use tokio::{sync::watch, task::JoinHandle, time::MissedTickBehavior};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    sync::watch,
+    task::JoinHandle,
+    time::MissedTickBehavior,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::ClientError;
+
+#[derive(Debug, Default)]
+pub(crate) struct LogicalTraffic {
+    sent: AtomicU64,
+    received: AtomicU64,
+}
+
+impl LogicalTraffic {
+    pub(crate) fn record_sent(&self, bytes: usize) {
+        saturating_add(&self.sent, bytes as u64);
+    }
+
+    pub(crate) fn record_received(&self, bytes: usize) {
+        saturating_add(&self.received, bytes as u64);
+    }
+
+    fn totals(&self) -> (u64, u64) {
+        (
+            self.sent.load(Ordering::Acquire),
+            self.received.load(Ordering::Acquire),
+        )
+    }
+}
+
+fn saturating_add(counter: &AtomicU64, delta: u64) {
+    let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        Some(current.saturating_add(delta))
+    });
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum TrafficDirection {
+    Sent,
+    Received,
+}
+
+pub(crate) struct MeteredIo<T> {
+    inner: T,
+    traffic: Arc<LogicalTraffic>,
+    direction: TrafficDirection,
+}
+
+impl<T> MeteredIo<T> {
+    pub(crate) fn new(inner: T, traffic: Arc<LogicalTraffic>, direction: TrafficDirection) -> Self {
+        Self {
+            inner,
+            traffic,
+            direction,
+        }
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for MeteredIo<T> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_read(context, buffer)
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for MeteredIo<T> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_write(context, buffer) {
+            Poll::Ready(Ok(written)) => {
+                match this.direction {
+                    TrafficDirection::Sent => this.traffic.record_sent(written),
+                    TrafficDirection::Received => this.traffic.record_received(written),
+                }
+                Poll::Ready(Ok(written))
+            }
+            result => result,
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(context)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(context)
+    }
+}
 
 /// Internal AsyncWrite gate used to make the real framed control write
 /// deterministically pending in process-level integration coverage.
@@ -46,6 +143,7 @@ pub(crate) struct TelemetryRuntime {
     hook: Option<Arc<dyn TelemetryRuntimeHook>>,
     shutdown: CancellationToken,
     owner: JoinHandle<()>,
+    traffic: Arc<LogicalTraffic>,
 }
 
 impl TelemetryRuntime {
@@ -53,6 +151,7 @@ impl TelemetryRuntime {
         config: Option<TelemetryConfig>,
         report_interval_override: Option<Duration>,
         hook: Option<Arc<dyn TelemetryRuntimeHook>>,
+        traffic: Arc<LogicalTraffic>,
     ) -> Option<Self> {
         let config = config.filter(|config| config.enabled)?;
         let sample_interval = Duration::from_secs(config.sample_interval_secs);
@@ -83,14 +182,20 @@ impl TelemetryRuntime {
             hook,
             shutdown,
             owner,
+            traffic,
         })
     }
 
     pub(crate) fn generation(&self) -> GenerationTelemetry {
+        let (last_sent, last_received) = self.traffic.totals();
         GenerationTelemetry {
             samples: self.samples.clone(),
             report_interval: self.report_interval,
             hook: self.hook.clone(),
+            traffic: self.traffic.clone(),
+            last_sent,
+            last_received,
+            last_rate_sample: Instant::now(),
         }
     }
 
@@ -106,6 +211,10 @@ pub(crate) struct GenerationTelemetry {
     samples: watch::Receiver<Option<HostMetrics>>,
     report_interval: Duration,
     hook: Option<Arc<dyn TelemetryRuntimeHook>>,
+    traffic: Arc<LogicalTraffic>,
+    last_sent: u64,
+    last_received: u64,
+    last_rate_sample: Instant,
 }
 
 impl GenerationTelemetry {
@@ -138,7 +247,20 @@ impl GenerationTelemetry {
                     if reports.is_closed() {
                         return;
                     }
-                    reports.send_replace(Some(report_from_sample(sample, sequence)));
+                    let now = Instant::now();
+                    let (sent, received) = self.traffic.totals();
+                    let elapsed = now.saturating_duration_since(self.last_rate_sample);
+                    let tx_bytes_per_sec = rate_per_second(sent.saturating_sub(self.last_sent), elapsed);
+                    let rx_bytes_per_sec = rate_per_second(received.saturating_sub(self.last_received), elapsed);
+                    self.last_sent = sent;
+                    self.last_received = received;
+                    self.last_rate_sample = now;
+                    reports.send_replace(Some(report_from_sample(
+                        sample,
+                        sequence,
+                        tx_bytes_per_sec,
+                        rx_bytes_per_sec,
+                    )));
                     if let Some(hook) = &self.hook {
                         hook.after_publish(sequence).await;
                     }
@@ -155,7 +277,12 @@ pub(crate) fn latest_telemetry_channel() -> (
     watch::channel(None)
 }
 
-fn report_from_sample(sample: HostMetrics, sequence: u64) -> TelemetryReport {
+fn report_from_sample(
+    sample: HostMetrics,
+    sequence: u64,
+    tx_bytes_per_sec: u64,
+    rx_bytes_per_sec: u64,
+) -> TelemetryReport {
     let (memory_used_bytes, memory_total_bytes) =
         bounded_pair(sample.memory_used_bytes, sample.memory_total_bytes);
     let (disk_used_bytes, disk_total_bytes) =
@@ -168,9 +295,14 @@ fn report_from_sample(sample: HostMetrics, sequence: u64) -> TelemetryReport {
         memory_total_bytes,
         disk_used_bytes,
         disk_total_bytes,
-        tx_bytes_per_sec: sample.network_tx_bytes_per_sec.unwrap_or_default(),
-        rx_bytes_per_sec: sample.network_rx_bytes_per_sec.unwrap_or_default(),
+        tx_bytes_per_sec,
+        rx_bytes_per_sec,
     }
+}
+
+fn rate_per_second(bytes: u64, elapsed: Duration) -> u64 {
+    let elapsed_millis = elapsed.as_millis().max(1);
+    u64::try_from(u128::from(bytes).saturating_mul(1_000) / elapsed_millis).unwrap_or(u64::MAX)
 }
 
 fn bounded_pair(used: Option<u64>, total: Option<u64>) -> (u64, u64) {

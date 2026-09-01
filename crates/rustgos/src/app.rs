@@ -1,6 +1,7 @@
 use std::{io, net::SocketAddr, sync::Arc, time::Duration};
 
 use rustgo_config::ServerConfig;
+use rustgo_observability::{HostSampler, ObservabilitySink, ObservationEvent};
 use rustgo_protocol::ProtocolVersion;
 use rustgo_transport::{TlsError, TlsServer, safe_display};
 use thiserror::Error;
@@ -162,6 +163,7 @@ pub struct ServerApp {
     observation: Option<ObservationService>,
     observation_token_issuer: Option<ObservationTokenIssuer>,
     rendezvous: RendezvousCoordinator,
+    observability_sink: Option<ObservabilitySink>,
 }
 
 impl ServerApp {
@@ -310,7 +312,15 @@ impl ServerApp {
             observation,
             observation_token_issuer,
             rendezvous,
+            observability_sink: None,
         })
+    }
+
+    /// Injects the non-blocking projection sink before the server runtime starts.
+    pub fn with_observability_sink(mut self, sink: ObservabilitySink) -> Result<Self, ServerError> {
+        self.registry.install_observability_sink(sink.clone())?;
+        self.observability_sink = Some(sink);
+        Ok(self)
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -344,6 +354,9 @@ impl ServerApp {
         let session_shutdown = CancellationToken::new();
         let mut rendezvous_expiry = tokio::time::interval(Duration::from_millis(250));
         rendezvous_expiry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut server_sampler = self.observability_sink.as_ref().map(|_| HostSampler::new());
+        let mut server_sample_ticks = tokio::time::interval(Duration::from_secs(2));
+        server_sample_ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut observation = self
             .observation
             .map(|service| Box::pin(service.run(session_shutdown.child_token())));
@@ -352,6 +365,15 @@ impl ServerApp {
             tokio::select! {
                 () = shutdown.cancelled() => break Ok(()),
                 _ = rendezvous_expiry.tick() => self.rendezvous.expire_now(),
+                _ = server_sample_ticks.tick(), if server_sampler.is_some() => {
+                    let metrics = server_sampler
+                        .as_mut()
+                        .expect("the guarded server sampler exists")
+                        .sample();
+                    if let Some(sink) = &self.observability_sink {
+                        let _ = sink.try_publish(ObservationEvent::ServerSample { metrics });
+                    }
+                }
                 observation_result = async {
                     match observation.as_mut() {
                         Some(service) => Some(service.await),

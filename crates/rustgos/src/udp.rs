@@ -11,6 +11,7 @@ use std::{
 
 use bytes::BytesMut;
 use rand::{TryRngCore, rngs::OsRng};
+use rustgo_observability::{BoundedLabel, ObservationEvent, ShortSessionId, TrafficCounters};
 use rustgo_protocol::{
     BoundedBytes, DataChannelKind, Frame, FrameCodec, FrameError, MAX_UDP_PAYLOAD_BYTES, Message,
     OpenUdpChannel, ProtocolVersion, SocketAddress, UDP_METADATA_LEN, UdpDatagram,
@@ -31,12 +32,13 @@ use tracing::Instrument;
 
 use crate::{
     control::{ControlError, FramedControl},
-    registry::{ClientRegistry, PendingUdpOpen, RegistryError, SessionRuntime},
+    registry::{ClientRegistry, PendingUdpOpen, RegistryError, SessionRuntime, now_unix_millis},
 };
 
 const MAX_SESSION_ID_ATTEMPTS: usize = 16;
 const DATA_ACKNOWLEDGEMENT_TIMEOUT: Duration = Duration::from_secs(10);
 const UDP_TUNNEL_RESTART_DELAY: Duration = Duration::from_millis(100);
+const OBSERVABILITY_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct UdpRuntimeLimits {
@@ -322,6 +324,7 @@ async fn run_listener_inner(
         runtime.protocol_version(),
         tunnel_id,
         tunnel_name,
+        runtime,
         max_sessions,
         max_payload,
         limits,
@@ -521,6 +524,10 @@ impl FlowTable {
         self.sweep_head = None;
         self.sweep_tail = None;
     }
+
+    fn session_ids(&self) -> Vec<u64> {
+        self.by_id.keys().copied().collect()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -585,6 +592,7 @@ async fn relay_datagrams(
     protocol_version: ProtocolVersion,
     tunnel_id: u32,
     tunnel_name: &str,
+    runtime: Arc<SessionRuntime>,
     max_sessions: usize,
     max_payload: usize,
     limits: UdpRuntimeLimits,
@@ -607,6 +615,9 @@ async fn relay_datagrams(
     let mut writer_finished = false;
     let mut flows = FlowTable::new(max_sessions);
     let mut forwarded_replies = 0_u64;
+    let mut pending_traffic = HashMap::<u64, TrafficCounters>::new();
+    let mut observability_flush = tokio::time::interval(OBSERVABILITY_FLUSH_INTERVAL);
+    observability_flush.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut receive_buffer = vec![0_u8; max_payload.saturating_add(1)];
     let sweep_batch = limits.effective_sweep_batch(max_sessions)?;
     let first_sweep = tokio::time::Instant::now()
@@ -626,6 +637,9 @@ async fn relay_datagrams(
                     Err(_) => Err(UdpRelayError::TaskJoin),
                 };
             }
+            _ = observability_flush.tick(), if runtime.observability_enabled() => {
+                flush_udp_traffic(&runtime, &mut pending_traffic, None);
+            }
             _ = sweep.tick() => {
                 let expired = flows.sweep_expired(
                     tokio::time::Instant::now(),
@@ -636,6 +650,8 @@ async fn relay_datagrams(
                     metrics.set_sessions(flows.len());
                     let expired_count = expired.len();
                     for session_id in expired {
+                        flush_udp_traffic(&runtime, &mut pending_traffic, Some(session_id));
+                        observe_udp_close(&runtime, session_id, "idle-timeout");
                         let retirement = Message::UdpSessionRetired(UdpSessionRetired {
                             tunnel_id,
                             session_id,
@@ -705,7 +721,20 @@ async fn relay_datagrams(
                                 event = %"udp_session_open"
                             );
                             tracing::info!(parent: &session, "UDP relay session opened");
+                            runtime.try_observe(ObservationEvent::UdpSessionOpened {
+                                client: runtime.observability_identity().clone(),
+                                session_id: observed_udp_session_id(session_id),
+                                tunnel: Some(
+                                    BoundedLabel::try_from(tunnel_name)
+                                        .expect("registered tunnel names are bounded"),
+                                ),
+                                opened_unix_millis: now_unix_millis(),
+                            });
                         }
+                        let counters = pending_traffic.entry(session_id).or_default();
+                        counters.received_bytes = counters
+                            .received_bytes
+                            .saturating_add(length as u64);
                     }
                     EnqueueResult::Full => {
                         if inserted {
@@ -757,6 +786,10 @@ async fn relay_datagrams(
                     break Err(UdpRelayError::ShortDatagramWrite);
                 }
                 forwarded_replies = forwarded_replies.saturating_add(1);
+                let counters = pending_traffic.entry(datagram.session_id).or_default();
+                counters.sent_bytes = counters
+                    .sent_bytes
+                    .saturating_add(sent as u64);
                 if limits.test_disconnect_after_replies == Some(forwarded_replies) {
                     tracing::warn!(
                         tunnel = %safe_display(tunnel_name),
@@ -774,6 +807,11 @@ async fn relay_datagrams(
     if !writer_finished {
         let _ = writer_task.await;
     }
+    for session_id in flows.session_ids() {
+        flush_udp_traffic(&runtime, &mut pending_traffic, Some(session_id));
+        observe_udp_close(&runtime, session_id, "channel-ended");
+    }
+    flush_udp_traffic(&runtime, &mut pending_traffic, None);
     flows.clear();
     metrics.set_sessions(0);
     metrics.queued.store(0, Ordering::Release);
@@ -788,6 +826,49 @@ async fn relay_datagrams(
         "event=udp_cleanup UDP relay state released"
     );
     result
+}
+
+fn observed_udp_session_id(session_id: u64) -> ShortSessionId {
+    ShortSessionId::from_bytes(&session_id.to_be_bytes())
+}
+
+fn flush_udp_traffic(
+    runtime: &SessionRuntime,
+    pending: &mut HashMap<u64, TrafficCounters>,
+    session_id: Option<u64>,
+) {
+    if let Some(session_id) = session_id {
+        if let Some(counters) = pending.remove(&session_id)
+            && counters != TrafficCounters::default()
+        {
+            runtime.try_observe(ObservationEvent::ByteCounterDelta {
+                client: runtime.observability_identity().clone(),
+                session_id: Some(observed_udp_session_id(session_id)),
+                counters,
+            });
+        }
+        return;
+    }
+    for (session_id, counters) in std::mem::take(pending) {
+        if counters != TrafficCounters::default() {
+            runtime.try_observe(ObservationEvent::ByteCounterDelta {
+                client: runtime.observability_identity().clone(),
+                session_id: Some(observed_udp_session_id(session_id)),
+                counters,
+            });
+        }
+    }
+}
+
+fn observe_udp_close(runtime: &SessionRuntime, session_id: u64, reason: &'static str) {
+    runtime.try_observe(ObservationEvent::UdpSessionClosed {
+        client: runtime.observability_identity().clone(),
+        session_id: observed_udp_session_id(session_id),
+        closed_unix_millis: now_unix_millis(),
+        terminal_reason: Some(
+            BoundedLabel::try_from(reason).expect("static terminal reasons are bounded"),
+        ),
+    });
 }
 
 async fn write_frames<W>(

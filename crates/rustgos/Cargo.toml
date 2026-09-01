@@ -12,6 +12,7 @@ postcard.workspace = true
 sha2.workspace = true
 rustgo-config = { path = "../rustgo-config" }
 rustgo-crypto = { path = "../rustgo-crypto" }
+rustgo-observability = { path = "../rustgo-observability" }
 rustgo-protocol = { path = "../rustgo-protocol" }
 rustgo-rendezvous = { path = "../rustgo-rendezvous" }
 rustgo-transport = { path = "../rustgo-transport" }

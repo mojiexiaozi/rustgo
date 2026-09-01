@@ -1585,6 +1585,7 @@ dependencies = [
  "rustgo-config",
  "rustgo-crypto",
  "rustgo-e2e",
+ "rustgo-observability",
  "rustgo-protocol",
  "rustgo-rendezvous",
  "rustgo-transport",

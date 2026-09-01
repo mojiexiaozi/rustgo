@@ -16,7 +16,10 @@ use tokio::{
 use tokio_rustls::client::TlsStream;
 use tokio_util::sync::CancellationToken;
 
-use crate::{ChildSessionContext, ChildSessionRequest, ChildSessionSupervisor, ControlClient};
+use crate::{
+    ChildSessionContext, ChildSessionRequest, ChildSessionSupervisor, ControlClient,
+    telemetry::{LogicalTraffic, MeteredIo, TrafficDirection},
+};
 
 const MAX_CLIENT_TCP_CONNECTIONS: usize = 4096;
 const MAX_CLIENT_CONCURRENT_LOCAL_CONNECTS: usize = 64;
@@ -35,6 +38,7 @@ pub(crate) struct TcpSessionSupervisor {
     permits: Arc<Semaphore>,
     local_connect_permits: Arc<Semaphore>,
     handshake_permits: Arc<Semaphore>,
+    traffic: Arc<LogicalTraffic>,
 }
 
 #[derive(Clone)]
@@ -44,7 +48,7 @@ struct TcpTunnelTarget {
 }
 
 impl TcpSessionSupervisor {
-    pub(crate) fn new(control: &ControlClient) -> Self {
+    pub(crate) fn new(control: &ControlClient, traffic: Arc<LogicalTraffic>) -> Self {
         let local_targets = control
             .config()
             .tunnels
@@ -73,6 +77,7 @@ impl TcpSessionSupervisor {
             permits: Arc::new(Semaphore::new(MAX_CLIENT_TCP_CONNECTIONS)),
             local_connect_permits: Arc::new(Semaphore::new(MAX_CLIENT_CONCURRENT_LOCAL_CONNECTS)),
             handshake_permits: Arc::new(Semaphore::new(MAX_CLIENT_CONCURRENT_TLS_HANDSHAKES)),
+            traffic,
         }
     }
 }
@@ -91,6 +96,7 @@ impl ChildSessionSupervisor for TcpSessionSupervisor {
         let permits = self.permits.clone();
         let local_connect_permits = self.local_connect_permits.clone();
         let handshake_permits = self.handshake_permits.clone();
+        let traffic = self.traffic.clone();
         Box::pin(async move {
             match request {
                 ChildSessionRequest::Tcp(request) => {
@@ -102,6 +108,7 @@ impl ChildSessionSupervisor for TcpSessionSupervisor {
                         permits,
                         local_connect_permits,
                         handshake_permits,
+                        traffic,
                         context,
                         request,
                         shutdown,
@@ -123,6 +130,7 @@ async fn run_tcp(
     permits: Arc<Semaphore>,
     local_connect_permits: Arc<Semaphore>,
     handshake_permits: Arc<Semaphore>,
+    traffic: Arc<LogicalTraffic>,
     context: ChildSessionContext,
     request: rustgo_protocol::OpenTcpStream,
     shutdown: CancellationToken,
@@ -185,6 +193,8 @@ async fn run_tcp(
         "TCP local relay connected"
     );
 
+    let mut local = MeteredIo::new(local, traffic.clone(), TrafficDirection::Received);
+    let mut data = MeteredIo::new(data, traffic, TrafficDirection::Sent);
     relay_local_connection(
         &mut local,
         &mut data,
@@ -281,13 +291,16 @@ where
     codec.decode_exact(&frame).map_err(Into::into)
 }
 
-async fn relay_local_connection(
-    local: &mut TcpStream,
-    data: &mut TlsStream<TcpStream>,
+async fn relay_local_connection<A, B>(
+    local: &mut A,
+    data: &mut B,
     connection_id: u64,
     shutdown: CancellationToken,
     _permit: OwnedSemaphorePermit,
-) {
+) where
+    A: AsyncRead + tokio::io::AsyncWrite + Unpin,
+    B: AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     if let Err(error) = copy_bidirectional_bounded(local, data, TCP_IDLE_TIMEOUT, shutdown).await {
         tracing::debug!(connection_id, error = %safe_display(&error), "TCP local relay ended");
     }

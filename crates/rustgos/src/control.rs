@@ -6,9 +6,11 @@ use std::{
 };
 
 use bytes::BytesMut;
+use rustgo_observability::{HostMetrics, ObservationEvent};
 use rustgo_protocol::{
-    AuthResult, BoundedString, ClientHandshakeState, ErrorMessage, Frame, FrameCodec, FrameError,
-    MAX_ERROR_DETAIL_BYTES, Message, ProtocolErrorCode, ProtocolVersion,
+    AuthResult, BoundedString, ClientHandshakeState, ControlMessageDirection, ErrorMessage, Frame,
+    FrameCodec, FrameError, MAX_ERROR_DETAIL_BYTES, Message, ProtocolErrorCode, ProtocolVersion,
+    TelemetryReport,
 };
 use rustgo_rendezvous::{RendezvousEnvelope, RendezvousPayload};
 use rustgo_transport::{EventRateLimit, TlsServer, safe_display, short_fingerprint};
@@ -22,7 +24,7 @@ use tracing::Instrument;
 use crate::{
     auth::{AuthAttemptReservation, Authenticator, FailedAuthLimiter, TlsHandshakePermit},
     observation::ObservationTokenIssuer,
-    registry::{ClientRegistry, ControlSessionGuard},
+    registry::{ClientRegistry, ControlSessionGuard, now_unix_millis},
     rendezvous::RendezvousCoordinator,
     tcp, udp,
 };
@@ -31,6 +33,9 @@ pub(crate) const SERVER_VERSION: ProtocolVersion = ProtocolVersion::SUPPORTED;
 const MAX_CONTROL_PAYLOAD: usize = 70 * 1024;
 const CONTROL_COMMAND_CAPACITY: usize = 1024;
 const AUTH_FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(5);
+const MIN_TELEMETRY_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_TELEMETRY_SAMPLE_AGE_MILLIS: u64 = 10 * 60 * 1_000;
+const MAX_TELEMETRY_FUTURE_SKEW_MILLIS: u64 = 5 * 60 * 1_000;
 static AUTH_FAILURE_LOG: OnceLock<EventRateLimit> = OnceLock::new();
 
 pub(crate) struct ControlContext {
@@ -317,6 +322,7 @@ where
     };
     *state = state.transition(&Message::RegisterTunnels(registration.clone()))?;
     let results = guard.register_tunnels(registration).await;
+    guard.publish_tunnel_inventory();
     framed
         .send(negotiated, Message::TunnelResults(results))
         .await?;
@@ -346,6 +352,7 @@ where
     let heartbeat_deadline = tokio::time::sleep(runtime.heartbeat_timeout);
     tokio::pin!(heartbeat_deadline);
     let generation_cancellation = guard.cancellation();
+    let mut telemetry = TelemetryAdmission::default();
     loop {
         tokio::select! {
             biased;
@@ -396,6 +403,26 @@ where
                                 .checked_add(runtime.heartbeat_timeout)
                                 .ok_or(ControlError::HeartbeatTimeout)?,
                         );
+                        guard.runtime_observe(ObservationEvent::Heartbeat {
+                            client: guard.observability_identity().clone(),
+                            received_unix_millis: now_unix_millis(),
+                        });
+                    }
+                    Message::TelemetryReport(report) => {
+                        *state = state.transition_control(
+                            negotiated,
+                            ControlMessageDirection::ClientToServer,
+                            &Message::TelemetryReport(report.clone()),
+                        )?;
+                        let received_unix_millis = now_unix_millis();
+                        if telemetry.accept(&report, received_unix_millis) {
+                            guard.runtime_observe(ObservationEvent::ClientTelemetryAccepted {
+                                client: guard.observability_identity().clone(),
+                                sequence: report.sequence,
+                                received_unix_millis,
+                                metrics: telemetry_metrics(report),
+                            });
+                        }
                     }
                     Message::TcpStreamReady(ready) if !ready.accepted => {
                         *state = state.transition(&Message::TcpStreamReady(ready.clone()))?;
@@ -512,6 +539,70 @@ where
                 }
             }
         }
+    }
+}
+
+#[derive(Default)]
+struct TelemetryAdmission {
+    last_sequence: Option<u64>,
+    last_sampled_unix_millis: Option<u64>,
+    last_accepted: Option<tokio::time::Instant>,
+}
+
+impl TelemetryAdmission {
+    fn accept(&mut self, report: &TelemetryReport, received_unix_millis: u64) -> bool {
+        if !valid_telemetry_report(report, received_unix_millis)
+            || self
+                .last_sequence
+                .is_some_and(|sequence| report.sequence <= sequence)
+            || self
+                .last_sampled_unix_millis
+                .is_some_and(|sampled| report.sampled_unix_millis < sampled)
+            || self
+                .last_accepted
+                .is_some_and(|accepted| accepted.elapsed() < MIN_TELEMETRY_INTERVAL)
+        {
+            return false;
+        }
+        self.last_sequence = Some(report.sequence);
+        self.last_sampled_unix_millis = Some(report.sampled_unix_millis);
+        self.last_accepted = Some(tokio::time::Instant::now());
+        true
+    }
+}
+
+fn valid_telemetry_report(report: &TelemetryReport, received_unix_millis: u64) -> bool {
+    report.sequence != 0
+        && report.sampled_unix_millis != 0
+        && report.cpu_basis_points <= 10_000
+        && report.memory_used_bytes <= report.memory_total_bytes
+        && report.disk_used_bytes <= report.disk_total_bytes
+        && report.sampled_unix_millis
+            <= received_unix_millis.saturating_add(MAX_TELEMETRY_FUTURE_SKEW_MILLIS)
+        && received_unix_millis.saturating_sub(report.sampled_unix_millis)
+            <= MAX_TELEMETRY_SAMPLE_AGE_MILLIS
+}
+
+fn telemetry_metrics(report: TelemetryReport) -> HostMetrics {
+    let (memory_used_bytes, memory_total_bytes) = (report.memory_total_bytes != 0)
+        .then_some((report.memory_used_bytes, report.memory_total_bytes))
+        .unzip();
+    let (disk_used_bytes, disk_total_bytes) = (report.disk_total_bytes != 0)
+        .then_some((report.disk_used_bytes, report.disk_total_bytes))
+        .unzip();
+    HostMetrics {
+        sampled_unix_millis: report.sampled_unix_millis,
+        cpu_basis_points: Some(report.cpu_basis_points),
+        process_cpu_basis_points: None,
+        memory_used_bytes,
+        memory_total_bytes,
+        process_memory_bytes: None,
+        disk_used_bytes,
+        disk_total_bytes,
+        disk_read_bytes_per_sec: None,
+        disk_write_bytes_per_sec: None,
+        network_rx_bytes_per_sec: Some(report.rx_bytes_per_sec),
+        network_tx_bytes_per_sec: Some(report.tx_bytes_per_sec),
     }
 }
 
