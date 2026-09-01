@@ -292,6 +292,23 @@ async fn wait_for_traffic_totals(
     Ok(())
 }
 
+async fn wait_for_snapshot_count(
+    hook: &TrafficSnapshotHook,
+    expected: u64,
+) -> Result<(), AnyError> {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if hook.snapshots.load(Ordering::Acquire) >= expected {
+                return;
+            }
+            hook.changed.notified().await;
+        }
+    })
+    .await
+    .map_err(|_| format!("logical traffic snapshots did not reach {expected}"))?;
+    Ok(())
+}
+
 async fn wait_for_online_clients(
     store: &ObservabilityStore,
     expected: &[&str],
@@ -580,6 +597,120 @@ async fn drive_production_tcp(
     let mut reply = vec![0; flow.from_local.len()];
     data.stream.read_exact(&mut reply).await?;
     assert_eq!(reply, flow.from_local);
+    Ok(())
+}
+
+struct BlockedPublisherHook {
+    traffic: TrafficSnapshotHook,
+    publisher_blocked: AtomicBool,
+    publisher_changed: Notify,
+    release_publisher: Semaphore,
+}
+
+impl Default for BlockedPublisherHook {
+    fn default() -> Self {
+        Self {
+            traffic: TrafficSnapshotHook::default(),
+            publisher_blocked: AtomicBool::new(false),
+            publisher_changed: Notify::new(),
+            release_publisher: Semaphore::new(0),
+        }
+    }
+}
+
+impl TelemetryRuntimeHook for BlockedPublisherHook {
+    fn sampler_started(&self) {
+        TelemetryRuntimeHook::sampler_started(&self.traffic);
+    }
+
+    fn before_publisher_run(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            self.publisher_blocked.store(true, Ordering::Release);
+            self.publisher_changed.notify_waiters();
+            self.release_publisher.acquire().await.unwrap().forget();
+        })
+    }
+
+    fn after_traffic_snapshot(&self, sent: u64, received: u64) {
+        TelemetryRuntimeHook::after_traffic_snapshot(&self.traffic, sent, received);
+    }
+}
+
+async fn wait_for_blocked_publisher(hook: &BlockedPublisherHook) -> Result<(), AnyError> {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if hook.publisher_blocked.load(Ordering::Acquire) {
+                return;
+            }
+            hook.publisher_changed.notified().await;
+        }
+    })
+    .await
+    .map_err(|_| "telemetry publisher did not reach its first-poll gate")?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn v03_activation_precedes_blocked_publisher_first_poll() -> Result<(), AnyError> {
+    const TO_LOCAL: &[u8] = b"before-publisher-poll-to-local";
+    const FROM_LOCAL: &[u8] = b"before-publisher-poll-from-local";
+
+    let pki = TestPki::generate()?;
+    let tls_server =
+        TlsServer::bind("127.0.0.1:0", &pki.certificate_file, &pki.private_key_file).await?;
+    let tcp_local = TcpListener::bind("127.0.0.1:0").await?;
+    let tcp_local_address = tcp_local.local_addr()?;
+    let tcp_echo = tokio::spawn(async move {
+        let (mut stream, _) = tcp_local.accept().await?;
+        let mut received = vec![0; TO_LOCAL.len()];
+        stream.read_exact(&mut received).await?;
+        assert_eq!(received, TO_LOCAL);
+        stream.write_all(FROM_LOCAL).await?;
+        Ok::<_, AnyError>(())
+    });
+
+    let mut fixture = client_fixture(&pki, tls_server.local_addr()?.to_string(), None)?;
+    fixture.config.tunnels = vec![TunnelConfig {
+        name: "synchronous-activation".to_owned(),
+        protocol: ConfigTunnelProtocol::Tcp,
+        local_addr: tcp_local_address.to_string(),
+        remote_port: 45_003,
+    }];
+    let hook = Arc::new(BlockedPublisherHook::default());
+    let shutdown = CancellationToken::new();
+    let app = ClientApp::from_config(fixture.config)?
+        .with_telemetry_test_runtime(Duration::from_millis(100), hook.clone())?;
+    let app_task = tokio::spawn(app.run_until(shutdown.clone()));
+    let mut control = accept_registered_session(&tls_server, ProtocolVersion::V0_3).await?;
+    wait_for_blocked_publisher(&hook).await?;
+
+    drive_production_tcp(
+        &tls_server,
+        &mut control,
+        ProductionTcpFlow {
+            version: ProtocolVersion::V0_3,
+            connection_id: 44,
+            binding_marker: 0x34,
+            to_local: TO_LOCAL,
+            from_local: FROM_LOCAL,
+        },
+    )
+    .await?;
+    tcp_echo.await??;
+    assert_eq!(
+        hook.traffic.snapshots.load(Ordering::Acquire),
+        0,
+        "the test must transfer production bytes before publisher progress"
+    );
+
+    hook.release_publisher.add_permits(1);
+    let expected = (FROM_LOCAL.len() as u64, TO_LOCAL.len() as u64);
+    wait_for_traffic_totals(&hook.traffic, expected).await?;
+    wait_for_snapshot_count(&hook.traffic, 2).await?;
+    assert_eq!(*hook.traffic.totals.lock().unwrap(), expected);
+
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(2), app_task).await???;
     Ok(())
 }
 

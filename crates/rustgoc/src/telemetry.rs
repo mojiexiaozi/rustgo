@@ -3,7 +3,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
     task::{Context, Poll},
     time::{Duration, Instant},
@@ -24,27 +24,37 @@ use crate::ClientError;
 
 #[derive(Debug, Default)]
 pub(crate) struct LogicalTraffic {
-    active: AtomicBool,
+    // Leases only gate recording. A byte updates its counter once regardless of
+    // how many generation and retained-session owners overlap.
+    active_leases: AtomicU64,
     sent: AtomicU64,
     received: AtomicU64,
 }
 
 impl LogicalTraffic {
     pub(crate) fn record_sent(&self, bytes: usize) {
-        if self.active.load(Ordering::Acquire) {
+        if self.active_leases.load(Ordering::Acquire) > 0 {
             saturating_add(&self.sent, bytes as u64);
         }
     }
 
     pub(crate) fn record_received(&self, bytes: usize) {
-        if self.active.load(Ordering::Acquire) {
+        if self.active_leases.load(Ordering::Acquire) > 0 {
             saturating_add(&self.received, bytes as u64);
         }
     }
 
-    fn activate(self: &Arc<Self>) -> LogicalTrafficActivation {
-        self.active.store(true, Ordering::Release);
-        LogicalTrafficActivation(self.clone())
+    pub(crate) fn retain_active(self: &Arc<Self>) -> Arc<LogicalTrafficActivation> {
+        self.active_leases.fetch_add(1, Ordering::AcqRel);
+        Arc::new(LogicalTrafficActivation(self.clone()))
+    }
+
+    fn activate_generation(self: &Arc<Self>) -> (LogicalTrafficActivation, (u64, u64)) {
+        // With zero leases no recorder can mutate the counters. With retained peer
+        // leases, this totals load is the exact new-generation rate boundary.
+        let baseline = self.totals();
+        self.active_leases.fetch_add(1, Ordering::AcqRel);
+        (LogicalTrafficActivation(self.clone()), baseline)
     }
 
     fn totals(&self) -> (u64, u64) {
@@ -55,11 +65,20 @@ impl LogicalTraffic {
     }
 }
 
-struct LogicalTrafficActivation(Arc<LogicalTraffic>);
+pub(crate) struct LogicalTrafficActivation(Arc<LogicalTraffic>);
 
 impl Drop for LogicalTrafficActivation {
     fn drop(&mut self) {
-        self.0.active.store(false, Ordering::Release);
+        let previous = self.0.active_leases.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "logical traffic lease count underflowed");
+    }
+}
+
+impl std::fmt::Debug for LogicalTrafficActivation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LogicalTrafficActivation")
+            .finish_non_exhaustive()
     }
 }
 
@@ -144,6 +163,12 @@ pub trait TelemetryRuntimeHook: Send + Sync + 'static {
     /// Test-only observation that the process host sampler was lazily started.
     #[doc(hidden)]
     fn sampler_started(&self) {}
+
+    /// Test-only gate before the generation publisher performs any async work.
+    #[doc(hidden)]
+    fn before_publisher_run(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async {})
+    }
 
     fn after_publish(&self, _sequence: u64) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async {})
@@ -238,7 +263,7 @@ impl TelemetryRuntime {
             .expect("the sampler was initialized above")
             .samples
             .clone();
-        let (last_sent, last_received) = self.traffic.totals();
+        let (activation, (last_sent, last_received)) = self.traffic.activate_generation();
         GenerationTelemetry {
             samples,
             report_interval: self.report_interval,
@@ -247,6 +272,7 @@ impl TelemetryRuntime {
             last_sent,
             last_received,
             last_rate_sample: Instant::now(),
+            activation: Some(activation),
         }
     }
 
@@ -269,6 +295,7 @@ pub(crate) struct GenerationTelemetry {
     last_sent: u64,
     last_received: u64,
     last_rate_sample: Instant,
+    activation: Option<LogicalTrafficActivation>,
 }
 
 impl GenerationTelemetry {
@@ -276,12 +303,24 @@ impl GenerationTelemetry {
         self.hook.clone()
     }
 
+    pub(crate) fn take_activation(&mut self) -> LogicalTrafficActivation {
+        self.activation
+            .take()
+            .expect("each telemetry generation owns exactly one activation")
+    }
+
     pub(crate) async fn run(
         mut self,
         reports: watch::Sender<Option<TelemetryReport>>,
         shutdown: CancellationToken,
     ) {
-        let _activation = self.traffic.activate();
+        if let Some(hook) = &self.hook {
+            tokio::select! {
+                biased;
+                () = shutdown.cancelled() => return,
+                () = hook.before_publisher_run() => {}
+            }
+        }
         let first_tick = tokio::time::Instant::now() + self.report_interval;
         let mut ticks = tokio::time::interval_at(first_tick, self.report_interval);
         ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);

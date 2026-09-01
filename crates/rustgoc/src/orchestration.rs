@@ -46,7 +46,8 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     BoxPeerDatagramSession, BoxPeerStream, ChildSessionContext, ClientError, ControlEvent,
     ExportRegistry, ForwardConnector, ForwardRuntime, PeerDatagramSession, PeerFuture,
-    PeerGenerationHandler, PeerOpenRequest, PeerRelayChannel, telemetry::LogicalTraffic,
+    PeerGenerationHandler, PeerOpenRequest, PeerRelayChannel,
+    telemetry::{LogicalTraffic, LogicalTrafficActivation},
 };
 
 const ACTOR_CAPACITY: usize = 1024;
@@ -426,6 +427,8 @@ struct Session {
     local_candidates_digest: Option<[u8; 32]>,
     peer_candidates_digest: Option<[u8; 32]>,
     selected_kind: Option<PathKind>,
+    // Direct sessions can outlive their control generation during reconnect grace.
+    traffic_activation: Option<Arc<LogicalTrafficActivation>>,
 }
 
 type PathRecheckReply = oneshot::Sender<Result<Vec<Arc<dyn PathAttempt>>, PathError>>;
@@ -694,6 +697,17 @@ impl Actor {
                 export: BoundedString::try_from(export.as_str()).map_err(|_| invalid())?,
             }),
         )?;
+        let traffic_activation = self
+            .context
+            .protocol_version()
+            .supports_telemetry()
+            .then(|| {
+                self.runtime
+                    .traffic
+                    .as_ref()
+                    .map(LogicalTraffic::retain_active)
+            })
+            .flatten();
         self.sessions.insert(
             session_id,
             Session {
@@ -733,6 +747,7 @@ impl Actor {
                 local_candidates_digest: None,
                 peer_candidates_digest: None,
                 selected_kind: None,
+                traffic_activation,
             },
         );
         if !resolve_only {
@@ -1144,6 +1159,17 @@ impl Actor {
                         .map(|_| TunnelProtocol::Udp)
                 });
             let (ephemerals, publics) = fresh_transport_keys();
+            let traffic_activation = self
+                .context
+                .protocol_version()
+                .supports_telemetry()
+                .then(|| {
+                    self.runtime
+                        .traffic
+                        .as_ref()
+                        .map(LogicalTraffic::retain_active)
+                })
+                .flatten();
             self.sessions.insert(
                 envelope.session_id,
                 Session {
@@ -1183,6 +1209,7 @@ impl Actor {
                     local_candidates_digest: None,
                     peer_candidates_digest: None,
                     selected_kind: None,
+                    traffic_activation,
                 },
             );
             self.request_observation(envelope.session_id).await?;
@@ -1723,12 +1750,11 @@ impl Actor {
                 };
                 let cancellation = session.cancellation.child_token();
                 let exports = self.runtime.exports.clone();
-                let traffic = self
-                    .context
-                    .protocol_version()
-                    .supports_telemetry()
-                    .then(|| self.runtime.traffic.clone())
-                    .flatten();
+                let traffic = session
+                    .traffic_activation
+                    .as_ref()
+                    .and_then(|_| self.runtime.traffic.clone());
+                let traffic_activation = session.traffic_activation.clone();
                 let meta = FlowMeta {
                     session_id: session_log_id(id),
                     open_id: CHANNEL_ID,
@@ -1761,6 +1787,7 @@ impl Actor {
                     let sender = self.runtime.commands.clone();
                     let flow = meta.clone();
                     self.tasks.spawn(async move {
+                        let _traffic_activation = traffic_activation;
                         flow.log("io_start");
                         run_direct_tcp(DirectTcpRun {
                             role,
@@ -1780,6 +1807,7 @@ impl Actor {
                     let sender = self.runtime.commands.clone();
                     let flow = meta.clone();
                     self.tasks.spawn(async move {
+                        let _traffic_activation = traffic_activation;
                         flow.log("io_start");
                         run_direct_quic(
                             role,
@@ -1905,12 +1933,11 @@ impl Actor {
         let cancellation = session.cancellation.child_token();
         let context = self.context.clone();
         let exports = self.runtime.exports.clone();
-        let traffic = self
-            .context
-            .protocol_version()
-            .supports_telemetry()
-            .then(|| self.runtime.traffic.clone())
-            .flatten();
+        let traffic = session
+            .traffic_activation
+            .as_ref()
+            .and_then(|_| self.runtime.traffic.clone());
+        let traffic_activation = session.traffic_activation.clone();
         let sender = self.runtime.commands.clone();
         let worker_sender = sender.clone();
         let flow = FlowMeta {
@@ -1923,6 +1950,7 @@ impl Actor {
             export: export.clone(),
         };
         self.tasks.spawn(async move {
+            let _traffic_activation = traffic_activation;
             let owned_flow = run_relay_session(RelayWorker {
                 session_id: id,
                 actor: worker_sender,

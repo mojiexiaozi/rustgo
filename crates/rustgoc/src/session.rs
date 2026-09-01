@@ -12,8 +12,8 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     ClientError, ControlEvent, ControlSession,
     telemetry::{
-        GenerationTelemetry, TelemetryControlWriteGate, TelemetryRuntimeHook,
-        latest_telemetry_channel,
+        GenerationTelemetry, LogicalTrafficActivation, TelemetryControlWriteGate,
+        TelemetryRuntimeHook, latest_telemetry_channel,
     },
 };
 
@@ -169,7 +169,7 @@ impl ControlSession {
     pub(crate) async fn run_generation_with_peer<C, F>(
         mut self,
         generation: SessionGeneration,
-        telemetry: Option<GenerationTelemetry>,
+        mut telemetry: Option<GenerationTelemetry>,
         shutdown: CancellationToken,
         supervisor: Arc<dyn ChildSessionSupervisor>,
         peer_handler: Option<Arc<dyn PeerGenerationHandler>>,
@@ -185,6 +185,8 @@ impl ControlSession {
         let (control_outbound, mut child_control) = mpsc::channel(CHILD_CONTROL_CAPACITY);
         let (telemetry_outbound, mut telemetry_control) = latest_telemetry_channel();
         let telemetry_hook = telemetry.as_ref().and_then(GenerationTelemetry::hook);
+        let traffic_activation: Option<LogicalTrafficActivation> =
+            telemetry.as_mut().map(GenerationTelemetry::take_activation);
         let telemetry_write_gate = telemetry_hook
             .as_ref()
             .and_then(|hook| hook.control_write_gate());
@@ -245,6 +247,7 @@ impl ControlSession {
         };
         // The generation remains authoritative until every owner has released its resources.
         on_inactive();
+        drop(traffic_activation);
         if join_failed {
             Err(ClientError::TaskJoin)
         } else {
