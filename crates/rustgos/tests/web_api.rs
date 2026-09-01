@@ -6,11 +6,12 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use rustgo_config::{Limits, ServerConfig, ServerSection, WebConfig};
+use rustgo_config::{Limits, ServerConfig, ServerSection, WebConfig, validate_client_name};
 use rustgo_observability::{
-    AuthenticatedClientIdentity, BoundedInventory, BoundedLabel, HistoryBatch, HistoryConfig,
-    HistoryService, HistoryWorkerHandle, HostMetrics, ObservabilitySink, ObservabilityStore,
-    ObservationEvent, ServerHistorySample, SessionPath, ShortSessionId, TrafficCounters,
+    AuthenticatedClientIdentity, BoundedInventory, BoundedLabel, ClientHistorySample, HistoryBatch,
+    HistoryConfig, HistoryService, HistoryWorkerHandle, HostMetrics, ObservabilitySink,
+    ObservabilityStore, ObservationEvent, ServerHistorySample, SessionPath, ShortSessionId,
+    TrafficCounters,
 };
 use rustgos::web::{DashboardDataSources, MAX_API_RESPONSE_BYTES, WebRuntimeLimits, WebServer};
 use serde_json::Value;
@@ -27,6 +28,17 @@ const PASSWORD: &str = "correct-horse-battery-staple";
 const UNICODE_CLIENT: &str = "北京-节点";
 const UNICODE_CLIENT_PATH: &str = "%E5%8C%97%E4%BA%AC-%E8%8A%82%E7%82%B9";
 const RAW_SESSION_ID: &[u8] = b"full-session-id-must-never-be-returned";
+const FUTURE_CLIENT: &str = "future-clock";
+const SPECIAL_CLIENTS: [(&str, &str); 7] = [
+    (".", "%2E"),
+    ("..", "%2E%2E"),
+    ("%", "%25"),
+    ("/", "%2F"),
+    ("\\", "%5C"),
+    ("控制\u{0000}", "%E6%8E%A7%E5%88%B6%00"),
+    ("%2F", "%252F"),
+];
+const FIXTURE_CLIENTS: usize = 4 + SPECIAL_CLIENTS.len();
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn authenticated_routes_expose_bounded_explicit_redacted_dtos() -> Result<(), Box<dyn Error>>
@@ -44,10 +56,13 @@ async fn authenticated_routes_expose_bounded_explicit_redacted_dtos() -> Result<
     let overview = rig.web.api("GET", "/api/v1/overview", &cookie).await?;
     assert_json_response(&overview, 200)?;
     let overview_json = overview.json()?;
-    assert_eq!(overview_json["clients"]["total"], 3);
+    assert_eq!(overview_json["clients"]["total"], FIXTURE_CLIENTS);
     assert_eq!(overview_json["server"]["metrics"]["available"], true);
     assert_eq!(overview_json["history"]["available"], true);
-    assert_eq!(overview_json["sessions"]["total"], 3);
+    assert_eq!(
+        overview_json["sessions"]["total"],
+        3 + SPECIAL_CLIENTS.len()
+    );
     assert!(!overview.body.contains(std::str::from_utf8(RAW_SESSION_ID)?));
     assert!(!overview.body.contains(PASSWORD));
     assert!(!overview.body.contains("candidate"));
@@ -149,6 +164,148 @@ async fn authenticated_routes_expose_bounded_explicit_redacted_dtos() -> Result<
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn configured_name_identity_and_future_timestamp_semantics_are_preserved()
+-> Result<(), Box<dyn Error>> {
+    let mut rig = TestRig::start(true, 3).await?;
+    let cookie = rig.web.login().await?;
+    let now = unix_millis_now();
+
+    for (name, encoded) in SPECIAL_CLIENTS {
+        validate_client_name(name)?;
+
+        let cards = rig
+            .web
+            .api(
+                "GET",
+                &format!("/api/v1/clients?search={encoded}&sort=name&order=asc&limit=256"),
+                &cookie,
+            )
+            .await?;
+        assert_json_response(&cards, 200)?;
+        assert!(
+            cards.json()?["clients"]["items"]
+                .as_array()
+                .ok_or("client cards are not an array")?
+                .iter()
+                .any(|client| client["name"] == name),
+            "search did not retain configured identity {name:?}"
+        );
+
+        let detail = rig
+            .web
+            .api("GET", &format!("/api/v1/clients/{encoded}"), &cookie)
+            .await?;
+        assert_json_response(&detail, 200)?;
+        assert_eq!(detail.json()?["client"]["name"], name);
+
+        let sessions = rig
+            .web
+            .api(
+                "GET",
+                &format!("/api/v1/sessions?client={encoded}"),
+                &cookie,
+            )
+            .await?;
+        assert_json_response(&sessions, 200)?;
+        let sessions = sessions.json()?;
+        assert_eq!(sessions["sessions"]["total"], 1);
+        assert_eq!(sessions["sessions"]["items"][0]["client"], name);
+
+        let history = rig
+            .web
+            .api(
+                "GET",
+                &format!(
+                    "/api/v1/history?scope=client&client={encoded}&metric=cpu_basis_points&start_unix_millis={}&end_unix_millis={}&resolution=raw&max_points=10",
+                    now.saturating_sub(60_000),
+                    now.saturating_add(60_000)
+                ),
+                &cookie,
+            )
+            .await?;
+        assert_json_response(&history, 200)?;
+        let history = history.json()?;
+        assert_eq!(history["query"]["client"], name);
+        assert_eq!(
+            history["points"]
+                .as_array()
+                .ok_or("history points are not an array")?
+                .len(),
+            1
+        );
+    }
+
+    let encoded_slash = rig.web.api("GET", "/api/v1/clients/%2F", &cookie).await?;
+    let double_encoded_slash = rig.web.api("GET", "/api/v1/clients/%252F", &cookie).await?;
+    assert_eq!(encoded_slash.json()?["client"]["name"], "/");
+    assert_eq!(double_encoded_slash.json()?["client"]["name"], "%2F");
+
+    let literal_separator = rig.web.api("GET", "/api/v1/clients/a/b", &cookie).await?;
+    assert_eq!(literal_separator.status, 400);
+    assert_eq!(
+        literal_separator.json()?["error"]["code"],
+        "invalid_client_name"
+    );
+
+    let server = rig
+        .web
+        .api("GET", "/api/v1/server/metrics", &cookie)
+        .await?;
+    let server = server.json()?;
+    assert_eq!(server["server"]["metrics"]["clock_skew"], true);
+    assert_eq!(server["server"]["metrics"]["stale"], true);
+    assert_eq!(server["server"]["metrics"]["age_millis"], Value::Null);
+
+    let future = rig
+        .web
+        .api("GET", &format!("/api/v1/clients/{FUTURE_CLIENT}"), &cookie)
+        .await?;
+    let future = future.json()?;
+    for field in ["heartbeat", "telemetry"] {
+        assert_eq!(future["client"][field]["clock_skew"], true, "{field}");
+        assert_eq!(future["client"][field]["stale"], true, "{field}");
+        assert_eq!(
+            future["client"][field]["age_millis"],
+            Value::Null,
+            "{field}"
+        );
+    }
+
+    let normal = rig
+        .web
+        .api(
+            "GET",
+            &format!("/api/v1/clients/{UNICODE_CLIENT_PATH}"),
+            &cookie,
+        )
+        .await?;
+    let normal = normal.json()?;
+    assert_eq!(normal["client"]["heartbeat"]["clock_skew"], false);
+    assert_eq!(normal["client"]["heartbeat"]["stale"], false);
+    assert!(normal["client"]["heartbeat"]["age_millis"].is_number());
+    assert_eq!(normal["client"]["telemetry"]["clock_skew"], false);
+
+    let missing = rig
+        .web
+        .api("GET", "/api/v1/clients/legacy", &cookie)
+        .await?;
+    let missing = missing.json()?;
+    for field in ["heartbeat", "telemetry"] {
+        assert_eq!(missing["client"][field]["available"], false, "{field}");
+        assert_eq!(missing["client"][field]["clock_skew"], false, "{field}");
+        assert_eq!(missing["client"][field]["stale"], false, "{field}");
+        assert_eq!(
+            missing["client"][field]["age_millis"],
+            Value::Null,
+            "{field}"
+        );
+    }
+
+    rig.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn filters_staleness_methods_and_history_failures_have_stable_bounds()
 -> Result<(), Box<dyn Error>> {
     let mut rig = TestRig::start(false, 600).await?;
@@ -212,12 +369,15 @@ async fn filters_staleness_methods_and_history_failures_have_stable_bounds()
         rig.web.api("GET", &oversized_query, &cookie).await?.status,
         400
     );
-    let ambiguous = rig
+    let double_encoded = rig
         .web
         .api("GET", "/api/v1/clients/%252e%252e", &cookie)
         .await?;
-    assert_eq!(ambiguous.status, 400);
-    assert_eq!(ambiguous.json()?["error"]["code"], "invalid_client_name");
+    assert_eq!(double_encoded.status, 404);
+    assert_eq!(double_encoded.json()?["error"]["code"], "client_not_found");
+    let malformed = rig.web.api("GET", "/api/v1/clients/%GG", &cookie).await?;
+    assert_eq!(malformed.status, 400);
+    assert_eq!(malformed.json()?["error"]["code"], "invalid_client_name");
 
     let anonymous_post = rig.web.request("POST", "/api/v1/overview", &[], "").await?;
     assert_eq!(anonymous_post.status, 401);
@@ -257,8 +417,8 @@ impl TestRig {
         seed_snapshot(&sink, session_count)?;
         wait_until(Duration::from_secs(2), || {
             let snapshot = store.snapshot();
-            snapshot.clients.len() == 3
-                && snapshot.sessions.len() == session_count
+            snapshot.clients.len() == FIXTURE_CLIENTS
+                && snapshot.sessions.len() == session_count + SPECIAL_CLIENTS.len()
                 && snapshot.event_queue_depth == 0
         })
         .await?;
@@ -285,6 +445,21 @@ impl TestRig {
                             TrafficCounters {
                                 received_bytes: offset,
                                 sent_bytes: offset * 2,
+                            },
+                        )
+                    })
+                    .collect(),
+                client_points: SPECIAL_CLIENTS
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (name, _))| {
+                        ClientHistorySample::from_metrics(
+                            identity(name, 10 + index as u64)
+                                .expect("configured test identity is bounded"),
+                            metrics(now.saturating_sub(index as u64), 700 + index as u16),
+                            TrafficCounters {
+                                received_bytes: index as u64,
+                                sent_bytes: index as u64 * 2,
                             },
                         )
                     })
@@ -324,6 +499,7 @@ fn seed_snapshot(sink: &ObservabilitySink, session_count: usize) -> Result<(), B
     let unicode = identity(UNICODE_CLIENT, 1)?;
     let legacy = identity("legacy", 2)?;
     let stale = identity("stale", 3)?;
+    let future = identity(FUTURE_CLIENT, 4)?;
     sink.try_publish(ObservationEvent::ServerSample {
         metrics: metrics(now, 2_500),
     })?;
@@ -378,6 +554,38 @@ fn seed_snapshot(sink: &ObservabilitySink, session_count: usize) -> Result<(), B
         received_unix_millis: now.saturating_sub(300_000),
         metrics: metrics(now.saturating_sub(300_000), 500),
     })?;
+    sink.try_publish(ObservationEvent::ClientAuthenticated {
+        client: future.clone(),
+        version: label("0.3.0")?,
+        authenticated_unix_millis: now,
+    })?;
+    sink.try_publish(ObservationEvent::Heartbeat {
+        client: future.clone(),
+        received_unix_millis: now.saturating_add(300_000),
+    })?;
+    sink.try_publish(ObservationEvent::ClientTelemetryAccepted {
+        client: future,
+        sequence: 1,
+        received_unix_millis: now.saturating_add(300_000),
+        metrics: metrics(now.saturating_add(300_000), 900),
+    })?;
+
+    for (index, (name, _)) in SPECIAL_CLIENTS.iter().enumerate() {
+        let client = identity(name, 10 + index as u64)?;
+        sink.try_publish(ObservationEvent::ClientAuthenticated {
+            client: client.clone(),
+            version: label("0.3.0")?,
+            authenticated_unix_millis: now.saturating_sub(1_000),
+        })?;
+        sink.try_publish(ObservationEvent::TcpSessionOpened {
+            client,
+            session_id: ShortSessionId::from_bytes(
+                format!("special-client-session-{index}").as_bytes(),
+            ),
+            tunnel: Some(label("special")?),
+            opened_unix_millis: now.saturating_sub(index as u64),
+        })?;
+    }
 
     for index in 0..session_count {
         let session_id = if index == 0 {
@@ -410,6 +618,9 @@ fn seed_snapshot(sink: &ObservabilitySink, session_count: usize) -> Result<(), B
             received_bytes: 77,
             sent_bytes: 88,
         },
+    })?;
+    sink.try_publish(ObservationEvent::ServerSample {
+        metrics: metrics(now.saturating_add(300_000), 3_000),
     })?;
     Ok(())
 }

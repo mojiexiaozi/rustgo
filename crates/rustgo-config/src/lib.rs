@@ -19,4 +19,4 @@ pub use p2p::{
     ConfigWarning, ExportConfig, ForwardConfig, MAX_ALLOWED_PEERS_PER_EXPORT, MAX_EXPORTS,
     MAX_FORWARDS, P2pConfig, PortRange,
 };
-pub use validate::{MAX_WEB_AUTHORITY_BYTES, ValidationError, WebOrigin};
+pub use validate::{MAX_WEB_AUTHORITY_BYTES, ValidationError, WebOrigin, validate_client_name};

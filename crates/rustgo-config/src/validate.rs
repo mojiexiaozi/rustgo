@@ -242,7 +242,7 @@ pub(crate) fn validate_server(config: &ServerConfig) -> Result<(), ValidationErr
     let mut names = HashSet::new();
     let mut public_keys = HashSet::new();
     for client in &config.clients {
-        validate_wire_string("clients.name", &client.name, MAX_CLIENT_NAME_BYTES)?;
+        validate_client_name(&client.name)?;
         if !names.insert(&client.name) {
             return Err(ValidationError::new(format!(
                 "duplicate client name `{}`",
@@ -258,7 +258,7 @@ pub(crate) fn validate_server(config: &ServerConfig) -> Result<(), ValidationErr
 }
 
 pub(crate) fn validate_client(config: &ClientConfig) -> Result<(), ValidationError> {
-    validate_wire_string("client.name", &config.client.name, MAX_CLIENT_NAME_BYTES)?;
+    validate_client_name(&config.client.name)?;
     validate_host_address("client.server_addr", &config.client.server_addr)?;
     require_non_empty("client.server_name", &config.client.server_name)?;
     require_nonzero(
@@ -359,14 +359,14 @@ pub(crate) fn validate_client(config: &ClientConfig) -> Result<(), ValidationErr
             )));
         }
         for peer in &export.allowed_peers {
-            validate_wire_string("exports.allowed_peers", peer, MAX_CLIENT_NAME_BYTES)?;
+            validate_client_name(peer)?;
         }
     }
 
     let mut forward_names = HashSet::new();
     for forward in &config.forwards {
         validate_wire_string("forwards.name", &forward.name, MAX_TUNNEL_NAME_BYTES)?;
-        validate_wire_string("forwards.peer", &forward.peer, MAX_CLIENT_NAME_BYTES)?;
+        validate_client_name(&forward.peer)?;
         validate_wire_string("forwards.export", &forward.export, MAX_TUNNEL_NAME_BYTES)?;
         validate_host_address("forwards.listen_addr", &forward.listen_addr)?;
         if forward.peer == config.client.name {
@@ -519,6 +519,10 @@ fn require_non_empty(field: &str, value: &str) -> Result<(), ValidationError> {
         return Err(ValidationError::new(format!("{field} must not be empty")));
     }
     Ok(())
+}
+
+pub fn validate_client_name(value: &str) -> Result<(), ValidationError> {
+    validate_wire_string("client name", value, MAX_CLIENT_NAME_BYTES)
 }
 
 fn validate_wire_string(

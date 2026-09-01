@@ -13,10 +13,12 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
+use rustgo_config::validate_client_name;
 use rustgo_observability::{
     ClientSnapshot, HistoryHealth as StoreHistoryHealth, HistoryMetric, HistoryQuery,
-    HistoryQueryError, HistoryResolution, HistoryScope, HostMetrics, MAX_HISTORY_POINTS,
-    OverviewSnapshot, SessionKind, SessionPath, SessionSnapshot, TrafficCounters,
+    HistoryQueryError, HistoryResolution, HistoryScope, HostMetrics,
+    MAX_AUTHENTICATED_CLIENT_NAME_BYTES, MAX_HISTORY_POINTS, OverviewSnapshot, SessionKind,
+    SessionPath, SessionSnapshot, TrafficCounters,
 };
 use serde::Serialize;
 
@@ -36,7 +38,6 @@ const MAX_QUERY_BYTES: usize = 2_048;
 const MAX_QUERY_PAIRS: usize = 12;
 const MAX_QUERY_KEY_BYTES: usize = 64;
 const MAX_QUERY_VALUE_BYTES: usize = 384;
-const MAX_CLIENT_NAME_BYTES: usize = 128;
 const MAX_SEARCH_BYTES: usize = 128;
 const MAX_CLIENT_ITEMS: usize = 256;
 const MAX_LIST_INVENTORY_ITEMS: usize = 2;
@@ -60,7 +61,7 @@ pub(super) fn routes() -> Router<Arc<WebState>> {
         )
         .route("/api/v1/clients", get(clients).fallback(method_not_allowed))
         .route(
-            "/api/v1/clients/{name}",
+            "/api/v1/clients/{*name}",
             get(client).fallback(method_not_allowed),
         )
         .route(
@@ -90,6 +91,7 @@ async fn overview(State(state): State<Arc<WebState>>, headers: HeaderMap) -> Res
     let response = OverviewResponse {
         generated_unix_millis: snapshot.generated_unix_millis,
         snapshot_stale: snapshot.generated_unix_millis == 0
+            || snapshot.generated_unix_millis > now
             || now.saturating_sub(snapshot.generated_unix_millis) > CLIENT_STALE_AFTER_MILLIS,
         server: server_dto(&snapshot, now),
         clients: BoundedItems::new(total_clients, clients),
@@ -128,9 +130,7 @@ async fn clients(
         Err(()) => return invalid_query(),
     };
     let search = match query.get("search") {
-        Some(value) if value.len() <= MAX_SEARCH_BYTES && !value.chars().any(char::is_control) => {
-            Some(value.clone())
-        }
+        Some(value) if value.len() <= MAX_SEARCH_BYTES => Some(value.clone()),
         Some(_) => return invalid_query(),
         None => None,
     };
@@ -249,7 +249,7 @@ async fn sessions(
         Err(()) => return invalid_query(),
     };
     let client_filter = match query.get("client") {
-        Some(value) if valid_client_name(value) => Some(value.as_str()),
+        Some(value) if validate_client_name(value).is_ok() => Some(value.as_str()),
         Some(_) => return invalid_query(),
         None => None,
     };
@@ -601,23 +601,12 @@ fn client_name_from_path(path: &str) -> Result<String, ()> {
     if raw.is_empty() || raw.contains('/') {
         return Err(());
     }
-    let name = percent_decode(raw, false, MAX_CLIENT_NAME_BYTES)?;
-    if valid_client_name(&name) {
+    let name = percent_decode(raw, false, MAX_AUTHENTICATED_CLIENT_NAME_BYTES)?;
+    if validate_client_name(&name).is_ok() {
         Ok(name)
     } else {
         Err(())
     }
-}
-
-fn valid_client_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= MAX_CLIENT_NAME_BYTES
-        && name != "."
-        && name != ".."
-        && !name.contains('/')
-        && !name.contains('\\')
-        && !name.contains('%')
-        && !name.chars().any(char::is_control)
 }
 
 fn bounded_limit(value: Option<&String>, maximum: usize) -> Result<usize, ()> {
@@ -636,7 +625,7 @@ fn history_query(query: &BTreeMap<String, String>) -> Result<HistoryQuery, ()> {
         "server" if !query.contains_key("client") => HistoryScope::Server,
         "client" => {
             let client = query.get("client").ok_or(())?;
-            if !valid_client_name(client) {
+            if validate_client_name(client).is_err() {
                 return Err(());
             }
             HistoryScope::Client(client.as_str().try_into().map_err(|_| ())?)
@@ -777,11 +766,19 @@ fn metrics_dto(
     now: u64,
     stale_after: u64,
 ) -> Metrics {
-    let age = freshness_timestamp.map(|timestamp| now.saturating_sub(timestamp));
     let available = metrics.is_some();
+    let receipt_clock_skew = freshness_timestamp.is_some_and(|timestamp| timestamp > now);
+    let sample_clock_skew = metrics.is_some_and(|metrics| metrics.sampled_unix_millis > now);
+    let clock_skew = receipt_clock_skew || sample_clock_skew;
+    let age = if clock_skew {
+        None
+    } else {
+        freshness_timestamp.map(|timestamp| now - timestamp)
+    };
     Metrics {
         available,
-        stale: available && age.is_some_and(|age| age > stale_after),
+        stale: available && (clock_skew || age.is_some_and(|age| age > stale_after)),
+        clock_skew,
         age_millis: age,
         sampled_unix_millis: metrics.map(|metrics| metrics.sampled_unix_millis),
         cpu_basis_points: metrics.and_then(|metrics| metrics.cpu_basis_points),
@@ -800,10 +797,16 @@ fn metrics_dto(
 }
 
 fn freshness(timestamp: Option<u64>, now: u64, stale_after: u64) -> Freshness {
-    let age = timestamp.map(|timestamp| now.saturating_sub(timestamp));
+    let clock_skew = timestamp.is_some_and(|timestamp| timestamp > now);
+    let age = if clock_skew {
+        None
+    } else {
+        timestamp.map(|timestamp| now - timestamp)
+    };
     Freshness {
         available: timestamp.is_some(),
-        stale: age.is_some_and(|age| age > stale_after),
+        stale: timestamp.is_some() && (clock_skew || age.is_some_and(|age| age > stale_after)),
+        clock_skew,
         received_unix_millis: timestamp,
         age_millis: age,
     }

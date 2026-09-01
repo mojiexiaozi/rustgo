@@ -109,6 +109,7 @@ pub(super) struct ServerMetrics {
 pub(super) struct Metrics {
     pub available: bool,
     pub stale: bool,
+    pub clock_skew: bool,
     pub age_millis: Option<u64>,
     pub sampled_unix_millis: Option<u64>,
     pub cpu_basis_points: Option<u16>,
@@ -150,6 +151,7 @@ pub(super) struct Client {
 pub(super) struct Freshness {
     pub available: bool,
     pub stale: bool,
+    pub clock_skew: bool,
     pub received_unix_millis: Option<u64>,
     pub age_millis: Option<u64>,
 }
