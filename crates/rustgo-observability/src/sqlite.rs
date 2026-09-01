@@ -2,7 +2,10 @@ use std::collections::{BTreeSet, VecDeque};
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
+use std::fs::OpenOptions;
 use std::io;
+use std::io::Write as _;
+use std::mem;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -19,10 +22,11 @@ use crate::{
 };
 
 pub const HISTORY_BATCH_QUEUE_CAPACITY: usize = 1024;
+pub const MAX_HISTORY_QUEUE_BYTES: usize = 64 * 1024 * 1024;
 pub const HISTORY_CONTROL_QUEUE_CAPACITY: usize = 128;
 pub const MAX_HISTORY_RECORDS_PER_BATCH: usize = 8192;
 pub const MAX_HISTORY_POINTS: usize = 2000;
-pub const HISTORY_SCHEMA_VERSION: u32 = 2;
+pub const HISTORY_SCHEMA_VERSION: u32 = 4;
 
 const RAW_RETENTION_MILLIS: u64 = 60 * 60 * 1000;
 const ONE_MINUTE_RETENTION_MILLIS: u64 = 24 * RAW_RETENTION_MILLIS;
@@ -36,10 +40,13 @@ const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(5);
 const WARNING_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_BATCH_WRITE_ATTEMPTS: usize = 3;
 const MAX_BATCHES_PER_TRANSACTION: usize = 64;
+const MAX_TRANSACTION_BYTES: usize = 4 * 1024 * 1024;
 const RETENTION_DELETE_LIMIT: usize = 1024;
-const RETENTION_DELETE_PASSES: usize = 128;
 const CAP_DELETE_LIMIT: usize = 512;
 const MIB: u64 = 1024 * 1024;
+const OWNERSHIP_MARKER_SUFFIX: &str = ".rustgo-owner";
+const OWNERSHIP_MARKER_CONTENT: &[u8] = b"rustgo-observability-history-v1\n";
+const MAINTENANCE_BUCKET_LIMIT: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryConfig {
@@ -180,6 +187,80 @@ impl HistoryBatch {
     pub fn is_empty(&self) -> bool {
         self.record_count() == 0
     }
+
+    fn compact(&mut self) {
+        self.server_points.shrink_to_fit();
+        self.client_points.shrink_to_fit();
+        self.client_lifecycle.shrink_to_fit();
+        self.session_summaries.shrink_to_fit();
+    }
+
+    fn owned_bytes(&self) -> usize {
+        let mut bytes = mem::size_of::<Self>()
+            .saturating_add(
+                self.server_points
+                    .capacity()
+                    .saturating_mul(mem::size_of::<ServerHistorySample>()),
+            )
+            .saturating_add(
+                self.client_points
+                    .capacity()
+                    .saturating_mul(mem::size_of::<ClientHistorySample>()),
+            )
+            .saturating_add(
+                self.client_lifecycle
+                    .capacity()
+                    .saturating_mul(mem::size_of::<ClientLifecycleRecord>()),
+            )
+            .saturating_add(
+                self.session_summaries
+                    .capacity()
+                    .saturating_mul(mem::size_of::<SessionSnapshot>()),
+            );
+        for sample in &self.client_points {
+            bytes = bytes.saturating_add(sample.client.name().len());
+        }
+        for lifecycle in &self.client_lifecycle {
+            bytes = bytes
+                .saturating_add(lifecycle.client.name().len())
+                .saturating_add(
+                    lifecycle
+                        .version
+                        .as_ref()
+                        .map_or(0, |version| version.as_str().len()),
+                );
+        }
+        for session in &self.session_summaries {
+            bytes = bytes
+                .saturating_add(session.id.as_str().len())
+                .saturating_add(session.client.as_str().len())
+                .saturating_add(
+                    session
+                        .peer
+                        .as_ref()
+                        .map_or(0, |value| value.as_str().len()),
+                )
+                .saturating_add(
+                    session
+                        .tunnel
+                        .as_ref()
+                        .map_or(0, |value| value.as_str().len()),
+                )
+                .saturating_add(
+                    session
+                        .export
+                        .as_ref()
+                        .map_or(0, |value| value.as_str().len()),
+                )
+                .saturating_add(
+                    session
+                        .terminal_reason
+                        .as_ref()
+                        .map_or(0, |value| value.as_str().len()),
+                );
+        }
+        bytes
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -300,6 +381,11 @@ pub struct HistoryHealth {
     pub recoveries: u64,
     pub total_database_bytes: u64,
     pub size_floor_reached: bool,
+    pub pending_batch_bytes: usize,
+    pub dropped_batch_bytes: u64,
+    pub dropped_late_points: u64,
+    pub history_failures: u64,
+    pub worker_running: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -307,6 +393,7 @@ pub enum HistoryPublishError {
     Closed,
     EmptyBatch,
     BatchTooLarge,
+    BatchMemoryTooLarge,
 }
 
 impl fmt::Display for HistoryPublishError {
@@ -317,6 +404,9 @@ impl fmt::Display for HistoryPublishError {
             Self::BatchTooLarge => write!(
                 formatter,
                 "history batch exceeds the {MAX_HISTORY_RECORDS_PER_BATCH}-record limit"
+            ),
+            Self::BatchMemoryTooLarge => formatter.write_str(
+                "history batch exceeds the bounded owned-memory or database-size budget",
             ),
         }
     }
@@ -358,6 +448,7 @@ impl std::error::Error for HistoryQueryError {}
 pub enum HistoryWorkerError {
     ThreadSpawn(io::Error),
     ThreadPanicked,
+    JoinTaskCancelled,
 }
 
 impl fmt::Display for HistoryWorkerError {
@@ -367,6 +458,9 @@ impl fmt::Display for HistoryWorkerError {
                 write!(formatter, "failed to start history worker: {error}")
             }
             Self::ThreadPanicked => formatter.write_str("history worker panicked"),
+            Self::JoinTaskCancelled => {
+                formatter.write_str("history worker join task was cancelled")
+            }
         }
     }
 }
@@ -375,13 +469,18 @@ impl std::error::Error for HistoryWorkerError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::ThreadSpawn(error) => Some(error),
-            Self::ThreadPanicked => None,
+            Self::ThreadPanicked | Self::JoinTaskCancelled => None,
         }
     }
 }
 
+struct QueuedBatch {
+    batch: HistoryBatch,
+    owned_bytes: usize,
+}
+
 enum Command {
-    Batch(HistoryBatch),
+    Batch(QueuedBatch),
     Query(
         HistoryQuery,
         oneshot::Sender<Result<HistorySeries, HistoryQueryError>>,
@@ -415,6 +514,7 @@ struct QueueState {
     commands: VecDeque<Command>,
     pending_batches: usize,
     pending_controls: usize,
+    pending_batch_bytes: usize,
     closed: bool,
 }
 
@@ -427,10 +527,15 @@ struct Shared {
     recoveries: AtomicU64,
     total_database_bytes: AtomicU64,
     size_floor_reached: AtomicBool,
+    dropped_batch_bytes: AtomicU64,
+    dropped_late_points: AtomicU64,
+    history_failures: AtomicU64,
+    worker_running: AtomicBool,
+    maximum_database_bytes: u64,
 }
 
 impl Shared {
-    fn new() -> Self {
+    fn new(maximum_database_bytes: u64) -> Self {
         Self {
             queue: Mutex::new(QueueState::default()),
             ready: Condvar::new(),
@@ -440,10 +545,15 @@ impl Shared {
             recoveries: AtomicU64::new(0),
             total_database_bytes: AtomicU64::new(0),
             size_floor_reached: AtomicBool::new(false),
+            dropped_batch_bytes: AtomicU64::new(0),
+            dropped_late_points: AtomicU64::new(0),
+            history_failures: AtomicU64::new(0),
+            worker_running: AtomicBool::new(false),
+            maximum_database_bytes,
         }
     }
 
-    fn push_batch(&self, batch: HistoryBatch) -> Result<(), HistoryPublishError> {
+    fn push_batch(&self, batch: QueuedBatch) -> Result<(), HistoryPublishError> {
         let mut queue = self
             .queue
             .lock()
@@ -451,13 +561,24 @@ impl Shared {
         if queue.closed {
             return Err(HistoryPublishError::Closed);
         }
-        if queue.pending_batches == HISTORY_BATCH_QUEUE_CAPACITY
-            && let Some(position) = queue.commands.iter().position(Command::is_batch)
+        while queue.pending_batches >= HISTORY_BATCH_QUEUE_CAPACITY
+            || queue.pending_batch_bytes.saturating_add(batch.owned_bytes) > MAX_HISTORY_QUEUE_BYTES
         {
-            queue.commands.remove(position);
+            let Some(position) = queue.commands.iter().position(Command::is_batch) else {
+                return Err(HistoryPublishError::BatchMemoryTooLarge);
+            };
+            let Some(Command::Batch(evicted)) = queue.commands.remove(position) else {
+                unreachable!("the located command is a history batch");
+            };
             queue.pending_batches -= 1;
+            queue.pending_batch_bytes = queue
+                .pending_batch_bytes
+                .saturating_sub(evicted.owned_bytes);
             self.dropped_batches.fetch_add(1, Ordering::Relaxed);
+            self.dropped_batch_bytes
+                .fetch_add(evicted.owned_bytes as u64, Ordering::Relaxed);
         }
+        queue.pending_batch_bytes = queue.pending_batch_bytes.saturating_add(batch.owned_bytes);
         queue.commands.push_back(Command::Batch(batch));
         queue.pending_batches += 1;
         self.ready.notify_one();
@@ -472,7 +593,7 @@ impl Shared {
         if queue.closed {
             return Err(HistoryQueryError::Closed);
         }
-        if queue.pending_controls == HISTORY_CONTROL_QUEUE_CAPACITY {
+        if queue.pending_controls >= HISTORY_CONTROL_QUEUE_CAPACITY {
             return Err(HistoryQueryError::Overloaded);
         }
         queue.commands.push_back(command);
@@ -497,24 +618,69 @@ impl Shared {
         let command = queue.commands.pop_front()?;
         if command.is_batch() {
             queue.pending_batches -= 1;
+            if let Command::Batch(batch) = &command {
+                queue.pending_batch_bytes =
+                    queue.pending_batch_bytes.saturating_sub(batch.owned_bytes);
+            }
         } else {
             queue.pending_controls -= 1;
         }
         Some(command)
     }
 
-    fn drain_following_batches(&self, batches: &mut Vec<HistoryBatch>) {
+    fn pop_control(&self, wait: Duration) -> Option<Command> {
+        let queue = self
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut queue =
+            if !queue.commands.iter().any(|command| !command.is_batch()) && !queue.closed {
+                self.ready
+                    .wait_timeout(queue, wait)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .0
+            } else {
+                queue
+            };
+        let position = queue
+            .commands
+            .iter()
+            .position(|command| !command.is_batch())?;
+        let command = queue
+            .commands
+            .remove(position)
+            .expect("the located history control remains queued");
+        queue.pending_controls -= 1;
+        Some(command)
+    }
+
+    fn drain_following_batches(&self, batches: &mut Vec<QueuedBatch>) {
         let mut queue = self
             .queue
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut transaction_bytes = batches
+            .iter()
+            .map(|batch| batch.owned_bytes)
+            .fold(0_usize, usize::saturating_add);
         while batches.len() < MAX_BATCHES_PER_TRANSACTION
             && queue.commands.front().is_some_and(Command::is_batch)
         {
+            let next_bytes = match queue.commands.front() {
+                Some(Command::Batch(batch)) => batch.owned_bytes,
+                _ => break,
+            };
+            if !batches.is_empty()
+                && transaction_bytes.saturating_add(next_bytes) > MAX_TRANSACTION_BYTES
+            {
+                break;
+            }
             let Some(Command::Batch(batch)) = queue.commands.pop_front() else {
                 break;
             };
             queue.pending_batches -= 1;
+            queue.pending_batch_bytes = queue.pending_batch_bytes.saturating_sub(batch.owned_bytes);
+            transaction_bytes = transaction_bytes.saturating_add(batch.owned_bytes);
             batches.push(batch);
         }
     }
@@ -557,14 +723,6 @@ impl Shared {
         self.ready.notify_all();
     }
 
-    fn closed_and_empty(&self) -> bool {
-        let queue = self
-            .queue
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        queue.closed && queue.commands.is_empty()
-    }
-
     fn discard_batches_when_closed(&self) -> bool {
         let mut queue = self
             .queue
@@ -575,9 +733,12 @@ impl Shared {
         }
         self.dropped_batches
             .fetch_add(queue.pending_batches as u64, Ordering::Relaxed);
+        self.dropped_batch_bytes
+            .fetch_add(queue.pending_batch_bytes as u64, Ordering::Relaxed);
         queue.commands.clear();
         queue.pending_batches = 0;
         queue.pending_controls = 0;
+        queue.pending_batch_bytes = 0;
         true
     }
 
@@ -586,6 +747,26 @@ impl Shared {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .pending_batches
+    }
+
+    fn pending_batch_bytes(&self) -> usize {
+        self.queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pending_batch_bytes
+    }
+
+    fn record_dropped_batch(&self, batch: &QueuedBatch) {
+        self.dropped_batches.fetch_add(1, Ordering::Relaxed);
+        self.dropped_batch_bytes
+            .fetch_add(batch.owned_bytes as u64, Ordering::Relaxed);
+    }
+
+    fn is_closed(&self) -> bool {
+        self.queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .closed
     }
 }
 
@@ -624,6 +805,53 @@ pub struct HistoryWorker {
     shared: Arc<Shared>,
 }
 
+pub struct HistoryWorkerHandle {
+    thread: Option<thread::JoinHandle<()>>,
+    shared: Arc<Shared>,
+}
+
+struct WorkerRunningFlag(Arc<Shared>);
+
+impl Drop for WorkerRunningFlag {
+    fn drop(&mut self) {
+        self.0.worker_running.store(false, Ordering::Release);
+    }
+}
+
+impl fmt::Debug for HistoryWorkerHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HistoryWorkerHandle")
+            .field(
+                "worker_running",
+                &self.shared.worker_running.load(Ordering::Acquire),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl HistoryWorkerHandle {
+    pub async fn shutdown(mut self) -> Result<(), HistoryWorkerError> {
+        self.shared.close();
+        let Some(thread) = self.thread.take() else {
+            return Ok(());
+        };
+        tokio::task::spawn_blocking(move || thread.join())
+            .await
+            .map_err(|_| HistoryWorkerError::JoinTaskCancelled)?
+            .map_err(|_| HistoryWorkerError::ThreadPanicked)
+    }
+}
+
+impl Drop for HistoryWorkerHandle {
+    fn drop(&mut self) {
+        self.shared.close();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 impl fmt::Debug for HistoryWorker {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -636,7 +864,7 @@ impl fmt::Debug for HistoryWorker {
 impl HistoryService {
     pub fn new(config: HistoryConfig) -> Result<(Self, HistoryWorker), HistoryConfigError> {
         config.validate()?;
-        let shared = Arc::new(Shared::new());
+        let shared = Arc::new(Shared::new(config.maximum_bytes()));
         Ok((
             Self {
                 shared: Arc::clone(&shared),
@@ -645,14 +873,27 @@ impl HistoryService {
         ))
     }
 
-    pub fn try_publish(&self, batch: HistoryBatch) -> Result<(), HistoryPublishError> {
+    pub fn try_publish(&self, mut batch: HistoryBatch) -> Result<(), HistoryPublishError> {
         if batch.is_empty() {
             return Err(HistoryPublishError::EmptyBatch);
         }
         if batch.record_count() > MAX_HISTORY_RECORDS_PER_BATCH {
             return Err(HistoryPublishError::BatchTooLarge);
         }
-        self.shared.push_batch(batch)
+        batch.compact();
+        let owned_bytes = batch
+            .owned_bytes()
+            .saturating_add(mem::size_of::<Command>());
+        if owned_bytes > MAX_HISTORY_QUEUE_BYTES
+            || owned_bytes as u64 > self.shared.maximum_database_bytes
+        {
+            self.shared.dropped_batches.fetch_add(1, Ordering::Relaxed);
+            self.shared
+                .dropped_batch_bytes
+                .fetch_add(owned_bytes as u64, Ordering::Relaxed);
+            return Err(HistoryPublishError::BatchMemoryTooLarge);
+        }
+        self.shared.push_batch(QueuedBatch { batch, owned_bytes })
     }
 
     pub async fn query(&self, query: HistoryQuery) -> Result<HistorySeries, HistoryQueryError> {
@@ -698,6 +939,11 @@ impl HistoryService {
             recoveries: self.shared.recoveries.load(Ordering::Relaxed),
             total_database_bytes: self.shared.total_database_bytes.load(Ordering::Relaxed),
             size_floor_reached: self.shared.size_floor_reached.load(Ordering::Relaxed),
+            pending_batch_bytes: self.shared.pending_batch_bytes(),
+            dropped_batch_bytes: self.shared.dropped_batch_bytes.load(Ordering::Relaxed),
+            dropped_late_points: self.shared.dropped_late_points.load(Ordering::Relaxed),
+            history_failures: self.shared.history_failures.load(Ordering::Relaxed),
+            worker_running: self.shared.worker_running.load(Ordering::Acquire),
         }
     }
 
@@ -707,48 +953,85 @@ impl HistoryService {
 }
 
 impl HistoryWorker {
-    pub async fn run(mut self) -> Result<(), HistoryWorkerError> {
-        let (completed, completion) = oneshot::channel();
+    pub fn start(mut self) -> Result<HistoryWorkerHandle, HistoryWorkerError> {
+        let shared = Arc::clone(&self.shared);
+        let thread_shared = Arc::clone(&shared);
         let thread = thread::Builder::new()
             .name("rustgo-sqlite-history".to_owned())
             .spawn(move || {
+                thread_shared.worker_running.store(true, Ordering::Release);
+                let _running = WorkerRunningFlag(Arc::clone(&thread_shared));
                 self.run_blocking();
-                let _ = completed.send(());
             })
             .map_err(HistoryWorkerError::ThreadSpawn)?;
-
-        let _ = completion.await;
-        thread
-            .join()
-            .map_err(|_| HistoryWorkerError::ThreadPanicked)
+        Ok(HistoryWorkerHandle {
+            thread: Some(thread),
+            shared,
+        })
     }
 
     fn run_blocking(&mut self) {
         let mut connection = None;
+        let mut raw_cutoff_unix_millis = 0_u64;
         let mut retry_backoff = INITIAL_RETRY_BACKOFF;
-        let mut retry_batch: Option<(Vec<HistoryBatch>, usize)> = None;
+        let mut next_open_attempt = Instant::now();
+        let mut retry_batches: VecDeque<(QueuedBatch, usize)> = VecDeque::new();
         let mut next_maintenance = Instant::now() + MAINTENANCE_INTERVAL;
+        let mut maintenance: Option<MaintenanceJob> = None;
+        let mut cap: Option<CapState> = None;
+        let mut background_turn = false;
         let mut warning_limiter = WarningLimiter::default();
 
         loop {
+            if self.shared.is_closed() {
+                if let Some(job) = maintenance.take() {
+                    job.finish(Err(HistoryQueryError::Closed));
+                }
+                while let Some((batch, _)) = retry_batches.pop_front() {
+                    self.shared.record_dropped_batch(&batch);
+                }
+                self.shared.fail_pending_controls();
+                self.shared.discard_batches_when_closed();
+                if let Some(database) = connection.as_ref() {
+                    let _ = checkpoint_database(database, &self.config, &self.shared);
+                }
+                return;
+            }
+
             if connection.is_none() {
+                if self.shared.history_failures.load(Ordering::Relaxed) > 0 {
+                    self.shared.fail_pending_controls();
+                }
+                let now = Instant::now();
+                if now < next_open_attempt {
+                    self.shared.wait(next_open_attempt.duration_since(now));
+                    continue;
+                }
                 match open_database(&self.config) {
                     Ok(opened) => {
-                        if !self.shared.history_available.swap(true, Ordering::AcqRel)
-                            && self.shared.recoveries.load(Ordering::Relaxed) > 0
-                        {
-                            tracing::info!(
-                                "SQLite history recovered; persisted metrics are available again"
-                            );
+                        if retry_batches.is_empty() {
+                            if !self.shared.history_available.swap(true, Ordering::AcqRel)
+                                && self.shared.history_failures.load(Ordering::Relaxed) > 0
+                            {
+                                tracing::info!(
+                                    "SQLite history recovered; persisted metrics are available again"
+                                );
+                            }
+                        } else {
+                            self.shared
+                                .history_available
+                                .store(false, Ordering::Release);
                         }
-                        connection = Some(opened);
-                        retry_backoff = INITIAL_RETRY_BACKOFF;
+                        raw_cutoff_unix_millis = opened.raw_cutoff_unix_millis;
+                        connection = Some(opened.connection);
+                        cap.get_or_insert_default();
+                        if retry_batches.is_empty() {
+                            retry_backoff = INITIAL_RETRY_BACKOFF;
+                        }
+                        background_turn = true;
                     }
                     Err(error) => {
-                        self.shared
-                            .history_available
-                            .store(false, Ordering::Release);
-                        warning_limiter.warn(&error);
+                        self.database_failed(&error, &mut warning_limiter);
                         if error.should_quarantine()
                             && quarantine_database(&self.config.database_path).unwrap_or(false)
                         {
@@ -756,19 +1039,10 @@ impl HistoryWorker {
                             tracing::warn!(
                                 "SQLite history file was quarantined; a fresh bounded history database will be created"
                             );
-                            retry_backoff = INITIAL_RETRY_BACKOFF;
+                            next_open_attempt = Instant::now();
                             continue;
                         }
-                        self.shared.fail_pending_controls();
-                        if self.shared.discard_batches_when_closed() {
-                            if let Some((batches, _)) = retry_batch.take() {
-                                self.shared
-                                    .dropped_batches
-                                    .fetch_add(batches.len() as u64, Ordering::Relaxed);
-                            }
-                            return;
-                        }
-                        self.shared.wait(retry_backoff);
+                        next_open_attempt = Instant::now() + retry_backoff;
                         retry_backoff = doubled_backoff(retry_backoff);
                         continue;
                     }
@@ -779,100 +1053,175 @@ impl HistoryWorker {
                 .as_mut()
                 .expect("history connection is initialized above");
 
-            if let Some((batches, attempts)) = retry_batch.take() {
-                match persist_batches(database, &batches) {
+            if let Some((batch, attempts)) = retry_batches.pop_front() {
+                match persist_batches(
+                    database,
+                    std::slice::from_ref(&batch),
+                    raw_cutoff_unix_millis,
+                    &self.shared,
+                ) {
                     Ok(()) => {
-                        self.shared.history_available.store(true, Ordering::Release);
+                        self.shared
+                            .history_available
+                            .store(retry_batches.is_empty(), Ordering::Release);
+                        cap.get_or_insert_default();
+                        background_turn = true;
+                        retry_backoff = INITIAL_RETRY_BACKOFF;
                     }
                     Err(error) => {
                         self.database_failed(&error, &mut warning_limiter);
                         connection = None;
                         self.quarantine_after_failure(&error);
                         if attempts + 1 < MAX_BATCH_WRITE_ATTEMPTS {
-                            retry_batch = Some((batches, attempts + 1));
+                            retry_batches.push_front((batch, attempts + 1));
                         } else {
-                            self.shared
-                                .dropped_batches
-                                .fetch_add(batches.len() as u64, Ordering::Relaxed);
+                            self.shared.record_dropped_batch(&batch);
                         }
+                        next_open_attempt = Instant::now() + retry_backoff;
+                        retry_backoff = doubled_backoff(retry_backoff);
                         continue;
                     }
                 }
             }
 
-            let now = Instant::now();
-            if now >= next_maintenance {
-                let wall_clock = unix_millis_now();
-                match maintain_database(database, &self.config, wall_clock, &self.shared) {
-                    Ok(()) => {
-                        self.shared.history_available.store(true, Ordering::Release);
-                        next_maintenance = Instant::now() + MAINTENANCE_INTERVAL;
-                    }
-                    Err(error) => {
-                        self.database_failed(&error, &mut warning_limiter);
-                        connection = None;
-                        self.quarantine_after_failure(&error);
-                    }
-                }
-                continue;
+            if maintenance.as_ref().is_some_and(MaintenanceJob::cancelled) {
+                maintenance = None;
+            }
+            if maintenance.is_none() && Instant::now() >= next_maintenance {
+                maintenance = Some(MaintenanceJob::new(unix_millis_now(), None));
+                background_turn = true;
             }
 
-            let wait = next_maintenance.saturating_duration_since(Instant::now());
-            let Some(command) = self.shared.pop(wait) else {
-                if self.shared.closed_and_empty() {
-                    let _ = checkpoint_database(database, &self.config, &self.shared);
-                    return;
+            if background_turn {
+                if let Some(state) = cap.as_mut() {
+                    match enforce_size_cap_step(database, &self.config, &self.shared, state) {
+                        Ok(true) => cap = None,
+                        Ok(false) => {}
+                        Err(error) => {
+                            self.database_failed(&error, &mut warning_limiter);
+                            connection = None;
+                            self.quarantine_after_failure(&error);
+                            next_open_attempt = Instant::now() + retry_backoff;
+                            retry_backoff = doubled_backoff(retry_backoff);
+                            continue;
+                        }
+                    }
+                    background_turn = false;
+                    continue;
+                }
+                if let Some(job) = maintenance.as_mut() {
+                    match maintenance_step(database, &self.config, job, &self.shared) {
+                        Ok(true) => {
+                            let completed = maintenance
+                                .take()
+                                .expect("completed maintenance job remains owned");
+                            raw_cutoff_unix_millis = raw_replay_cutoff(completed.now_unix_millis);
+                            completed.finish(Ok(()));
+                            next_maintenance = Instant::now() + MAINTENANCE_INTERVAL;
+                        }
+                        Ok(false) => {
+                            if matches!(
+                                job.phase,
+                                MaintenancePhase::Cap(_) | MaintenancePhase::Done
+                            ) {
+                                raw_cutoff_unix_millis = raw_replay_cutoff(job.now_unix_millis);
+                            }
+                        }
+                        Err(error) => {
+                            if let Some(failed) = maintenance.take() {
+                                failed.finish(Err(HistoryQueryError::Unavailable));
+                            }
+                            self.database_failed(&error, &mut warning_limiter);
+                            connection = None;
+                            self.quarantine_after_failure(&error);
+                            next_open_attempt = Instant::now() + retry_backoff;
+                            retry_backoff = doubled_backoff(retry_backoff);
+                            continue;
+                        }
+                    }
+                    background_turn = false;
+                    continue;
+                }
+            }
+
+            let cap_pending = cap.is_some()
+                || maintenance
+                    .as_ref()
+                    .is_some_and(MaintenanceJob::enforcing_cap);
+            let background_pending = cap_pending || maintenance.is_some();
+            let wait = if background_pending {
+                Duration::ZERO
+            } else {
+                next_maintenance.saturating_duration_since(Instant::now())
+            };
+            let command = if cap_pending {
+                self.shared.pop_control(wait)
+            } else {
+                self.shared.pop(wait)
+            };
+            let Some(command) = command else {
+                if background_pending {
+                    background_turn = true;
                 }
                 continue;
             };
+            background_turn = true;
 
             match command {
                 Command::Batch(batch) => {
                     let mut batches = vec![batch];
                     self.shared.drain_following_batches(&mut batches);
-                    match persist_batches(database, &batches) {
+                    match persist_batches(database, &batches, raw_cutoff_unix_millis, &self.shared)
+                    {
                         Ok(()) => {
                             self.shared.history_available.store(true, Ordering::Release);
+                            cap.get_or_insert_default();
+                            retry_backoff = INITIAL_RETRY_BACKOFF;
                         }
                         Err(error) => {
                             self.database_failed(&error, &mut warning_limiter);
-                            retry_batch = Some((batches, 1));
+                            retry_batches.extend(batches.into_iter().map(|batch| (batch, 1)));
                             connection = None;
                             self.quarantine_after_failure(&error);
+                            next_open_attempt = Instant::now() + retry_backoff;
+                            retry_backoff = doubled_backoff(retry_backoff);
                         }
                     }
                 }
-                Command::Query(query, response) => match query_database(database, &query) {
-                    Ok(series) => {
-                        self.shared.history_available.store(true, Ordering::Release);
-                        let _ = response.send(Ok(series));
+                Command::Query(query, response) => {
+                    if response.is_closed() {
+                        continue;
                     }
-                    Err(error) => {
-                        self.database_failed(&error, &mut warning_limiter);
-                        let _ = response.send(Err(HistoryQueryError::Unavailable));
-                        connection = None;
-                        self.quarantine_after_failure(&error);
-                    }
-                },
-                Command::Maintain(now, response) => {
-                    match maintain_database(database, &self.config, now, &self.shared) {
-                        Ok(()) => {
-                            self.shared.history_available.store(true, Ordering::Release);
-                            let _ = response.send(Ok(()));
-                            next_maintenance = Instant::now() + MAINTENANCE_INTERVAL;
+                    match query_database(database, &query) {
+                        Ok(series) => {
+                            let _ = response.send(Ok(series));
                         }
                         Err(error) => {
                             self.database_failed(&error, &mut warning_limiter);
                             let _ = response.send(Err(HistoryQueryError::Unavailable));
                             connection = None;
                             self.quarantine_after_failure(&error);
+                            next_open_attempt = Instant::now() + retry_backoff;
+                            retry_backoff = doubled_backoff(retry_backoff);
                         }
+                    }
+                }
+                Command::Maintain(now, response) => {
+                    if response.is_closed() {
+                        continue;
+                    }
+                    if maintenance.is_some() {
+                        let _ = response.send(Err(HistoryQueryError::Overloaded));
+                    } else {
+                        maintenance = Some(MaintenanceJob::new(now, Some(response)));
                     }
                 }
                 Command::Checkpoint(response) => {
+                    if response.is_closed() {
+                        continue;
+                    }
                     match checkpoint_database(database, &self.config, &self.shared) {
                         Ok(()) => {
-                            self.shared.history_available.store(true, Ordering::Release);
                             let _ = response.send(Ok(()));
                         }
                         Err(error) => {
@@ -880,6 +1229,8 @@ impl HistoryWorker {
                             let _ = response.send(Err(HistoryQueryError::Unavailable));
                             connection = None;
                             self.quarantine_after_failure(&error);
+                            next_open_attempt = Instant::now() + retry_backoff;
+                            retry_backoff = doubled_backoff(retry_backoff);
                         }
                     }
                 }
@@ -891,6 +1242,7 @@ impl HistoryWorker {
         self.shared
             .history_available
             .store(false, Ordering::Release);
+        self.shared.history_failures.fetch_add(1, Ordering::Relaxed);
         warnings.warn(error);
     }
 
@@ -938,17 +1290,24 @@ enum DatabaseError {
     IncompatibleSchema(u32),
     Integrity(String),
     ValueOutOfRange(&'static str),
+    UnsafePath(&'static str),
+    SchemaDamage(String),
+    Ownership(String),
 }
 
 impl DatabaseError {
     fn should_quarantine(&self) -> bool {
         match self {
-            Self::IncompatibleSchema(_) | Self::Integrity(_) => true,
+            Self::IncompatibleSchema(_) | Self::Integrity(_) | Self::SchemaDamage(_) => true,
             Self::Sqlite(rusqlite::Error::SqliteFailure(code, _)) => matches!(
                 code.code,
                 rusqlite::ffi::ErrorCode::DatabaseCorrupt | rusqlite::ffi::ErrorCode::NotADatabase
             ),
-            Self::Sqlite(_) | Self::Io(_) | Self::ValueOutOfRange(_) => false,
+            Self::Sqlite(_)
+            | Self::Io(_)
+            | Self::ValueOutOfRange(_)
+            | Self::UnsafePath(_)
+            | Self::Ownership(_) => false,
         }
     }
 }
@@ -974,6 +1333,11 @@ impl fmt::Display for DatabaseError {
                     "history {field} is outside SQLite's integer range"
                 )
             }
+            Self::UnsafePath(reason) => write!(formatter, "unsafe history database path: {reason}"),
+            Self::SchemaDamage(reason) => write!(formatter, "history schema is damaged: {reason}"),
+            Self::Ownership(reason) => {
+                write!(formatter, "history ownership marker is invalid: {reason}")
+            }
         }
     }
 }
@@ -990,7 +1354,13 @@ impl From<io::Error> for DatabaseError {
     }
 }
 
-fn open_database(config: &HistoryConfig) -> Result<Connection, DatabaseError> {
+struct OpenedDatabase {
+    connection: Connection,
+    raw_cutoff_unix_millis: u64,
+}
+
+fn open_database(config: &HistoryConfig) -> Result<OpenedDatabase, DatabaseError> {
+    validate_database_path(&config.database_path)?;
     let connection = Connection::open_with_flags(
         &config.database_path,
         OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -1013,7 +1383,20 @@ fn open_database(config: &HistoryConfig) -> Result<Connection, DatabaseError> {
     if !integrity.eq_ignore_ascii_case("ok") {
         return Err(DatabaseError::Integrity(integrity));
     }
-    Ok(connection)
+    validate_schema(&connection)?;
+    ensure_ownership_marker(&config.database_path)?;
+    write_probe(&connection)?;
+    let last_maintenance: i64 = connection.query_row(
+        "SELECT last_maintenance_ms FROM history_health WHERE id = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    let last_maintenance = u64::try_from(last_maintenance)
+        .map_err(|_| DatabaseError::SchemaDamage("negative maintenance timestamp".to_owned()))?;
+    Ok(OpenedDatabase {
+        connection,
+        raw_cutoff_unix_millis: raw_replay_cutoff(last_maintenance),
+    })
 }
 
 fn migrate(connection: &Connection) -> Result<(), DatabaseError> {
@@ -1087,12 +1470,286 @@ fn migrate(connection: &Connection) -> Result<(), DatabaseError> {
         transaction.pragma_update(None, "user_version", 2)?;
         transaction.commit()?;
     }
+    if version < 3 {
+        let transaction = connection.unchecked_transaction()?;
+        transaction.execute_batch(
+            "CREATE TABLE IF NOT EXISTS history_health (
+                 id INTEGER PRIMARY KEY CHECK (id = 1),
+                 last_maintenance_ms INTEGER NOT NULL CHECK (last_maintenance_ms >= 0),
+                 probe_nonce INTEGER NOT NULL
+             );
+             INSERT OR IGNORE INTO history_health (id, last_maintenance_ms, probe_nonce)
+             VALUES (1, 0, 0);",
+        )?;
+        transaction.pragma_update(None, "user_version", 3)?;
+        transaction.commit()?;
+    }
+    if version < 4 {
+        let transaction = connection.unchecked_transaction()?;
+        transaction.execute_batch(
+            "CREATE INDEX IF NOT EXISTS server_metric_query
+                 ON server_metric_points (resolution, metric, timestamp_ms);
+             CREATE INDEX IF NOT EXISTS client_metric_retention
+                 ON client_metric_points (resolution, timestamp_ms, client_name);",
+        )?;
+        transaction.pragma_update(None, "user_version", 4)?;
+        transaction.commit()?;
+    }
     Ok(())
+}
+
+fn validate_database_path(path: &Path) -> Result<(), DatabaseError> {
+    if is_protected_history_path(path) {
+        return Err(DatabaseError::UnsafePath(
+            "configuration, key, and certificate-like paths are not valid history databases",
+        ));
+    }
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(DatabaseError::UnsafePath(
+                "database path is a symbolic link",
+            ));
+        }
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            return Err(DatabaseError::UnsafePath(
+                "database path is not a regular file",
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    for member in [
+        sidecar_path(path, "-wal"),
+        sidecar_path(path, "-shm"),
+        ownership_marker_path(path),
+    ] {
+        match fs::symlink_metadata(member) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(DatabaseError::UnsafePath(
+                    "history database family contains a symbolic link",
+                ));
+            }
+            Ok(metadata) if !metadata.file_type().is_file() => {
+                return Err(DatabaseError::UnsafePath(
+                    "history database family contains a non-file member",
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+fn is_protected_history_path(path: &Path) -> bool {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches!(
+        extension.as_str(),
+        "toml" | "key" | "pem" | "crt" | "cert" | "cer" | "der" | "p12" | "pfx"
+    )
+}
+
+fn validate_schema(connection: &Connection) -> Result<(), DatabaseError> {
+    for (table, columns) in [
+        (
+            "server_metric_points",
+            &[
+                "resolution",
+                "timestamp_ms",
+                "metric",
+                "value",
+                "sample_count",
+            ][..],
+        ),
+        (
+            "client_metric_points",
+            &[
+                "client_name",
+                "resolution",
+                "timestamp_ms",
+                "metric",
+                "value",
+                "sample_count",
+            ][..],
+        ),
+        (
+            "client_lifecycle",
+            &[
+                "id",
+                "client_name",
+                "generation",
+                "event_kind",
+                "timestamp_ms",
+                "version",
+            ][..],
+        ),
+        (
+            "session_summaries",
+            &[
+                "session_id",
+                "client_name",
+                "peer",
+                "tunnel",
+                "export_name",
+                "kind",
+                "path",
+                "received_bytes",
+                "sent_bytes",
+                "opened_ms",
+                "closed_ms",
+                "terminal_reason",
+            ][..],
+        ),
+        (
+            "history_health",
+            &["id", "last_maintenance_ms", "probe_nonce"][..],
+        ),
+    ] {
+        let exists: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |row| row.get(0),
+        )?;
+        if exists != 1 {
+            return Err(DatabaseError::SchemaDamage(format!(
+                "required table {table} is missing"
+            )));
+        }
+        let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+        let present = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        for column in columns {
+            if !present.contains(*column) {
+                return Err(DatabaseError::SchemaDamage(format!(
+                    "required column {table}.{column} is missing"
+                )));
+            }
+        }
+    }
+    for (index, columns) in [
+        (
+            "server_metric_query",
+            &["resolution", "metric", "timestamp_ms"][..],
+        ),
+        (
+            "client_metric_query",
+            &["resolution", "metric", "timestamp_ms", "client_name"][..],
+        ),
+        (
+            "client_metric_retention",
+            &["resolution", "timestamp_ms", "client_name"][..],
+        ),
+        ("client_lifecycle_time", &["timestamp_ms", "id"][..]),
+        (
+            "client_lifecycle_latest",
+            &["client_name", "timestamp_ms", "id"][..],
+        ),
+        (
+            "session_summaries_time",
+            &["closed_ms", "opened_ms", "session_id"][..],
+        ),
+    ] {
+        let exists: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+            [index],
+            |row| row.get(0),
+        )?;
+        if exists != 1 {
+            return Err(DatabaseError::SchemaDamage(format!(
+                "required index {index} is missing"
+            )));
+        }
+        let mut statement = connection.prepare(&format!("PRAGMA index_info({index})"))?;
+        let present = statement
+            .query_map([], |row| row.get::<_, String>(2))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if present
+            .iter()
+            .map(String::as_str)
+            .ne(columns.iter().copied())
+        {
+            return Err(DatabaseError::SchemaDamage(format!(
+                "required index {index} has unexpected columns"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn write_probe(connection: &Connection) -> Result<(), DatabaseError> {
+    let transaction = connection.unchecked_transaction()?;
+    let changed = transaction.execute(
+        "UPDATE history_health SET probe_nonce = probe_nonce + 1 WHERE id = 1",
+        [],
+    )?;
+    if changed != 1 {
+        return Err(DatabaseError::SchemaDamage(
+            "write probe row is missing".to_owned(),
+        ));
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+fn ownership_marker_path(path: &Path) -> PathBuf {
+    sidecar_path(path, OWNERSHIP_MARKER_SUFFIX)
+}
+
+fn ensure_ownership_marker(path: &Path) -> Result<(), DatabaseError> {
+    let marker = ownership_marker_path(path);
+    match fs::symlink_metadata(&marker) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(DatabaseError::Ownership(
+                "ownership marker is a symbolic link".to_owned(),
+            ));
+        }
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            return Err(DatabaseError::Ownership(
+                "ownership marker is not a regular file".to_owned(),
+            ));
+        }
+        Ok(_) => {
+            if fs::read(&marker)? != OWNERSHIP_MARKER_CONTENT {
+                return Err(DatabaseError::Ownership(
+                    "ownership marker content does not match Rustgo history".to_owned(),
+                ));
+            }
+            return Ok(());
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker)?;
+    file.write_all(OWNERSHIP_MARKER_CONTENT)?;
+    file.flush()?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn has_valid_ownership_marker(path: &Path) -> bool {
+    let marker = ownership_marker_path(path);
+    fs::symlink_metadata(&marker)
+        .ok()
+        .filter(|metadata| metadata.file_type().is_file())
+        .and_then(|_| fs::read(marker).ok())
+        .is_some_and(|content| content == OWNERSHIP_MARKER_CONTENT)
 }
 
 fn persist_batches(
     connection: &mut Connection,
-    batches: &[HistoryBatch],
+    batches: &[QueuedBatch],
+    raw_cutoff_unix_millis: u64,
+    shared: &Shared,
 ) -> Result<(), DatabaseError> {
     let transaction = connection.transaction()?;
     let mut server_minutes = BTreeSet::new();
@@ -1100,8 +1757,13 @@ fn persist_batches(
     let mut client_minutes = BTreeSet::new();
     let mut client_five_minutes = BTreeSet::new();
 
-    for batch in batches {
+    for queued in batches {
+        let batch = &queued.batch;
         for sample in &batch.server_points {
+            if sample.timestamp_unix_millis < raw_cutoff_unix_millis {
+                shared.dropped_late_points.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
             insert_server_sample(&transaction, sample)?;
             server_minutes.insert(bucket_start(
                 sample.timestamp_unix_millis,
@@ -1113,6 +1775,10 @@ fn persist_batches(
             ));
         }
         for sample in &batch.client_points {
+            if sample.timestamp_unix_millis < raw_cutoff_unix_millis {
+                shared.dropped_late_points.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
             insert_client_sample(&transaction, sample)?;
             client_minutes.insert((
                 sample.client.name().to_owned(),
@@ -1314,62 +1980,6 @@ fn aggregate_client_bucket(
     Ok(())
 }
 
-fn aggregate_all(connection: &Connection) -> Result<(), DatabaseError> {
-    aggregate_all_server(connection, 0, 1, MINUTE_BUCKET_MILLIS)?;
-    aggregate_all_client(connection, 0, 1, MINUTE_BUCKET_MILLIS)?;
-    aggregate_all_server(connection, 1, 2, FIVE_MINUTE_BUCKET_MILLIS)?;
-    aggregate_all_client(connection, 1, 2, FIVE_MINUTE_BUCKET_MILLIS)?;
-    Ok(())
-}
-
-fn aggregate_all_server(
-    connection: &Connection,
-    source_resolution: i64,
-    target_resolution: i64,
-    width: u64,
-) -> Result<(), DatabaseError> {
-    let width = sqlite_integer(width, "aggregation width")?;
-    connection.execute(
-        "INSERT INTO server_metric_points
-         (resolution, timestamp_ms, metric, value, sample_count)
-         SELECT ?1, (timestamp_ms / ?2) * ?2, metric,
-                SUM(value * sample_count) / SUM(sample_count),
-                SUM(sample_count)
-         FROM server_metric_points
-         WHERE resolution = ?3
-         GROUP BY (timestamp_ms / ?2), metric
-         ON CONFLICT (resolution, timestamp_ms, metric) DO UPDATE SET
-             value = excluded.value,
-             sample_count = excluded.sample_count",
-        params![target_resolution, width, source_resolution],
-    )?;
-    Ok(())
-}
-
-fn aggregate_all_client(
-    connection: &Connection,
-    source_resolution: i64,
-    target_resolution: i64,
-    width: u64,
-) -> Result<(), DatabaseError> {
-    let width = sqlite_integer(width, "aggregation width")?;
-    connection.execute(
-        "INSERT INTO client_metric_points
-         (client_name, resolution, timestamp_ms, metric, value, sample_count)
-         SELECT client_name, ?1, (timestamp_ms / ?2) * ?2, metric,
-                SUM(value * sample_count) / SUM(sample_count),
-                SUM(sample_count)
-         FROM client_metric_points
-         WHERE resolution = ?3
-         GROUP BY client_name, (timestamp_ms / ?2), metric
-         ON CONFLICT (client_name, resolution, timestamp_ms, metric) DO UPDATE SET
-             value = excluded.value,
-             sample_count = excluded.sample_count",
-        params![target_resolution, width, source_resolution],
-    )?;
-    Ok(())
-}
-
 fn metric_values(metrics: &HostMetrics, traffic: TrafficCounters) -> Vec<(HistoryMetric, f64)> {
     let mut values = Vec::with_capacity(13);
     push_metric_u16(
@@ -1552,106 +2162,201 @@ fn query_database(
     Ok(HistorySeries { resolution, points })
 }
 
-fn maintain_database(
+enum MaintenancePhase {
+    Raw,
+    OneMinute,
+    FiveMinutes,
+    Lifecycle,
+    Sessions,
+    RecordCompletion,
+    Cap(CapState),
+    Done,
+}
+
+struct MaintenanceJob {
+    now_unix_millis: u64,
+    phase: MaintenancePhase,
+    response: Option<oneshot::Sender<Result<(), HistoryQueryError>>>,
+}
+
+impl MaintenanceJob {
+    fn new(
+        now_unix_millis: u64,
+        response: Option<oneshot::Sender<Result<(), HistoryQueryError>>>,
+    ) -> Self {
+        Self {
+            now_unix_millis,
+            phase: MaintenancePhase::Raw,
+            response,
+        }
+    }
+
+    fn cancelled(&self) -> bool {
+        self.response
+            .as_ref()
+            .is_some_and(oneshot::Sender::is_closed)
+    }
+
+    fn enforcing_cap(&self) -> bool {
+        matches!(self.phase, MaintenancePhase::Cap(_))
+    }
+
+    fn finish(mut self, result: Result<(), HistoryQueryError>) {
+        if let Some(response) = self.response.take() {
+            let _ = response.send(result);
+        }
+    }
+}
+
+fn maintenance_step(
     connection: &mut Connection,
     config: &HistoryConfig,
-    now_unix_millis: u64,
+    job: &mut MaintenanceJob,
     shared: &Shared,
-) -> Result<(), DatabaseError> {
-    aggregate_all(connection)?;
-    let transaction = connection.transaction()?;
-    delete_older_metric_rows(
-        &transaction,
-        0,
-        now_unix_millis.saturating_sub(RAW_RETENTION_MILLIS),
-    )?;
-    delete_older_metric_rows(
-        &transaction,
-        1,
-        now_unix_millis.saturating_sub(ONE_MINUTE_RETENTION_MILLIS),
-    )?;
-    let history_cutoff = now_unix_millis.saturating_sub(config.retention_millis());
-    delete_older_metric_rows(&transaction, 2, history_cutoff)?;
-    delete_old_lifecycle(&transaction, history_cutoff)?;
-    delete_old_sessions(&transaction, history_cutoff)?;
-    transaction.commit()?;
-    enforce_size_cap(connection, config, shared)
+) -> Result<bool, DatabaseError> {
+    match &mut job.phase {
+        MaintenancePhase::Raw => {
+            if delete_metric_bucket_chunk(connection, 0, raw_replay_cutoff(job.now_unix_millis))? {
+                job.phase = MaintenancePhase::OneMinute;
+            }
+        }
+        MaintenancePhase::OneMinute => {
+            if delete_metric_bucket_chunk(
+                connection,
+                1,
+                job.now_unix_millis
+                    .saturating_sub(ONE_MINUTE_RETENTION_MILLIS),
+            )? {
+                job.phase = MaintenancePhase::FiveMinutes;
+            }
+        }
+        MaintenancePhase::FiveMinutes => {
+            if delete_metric_bucket_chunk(
+                connection,
+                2,
+                job.now_unix_millis
+                    .saturating_sub(config.retention_millis()),
+            )? {
+                job.phase = MaintenancePhase::Lifecycle;
+            }
+        }
+        MaintenancePhase::Lifecycle => {
+            let cutoff = sqlite_integer(
+                job.now_unix_millis
+                    .saturating_sub(config.retention_millis()),
+                "lifecycle retention cutoff",
+            )?;
+            let deleted = connection.execute(
+                "DELETE FROM client_lifecycle
+                 WHERE id IN (
+                     SELECT id FROM client_lifecycle
+                     WHERE timestamp_ms < ?1
+                     ORDER BY timestamp_ms ASC, id ASC
+                     LIMIT ?2
+                 )",
+                params![cutoff, RETENTION_DELETE_LIMIT as i64],
+            )?;
+            if deleted < RETENTION_DELETE_LIMIT {
+                job.phase = MaintenancePhase::Sessions;
+            }
+        }
+        MaintenancePhase::Sessions => {
+            let cutoff = sqlite_integer(
+                job.now_unix_millis
+                    .saturating_sub(config.retention_millis()),
+                "session retention cutoff",
+            )?;
+            let deleted = connection.execute(
+                "DELETE FROM session_summaries
+                 WHERE rowid IN (
+                     SELECT rowid FROM session_summaries
+                     WHERE closed_ms IS NOT NULL AND closed_ms < ?1
+                     ORDER BY closed_ms ASC, rowid ASC
+                     LIMIT ?2
+                 )",
+                params![cutoff, RETENTION_DELETE_LIMIT as i64],
+            )?;
+            if deleted < RETENTION_DELETE_LIMIT {
+                job.phase = MaintenancePhase::RecordCompletion;
+            }
+        }
+        MaintenancePhase::RecordCompletion => {
+            let now = sqlite_integer(job.now_unix_millis, "maintenance timestamp")?;
+            connection.execute(
+                "UPDATE history_health SET last_maintenance_ms = ?1 WHERE id = 1",
+                [now],
+            )?;
+            job.phase = MaintenancePhase::Cap(CapState::default());
+        }
+        MaintenancePhase::Cap(state) => {
+            if enforce_size_cap_step(connection, config, shared, state)? {
+                job.phase = MaintenancePhase::Done;
+            }
+        }
+        MaintenancePhase::Done => return Ok(true),
+    }
+    Ok(matches!(job.phase, MaintenancePhase::Done))
 }
 
-fn delete_older_metric_rows(
-    transaction: &Transaction<'_>,
+fn raw_replay_cutoff(maintenance_unix_millis: u64) -> u64 {
+    let cutoff = maintenance_unix_millis.saturating_sub(RAW_RETENTION_MILLIS);
+    if cutoff == 0 {
+        return 0;
+    }
+    cutoff.saturating_add(FIVE_MINUTE_BUCKET_MILLIS - 1) / FIVE_MINUTE_BUCKET_MILLIS
+        * FIVE_MINUTE_BUCKET_MILLIS
+}
+
+fn delete_metric_bucket_chunk(
+    connection: &mut Connection,
     resolution: i64,
     cutoff: u64,
-) -> Result<(), DatabaseError> {
+) -> Result<bool, DatabaseError> {
     let cutoff = sqlite_integer(cutoff, "retention cutoff")?;
-    for _ in 0..RETENTION_DELETE_PASSES {
-        let server_deleted = transaction.execute(
-            "DELETE FROM server_metric_points
-             WHERE (resolution, timestamp_ms, metric) IN (
-                 SELECT resolution, timestamp_ms, metric
-                 FROM server_metric_points
-                 WHERE resolution = ?1 AND timestamp_ms < ?2
-                 ORDER BY timestamp_ms ASC, metric ASC
-                 LIMIT ?3
-             )",
-            params![resolution, cutoff, RETENTION_DELETE_LIMIT as i64],
+    let server_buckets = {
+        let mut statement = connection.prepare(
+            "SELECT DISTINCT timestamp_ms FROM server_metric_points
+             WHERE resolution = ?1 AND timestamp_ms < ?2
+             ORDER BY timestamp_ms ASC LIMIT ?3",
         )?;
-        let client_deleted = transaction.execute(
+        statement
+            .query_map(
+                params![resolution, cutoff, MAINTENANCE_BUCKET_LIMIT as i64],
+                |row| row.get::<_, i64>(0),
+            )?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let client_buckets = {
+        let mut statement = connection.prepare(
+            "SELECT client_name, timestamp_ms FROM client_metric_points
+             WHERE resolution = ?1 AND timestamp_ms < ?2
+             GROUP BY client_name, timestamp_ms
+             ORDER BY timestamp_ms ASC, client_name ASC LIMIT ?3",
+        )?;
+        statement
+            .query_map(
+                params![resolution, cutoff, MAINTENANCE_BUCKET_LIMIT as i64],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let transaction = connection.transaction()?;
+    for timestamp in &server_buckets {
+        transaction.execute(
+            "DELETE FROM server_metric_points WHERE resolution = ?1 AND timestamp_ms = ?2",
+            params![resolution, timestamp],
+        )?;
+    }
+    for (client, timestamp) in &client_buckets {
+        transaction.execute(
             "DELETE FROM client_metric_points
-             WHERE (client_name, resolution, timestamp_ms, metric) IN (
-                 SELECT client_name, resolution, timestamp_ms, metric
-                 FROM client_metric_points
-                 WHERE resolution = ?1 AND timestamp_ms < ?2
-                 ORDER BY timestamp_ms ASC, client_name ASC, metric ASC
-                 LIMIT ?3
-             )",
-            params![resolution, cutoff, RETENTION_DELETE_LIMIT as i64],
+             WHERE client_name = ?1 AND resolution = ?2 AND timestamp_ms = ?3",
+            params![client, resolution, timestamp],
         )?;
-        if server_deleted < RETENTION_DELETE_LIMIT && client_deleted < RETENTION_DELETE_LIMIT {
-            break;
-        }
     }
-    Ok(())
-}
-
-fn delete_old_lifecycle(transaction: &Transaction<'_>, cutoff: u64) -> Result<(), DatabaseError> {
-    let cutoff = sqlite_integer(cutoff, "lifecycle retention cutoff")?;
-    for _ in 0..RETENTION_DELETE_PASSES {
-        let deleted = transaction.execute(
-            "DELETE FROM client_lifecycle
-             WHERE id IN (
-                 SELECT id FROM client_lifecycle
-                 WHERE timestamp_ms < ?1
-                 ORDER BY timestamp_ms ASC, id ASC
-                 LIMIT ?2
-             )",
-            params![cutoff, RETENTION_DELETE_LIMIT as i64],
-        )?;
-        if deleted < RETENTION_DELETE_LIMIT {
-            break;
-        }
-    }
-    Ok(())
-}
-
-fn delete_old_sessions(transaction: &Transaction<'_>, cutoff: u64) -> Result<(), DatabaseError> {
-    let cutoff = sqlite_integer(cutoff, "session retention cutoff")?;
-    for _ in 0..RETENTION_DELETE_PASSES {
-        let deleted = transaction.execute(
-            "DELETE FROM session_summaries
-             WHERE rowid IN (
-                 SELECT rowid FROM session_summaries
-                 WHERE COALESCE(closed_ms, opened_ms) < ?1
-                 ORDER BY COALESCE(closed_ms, opened_ms) ASC, rowid ASC
-                 LIMIT ?2
-             )",
-            params![cutoff, RETENTION_DELETE_LIMIT as i64],
-        )?;
-        if deleted < RETENTION_DELETE_LIMIT {
-            break;
-        }
-    }
-    Ok(())
+    transaction.commit()?;
+    Ok(server_buckets.len() < MAINTENANCE_BUCKET_LIMIT
+        && client_buckets.len() < MAINTENANCE_BUCKET_LIMIT)
 }
 
 fn checkpoint_database(
@@ -1665,37 +2370,46 @@ fn checkpoint_database(
     Ok(())
 }
 
-fn enforce_size_cap(
+#[derive(Default)]
+struct CapState {
+    active: bool,
+}
+
+fn enforce_size_cap_step(
     connection: &mut Connection,
     config: &HistoryConfig,
     shared: &Shared,
-) -> Result<(), DatabaseError> {
-    checkpoint_truncate(connection)?;
-    incremental_vacuum(connection)?;
+    state: &mut CapState,
+) -> Result<bool, DatabaseError> {
     let maximum = config.maximum_bytes();
     let target = maximum.saturating_mul(9) / 10;
     let mut total = database_family_size(&config.database_path)?;
-    shared.size_floor_reached.store(false, Ordering::Relaxed);
-    if total <= maximum {
+    if !state.active && total <= maximum {
         shared.total_database_bytes.store(total, Ordering::Relaxed);
-        return Ok(());
+        return Ok(true);
     }
-
-    loop {
-        let deleted = prune_cap_batch(connection)?;
-        if !deleted {
-            shared.size_floor_reached.store(true, Ordering::Relaxed);
-            break;
-        }
-        checkpoint_truncate(connection)?;
-        incremental_vacuum(connection)?;
-        total = database_family_size(&config.database_path)?;
-        if total <= target {
-            break;
-        }
+    if !state.active {
+        state.active = true;
+        shared.size_floor_reached.store(false, Ordering::Relaxed);
     }
+    checkpoint_truncate(connection)?;
+    incremental_vacuum(connection)?;
+    total = database_family_size(&config.database_path)?;
+    if total <= target {
+        shared.total_database_bytes.store(total, Ordering::Relaxed);
+        return Ok(true);
+    }
+    let deleted = prune_cap_batch(connection)?;
+    if !deleted {
+        shared.size_floor_reached.store(true, Ordering::Relaxed);
+        shared.total_database_bytes.store(total, Ordering::Relaxed);
+        return Ok(true);
+    }
+    checkpoint_truncate(connection)?;
+    incremental_vacuum(connection)?;
+    total = database_family_size(&config.database_path)?;
     shared.total_database_bytes.store(total, Ordering::Relaxed);
-    Ok(())
+    Ok(total <= target)
 }
 
 fn prune_cap_batch(connection: &mut Connection) -> Result<bool, DatabaseError> {
@@ -1720,90 +2434,75 @@ fn prune_metric_table(
 ) -> Result<bool, DatabaseError> {
     let bucket_limit = (CAP_DELETE_LIMIT / 13).max(1) as i64;
     if table == "server_metric_points" {
-        let buckets: usize = connection.query_row(
-            "SELECT COUNT(DISTINCT timestamp_ms)
-             FROM server_metric_points
-             WHERE resolution = ?1",
-            [resolution],
-            |row| row.get(0),
-        )?;
-        if buckets <= 1 {
-            return Ok(false);
-        }
-        let limit = (buckets - 1).min(bucket_limit as usize) as i64;
-        let deleted = connection.execute(
-            "DELETE FROM server_metric_points
-             WHERE resolution = ?1 AND timestamp_ms IN (
-                 SELECT DISTINCT timestamp_ms
+        let buckets = {
+            let mut statement = connection.prepare(
+                "SELECT DISTINCT timestamp_ms
                  FROM server_metric_points
                  WHERE resolution = ?1
                  ORDER BY timestamp_ms ASC
-                 LIMIT ?2
-             )",
-            params![resolution, limit],
-        )?;
+                 LIMIT ?2",
+            )?;
+            statement
+                .query_map(params![resolution, bucket_limit + 1], |row| {
+                    row.get::<_, i64>(0)
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        if buckets.len() <= 1 {
+            return Ok(false);
+        }
+        let transaction = connection.transaction()?;
+        for timestamp in buckets.iter().take(buckets.len() - 1) {
+            transaction.execute(
+                "DELETE FROM server_metric_points
+                 WHERE resolution = ?1 AND timestamp_ms = ?2",
+                params![resolution, timestamp],
+            )?;
+        }
+        transaction.commit()?;
+        let deleted = buckets.len() - 1;
         return Ok(deleted > 0);
     }
 
-    let deletable: usize = connection.query_row(
-        "SELECT COUNT(*) FROM (
-             SELECT candidate.client_name, candidate.timestamp_ms
+    let buckets = {
+        let mut statement = connection.prepare(
+            "SELECT candidate.client_name, candidate.timestamp_ms
              FROM client_metric_points AS candidate
              WHERE candidate.resolution = ?1
-               AND candidate.timestamp_ms < (
-                   SELECT MAX(current.timestamp_ms)
-                   FROM client_metric_points AS current
-                   WHERE current.client_name = candidate.client_name
-                     AND current.resolution = ?1
-               )
-             GROUP BY candidate.client_name, candidate.timestamp_ms
-         )",
-        [resolution],
-        |row| row.get(0),
-    )?;
-    if deletable == 0 {
-        return Ok(false);
-    }
-    let limit = deletable.min(bucket_limit as usize) as i64;
-    let deleted = connection.execute(
-        "DELETE FROM client_metric_points
-         WHERE resolution = ?1 AND (client_name, timestamp_ms) IN (
-             SELECT candidate.client_name, candidate.timestamp_ms
-             FROM client_metric_points AS candidate
-             WHERE candidate.resolution = ?1
-               AND candidate.timestamp_ms < (
-                   SELECT MAX(current.timestamp_ms)
-                   FROM client_metric_points AS current
-                   WHERE current.client_name = candidate.client_name
-                     AND current.resolution = ?1
+               AND EXISTS (
+                   SELECT 1
+                   FROM client_metric_points AS newer
+                   WHERE newer.client_name = candidate.client_name
+                     AND newer.resolution = ?1
+                     AND newer.timestamp_ms > candidate.timestamp_ms
                )
              GROUP BY candidate.client_name, candidate.timestamp_ms
              ORDER BY candidate.timestamp_ms ASC, candidate.client_name ASC
-             LIMIT ?2
-         )",
-        params![resolution, limit],
-    )?;
+             LIMIT ?2",
+        )?;
+        statement
+            .query_map(params![resolution, bucket_limit], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    if buckets.is_empty() {
+        return Ok(false);
+    }
+    let transaction = connection.transaction()?;
+    for (client, timestamp) in &buckets {
+        transaction.execute(
+            "DELETE FROM client_metric_points
+             WHERE client_name = ?1 AND resolution = ?2 AND timestamp_ms = ?3",
+            params![client, resolution, timestamp],
+        )?;
+    }
+    transaction.commit()?;
+    let deleted = buckets.len();
     Ok(deleted > 0)
 }
 
 fn prune_lifecycle(connection: &mut Connection) -> Result<bool, DatabaseError> {
-    let deletable: usize = connection.query_row(
-        "SELECT COUNT(*)
-         FROM client_lifecycle AS candidate
-         WHERE candidate.id <> (
-             SELECT current.id
-             FROM client_lifecycle AS current
-             WHERE current.client_name = candidate.client_name
-             ORDER BY current.timestamp_ms DESC, current.id DESC
-             LIMIT 1
-         )",
-        [],
-        |row| row.get(0),
-    )?;
-    if deletable == 0 {
-        return Ok(false);
-    }
-    let limit = deletable.min(CAP_DELETE_LIMIT) as i64;
     let deleted = connection.execute(
         "DELETE FROM client_lifecycle
          WHERE id IN (
@@ -1819,29 +2518,28 @@ fn prune_lifecycle(connection: &mut Connection) -> Result<bool, DatabaseError> {
              ORDER BY candidate.timestamp_ms ASC, candidate.id ASC
              LIMIT ?1
          )",
-        [limit],
+        [CAP_DELETE_LIMIT as i64],
     )?;
     Ok(deleted > 0)
 }
 
 fn prune_sessions(connection: &mut Connection) -> Result<bool, DatabaseError> {
-    let count: usize =
-        connection.query_row("SELECT COUNT(*) FROM session_summaries", [], |row| {
-            row.get(0)
-        })?;
-    if count <= 1 {
-        return Ok(false);
-    }
-    let limit = (count - 1).min(CAP_DELETE_LIMIT) as i64;
     let deleted = connection.execute(
         "DELETE FROM session_summaries
          WHERE rowid IN (
              SELECT rowid FROM session_summaries
              WHERE closed_ms IS NOT NULL
+               AND rowid <> (
+                   SELECT newest.rowid
+                   FROM session_summaries AS newest
+                   WHERE newest.closed_ms IS NOT NULL
+                   ORDER BY newest.closed_ms DESC, newest.rowid DESC
+                   LIMIT 1
+               )
              ORDER BY closed_ms ASC, rowid ASC
              LIMIT ?1
          )",
-        [limit],
+        [CAP_DELETE_LIMIT as i64],
     )?;
     Ok(deleted > 0)
 }
@@ -1870,7 +2568,12 @@ fn database_family_size(path: &Path) -> Result<u64, DatabaseError> {
         sidecar_path(path, "-wal"),
         sidecar_path(path, "-shm"),
     ] {
-        match fs::metadata(candidate) {
+        match fs::symlink_metadata(candidate) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(DatabaseError::UnsafePath(
+                    "history database family contains a symbolic link",
+                ));
+            }
             Ok(metadata) => {
                 total = total.saturating_add(metadata.len());
             }
@@ -1882,25 +2585,50 @@ fn database_family_size(path: &Path) -> Result<u64, DatabaseError> {
 }
 
 fn quarantine_database(path: &Path) -> Result<bool, DatabaseError> {
-    let metadata = match fs::metadata(path) {
+    if is_protected_history_path(path) || !has_valid_ownership_marker(path) {
+        return Ok(false);
+    }
+    let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error.into()),
     };
-    if !metadata.is_file() {
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
         return Ok(false);
     }
 
-    let timestamp = unix_millis_now();
+    let mut sources = Vec::new();
+    for source in [
+        path.to_path_buf(),
+        sidecar_path(path, "-wal"),
+        sidecar_path(path, "-shm"),
+        ownership_marker_path(path),
+    ] {
+        match fs::symlink_metadata(&source) {
+            Ok(metadata)
+                if !metadata.file_type().is_symlink() && metadata.file_type().is_file() =>
+            {
+                sources.push(source);
+            }
+            Ok(_) => return Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+
     let mut quarantine = None;
     for counter in 0..1000_u16 {
         let candidate = path.with_file_name(format!(
-            "{}.corrupt-{timestamp}-{counter}",
+            "{}.quarantine-{counter}",
             path.file_name().unwrap_or_default().to_string_lossy()
         ));
-        if !candidate.exists() {
-            quarantine = Some(candidate);
-            break;
+        match fs::create_dir(&candidate) {
+            Ok(()) => {
+                quarantine = Some(candidate);
+                break;
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
         }
     }
     let quarantine = quarantine.ok_or_else(|| {
@@ -1909,18 +2637,25 @@ fn quarantine_database(path: &Path) -> Result<bool, DatabaseError> {
             "could not allocate a unique SQLite quarantine name",
         ))
     })?;
-    fs::rename(path, &quarantine)?;
-    for suffix in ["-wal", "-shm"] {
-        let source = sidecar_path(path, suffix);
-        if source.is_file() {
-            let target = sidecar_path(&quarantine, suffix);
-            if let Err(error) = fs::rename(&source, &target) {
-                tracing::warn!(
-                    error = %error,
-                    sidecar = suffix,
-                    "could not quarantine a SQLite history sidecar"
-                );
+    let mut linked = Vec::new();
+    for source in &sources {
+        let target = quarantine.join(source.file_name().ok_or_else(|| {
+            DatabaseError::UnsafePath("history family member has no literal file name")
+        })?);
+        if let Err(error) = fs::hard_link(source, &target) {
+            for created in linked {
+                let _ = fs::remove_file(created);
             }
+            let _ = fs::remove_dir(&quarantine);
+            return Err(error.into());
+        }
+        linked.push(target);
+    }
+    let marker = ownership_marker_path(path);
+    fs::remove_file(&marker)?;
+    for source in sources {
+        if source != marker {
+            fs::remove_file(source)?;
         }
     }
     Ok(true)
