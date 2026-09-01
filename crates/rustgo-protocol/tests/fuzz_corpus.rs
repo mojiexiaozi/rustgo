@@ -41,6 +41,7 @@ fn checked_in_fuzz_corpus_contains_one_valid_frame_per_message_family() {
         MessageId::OPEN_UDP_CHANNEL,
         MessageId::DATA_CHANNEL_BIND,
         MessageId::UDP_SESSION_RETIRED,
+        MessageId::TELEMETRY_REPORT,
     ]
     .map(MessageId::as_u16)
     .into_iter()

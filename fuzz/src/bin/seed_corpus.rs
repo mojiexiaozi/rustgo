@@ -5,8 +5,8 @@ use rustgo_protocol::{
     DataChannelBind, DataChannelKind, ErrorMessage, FrameCodec, Heartbeat, MAX_BINDING_TOKEN_BYTES,
     MAX_UDP_PAYLOAD_BYTES, Message, OpenTcpStream, OpenUdpChannel, ProtocolErrorCode,
     ProtocolVersion, RegisterTunnels, ServerChallenge, SocketAddress, TcpStreamReady,
-    TunnelProtocol, TunnelRegistration, TunnelResult, TunnelResults, UDP_METADATA_LEN, UdpDatagram,
-    UdpSessionRetired,
+    TelemetryReport, TunnelProtocol, TunnelRegistration, TunnelResult, TunnelResults,
+    UDP_METADATA_LEN, UdpDatagram, UdpSessionRetired,
 };
 
 fn text<const MAX: usize>(value: &str) -> BoundedString<MAX> {
@@ -159,5 +159,20 @@ fn main() -> Result<(), Box<dyn Error>> {
     for (name, message) in seed_messages() {
         fs::write(output.join(name), codec.encode(version, 0, &message)?)?;
     }
+    let telemetry = Message::TelemetryReport(TelemetryReport {
+        sampled_unix_millis: 1_725_000_000_000,
+        sequence: 1,
+        cpu_basis_points: 5_000,
+        memory_used_bytes: 4 * 1024 * 1024 * 1024,
+        memory_total_bytes: 8 * 1024 * 1024 * 1024,
+        disk_used_bytes: 500 * 1024 * 1024 * 1024,
+        disk_total_bytes: 1_000 * 1024 * 1024 * 1024,
+        tx_bytes_per_sec: 125_000,
+        rx_bytes_per_sec: 250_000,
+    });
+    fs::write(
+        output.join("30-telemetry-report"),
+        codec.encode(ProtocolVersion::V0_3, 0, &telemetry)?,
+    )?;
     Ok(())
 }
