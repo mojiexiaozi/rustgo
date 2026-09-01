@@ -1,10 +1,19 @@
 use rustgo_observability::{
-    AuthenticatedClientIdentity, EVENT_QUEUE_CAPACITY, HostMetrics, ObservabilityStore,
+    AuthenticatedClientIdentity, BoundedInventory, BoundedLabel, EVENT_QUEUE_CAPACITY, HostMetrics,
+    MAX_EVENT_LABEL_BYTES, MAX_INVENTORY_ITEMS, MAX_TERMINAL_SESSIONS, ObservabilityStore,
     ObservationEvent, PublishError, SessionPath, ShortSessionId, TrafficCounters,
 };
 
 fn identity(name: &str, generation: u64) -> AuthenticatedClientIdentity {
     AuthenticatedClientIdentity::from_server_authentication(name, generation).unwrap()
+}
+
+fn label(value: &str) -> BoundedLabel {
+    BoundedLabel::try_from(value).unwrap()
+}
+
+fn inventory<const N: usize>(names: [&str; N]) -> BoundedInventory {
+    BoundedInventory::try_from_names(names).unwrap()
 }
 
 fn metrics(sampled_unix_millis: u64, cpu_basis_points: u16) -> HostMetrics {
@@ -43,7 +52,7 @@ async fn lifecycle_events_project_one_immutable_overview() {
 
     sink.try_publish(ObservationEvent::ClientAuthenticated {
         client: client.clone(),
-        version: "0.3.0".to_owned(),
+        version: label("0.3.0"),
         authenticated_unix_millis: 1_000,
     })
     .unwrap();
@@ -61,17 +70,17 @@ async fn lifecycle_events_project_one_immutable_overview() {
     .unwrap();
     sink.try_publish(ObservationEvent::TunnelInventory {
         client: client.clone(),
-        names: vec!["ssh".to_owned(), "dns".to_owned()],
+        names: inventory(["ssh", "dns"]),
     })
     .unwrap();
     sink.try_publish(ObservationEvent::ExportInventory {
         client: client.clone(),
-        names: vec!["git".to_owned()],
+        names: inventory(["git"]),
     })
     .unwrap();
     sink.try_publish(ObservationEvent::ForwardInventory {
         client: client.clone(),
-        names: vec!["office-db".to_owned()],
+        names: inventory(["office-db"]),
     })
     .unwrap();
     sink.try_publish(ObservationEvent::ServerSample {
@@ -81,22 +90,22 @@ async fn lifecycle_events_project_one_immutable_overview() {
     sink.try_publish(ObservationEvent::TcpSessionOpened {
         client: client.clone(),
         session_id: tcp_id.clone(),
-        tunnel: Some("ssh".to_owned()),
+        tunnel: Some(label("ssh")),
         opened_unix_millis: 1_300,
     })
     .unwrap();
     sink.try_publish(ObservationEvent::UdpSessionOpened {
         client: client.clone(),
         session_id: udp_id,
-        tunnel: Some("dns".to_owned()),
+        tunnel: Some(label("dns")),
         opened_unix_millis: 1_310,
     })
     .unwrap();
     sink.try_publish(ObservationEvent::P2pSessionOpened {
         client: client.clone(),
         session_id: p2p_id,
-        peer: "nas".to_owned(),
-        export: Some("git".to_owned()),
+        peer: label("nas"),
+        export: Some(label("git")),
         path: SessionPath::P2pDirect,
         opened_unix_millis: 1_320,
     })
@@ -114,7 +123,7 @@ async fn lifecycle_events_project_one_immutable_overview() {
         client: client.clone(),
         session_id: ShortSessionId::from_bytes(b"full-private-tcp-session-id"),
         closed_unix_millis: 1_400,
-        terminal_reason: Some("eof".to_owned()),
+        terminal_reason: Some(label("eof")),
     })
     .unwrap();
     sink.try_publish(ObservationEvent::ClientDisconnected {
@@ -139,10 +148,10 @@ async fn lifecycle_events_project_one_immutable_overview() {
     assert_eq!(snapshot.server.active_p2p_sessions, 1);
 
     let projected = &snapshot.clients[0];
-    assert_eq!(projected.name, "office-laptop");
+    assert_eq!(projected.name.as_str(), "office-laptop");
     assert_eq!(projected.generation, 7);
     assert!(!projected.online);
-    assert_eq!(projected.version, "0.3.0");
+    assert_eq!(projected.version.as_str(), "0.3.0");
     assert_eq!(projected.last_heartbeat_unix_millis, Some(1_100));
     assert_eq!(projected.telemetry_sequence, Some(3));
     assert_eq!(projected.telemetry_received_unix_millis, Some(1_200));
@@ -150,9 +159,17 @@ async fn lifecycle_events_project_one_immutable_overview() {
         projected.metrics.as_ref().unwrap().cpu_basis_points,
         Some(2_500)
     );
-    assert_eq!(projected.tunnels, ["dns", "ssh"]);
-    assert_eq!(projected.exports, ["git"]);
-    assert_eq!(projected.forwards, ["office-db"]);
+    assert_eq!(
+        projected
+            .tunnels
+            .as_slice()
+            .iter()
+            .map(BoundedLabel::as_str)
+            .collect::<Vec<_>>(),
+        ["dns", "ssh"]
+    );
+    assert_eq!(projected.exports.as_slice()[0].as_str(), "git");
+    assert_eq!(projected.forwards.as_slice()[0].as_str(), "office-db");
     assert_eq!(projected.traffic.received_bytes, 40);
     assert_eq!(projected.traffic.sent_bytes, 60);
     assert_eq!(snapshot.sessions.len(), 3);
@@ -163,7 +180,8 @@ async fn lifecycle_events_project_one_immutable_overview() {
             .find(|session| session.id == ShortSessionId::from_bytes(b"full-private-tcp-session-id"))
             .unwrap()
             .terminal_reason
-            .as_deref(),
+            .as_ref()
+            .map(BoundedLabel::as_str),
         Some("eof")
     );
 }
@@ -177,7 +195,7 @@ async fn newer_generation_replaces_live_state_and_fences_old_events() {
 
     sink.try_publish(ObservationEvent::ClientAuthenticated {
         client: generation_one.clone(),
-        version: "0.3.0".to_owned(),
+        version: label("0.3.0"),
         authenticated_unix_millis: 100,
     })
     .unwrap();
@@ -191,7 +209,7 @@ async fn newer_generation_replaces_live_state_and_fences_old_events() {
     sink.try_publish(ObservationEvent::P2pSessionOpened {
         client: generation_one.clone(),
         session_id: old_session.clone(),
-        peer: "nas".to_owned(),
+        peer: label("nas"),
         export: None,
         path: SessionPath::Relay,
         opened_unix_millis: 120,
@@ -199,7 +217,7 @@ async fn newer_generation_replaces_live_state_and_fences_old_events() {
     .unwrap();
     sink.try_publish(ObservationEvent::ClientAuthenticated {
         client: generation_two.clone(),
-        version: "0.3.1".to_owned(),
+        version: label("0.3.1"),
         authenticated_unix_millis: 200,
     })
     .unwrap();
@@ -223,7 +241,7 @@ async fn newer_generation_replaces_live_state_and_fences_old_events() {
     let snapshot = store.snapshot();
     let client = &snapshot.clients[0];
     assert_eq!(client.generation, 2);
-    assert_eq!(client.version, "0.3.1");
+    assert_eq!(client.version.as_str(), "0.3.1");
     assert_eq!(client.reconnects, 1);
     assert_eq!(client.telemetry_sequence, Some(1));
     assert_eq!(client.metrics.as_ref().unwrap().cpu_basis_points, Some(200));
@@ -234,7 +252,7 @@ async fn newer_generation_replaces_live_state_and_fences_old_events() {
         .unwrap();
     assert_eq!(replaced.closed_unix_millis, Some(200));
     assert_eq!(
-        replaced.terminal_reason.as_deref(),
+        replaced.terminal_reason.as_ref().map(BoundedLabel::as_str),
         Some("generation_replaced")
     );
 }
@@ -245,7 +263,7 @@ async fn duplicate_and_out_of_order_telemetry_do_not_replace_the_latest_sample()
     let client = identity("field-device", 4);
     sink.try_publish(ObservationEvent::ClientAuthenticated {
         client: client.clone(),
-        version: "0.3.0".to_owned(),
+        version: label("0.3.0"),
         authenticated_unix_millis: 1,
     })
     .unwrap();
@@ -266,6 +284,161 @@ async fn duplicate_and_out_of_order_telemetry_do_not_replace_the_latest_sample()
     assert_eq!(
         projected.metrics.as_ref().unwrap().cpu_basis_points,
         Some(900)
+    );
+}
+
+async fn publish_while_worker_drains(
+    sink: &rustgo_observability::ObservabilitySink,
+    event: ObservationEvent,
+) {
+    loop {
+        match sink.try_publish(event.clone()) {
+            Ok(()) => return,
+            Err(PublishError::Full) => tokio::task::yield_now().await,
+            Err(PublishError::Closed) => panic!("observability worker closed unexpectedly"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn terminal_session_churn_keeps_all_active_and_only_the_latest_4096_terminal_sessions() {
+    let (store, sink, worker) = ObservabilityStore::new();
+    let task = tokio::spawn(worker.run());
+    let client = identity("session-device", 1);
+    publish_while_worker_drains(
+        &sink,
+        ObservationEvent::ClientAuthenticated {
+            client: client.clone(),
+            version: label("0.3.0"),
+            authenticated_unix_millis: 1,
+        },
+    )
+    .await;
+
+    let active_tcp = ShortSessionId::from_bytes(b"active-tcp");
+    let active_p2p = ShortSessionId::from_bytes(b"active-p2p");
+    publish_while_worker_drains(
+        &sink,
+        ObservationEvent::TcpSessionOpened {
+            client: client.clone(),
+            session_id: active_tcp.clone(),
+            tunnel: Some(label("ssh")),
+            opened_unix_millis: 10,
+        },
+    )
+    .await;
+    publish_while_worker_drains(
+        &sink,
+        ObservationEvent::P2pSessionOpened {
+            client: client.clone(),
+            session_id: active_p2p.clone(),
+            peer: label("nas"),
+            export: Some(label("backup")),
+            path: SessionPath::P2pDirect,
+            opened_unix_millis: 11,
+        },
+    )
+    .await;
+
+    for index in 0..=MAX_TERMINAL_SESSIONS {
+        let raw_id = format!("terminal-session-{index}");
+        let session_id = ShortSessionId::from_bytes(raw_id.as_bytes());
+        publish_while_worker_drains(
+            &sink,
+            ObservationEvent::UdpSessionOpened {
+                client: client.clone(),
+                session_id: session_id.clone(),
+                tunnel: Some(label("dns")),
+                opened_unix_millis: 100 + index as u64,
+            },
+        )
+        .await;
+        publish_while_worker_drains(
+            &sink,
+            ObservationEvent::UdpSessionClosed {
+                client: client.clone(),
+                session_id,
+                closed_unix_millis: 10_000 + index as u64,
+                terminal_reason: Some(label("complete")),
+            },
+        )
+        .await;
+    }
+
+    drop(sink);
+    task.await.unwrap();
+
+    let snapshot = store.snapshot();
+    assert_eq!(snapshot.sessions.len(), MAX_TERMINAL_SESSIONS + 2);
+    assert_eq!(snapshot.server.active_tcp_sessions, 1);
+    assert_eq!(snapshot.server.active_p2p_sessions, 1);
+    assert!(
+        snapshot
+            .sessions
+            .iter()
+            .any(|session| session.id == active_tcp)
+    );
+    assert!(
+        snapshot
+            .sessions
+            .iter()
+            .any(|session| session.id == active_p2p)
+    );
+    assert!(
+        !snapshot
+            .sessions
+            .iter()
+            .any(|session| { session.id == ShortSessionId::from_bytes(b"terminal-session-0") })
+    );
+    assert!(snapshot.sessions.iter().any(|session| {
+        session.id
+            == ShortSessionId::from_bytes(
+                format!("terminal-session-{MAX_TERMINAL_SESSIONS}").as_bytes(),
+            )
+    }));
+}
+
+#[tokio::test]
+async fn labels_reject_more_than_128_utf8_bytes_and_inventory_is_bounded_before_publish() {
+    let exact = "界".repeat(MAX_EVENT_LABEL_BYTES / "界".len());
+    let exact = format!("{exact}ab");
+    assert_eq!(exact.len(), MAX_EVENT_LABEL_BYTES);
+    assert!(BoundedLabel::try_from(exact).is_ok());
+
+    let oversized = "界".repeat((MAX_EVENT_LABEL_BYTES / "界".len()) + 1);
+    let error = BoundedLabel::try_from(oversized).unwrap_err();
+    assert_eq!(error.actual_bytes(), 129);
+    assert_eq!(error.maximum_bytes(), MAX_EVENT_LABEL_BYTES);
+
+    let names = (0..300).map(|index| format!("tunnel-{index:03}"));
+    let inventory = BoundedInventory::try_from_names(names).unwrap();
+    assert_eq!(inventory.len(), MAX_INVENTORY_ITEMS);
+    assert_eq!(inventory.as_slice()[0].as_str(), "tunnel-000");
+    assert_eq!(inventory.as_slice()[255].as_str(), "tunnel-255");
+
+    let (store, sink, worker) = ObservabilityStore::new();
+    let client = identity("bounded-device", 1);
+    sink.try_publish(ObservationEvent::ClientAuthenticated {
+        client: client.clone(),
+        version: label("0.3.0"),
+        authenticated_unix_millis: 1,
+    })
+    .unwrap();
+    sink.try_publish(ObservationEvent::TunnelInventory {
+        client,
+        names: inventory,
+    })
+    .unwrap();
+    finish(sink, worker).await;
+
+    let projected = &store.snapshot().clients[0];
+    assert_eq!(projected.tunnels.len(), MAX_INVENTORY_ITEMS);
+    assert!(
+        projected
+            .tunnels
+            .as_slice()
+            .iter()
+            .all(|name| name.as_str().len() <= MAX_EVENT_LABEL_BYTES)
     );
 }
 

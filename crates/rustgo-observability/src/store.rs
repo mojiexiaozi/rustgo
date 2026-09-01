@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
@@ -6,18 +6,19 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
 
 use crate::{
-    AuthenticatedClientIdentity, ClientSnapshot, HostMetrics, OverviewSnapshot, ServerSnapshot,
-    SessionKind, SessionPath, SessionSnapshot, ShortSessionId, TrafficCounters,
+    AuthenticatedClientIdentity, BoundedInventory, BoundedLabel, ClientSnapshot, HostMetrics,
+    OverviewSnapshot, ServerSnapshot, SessionKind, SessionPath, SessionSnapshot, ShortSessionId,
+    TrafficCounters,
 };
 
 pub const EVENT_QUEUE_CAPACITY: usize = 1024;
-const MAX_INVENTORY_ITEMS: usize = 256;
+pub const MAX_TERMINAL_SESSIONS: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ObservationEvent {
     ClientAuthenticated {
         client: AuthenticatedClientIdentity,
-        version: String,
+        version: BoundedLabel,
         authenticated_unix_millis: u64,
     },
     ClientDisconnected {
@@ -36,45 +37,45 @@ pub enum ObservationEvent {
     },
     TunnelInventory {
         client: AuthenticatedClientIdentity,
-        names: Vec<String>,
+        names: BoundedInventory,
     },
     ExportInventory {
         client: AuthenticatedClientIdentity,
-        names: Vec<String>,
+        names: BoundedInventory,
     },
     ForwardInventory {
         client: AuthenticatedClientIdentity,
-        names: Vec<String>,
+        names: BoundedInventory,
     },
     TcpSessionOpened {
         client: AuthenticatedClientIdentity,
         session_id: ShortSessionId,
-        tunnel: Option<String>,
+        tunnel: Option<BoundedLabel>,
         opened_unix_millis: u64,
     },
     TcpSessionClosed {
         client: AuthenticatedClientIdentity,
         session_id: ShortSessionId,
         closed_unix_millis: u64,
-        terminal_reason: Option<String>,
+        terminal_reason: Option<BoundedLabel>,
     },
     UdpSessionOpened {
         client: AuthenticatedClientIdentity,
         session_id: ShortSessionId,
-        tunnel: Option<String>,
+        tunnel: Option<BoundedLabel>,
         opened_unix_millis: u64,
     },
     UdpSessionClosed {
         client: AuthenticatedClientIdentity,
         session_id: ShortSessionId,
         closed_unix_millis: u64,
-        terminal_reason: Option<String>,
+        terminal_reason: Option<BoundedLabel>,
     },
     P2pSessionOpened {
         client: AuthenticatedClientIdentity,
         session_id: ShortSessionId,
-        peer: String,
-        export: Option<String>,
+        peer: BoundedLabel,
+        export: Option<BoundedLabel>,
         path: SessionPath,
         opened_unix_millis: u64,
     },
@@ -82,7 +83,7 @@ pub enum ObservationEvent {
         client: AuthenticatedClientIdentity,
         session_id: ShortSessionId,
         closed_unix_millis: u64,
-        terminal_reason: Option<String>,
+        terminal_reason: Option<BoundedLabel>,
     },
     ByteCounterDelta {
         client: AuthenticatedClientIdentity,
@@ -233,6 +234,7 @@ struct Projection {
     server_traffic: TrafficCounters,
     clients: BTreeMap<String, ClientSnapshot>,
     sessions: BTreeMap<ShortSessionId, SessionSnapshot>,
+    terminal_sessions: BTreeSet<(u64, ShortSessionId)>,
 }
 
 impl Projection {
@@ -290,17 +292,17 @@ impl Projection {
             }
             ObservationEvent::TunnelInventory { client, names } => {
                 if let Some(projected) = self.online_client_mut(&client) {
-                    projected.tunnels = normalize_inventory(names);
+                    projected.tunnels = names;
                 }
             }
             ObservationEvent::ExportInventory { client, names } => {
                 if let Some(projected) = self.online_client_mut(&client) {
-                    projected.exports = normalize_inventory(names);
+                    projected.exports = names;
                 }
             }
             ObservationEvent::ForwardInventory { client, names } => {
                 if let Some(projected) = self.online_client_mut(&client) {
-                    projected.forwards = normalize_inventory(names);
+                    projected.forwards = names;
                 }
             }
             ObservationEvent::TcpSessionOpened {
@@ -402,7 +404,7 @@ impl Projection {
     fn client_authenticated(
         &mut self,
         client: AuthenticatedClientIdentity,
-        version: String,
+        version: BoundedLabel,
         authenticated_unix_millis: u64,
     ) {
         if self
@@ -415,11 +417,18 @@ impl Projection {
 
         let previous = self.clients.remove(client.name());
         let (traffic, reconnects) = if let Some(previous) = previous {
+            let replacement_reason = BoundedLabel::try_from("generation_replaced")
+                .expect("static terminal reason is bounded");
+            let mut terminalized = Vec::new();
             for session in self.sessions.values_mut().filter(|session| {
-                session.client == client.name() && session.closed_unix_millis.is_none()
+                session.client.as_str() == client.name() && session.closed_unix_millis.is_none()
             }) {
                 session.closed_unix_millis = Some(authenticated_unix_millis);
-                session.terminal_reason = Some("generation_replaced".to_owned());
+                session.terminal_reason = Some(replacement_reason.clone());
+                terminalized.push(session.id.clone());
+            }
+            for session_id in terminalized {
+                self.record_terminal(session_id, authenticated_unix_millis);
             }
             (previous.traffic, previous.reconnects.saturating_add(1))
         } else {
@@ -429,7 +438,7 @@ impl Projection {
         self.clients.insert(
             client.name().to_owned(),
             ClientSnapshot {
-                name: client.name().to_owned(),
+                name: client.label().clone(),
                 generation: client.generation(),
                 version,
                 online: true,
@@ -440,9 +449,9 @@ impl Projection {
                 telemetry_sequence: None,
                 metrics: None,
                 traffic,
-                tunnels: Vec::new(),
-                exports: Vec::new(),
-                forwards: Vec::new(),
+                tunnels: BoundedInventory::default(),
+                exports: BoundedInventory::default(),
+                forwards: BoundedInventory::default(),
                 reconnects,
             },
         );
@@ -456,19 +465,27 @@ impl Projection {
         session_id: ShortSessionId,
         kind: SessionKind,
         path: SessionPath,
-        peer: Option<String>,
-        tunnel: Option<String>,
-        export: Option<String>,
+        peer: Option<BoundedLabel>,
+        tunnel: Option<BoundedLabel>,
+        export: Option<BoundedLabel>,
         opened_unix_millis: u64,
     ) {
         if self.online_client_mut(&client).is_none() {
             return;
         }
+        if let Some(closed_unix_millis) = self
+            .sessions
+            .get(&session_id)
+            .and_then(|session| session.closed_unix_millis)
+        {
+            self.terminal_sessions
+                .remove(&(closed_unix_millis, session_id.clone()));
+        }
         self.sessions.insert(
             session_id.clone(),
             SessionSnapshot {
                 id: session_id,
-                client: client.name().to_owned(),
+                client: client.label().clone(),
                 peer,
                 tunnel,
                 export,
@@ -489,13 +506,13 @@ impl Projection {
         session_id: &ShortSessionId,
         expected_kind: SessionKind,
         closed_unix_millis: u64,
-        terminal_reason: Option<String>,
+        terminal_reason: Option<BoundedLabel>,
     ) {
         if !self.is_current_client(client) {
             return;
         }
         let applied = if let Some(session) = self.sessions.get_mut(session_id)
-            && session.client == client.name()
+            && session.client.as_str() == client.name()
             && session.kind == expected_kind
             && session.closed_unix_millis.is_none()
         {
@@ -505,6 +522,9 @@ impl Projection {
         } else {
             false
         };
+        if applied {
+            self.record_terminal(session_id.clone(), closed_unix_millis);
+        }
         self.advance_if(applied, closed_unix_millis);
     }
 
@@ -521,7 +541,7 @@ impl Projection {
         self.server_traffic.saturating_add(counters);
         if let Some(session_id) = session_id
             && let Some(session) = self.sessions.get_mut(session_id)
-            && session.client == client.name()
+            && session.client.as_str() == client.name()
             && session.closed_unix_millis.is_none()
         {
             session.traffic.saturating_add(counters);
@@ -557,6 +577,23 @@ impl Projection {
         }
     }
 
+    fn record_terminal(&mut self, session_id: ShortSessionId, closed_unix_millis: u64) {
+        self.terminal_sessions
+            .insert((closed_unix_millis, session_id));
+        while self.terminal_sessions.len() > MAX_TERMINAL_SESSIONS {
+            let Some((evicted_at, evicted_id)) = self.terminal_sessions.pop_first() else {
+                break;
+            };
+            if self
+                .sessions
+                .get(&evicted_id)
+                .is_some_and(|session| session.closed_unix_millis == Some(evicted_at))
+            {
+                self.sessions.remove(&evicted_id);
+            }
+        }
+    }
+
     fn snapshot(&self) -> OverviewSnapshot {
         let clients = self.clients.values().cloned().collect::<Vec<_>>();
         let sessions = self.sessions.values().cloned().collect::<Vec<_>>();
@@ -580,13 +617,6 @@ impl Projection {
             dropped_events: 0,
         }
     }
-}
-
-fn normalize_inventory(mut names: Vec<String>) -> Vec<String> {
-    names.sort_unstable();
-    names.dedup();
-    names.truncate(MAX_INVENTORY_ITEMS);
-    names
 }
 
 fn active_sessions(sessions: &[SessionSnapshot], kind: SessionKind) -> usize {

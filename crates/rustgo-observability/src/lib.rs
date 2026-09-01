@@ -7,6 +7,6 @@ mod store;
 
 pub use model::*;
 pub use store::{
-    EVENT_QUEUE_CAPACITY, ObservabilitySink, ObservabilityStore, ObservabilityWorker,
-    ObservationEvent, PublishError,
+    EVENT_QUEUE_CAPACITY, MAX_TERMINAL_SESSIONS, ObservabilitySink, ObservabilityStore,
+    ObservabilityWorker, ObservationEvent, PublishError,
 };
