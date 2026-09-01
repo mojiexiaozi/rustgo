@@ -144,6 +144,8 @@ pub(super) struct Client {
     pub inventory: Inventory,
     pub sessions: SessionCounts,
     pub paths: PathCounts,
+    pub active_path: &'static str,
+    pub traffic_sort_bytes: String,
     pub reconnects: u64,
 }
 

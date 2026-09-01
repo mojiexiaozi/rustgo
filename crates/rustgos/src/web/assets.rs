@@ -94,30 +94,26 @@ fn asset_response(asset: &'static Asset, request_headers: &HeaderMap, no_store: 
     {
         let mut response = StatusCode::NOT_MODIFIED.into_response();
         let headers = response.headers_mut();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static(asset.content_type));
         headers.insert(ETAG, etag.clone());
         headers.insert(
             CACHE_CONTROL,
-            HeaderValue::from_static(if no_store {
-                "no-store"
-            } else {
-                "public, max-age=31536000, immutable"
-            }),
+            HeaderValue::from_static(cache_control(no_store)),
         );
         return response;
     }
-    let cache_control = if no_store {
-        "no-store"
-    } else {
-        "public, max-age=31536000, immutable"
-    };
     (
         StatusCode::OK,
         [
             (CONTENT_TYPE, asset.content_type),
-            (CACHE_CONTROL, cache_control),
+            (CACHE_CONTROL, cache_control(no_store)),
             (ETAG, etag.to_str().expect("static ETag stays valid")),
         ],
         Body::from(asset.bytes),
     )
         .into_response()
+}
+
+fn cache_control(no_store: bool) -> &'static str {
+    if no_store { "no-store" } else { "no-cache" }
 }

@@ -29,6 +29,8 @@ const UNICODE_CLIENT: &str = "北京-节点";
 const UNICODE_CLIENT_PATH: &str = "%E5%8C%97%E4%BA%AC-%E8%8A%82%E7%82%B9";
 const RAW_SESSION_ID: &[u8] = b"full-session-id-must-never-be-returned";
 const FUTURE_CLIENT: &str = "future-clock";
+const LARGE_RECEIVED_BYTES: u64 = 9_007_199_254_740_993;
+const TRAFFIC_SORT_BYTES: &str = "9007199254741000";
 const SPECIAL_CLIENTS: [(&str, &str); 7] = [
     (".", "%2E"),
     ("..", "%2E%2E"),
@@ -61,7 +63,7 @@ async fn authenticated_routes_expose_bounded_explicit_redacted_dtos() -> Result<
     assert_eq!(overview_json["history"]["available"], true);
     assert_eq!(
         overview_json["sessions"]["total"],
-        3 + SPECIAL_CLIENTS.len()
+        3 + SPECIAL_CLIENTS.len() + 1
     );
     assert!(!overview.body.contains(std::str::from_utf8(RAW_SESSION_ID)?));
     assert!(!overview.body.contains(PASSWORD));
@@ -73,7 +75,10 @@ async fn authenticated_routes_expose_bounded_explicit_redacted_dtos() -> Result<
         .api("GET", "/api/v1/server/metrics", &cookie)
         .await?;
     assert_json_response(&server, 200)?;
-    assert_eq!(server.json()?["server"]["traffic"]["received_bytes"], 77);
+    assert_eq!(
+        server.json()?["server"]["traffic"]["received_bytes"],
+        LARGE_RECEIVED_BYTES
+    );
 
     let clients = rig
         .web
@@ -90,6 +95,10 @@ async fn authenticated_routes_expose_bounded_explicit_redacted_dtos() -> Result<
     assert_eq!(
         clients_json["clients"]["items"][0]["telemetry"]["available"],
         true
+    );
+    assert_eq!(
+        clients_json["clients"]["items"][0]["traffic_sort_bytes"],
+        TRAFFIC_SORT_BYTES
     );
 
     let detail = rig
@@ -108,6 +117,8 @@ async fn authenticated_routes_expose_bounded_explicit_redacted_dtos() -> Result<
         "files"
     );
     assert_eq!(detail_json["client"]["paths"]["p2p_direct"], 1);
+    assert_eq!(detail_json["client"]["paths"]["p2p_fallback"], 1);
+    assert_eq!(detail_json["client"]["active_path"], "mixed");
     assert_eq!(
         detail_json["sessions"]["items"][0]["id"]
             .as_str()
@@ -333,6 +344,18 @@ async fn filters_staleness_methods_and_history_failures_have_stable_bounds()
     assert_eq!(stale["telemetry"]["available"], true);
     assert_eq!(stale["telemetry"]["stale"], true);
     assert_eq!(stale["heartbeat"]["stale"], true);
+    assert_cpu_unavailable_tail(items)?;
+
+    let cpu_ascending = rig
+        .web
+        .api("GET", "/api/v1/clients?sort=cpu&order=asc", &cookie)
+        .await?;
+    let cpu_ascending = cpu_ascending.json()?;
+    assert_cpu_unavailable_tail(
+        cpu_ascending["clients"]["items"]
+            .as_array()
+            .ok_or("clients are not an array")?,
+    )?;
 
     let sessions = rig.web.api("GET", "/api/v1/sessions", &cookie).await?;
     assert_json_response(&sessions, 200)?;
@@ -418,7 +441,7 @@ impl TestRig {
         wait_until(Duration::from_secs(2), || {
             let snapshot = store.snapshot();
             snapshot.clients.len() == FIXTURE_CLIENTS
-                && snapshot.sessions.len() == session_count + SPECIAL_CLIENTS.len()
+                && snapshot.sessions.len() == session_count + SPECIAL_CLIENTS.len() + 1
                 && snapshot.event_queue_depth == 0
         })
         .await?;
@@ -611,12 +634,27 @@ fn seed_snapshot(sink: &ObservabilitySink, session_count: usize) -> Result<(), B
             })?;
         }
     }
+    let closed_session = ShortSessionId::from_bytes(b"closed-p2p-session");
+    sink.try_publish(ObservationEvent::P2pSessionOpened {
+        client: unicode.clone(),
+        session_id: closed_session.clone(),
+        peer: label("peer-closed")?,
+        export: Some(label("files")?),
+        path: SessionPath::P2pFallback,
+        opened_unix_millis: now.saturating_sub(20_000),
+    })?;
+    sink.try_publish(ObservationEvent::P2pSessionClosed {
+        client: unicode.clone(),
+        session_id: closed_session,
+        closed_unix_millis: now.saturating_sub(10_000),
+        terminal_reason: Some(label("finished")?),
+    })?;
     sink.try_publish(ObservationEvent::ByteCounterDelta {
         client: unicode,
         session_id: Some(ShortSessionId::from_bytes(RAW_SESSION_ID)),
         counters: TrafficCounters {
-            received_bytes: 77,
-            sent_bytes: 88,
+            received_bytes: LARGE_RECEIVED_BYTES,
+            sent_bytes: 7,
         },
     })?;
     sink.try_publish(ObservationEvent::ServerSample {
@@ -827,6 +865,25 @@ fn assert_json_response(response: &HttpResponse, status: u16) -> Result<(), Box<
     assert_eq!(response.header("cache-control"), Some("no-store"));
     assert!(response.body.len() <= MAX_API_RESPONSE_BYTES);
     let _: Value = response.json()?;
+    Ok(())
+}
+
+fn assert_cpu_unavailable_tail(items: &[Value]) -> Result<(), Box<dyn Error>> {
+    let first_unavailable = items
+        .iter()
+        .position(|client| client["telemetry"]["cpu_basis_points"].is_null())
+        .unwrap_or(items.len());
+    assert!(
+        items[..first_unavailable]
+            .iter()
+            .all(|client| client["telemetry"]["cpu_basis_points"].is_number())
+    );
+    let unavailable_names: Vec<&str> = items[first_unavailable..]
+        .iter()
+        .map(|client| client["name"].as_str().ok_or("client name is missing"))
+        .collect::<Result<_, _>>()?;
+    assert!(unavailable_names.windows(2).all(|pair| pair[0] <= pair[1]));
+    assert!(unavailable_names.contains(&"legacy"));
     Ok(())
 }
 

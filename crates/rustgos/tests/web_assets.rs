@@ -69,10 +69,9 @@ async fn embedded_assets_are_allowlisted_cacheable_and_csp_compatible() -> Resul
             .await?;
         assert_eq!(not_modified.status, 304, "{path} did not honor its ETag");
         assert_eq!(not_modified.header("etag"), Some(etag.as_str()));
-        assert_eq!(
-            not_modified.header("cache-control"),
-            Some("public, max-age=31536000, immutable")
-        );
+        assert_eq!(not_modified.header("cache-control"), Some("no-cache"));
+        assert_eq!(not_modified.header("content-type"), Some(content_type));
+        assert_security_headers(&not_modified)?;
     }
 
     let unknown = server
@@ -91,6 +90,7 @@ fn checked_in_dashboard_uses_only_relative_allowlisted_resources() {
     let login = include_str!("../web/login.html");
     let script = include_str!("../web/app.js");
     let login_script = include_str!("../web/login.js");
+    let stylesheet = include_str!("../web/app.css");
     let assets = include_str!("../src/web/assets.rs");
     let combined = format!("{index}\n{login}\n{script}\n{login_script}");
 
@@ -111,6 +111,24 @@ fn checked_in_dashboard_uses_only_relative_allowlisted_resources() {
     assert!(!combined.contains("WebSocket"));
     assert!(script.contains("AbortController"));
     assert!(script.contains("visibilitychange"));
+    assert!(script.contains("HISTORY_REFRESH_MILLIS = 30000"));
+    assert!(script.contains("pollInFlight"));
+    assert!(script.contains("pollQueued"));
+    assert!(script.contains("requestPoll"));
+    assert!(script.contains("BigInt(a.traffic_sort_bytes)"));
+    assert!(script.contains("client.active_path"));
+    assert!(script.contains("Units:"));
+    assert!(script.contains("minimum"));
+    assert!(script.contains("maximum"));
+    assert!(script.contains("rising"));
+    assert!(script.contains("primaryLabel: \"Download\""));
+    assert!(script.contains("secondaryLabel: \"Upload\""));
+    assert!(script.contains("createElementNS(\"http://www.w3.org/2000/svg\", \"title\")"));
+    assert!(script.contains("createElementNS(\"http://www.w3.org/2000/svg\", \"desc\")"));
+    assert!(stylesheet.contains(".chart polyline"));
+    assert!(stylesheet.contains(".chart polyline.primary"));
+    assert!(stylesheet.contains(".chart polyline.secondary"));
+    assert!(!stylesheet.contains(".chart path"));
     assert!(script.contains("/api/v1/overview"));
     assert!(script.contains("/api/v1/clients/"));
     assert!(script.contains("/api/v1/sessions"));
@@ -120,6 +138,8 @@ fn checked_in_dashboard_uses_only_relative_allowlisted_resources() {
         4,
         "the dashboard may only issue its four documented API route families"
     );
+    assert!(!assets.contains("max-age=31536000"));
+    assert!(assets.contains("\"no-cache\""));
     for forbidden in [
         PASSWORD,
         "candidate",
@@ -137,10 +157,7 @@ fn checked_in_dashboard_uses_only_relative_allowlisted_resources() {
 
 fn assert_asset_headers(response: &HttpResponse, content_type: &str) -> Result<(), Box<dyn Error>> {
     assert_eq!(response.header("content-type"), Some(content_type));
-    assert_eq!(
-        response.header("cache-control"),
-        Some("public, max-age=31536000, immutable")
-    );
+    assert_eq!(response.header("cache-control"), Some("no-cache"));
     assert!(response.header("etag").is_some());
     assert_security_headers(response)
 }

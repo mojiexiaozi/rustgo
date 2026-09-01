@@ -756,6 +756,8 @@ fn client_dto(
         },
         sessions: session_counts_refs(&owned_sessions),
         paths: path_counts(&owned_sessions),
+        active_path: active_path(&owned_sessions),
+        traffic_sort_bytes: traffic_total(client.traffic).to_string(),
         reconnects: client.reconnects,
     }
 }
@@ -893,6 +895,30 @@ fn path_counts(sessions: &[&SessionSnapshot]) -> PathCounts {
         }
     }
     counts
+}
+
+fn active_path(sessions: &[&SessionSnapshot]) -> &'static str {
+    let mut relay = false;
+    let mut direct = false;
+    let mut fallback = false;
+    for session in sessions
+        .iter()
+        .copied()
+        .filter(|session| session.closed_unix_millis.is_none())
+    {
+        match session.path {
+            SessionPath::Relay => relay = true,
+            SessionPath::P2pDirect => direct = true,
+            SessionPath::P2pFallback => fallback = true,
+        }
+    }
+    match (relay, direct, fallback) {
+        (false, false, false) => "none",
+        (true, false, false) => "relay",
+        (false, true, false) => "p2p-direct",
+        (false, false, true) => "p2p-fallback",
+        _ => "mixed",
+    }
 }
 
 fn observability_health(snapshot: &OverviewSnapshot) -> ObservabilityHealth {

@@ -3,6 +3,7 @@
 
   const POLL_MILLIS = 2000;
   const MAX_BACKOFF_MILLIS = 30000;
+  const HISTORY_REFRESH_MILLIS = 30000;
   const controllers = new Map();
   const state = {
     overview: null,
@@ -13,8 +14,11 @@
     clientDescending: true,
     failures: 0,
     timer: null,
-    serverHistoryKey: "",
-    clientHistoryKey: "",
+    pollInFlight: false,
+    pollQueued: false,
+    pollGeneration: 0,
+    serverHistory: { key: "", expiresAt: 0, retryAfter: 0, generation: 0 },
+    clientHistory: { key: "", expiresAt: 0, retryAfter: 0, generation: 0 },
   };
   const $ = (id) => document.getElementById(id);
   const text = (id, value) => { const node = $(id); if (node) node.textContent = value; };
@@ -137,9 +141,21 @@
       let result = 0;
       if (state.clientSort === "online") result = Number(a.online) - Number(b.online);
       else if (state.clientSort === "name") result = a.name.localeCompare(b.name);
-      else if (state.clientSort === "traffic") result = (a.traffic.received_bytes + a.traffic.sent_bytes) - (b.traffic.received_bytes + b.traffic.sent_bytes);
-      else if (state.clientSort === "cpu") result = (a.telemetry.cpu_basis_points ?? -1) - (b.telemetry.cpu_basis_points ?? -1);
-      if (result === 0) return left.index - right.index;
+      else if (state.clientSort === "traffic") {
+        const aTraffic = BigInt(a.traffic_sort_bytes);
+        const bTraffic = BigInt(b.traffic_sort_bytes);
+        result = aTraffic === bTraffic ? 0 : (aTraffic > bTraffic ? 1 : -1);
+      } else if (state.clientSort === "cpu") {
+        const aCpu = a.telemetry.cpu_basis_points;
+        const bCpu = b.telemetry.cpu_basis_points;
+        if (aCpu == null && bCpu != null) return 1;
+        if (aCpu != null && bCpu == null) return -1;
+        result = aCpu == null ? 0 : aCpu - bCpu;
+      }
+      if (result === 0) {
+        const byName = a.name.localeCompare(b.name);
+        return byName || left.index - right.index;
+      }
       return result * direction;
     };
     return entries.sort(compare).map(({ client }) => client);
@@ -160,10 +176,8 @@
     list.append(dt, dd);
   }
 
-  function primaryPath(paths) {
-    const choices = [["Direct P2P", paths.p2p_direct], ["Relay", paths.relay], ["Fallback P2P", paths.p2p_fallback]];
-    choices.sort((left, right) => right[1] - left[1]);
-    return choices[0][1] ? `${choices[0][0]} (${choices[0][1]})` : "No active path";
+  function activePathLabel(path) {
+    return ({ relay: "Relay", "p2p-direct": "Direct P2P", "p2p-fallback": "Fallback P2P", mixed: "Mixed active paths", none: "No active path" })[path] || "Unavailable";
   }
 
   function clientCard(client) {
@@ -190,7 +204,7 @@
     appendDefinition(details, "Logical traffic", `${formatBytes(client.traffic.sent_bytes)} / ${formatBytes(client.traffic.received_bytes)}`);
     appendDefinition(details, "Exports / forwards", `${client.inventory.exports.total} / ${client.inventory.forwards.total}`);
     appendDefinition(details, "Sessions", `${client.sessions.active} active · ${client.sessions.total} total`);
-    appendDefinition(details, "Active path", primaryPath(client.paths));
+    appendDefinition(details, "Active path", activePathLabel(client.active_path));
     article.append(top, badges, details);
     return article;
   }
@@ -205,14 +219,33 @@
     text("clients-summary", `${items.length} shown of ${clients.total} clients`);
   }
 
-  function chartNode(id, primary, secondary, label) {
+  function describeSeries(label, points, formatValue) {
+    const values = points.map((point) => point.value).filter(Number.isFinite);
+    if (!values.length) return `${label}: no data`;
+    const first = values[0];
+    const latest = values[values.length - 1];
+    const trend = latest > first ? "rising" : latest < first ? "falling" : "steady";
+    return `${label}: latest ${formatValue(latest)}, minimum ${formatValue(Math.min(...values))}, maximum ${formatValue(Math.max(...values))}, ${trend}`;
+  }
+
+  function chartNode(id, primary, secondary, options) {
     const container = $(id);
     if (!container) return;
+    const { title, unit, range, primaryLabel, secondaryLabel = "", formatValue } = options;
+    const summary = [
+      `${title}. Range: ${range}. Units: ${unit}.`,
+      describeSeries(primaryLabel, primary, formatValue),
+      secondaryLabel ? describeSeries(secondaryLabel, secondary, formatValue) : "",
+    ].filter(Boolean).join(" ");
     container.replaceChildren();
+    container.setAttribute("aria-label", summary);
     const all = [...primary, ...secondary].filter((point) => Number.isFinite(point.value));
     if (!all.length) {
-      const empty = document.createElement("p"); empty.className = "chart-empty"; empty.textContent = "No history is available for this range.";
-      container.append(empty); return;
+      const empty = document.createElement("p");
+      empty.className = "chart-empty";
+      empty.textContent = `${title}: no history is available for ${range} (${unit}).`;
+      container.append(empty);
+      return;
     }
     const width = 620; const height = 180; const padding = 16;
     const minX = Math.min(...all.map((point) => point.timestamp_unix_millis));
@@ -226,18 +259,24 @@
     };
     const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
     svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
-    svg.setAttribute("aria-hidden", "true");
-    const makePath = (points, className) => {
+    svg.setAttribute("role", "img");
+    const svgTitle = document.createElementNS("http://www.w3.org/2000/svg", "title");
+    svgTitle.textContent = title;
+    const description = document.createElementNS("http://www.w3.org/2000/svg", "desc");
+    description.textContent = summary;
+    svg.append(svgTitle, description);
+    const makeLine = (points, className) => {
       if (!points.length) return;
-      const path = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
-      path.setAttribute("points", points.map(pointFor).join(" "));
-      path.setAttribute("class", className);
-      svg.append(path);
+      const line = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
+      line.setAttribute("points", points.map(pointFor).join(" "));
+      line.setAttribute("class", className);
+      svg.append(line);
     };
-    makePath(primary, "primary"); makePath(secondary, "secondary");
-    const caption = document.createElement("span"); caption.className = "sr-only";
-    caption.textContent = `${label}. Latest value ${all[all.length - 1].value}.`;
-    container.setAttribute("aria-label", caption.textContent);
+    makeLine(primary, "primary");
+    makeLine(secondary, "secondary");
+    const caption = document.createElement("span");
+    caption.className = "sr-only";
+    caption.textContent = summary;
     container.append(svg, caption);
   }
 
@@ -248,12 +287,33 @@
     return requestJson(`/api/v1/history?${query}`, key);
   }
 
+  function historyRangeLabel(range) {
+    return range === 3600000 ? "1 hour" : range === 604800000 ? "7 days" : "24 hours";
+  }
+
+  function historyDue(cache, key) {
+    const now = Date.now();
+    return cache.key !== key || now >= cache.expiresAt && now >= cache.retryAfter;
+  }
+
+  function markHistorySuccess(cache, key) {
+    cache.key = key;
+    cache.expiresAt = Date.now() + HISTORY_REFRESH_MILLIS;
+    cache.retryAfter = 0;
+  }
+
+  function markHistoryFailure(cache, key) {
+    cache.key = key;
+    cache.expiresAt = 0;
+    cache.retryAfter = Date.now() + HISTORY_REFRESH_MILLIS;
+  }
+
   async function refreshServerHistory() {
     if (!state.overview) return;
     const range = Number($("history-range")?.value || 86400000);
     const key = `${range}`;
-    if (state.serverHistoryKey === key) return;
-    state.serverHistoryKey = key;
+    if (!historyDue(state.serverHistory, key)) return true;
+    const generation = state.serverHistory.generation;
     try {
       const [cpu, memory, received, sent, trafficReceived, trafficSent] = await Promise.all([
         loadHistory("server", "", "cpu_basis_points", range, "history-server-cpu"),
@@ -263,15 +323,21 @@
         loadHistory("server", "", "traffic_received_bytes", range, "history-server-traffic-rx"),
         loadHistory("server", "", "traffic_sent_bytes", range, "history-server-traffic-tx"),
       ]);
-      if (state.serverHistoryKey !== key) return;
-      chartNode("chart-cpu", cpu.points, [], "Server CPU history");
-      chartNode("chart-memory", memory.points, [], "Server memory history");
-      chartNode("chart-network", received.points, sent.points, "Server network history");
-      chartNode("chart-traffic", trafficReceived.points, trafficSent.points, "Server Rustgo traffic history");
+      if (state.serverHistory.generation !== generation) return true;
+      markHistorySuccess(state.serverHistory, key);
+      const rangeLabel = historyRangeLabel(range);
+      chartNode("chart-cpu", cpu.points, [], { title: "Server CPU history", unit: "percent", range: rangeLabel, primaryLabel: "CPU", formatValue: formatPercent });
+      chartNode("chart-memory", memory.points, [], { title: "Server memory history", unit: "bytes", range: rangeLabel, primaryLabel: "Memory", formatValue: formatBytes });
+      chartNode("chart-network", received.points, sent.points, { title: "Server network history", unit: "bytes per second", range: rangeLabel, primaryLabel: "Download", secondaryLabel: "Upload", formatValue: formatRate });
+      chartNode("chart-traffic", trafficReceived.points, trafficSent.points, { title: "Server Rustgo traffic history", unit: "bytes", range: rangeLabel, primaryLabel: "Logical download", secondaryLabel: "Logical upload", formatValue: formatBytes });
+      return true;
     } catch (error) {
-      if (error.name !== "AbortError" && state.serverHistoryKey === key) {
-        for (const id of ["chart-cpu", "chart-memory", "chart-network", "chart-traffic"]) chartNode(id, [], [], "History unavailable");
-      }
+      if (error.name === "AbortError") throw error;
+      if (state.serverHistory.generation !== generation) return true;
+      markHistoryFailure(state.serverHistory, key);
+      const rangeLabel = historyRangeLabel(range);
+      for (const id of ["chart-cpu", "chart-memory", "chart-network", "chart-traffic"]) chartNode(id, [], [], { title: "History unavailable", unit: "data", range: rangeLabel, primaryLabel: "History", formatValue: String });
+      return false;
     }
   }
 
@@ -282,7 +348,7 @@
     const metrics = $("client-detail-metrics");
     if (metrics) {
       metrics.replaceChildren();
-      const values = [["CPU", formatPercent(client.telemetry.cpu_basis_points), metricNote(client.telemetry)], ["Memory", formatBytes(client.telemetry.memory_used_bytes), metricNote(client.telemetry)], ["Storage", formatBytes(client.telemetry.disk_used_bytes), metricNote(client.telemetry)], ["Upload", formatRate(client.telemetry.network_sent_bytes_per_second), `${formatBytes(client.traffic.sent_bytes)} logical sent`], ["Download", formatRate(client.telemetry.network_received_bytes_per_second), `${formatBytes(client.traffic.received_bytes)} logical received`], ["Path", primaryPath(client.paths), `${client.reconnects} reconnects`]];
+      const values = [["CPU", formatPercent(client.telemetry.cpu_basis_points), metricNote(client.telemetry)], ["Memory", formatBytes(client.telemetry.memory_used_bytes), metricNote(client.telemetry)], ["Storage", formatBytes(client.telemetry.disk_used_bytes), metricNote(client.telemetry)], ["Upload", formatRate(client.telemetry.network_sent_bytes_per_second), `${formatBytes(client.traffic.sent_bytes)} logical sent`], ["Download", formatRate(client.telemetry.network_received_bytes_per_second), `${formatBytes(client.traffic.received_bytes)} logical received`], ["Path", activePathLabel(client.active_path), `${client.reconnects} reconnects`]];
       for (const [label, value, note] of values) {
         const card = document.createElement("article"); card.className = "metric-card";
         const heading = document.createElement("h2"); heading.textContent = label;
@@ -306,19 +372,28 @@
   async function refreshClientHistory(name) {
     const range = Number($("history-range")?.value || 86400000);
     const key = `${name}\u0000${range}`;
-    if (state.clientHistoryKey === key) return;
-    state.clientHistoryKey = key;
+    if (!historyDue(state.clientHistory, key)) return true;
+    const generation = state.clientHistory.generation;
     try {
       const [cpu, received, sent] = await Promise.all([
         loadHistory("client", name, "cpu_basis_points", range, "history-client-cpu"),
         loadHistory("client", name, "traffic_received_bytes", range, "history-client-rx"),
         loadHistory("client", name, "traffic_sent_bytes", range, "history-client-tx"),
       ]);
-      if (state.clientHistoryKey !== key) return;
-      chartNode("client-chart-cpu", cpu.points, [], "Client CPU history");
-      chartNode("client-chart-traffic", received.points, sent.points, "Client traffic history");
+      if (state.clientHistory.generation !== generation) return true;
+      markHistorySuccess(state.clientHistory, key);
+      const rangeLabel = historyRangeLabel(range);
+      chartNode("client-chart-cpu", cpu.points, [], { title: "Client CPU history", unit: "percent", range: rangeLabel, primaryLabel: "CPU", formatValue: formatPercent });
+      chartNode("client-chart-traffic", received.points, sent.points, { title: "Client traffic history", unit: "bytes", range: rangeLabel, primaryLabel: "Logical download", secondaryLabel: "Logical upload", formatValue: formatBytes });
+      return true;
     } catch (error) {
-      if (error.name !== "AbortError" && state.clientHistoryKey === key) { chartNode("client-chart-cpu", [], [], "Client history unavailable"); chartNode("client-chart-traffic", [], [], "Client history unavailable"); }
+      if (error.name === "AbortError") throw error;
+      if (state.clientHistory.generation !== generation) return true;
+      markHistoryFailure(state.clientHistory, key);
+      const rangeLabel = historyRangeLabel(range);
+      chartNode("client-chart-cpu", [], [], { title: "Client history unavailable", unit: "data", range: rangeLabel, primaryLabel: "History", formatValue: String });
+      chartNode("client-chart-traffic", [], [], { title: "Client history unavailable", unit: "data", range: rangeLabel, primaryLabel: "History", formatValue: String });
+      return false;
     }
   }
 
@@ -346,16 +421,20 @@
     const route = showRoute();
     if (route.view === "overview") {
       if (state.overview) renderOverview(state.overview);
-      await refreshServerHistory();
+      return refreshServerHistory();
     } else if (route.view === "client" && route.name) {
       const detail = await requestJson(`/api/v1/clients/${encodeURIComponent(route.name)}`, "detail");
-      if (activeRoute().view !== "client" || activeRoute().name !== route.name) return;
-      state.detail = detail; renderClientDetail(detail); await refreshClientHistory(route.name);
+      if (activeRoute().view !== "client" || activeRoute().name !== route.name) return true;
+      state.detail = detail;
+      renderClientDetail(detail);
+      return refreshClientHistory(route.name);
     } else if (route.view === "sessions") {
       const sessions = await requestJson(sessionFilterPath(), "sessions");
-      if (activeRoute().view !== "sessions") return;
-      state.sessionData = sessions; renderSessions(sessions);
+      if (activeRoute().view !== "sessions") return true;
+      state.sessionData = sessions;
+      renderSessions(sessions);
     }
+    return true;
   }
 
   function scheduleNext() {
@@ -365,32 +444,80 @@
     state.timer = window.setTimeout(poll, delay);
   }
 
-  async function poll() {
+  function requestPoll() {
+    clearTimeout(state.timer);
     if (document.hidden) return;
+    if (state.pollInFlight) {
+      state.pollQueued = true;
+      return;
+    }
+    void poll();
+  }
+
+  async function poll() {
+    if (document.hidden || state.pollInFlight) return;
+    state.pollInFlight = true;
+    const generation = ++state.pollGeneration;
     try {
       const overview = await requestJson("/api/v1/overview", "overview");
       state.overview = overview;
+      const viewSucceeded = await refreshCurrentRoute();
+      if (!viewSucceeded) throw new Error("current dashboard view did not refresh");
       state.failures = 0;
       setStatus(overview.snapshot_stale ? "Live snapshot is stale" : "Live · updates every 2 seconds", overview.snapshot_stale ? "stale" : "live");
-      await refreshCurrentRoute();
     } catch (error) {
       if (error.name !== "AbortError") {
         state.failures += 1;
         setStatus(`Data is stale · retrying in ${Math.min(MAX_BACKOFF_MILLIS, POLL_MILLIS * 2 ** state.failures) / 1000}s`, "stale");
       }
-    } finally { scheduleNext(); }
+    } finally {
+      if (generation === state.pollGeneration) state.pollInFlight = false;
+      if (document.hidden) {
+        state.pollQueued = false;
+      } else if (state.pollQueued) {
+        state.pollQueued = false;
+        requestPoll();
+      } else {
+        scheduleNext();
+      }
+    }
   }
 
-  function resetHistory() { state.serverHistoryKey = ""; state.clientHistoryKey = ""; }
+  function abortHistoryRequests() {
+    for (const [key, controller] of controllers) if (key.startsWith("history-")) controller.abort();
+  }
+
+  function abortSupersededViewRequests() {
+    controllers.get("detail")?.abort();
+    controllers.get("sessions")?.abort();
+  }
+
+  function resetHistory() {
+    abortHistoryRequests();
+    for (const cache of [state.serverHistory, state.clientHistory]) {
+      cache.key = "";
+      cache.expiresAt = 0;
+      cache.retryAfter = 0;
+      cache.generation += 1;
+    }
+  }
 
   $("client-search")?.addEventListener("input", (event) => { state.clientSearch = event.target.value; if (state.overview) renderClientGrid(state.overview.clients); });
   $("client-sort")?.addEventListener("change", (event) => { state.clientSort = event.target.value; state.clientDescending = event.target.value !== "name"; text("client-order", state.clientDescending ? "Descending" : "Ascending"); if (state.overview) renderClientGrid(state.overview.clients); });
   $("client-order")?.addEventListener("click", () => { state.clientDescending = !state.clientDescending; text("client-order", state.clientDescending ? "Descending" : "Ascending"); if (state.overview) renderClientGrid(state.overview.clients); });
-  $("history-range")?.addEventListener("change", () => { resetHistory(); poll(); });
-  $("session-filters")?.addEventListener("submit", (event) => { event.preventDefault(); if (activeRoute().view === "sessions") poll(); });
+  $("history-range")?.addEventListener("change", () => { resetHistory(); requestPoll(); });
+  $("session-filters")?.addEventListener("submit", (event) => { event.preventDefault(); abortSupersededViewRequests(); if (activeRoute().view === "sessions") requestPoll(); });
   $("logout-button")?.addEventListener("click", async () => { try { await fetch("/logout", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, credentials: "same-origin", body: "" }); } finally { window.location.assign("/login"); } });
-  window.addEventListener("hashchange", () => { resetHistory(); poll(); });
-  document.addEventListener("visibilitychange", () => { if (!document.hidden) poll(); else { clearTimeout(state.timer); for (const controller of controllers.values()) controller.abort(); } });
+  window.addEventListener("hashchange", () => { abortSupersededViewRequests(); resetHistory(); requestPoll(); });
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) {
+      clearTimeout(state.timer);
+      state.pollQueued = false;
+      for (const controller of controllers.values()) controller.abort();
+    } else {
+      requestPoll();
+    }
+  });
   showRoute();
-  poll();
+  requestPoll();
 })();
