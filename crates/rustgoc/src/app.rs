@@ -214,7 +214,7 @@ impl ClientApp {
 
     pub async fn run_until(mut self, shutdown: CancellationToken) -> Result<(), ClientError> {
         self.status.send_replace(ClientStatus::default());
-        let telemetry = self.logical_traffic.clone().and_then(|traffic| {
+        let mut telemetry = self.logical_traffic.clone().and_then(|traffic| {
             TelemetryRuntime::start(
                 self.telemetry.take(),
                 self.telemetry_report_interval_override.take(),
@@ -231,7 +231,7 @@ impl ClientApp {
             ))
         });
         let result = self
-            .run_reconnect_loop(shutdown, peer_runtime.clone(), telemetry.as_ref())
+            .run_reconnect_loop(shutdown, peer_runtime.clone(), telemetry.as_mut())
             .await;
         let telemetry_result = match telemetry {
             Some(telemetry) => telemetry.shutdown().await,
@@ -245,7 +245,7 @@ impl ClientApp {
         &mut self,
         shutdown: CancellationToken,
         peer_runtime: Arc<dyn PeerGenerationHandler>,
-        telemetry: Option<&TelemetryRuntime>,
+        mut telemetry: Option<&mut TelemetryRuntime>,
     ) -> Result<(), ClientError> {
         loop {
             let connected = tokio::select! {
@@ -259,7 +259,7 @@ impl ClientApp {
                     let generation = SessionGeneration::next(self.last_generation)?;
                     let protocol_version = session.protocol_version();
                     let generation_telemetry = if session.supports_telemetry() {
-                        telemetry.map(TelemetryRuntime::generation)
+                        telemetry.as_deref_mut().map(TelemetryRuntime::generation)
                     } else {
                         None
                     };

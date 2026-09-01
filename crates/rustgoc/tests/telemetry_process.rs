@@ -236,13 +236,36 @@ fn enabled_telemetry() -> TelemetryConfig {
 struct TrafficSnapshotHook {
     totals: Mutex<(u64, u64)>,
     changed: Notify,
+    snapshots: std::sync::atomic::AtomicU64,
+    sampler_active: AtomicBool,
+    sampler_changed: Notify,
 }
 
 impl TelemetryRuntimeHook for TrafficSnapshotHook {
+    fn sampler_started(&self) {
+        self.sampler_active.store(true, Ordering::Release);
+        self.sampler_changed.notify_waiters();
+    }
+
     fn after_traffic_snapshot(&self, sent: u64, received: u64) {
         *self.totals.lock().unwrap() = (sent, received);
+        self.snapshots.fetch_add(1, Ordering::AcqRel);
         self.changed.notify_waiters();
     }
+}
+
+async fn wait_for_sampler(hook: &TrafficSnapshotHook) -> Result<(), AnyError> {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if hook.sampler_active.load(Ordering::Acquire) {
+                return;
+            }
+            hook.sampler_changed.notified().await;
+        }
+    })
+    .await
+    .map_err(|_| "host sampler did not start for the V0.3 generation")?;
+    Ok(())
 }
 
 async fn wait_for_traffic_totals(
@@ -251,7 +274,9 @@ async fn wait_for_traffic_totals(
 ) -> Result<(), AnyError> {
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
-            if *hook.totals.lock().unwrap() == expected {
+            if hook.snapshots.load(Ordering::Acquire) > 0
+                && *hook.totals.lock().unwrap() == expected
+            {
                 return;
             }
             hook.changed.notified().await;
@@ -512,8 +537,57 @@ async fn production_p2p_fallback_counts_only_application_payload() -> Result<(),
     Ok(())
 }
 
+struct ProductionTcpFlow<'a> {
+    version: ProtocolVersion,
+    connection_id: u64,
+    binding_marker: u8,
+    to_local: &'a [u8],
+    from_local: &'a [u8],
+}
+
+async fn drive_production_tcp(
+    tls_server: &TlsServer,
+    control: &mut FramedServer,
+    flow: ProductionTcpFlow<'_>,
+) -> Result<(), AnyError> {
+    let binding = bytes::<MAX_BINDING_TOKEN_BYTES>(&[flow.binding_marker; MAX_BINDING_TOKEN_BYTES]);
+    control
+        .send(Message::OpenTcpStream(OpenTcpStream {
+            tunnel_id: 1,
+            connection_id: flow.connection_id,
+            peer: SocketAddress::V4 {
+                octets: [198, 51, 100, 1],
+                port: 51_001,
+            },
+            binding_token: binding.clone(),
+        }))
+        .await?;
+    let (socket, _) = tls_server.accept_tcp().await?;
+    let mut data = FramedServer::new(flow.version, tls_server.handshake(socket).await?);
+    let Message::DataChannelBind(bind) = data.receive().await?.message else {
+        return Err("production TCP child did not authenticate its data channel".into());
+    };
+    assert_eq!(bind.kind, DataChannelKind::TCP);
+    assert_eq!(bind.target_id, flow.connection_id);
+    assert_eq!(bind.binding_token, binding);
+    data.send(Message::TcpStreamReady(TcpStreamReady {
+        connection_id: flow.connection_id,
+        accepted: true,
+        error: None,
+    }))
+    .await?;
+    data.stream.write_all(flow.to_local).await?;
+    let mut reply = vec![0; flow.from_local.len()];
+    data.stream.read_exact(&mut reply).await?;
+    assert_eq!(reply, flow.from_local);
+    Ok(())
+}
+
 #[tokio::test]
-async fn production_tcp_and_udp_paths_count_logical_payload_exactly_once() -> Result<(), AnyError> {
+async fn absent_config_starts_only_for_v03_and_counts_production_payload_once()
+-> Result<(), AnyError> {
+    const V02_TCP_TO_LOCAL: &[u8] = b"v02-tcp-to-local";
+    const V02_TCP_FROM_LOCAL: &[u8] = b"v02-tcp-from-local";
     const TCP_TO_LOCAL: &[u8] = b"tcp-to-local";
     const TCP_FROM_LOCAL: &[u8] = b"tcp-from-local";
     const UDP_TO_LOCAL: &[u8] = b"udp-to-local";
@@ -527,11 +601,17 @@ async fn production_tcp_and_udp_paths_count_logical_payload_exactly_once() -> Re
     let tcp_local_address = tcp_local.local_addr()?;
     let udp_local_address = udp_local.local_addr()?;
     let tcp_echo = tokio::spawn(async move {
-        let (mut stream, _) = tcp_local.accept().await?;
-        let mut received = vec![0; TCP_TO_LOCAL.len()];
-        stream.read_exact(&mut received).await?;
-        assert_eq!(received, TCP_TO_LOCAL);
-        stream.write_all(TCP_FROM_LOCAL).await?;
+        let exchanges: [(&[u8], &[u8]); 2] = [
+            (V02_TCP_TO_LOCAL, V02_TCP_FROM_LOCAL),
+            (TCP_TO_LOCAL, TCP_FROM_LOCAL),
+        ];
+        for (expected, response) in exchanges {
+            let (mut stream, _) = tcp_local.accept().await?;
+            let mut received = vec![0; expected.len()];
+            stream.read_exact(&mut received).await?;
+            assert_eq!(received, expected);
+            stream.write_all(response).await?;
+        }
         Ok::<_, AnyError>(())
     });
     let udp_echo = tokio::spawn(async move {
@@ -562,40 +642,45 @@ async fn production_tcp_and_udp_paths_count_logical_payload_exactly_once() -> Re
     let app = ClientApp::from_config(fixture.config)?
         .with_telemetry_test_runtime(Duration::from_millis(100), hook.clone())?;
     let app_task = tokio::spawn(app.run_until(shutdown.clone()));
-    let mut control = accept_registered_session(&tls_server, ProtocolVersion::V0_3).await?;
+    let mut control = accept_registered_session(&tls_server, ProtocolVersion::V0_2).await?;
+    drive_production_tcp(
+        &tls_server,
+        &mut control,
+        ProductionTcpFlow {
+            version: ProtocolVersion::V0_2,
+            connection_id: 40,
+            binding_marker: 0x30,
+            to_local: V02_TCP_TO_LOCAL,
+            from_local: V02_TCP_FROM_LOCAL,
+        },
+    )
+    .await?;
+    assert!(
+        !hook.sampler_active.load(Ordering::Acquire),
+        "absent config must not start sampling for a V0.2 generation"
+    );
 
-    let tcp_binding = bytes::<MAX_BINDING_TOKEN_BYTES>(&[0x31; MAX_BINDING_TOKEN_BYTES]);
-    control
-        .send(Message::OpenTcpStream(OpenTcpStream {
-            tunnel_id: 1,
+    drop(control);
+    let mut control = tokio::time::timeout(
+        Duration::from_secs(4),
+        accept_registered_session(&tls_server, ProtocolVersion::V0_3),
+    )
+    .await??;
+    wait_for_sampler(&hook).await?;
+    wait_for_traffic_totals(&hook, (0, 0)).await?;
+
+    drive_production_tcp(
+        &tls_server,
+        &mut control,
+        ProductionTcpFlow {
+            version: ProtocolVersion::V0_3,
             connection_id: 41,
-            peer: SocketAddress::V4 {
-                octets: [198, 51, 100, 1],
-                port: 51_001,
-            },
-            binding_token: tcp_binding.clone(),
-        }))
-        .await?;
-    let (socket, _) = tls_server.accept_tcp().await?;
-    let mut tcp_data =
-        FramedServer::new(ProtocolVersion::V0_3, tls_server.handshake(socket).await?);
-    let Message::DataChannelBind(bind) = tcp_data.receive().await?.message else {
-        return Err("production TCP child did not authenticate its data channel".into());
-    };
-    assert_eq!(bind.kind, DataChannelKind::TCP);
-    assert_eq!(bind.target_id, 41);
-    assert_eq!(bind.binding_token, tcp_binding);
-    tcp_data
-        .send(Message::TcpStreamReady(TcpStreamReady {
-            connection_id: 41,
-            accepted: true,
-            error: None,
-        }))
-        .await?;
-    tcp_data.stream.write_all(TCP_TO_LOCAL).await?;
-    let mut tcp_reply = vec![0; TCP_FROM_LOCAL.len()];
-    tcp_data.stream.read_exact(&mut tcp_reply).await?;
-    assert_eq!(tcp_reply, TCP_FROM_LOCAL);
+            binding_marker: 0x31,
+            to_local: TCP_TO_LOCAL,
+            from_local: TCP_FROM_LOCAL,
+        },
+    )
+    .await?;
     tcp_echo.await??;
 
     let udp_binding = bytes::<MAX_BINDING_TOKEN_BYTES>(&[0x32; MAX_BINDING_TOKEN_BYTES]);
@@ -704,7 +789,7 @@ async fn v03_heartbeat_preempts_telemetry_and_shutdown_joins_publishers() -> Res
 
 #[tokio::test]
 async fn older_negotiation_and_disabled_v03_emit_no_telemetry() -> Result<(), AnyError> {
-    assert_no_telemetry(ProtocolVersion::V0_2, Some(enabled_telemetry())).await?;
+    assert_no_telemetry(ProtocolVersion::V0_2, None).await?;
     assert_no_telemetry(
         ProtocolVersion::V0_3,
         Some(TelemetryConfig {
@@ -899,9 +984,11 @@ async fn assert_no_telemetry(
     let tls_server =
         TlsServer::bind("127.0.0.1:0", &pki.certificate_file, &pki.private_key_file).await?;
     let fixture = client_fixture(&pki, tls_server.local_addr()?.to_string(), telemetry)?;
+    let hook = Arc::new(TrafficSnapshotHook::default());
     let shutdown = CancellationToken::new();
-    let app_task =
-        tokio::spawn(ClientApp::from_config(fixture.config)?.run_until(shutdown.clone()));
+    let app = ClientApp::from_config(fixture.config)?
+        .with_telemetry_test_runtime(Duration::from_millis(50), hook.clone())?;
+    let app_task = tokio::spawn(app.run_until(shutdown.clone()));
     let mut server = accept_registered_session(&tls_server, version).await?;
     let deadline = tokio::time::Instant::now() + Duration::from_millis(1_300);
     let mut heartbeat_seen = false;
@@ -928,6 +1015,10 @@ async fn assert_no_telemetry(
     assert!(
         heartbeat_seen,
         "control generation must remain alive during the observation window"
+    );
+    assert!(
+        !hook.sampler_active.load(Ordering::Acquire),
+        "an older or explicitly disabled generation must not start the host sampler"
     );
 
     shutdown.cancel();

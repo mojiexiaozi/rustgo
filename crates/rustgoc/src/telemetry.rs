@@ -141,6 +141,10 @@ pub trait TelemetryControlWriteGate: Send + Sync + 'static {
 /// coalescing and write backpressure without depending on kernel socket sizes.
 #[doc(hidden)]
 pub trait TelemetryRuntimeHook: Send + Sync + 'static {
+    /// Test-only observation that the process host sampler was lazily started.
+    #[doc(hidden)]
+    fn sampler_started(&self) {}
+
     fn after_publish(&self, _sequence: u64) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async {})
     }
@@ -161,12 +165,17 @@ pub trait TelemetryRuntimeHook: Send + Sync + 'static {
 
 /// Process-lifetime owner for the stateful host sampler.
 pub(crate) struct TelemetryRuntime {
-    samples: watch::Receiver<Option<HostMetrics>>,
+    sample_interval: Duration,
     report_interval: Duration,
     hook: Option<Arc<dyn TelemetryRuntimeHook>>,
+    sampler: Option<SamplerOwner>,
+    traffic: Arc<LogicalTraffic>,
+}
+
+struct SamplerOwner {
+    samples: watch::Receiver<Option<HostMetrics>>,
     shutdown: CancellationToken,
     owner: JoinHandle<()>,
-    traffic: Arc<LogicalTraffic>,
 }
 
 impl TelemetryRuntime {
@@ -183,39 +192,55 @@ impl TelemetryRuntime {
         let sample_interval = Duration::from_secs(config.sample_interval_secs);
         let report_interval = report_interval_override
             .unwrap_or_else(|| Duration::from_secs(config.report_interval_secs));
-        let shutdown = CancellationToken::new();
-        let owner_shutdown = shutdown.clone();
-        let (samples, receiver) = watch::channel(None);
-        let owner = tokio::spawn(async move {
-            let mut sampler = HostSampler::new();
-            let mut ticks = tokio::time::interval(sample_interval);
-            ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
-
-            loop {
-                tokio::select! {
-                    biased;
-                    () = owner_shutdown.cancelled() => return,
-                    _ = ticks.tick() => {
-                        samples.send_replace(Some(sampler.sample()));
-                    }
-                }
-            }
-        });
 
         Some(Self {
-            samples: receiver,
+            sample_interval,
             report_interval,
             hook,
-            shutdown,
-            owner,
+            sampler: None,
             traffic,
         })
     }
 
-    pub(crate) fn generation(&self) -> GenerationTelemetry {
+    pub(crate) fn generation(&mut self) -> GenerationTelemetry {
+        if self.sampler.is_none() {
+            if let Some(hook) = &self.hook {
+                hook.sampler_started();
+            }
+            let shutdown = CancellationToken::new();
+            let owner_shutdown = shutdown.clone();
+            let (samples, receiver) = watch::channel(None);
+            let sample_interval = self.sample_interval;
+            let owner = tokio::spawn(async move {
+                let mut sampler = HostSampler::new();
+                let mut ticks = tokio::time::interval(sample_interval);
+                ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+                loop {
+                    tokio::select! {
+                        biased;
+                        () = owner_shutdown.cancelled() => return,
+                        _ = ticks.tick() => {
+                            samples.send_replace(Some(sampler.sample()));
+                        }
+                    }
+                }
+            });
+            self.sampler = Some(SamplerOwner {
+                samples: receiver,
+                shutdown,
+                owner,
+            });
+        }
+        let samples = self
+            .sampler
+            .as_ref()
+            .expect("the sampler was initialized above")
+            .samples
+            .clone();
         let (last_sent, last_received) = self.traffic.totals();
         GenerationTelemetry {
-            samples: self.samples.clone(),
+            samples,
             report_interval: self.report_interval,
             hook: self.hook.clone(),
             traffic: self.traffic.clone(),
@@ -226,8 +251,11 @@ impl TelemetryRuntime {
     }
 
     pub(crate) async fn shutdown(self) -> Result<(), ClientError> {
-        self.shutdown.cancel();
-        self.owner.await.map_err(|_| ClientError::TaskJoin)
+        let Some(sampler) = self.sampler else {
+            return Ok(());
+        };
+        sampler.shutdown.cancel();
+        sampler.owner.await.map_err(|_| ClientError::TaskJoin)
     }
 }
 

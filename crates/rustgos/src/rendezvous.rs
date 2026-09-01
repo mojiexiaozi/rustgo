@@ -173,7 +173,9 @@ struct StoredSession {
     candidate_digests: [Option<[u8; 32]>; 2],
     generation_started: Instant,
     observed_path: Option<SessionPath>,
+    fallback_consumer_internal_frames_remaining: u8,
     fallback_provider_internal_frames_remaining: u8,
+    pending_preselection_relay_traffic: TrafficCounters,
     pending_relay_traffic: TrafficCounters,
     last_observability_flush: Instant,
 }
@@ -557,26 +559,30 @@ impl RendezvousCoordinator {
                 );
             })?;
             if self.registry.observability_enabled() {
-                if session.provider.matches(authenticated.identity())
-                    && session.fallback_provider_internal_frames_remaining > 0
-                {
+                let consumer = session.consumer.matches(authenticated.identity());
+                if consumer && session.fallback_consumer_internal_frames_remaining > 0 {
+                    // The initiator's first relay record is AUTH_RECORD.
+                    session.fallback_consumer_internal_frames_remaining -= 1;
+                } else if !consumer && session.fallback_provider_internal_frames_remaining > 0 {
                     // Relay authorization precedes I/O. The responder then emits exactly
                     // AUTH_RECORD and OPEN_OK/OPEN_REJECTED before any application payload;
                     // either may arrive before the initiator reports the selected path.
                     session.fallback_provider_internal_frames_remaining -= 1;
-                } else if session.observed_path == Some(SessionPath::P2pFallback) {
+                } else {
                     let logical_bytes =
                         frame.ciphertext().len().saturating_sub(PEER_AEAD_TAG_BYTES) as u64;
-                    if session.consumer.matches(authenticated.identity()) {
-                        session.pending_relay_traffic.sent_bytes = session
-                            .pending_relay_traffic
-                            .sent_bytes
-                            .saturating_add(logical_bytes);
-                    } else {
-                        session.pending_relay_traffic.received_bytes = session
-                            .pending_relay_traffic
-                            .received_bytes
-                            .saturating_add(logical_bytes);
+                    let traffic = match session.observed_path {
+                        Some(SessionPath::P2pFallback) => Some(&mut session.pending_relay_traffic),
+                        None => Some(&mut session.pending_preselection_relay_traffic),
+                        Some(SessionPath::P2pDirect | SessionPath::Relay) => None,
+                    };
+                    if let Some(traffic) = traffic {
+                        if consumer {
+                            traffic.sent_bytes = traffic.sent_bytes.saturating_add(logical_bytes);
+                        } else {
+                            traffic.received_bytes =
+                                traffic.received_bytes.saturating_add(logical_bytes);
+                        }
                     }
                 }
             }
@@ -719,6 +725,14 @@ impl RendezvousCoordinator {
                 candidate_digests: [None, None],
                 generation_started: Instant::now(),
                 observed_path: None,
+                fallback_consumer_internal_frames_remaining: if self
+                    .registry
+                    .observability_enabled()
+                {
+                    1
+                } else {
+                    0
+                },
                 fallback_provider_internal_frames_remaining: if self
                     .registry
                     .observability_enabled()
@@ -727,6 +741,7 @@ impl RendezvousCoordinator {
                 } else {
                     0
                 },
+                pending_preselection_relay_traffic: TrafficCounters::default(),
                 pending_relay_traffic: TrafficCounters::default(),
                 last_observability_flush: Instant::now(),
             })),
@@ -999,17 +1014,27 @@ impl RendezvousCoordinator {
                 "peer relay request admitted"
             );
         }
-        let opened = if let Some(path) = observed_path
+        let (opened, preselection_traffic) = if let Some(path) = observed_path
             && session.observed_path.is_none()
         {
             session.observed_path = Some(path);
-            Some(observe_p2p_open(session, path))
+            let preselection_traffic = if path == SessionPath::P2pFallback {
+                let pending = std::mem::take(&mut session.pending_preselection_relay_traffic);
+                p2p_traffic_event(session, pending)
+            } else {
+                session.pending_preselection_relay_traffic = TrafficCounters::default();
+                None
+            };
+            (Some(observe_p2p_open(session, path)), preselection_traffic)
         } else {
-            None
+            (None, None)
         };
         drop(state);
         if let Some(opened) = opened {
             self.registry.try_observe(opened);
+        }
+        if let Some(traffic) = preselection_traffic {
+            self.registry.try_observe(traffic);
         }
         permit.send(message);
         if let Some((consumer, provider, grant)) = punch {

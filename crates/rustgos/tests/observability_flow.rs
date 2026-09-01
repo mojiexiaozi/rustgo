@@ -246,6 +246,7 @@ async fn open_fallback(
     provider: &mut Client,
     marker: u8,
     expiry: u64,
+    provider_preselection_bytes: usize,
 ) -> Result<(), AnyError> {
     let messages = [
         (
@@ -299,6 +300,9 @@ async fn open_fallback(
             relay_frame(consumer, provider, marker, 1, 21).await?;
             relay_frame(provider, consumer, marker, 1, 21).await?;
             relay_frame(provider, consumer, marker, 2, 21).await?;
+            if provider_preselection_bytes > 0 {
+                relay_frame(provider, consumer, marker, 3, provider_preselection_bytes).await?;
+            }
         }
     }
     Ok(())
@@ -665,7 +669,7 @@ async fn authenticated_runtime_activity_projects_without_trusting_client_identit
     alpha.send_envelope(&close).await?;
     assert_eq!(beta.receive_envelope().await?, close);
 
-    open_fallback(&mut alpha, &mut beta, 0x72, expiry).await?;
+    open_fallback(&mut alpha, &mut beta, 0x72, expiry, 0).await?;
     let zero_fallback_id = ShortSessionId::from_bytes(&[0x72; 32]);
     let zero_close = envelope(
         0x72,
@@ -678,10 +682,19 @@ async fn authenticated_runtime_activity_projects_without_trusting_client_identit
     alpha.send_envelope(&zero_close).await?;
     assert_eq!(beta.receive_envelope().await?, zero_close);
 
-    open_fallback(&mut alpha, &mut beta, 0x73, expiry).await?;
-    relay_frame(&mut alpha, &mut beta, 0x73, 2, 5).await?;
-    relay_frame(&mut beta, &mut alpha, 0x73, 3, 7).await?;
+    open_fallback(&mut alpha, &mut beta, 0x73, expiry, 7).await?;
     let data_fallback_id = ShortSessionId::from_bytes(&[0x73; 32]);
+    wait_for(&store, "provider-first-fallback-traffic", |snapshot| {
+        snapshot.sessions.iter().any(|session| {
+            session.id == data_fallback_id
+                && session.path == SessionPath::P2pFallback
+                && session.traffic.received_bytes == 7
+                && session.traffic.sent_bytes == 0
+                && session.closed_unix_millis.is_none()
+        })
+    })
+    .await?;
+    relay_frame(&mut alpha, &mut beta, 0x73, 2, 5).await?;
     let data_close = envelope(
         0x73,
         "alpha",
