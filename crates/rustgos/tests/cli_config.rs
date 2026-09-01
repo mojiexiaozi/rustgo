@@ -143,7 +143,7 @@ fn check_accepts_enabled_web_defaults_when_its_toml_is_private() {
     fs::write(
         &path,
         format!(
-            "{}\n[web]\nenabled = true\nadmin_password = \"a-password-that-is-at-least-sixteen-bytes\"\n",
+            "{}\n[web]\nenabled = true\nexternal_origin = \"https://dashboard.example\"\nadmin_password = \"a-password-that-is-at-least-sixteen-bytes\"\n",
             valid_config(&material.public_key)
         ),
     )
@@ -180,7 +180,7 @@ fn check_warns_that_enabled_web_configuration_needs_manual_acl_review() {
     fs::write(
         &path,
         format!(
-            "{}\n[web]\nenabled = true\nadmin_password = \"a-password-that-is-at-least-sixteen-bytes\"\n",
+            "{}\n[web]\nenabled = true\nexternal_origin = \"https://dashboard.example\"\nadmin_password = \"a-password-that-is-at-least-sixteen-bytes\"\n",
             valid_config(&material.public_key)
         ),
     )

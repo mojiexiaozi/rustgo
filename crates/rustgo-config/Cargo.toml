@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 base64.workspace = true
+http.workspace = true
 rustgo-protocol = { path = "../rustgo-protocol" }
 serde.workspace = true
 thiserror.workspace = true

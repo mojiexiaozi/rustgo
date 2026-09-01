@@ -3,11 +3,12 @@
 mod auth;
 mod security;
 
-use std::{fmt, io, net::SocketAddr, sync::Arc, time::Duration};
+use std::{convert::Infallible, fmt, io, net::SocketAddr, sync::Arc, time::Duration};
 
 use auth::{AuthenticationState, SESSION_COOKIE_NAME};
 use axum::{
-    Form, Router, body,
+    Form, Router,
+    body::{self, Body},
     extract::{ConnectInfo, DefaultBodyLimit, FromRequest, Request, State},
     http::{
         HeaderMap, HeaderValue, StatusCode,
@@ -17,13 +18,22 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{any, get, post},
 };
-use rustgo_config::ServerConfig;
+use hyper::{body::Incoming, server::conn::http1, service::service_fn};
+use hyper_util::rt::{TokioIo, TokioTimer};
+use rustgo_config::{ServerConfig, WebOrigin};
 use serde::Deserialize;
 use thiserror::Error;
-use tokio::net::TcpListener;
+use tokio::{
+    net::{TcpListener, TcpStream},
+    sync::{OwnedSemaphorePermit, Semaphore},
+    task::JoinSet,
+};
 use tokio_util::sync::CancellationToken;
+use tower::ServiceExt as _;
 
-use self::security::{response_security_headers, same_origin, single_cookie_header};
+use self::security::{
+    apply_response_security_headers, response_security_headers, same_origin, single_cookie_header,
+};
 
 const MAX_LOGIN_BODY_BYTES: usize = 1_024;
 const MAX_LOGOUT_BODY_BYTES: usize = 64;
@@ -33,6 +43,12 @@ const MAX_SESSIONS: usize = 32;
 const MAX_LOGIN_ATTEMPTS_PER_PEER: usize = 1_024;
 const MAX_GLOBAL_LOGIN_ATTEMPTS: usize = 4_096;
 const MAX_TRACKED_LOGIN_PEERS: usize = 1_024;
+const MAX_CONNECTIONS: usize = 1_024;
+const MAX_CONCURRENT_REQUESTS: usize = 1_024;
+const MAX_HTTP_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_GRACEFUL_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const HTTP_MAX_HEADERS: usize = 64;
+const HTTP_MAX_BUFFER_BYTES: usize = 16 * 1_024;
 
 #[derive(Debug, Clone)]
 pub struct WebRuntimeLimits {
@@ -43,6 +59,12 @@ pub struct WebRuntimeLimits {
     pub max_login_attempts_per_peer: usize,
     pub max_global_login_attempts: usize,
     pub max_tracked_login_peers: usize,
+    pub max_connections: usize,
+    pub max_concurrent_requests: usize,
+    pub header_read_timeout: Duration,
+    pub request_timeout: Duration,
+    pub body_read_timeout: Duration,
+    pub graceful_drain_timeout: Duration,
 }
 
 impl Default for WebRuntimeLimits {
@@ -55,6 +77,12 @@ impl Default for WebRuntimeLimits {
             max_login_attempts_per_peer: 8,
             max_global_login_attempts: 64,
             max_tracked_login_peers: MAX_TRACKED_LOGIN_PEERS,
+            max_connections: 64,
+            max_concurrent_requests: 32,
+            header_read_timeout: Duration::from_secs(5),
+            request_timeout: Duration::from_secs(10),
+            body_read_timeout: Duration::from_secs(3),
+            graceful_drain_timeout: Duration::from_secs(5),
         }
     }
 }
@@ -74,9 +102,26 @@ impl WebRuntimeLimits {
             || self.max_global_login_attempts > MAX_GLOBAL_LOGIN_ATTEMPTS
             || self.max_tracked_login_peers == 0
             || self.max_tracked_login_peers > MAX_TRACKED_LOGIN_PEERS
+            || self.max_connections == 0
+            || self.max_connections > MAX_CONNECTIONS
+            || self.max_concurrent_requests == 0
+            || self.max_concurrent_requests > MAX_CONCURRENT_REQUESTS
+            || self.max_concurrent_requests > self.max_connections
+            || self.header_read_timeout.is_zero()
+            || self.header_read_timeout > MAX_HTTP_TIMEOUT
+            || self.request_timeout.is_zero()
+            || self.request_timeout > MAX_HTTP_TIMEOUT
+            || self.body_read_timeout.is_zero()
+            || self.body_read_timeout > self.request_timeout
+            || self.graceful_drain_timeout.is_zero()
+            || self.graceful_drain_timeout > MAX_GRACEFUL_DRAIN_TIMEOUT
             || now.checked_add(self.session_idle_timeout).is_none()
             || now.checked_add(self.session_absolute_timeout).is_none()
             || now.checked_add(self.login_window).is_none()
+            || now.checked_add(self.header_read_timeout).is_none()
+            || now.checked_add(self.request_timeout).is_none()
+            || now.checked_add(self.body_read_timeout).is_none()
+            || now.checked_add(self.graceful_drain_timeout).is_none()
         {
             return Err(WebError::InvalidRuntimeLimits);
         }
@@ -87,6 +132,7 @@ impl WebRuntimeLimits {
 pub struct WebServer {
     listener: TcpListener,
     router: Router,
+    runtime_limits: WebRuntimeLimits,
 }
 
 impl WebServer {
@@ -108,6 +154,8 @@ impl WebServer {
             .as_ref()
             .filter(|web| web.enabled)
             .ok_or(WebError::Disabled)?;
+        let expected_origin = WebOrigin::from_config(web)
+            .map_err(|error| WebError::InvalidConfiguration(error.to_string()))?;
         let configured_address = web
             .bind
             .parse::<SocketAddr>()
@@ -127,11 +175,16 @@ impl WebServer {
 
         let state = Arc::new(WebState {
             authentication,
-            expected_host: bound_address.to_string(),
+            expected_origin,
             cookie_secure: web.cookie_secure,
+            body_read_timeout: limits.body_read_timeout,
         });
         let router = build_router(state);
-        Ok(Self { listener, router })
+        Ok(Self {
+            listener,
+            router,
+            runtime_limits: limits,
+        })
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -143,14 +196,59 @@ impl WebServer {
     }
 
     pub async fn run_until(self, shutdown: CancellationToken) -> Result<(), WebError> {
-        axum::serve(
-            self.listener,
-            self.router
-                .into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(async move { shutdown.cancelled().await })
-        .await?;
-        Ok(())
+        let connection_slots = Arc::new(Semaphore::new(self.runtime_limits.max_connections));
+        let request_slots = Arc::new(Semaphore::new(self.runtime_limits.max_concurrent_requests));
+        let connection_shutdown = CancellationToken::new();
+        let mut connections = JoinSet::new();
+
+        let accept_result = 'accept: loop {
+            tokio::select! {
+                biased;
+                () = shutdown.cancelled() => break Ok(()),
+                completed = connections.join_next(), if !connections.is_empty() => {
+                    let _ = completed;
+                }
+                permit = connection_slots.clone().acquire_owned() => {
+                    let permit = permit.expect("the Web connection semaphore remains open");
+                    let accepted = tokio::select! {
+                        biased;
+                        () = shutdown.cancelled() => {
+                            drop(permit);
+                            break 'accept Ok(());
+                        }
+                        accepted = self.listener.accept() => accepted,
+                    };
+                    let (stream, peer) = match accepted {
+                        Ok(accepted) => accepted,
+                        Err(error) => break Err(WebError::Io(error)),
+                    };
+                    connections.spawn(run_connection(
+                        stream,
+                        peer,
+                        permit,
+                        ConnectionRuntime {
+                            router: self.router.clone(),
+                            request_slots: request_slots.clone(),
+                            shutdown: connection_shutdown.child_token(),
+                            header_read_timeout: self.runtime_limits.header_read_timeout,
+                            request_timeout: self.runtime_limits.request_timeout,
+                        },
+                    ));
+                }
+            }
+        };
+
+        connection_shutdown.cancel();
+        if tokio::time::timeout(self.runtime_limits.graceful_drain_timeout, async {
+            while connections.join_next().await.is_some() {}
+        })
+        .await
+        .is_err()
+        {
+            connections.abort_all();
+            while connections.join_next().await.is_some() {}
+        }
+        accept_result
     }
 }
 
@@ -165,8 +263,9 @@ impl fmt::Debug for WebServer {
 
 struct WebState {
     authentication: AuthenticationState,
-    expected_host: String,
+    expected_origin: WebOrigin,
     cookie_secure: bool,
+    body_read_timeout: Duration,
 }
 
 fn build_router(state: Arc<WebState>) -> Router {
@@ -196,7 +295,7 @@ async fn login(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     request: Request,
 ) -> Response {
-    if !same_origin(request.headers(), &state.expected_host, state.cookie_secure)
+    if !same_origin(request.headers(), &state.expected_origin)
         || !is_form_request(request.headers())
         || request
             .headers()
@@ -208,9 +307,15 @@ async fn login(
         return rejected_request();
     }
 
-    let form = match Form::<LoginForm>::from_request(request, &()).await {
-        Ok(Form(form)) => form,
-        Err(_) => return rejected_request(),
+    let form = match tokio::time::timeout(
+        state.body_read_timeout,
+        Form::<LoginForm>::from_request(request, &()),
+    )
+    .await
+    {
+        Ok(Ok(Form(form))) => form,
+        Ok(Err(_)) => return rejected_request(),
+        Err(_) => return request_timed_out(),
     };
     if !state.authentication.admit_login(peer.ip()) {
         return authentication_failed();
@@ -236,7 +341,7 @@ async fn login(
 }
 
 async fn logout(State(state): State<Arc<WebState>>, request: Request) -> Response {
-    if !same_origin(request.headers(), &state.expected_host, state.cookie_secure)
+    if !same_origin(request.headers(), &state.expected_origin)
         || !is_form_request(request.headers())
         || request
             .headers()
@@ -248,8 +353,15 @@ async fn logout(State(state): State<Arc<WebState>>, request: Request) -> Respons
         return rejected_request();
     }
     let cookie = single_cookie_header(request.headers()).map(str::to_owned);
-    let Ok(logout_body) = body::to_bytes(request.into_body(), MAX_LOGOUT_BODY_BYTES).await else {
-        return rejected_request();
+    let logout_body = match tokio::time::timeout(
+        state.body_read_timeout,
+        body::to_bytes(request.into_body(), MAX_LOGOUT_BODY_BYTES),
+    )
+    .await
+    {
+        Ok(Ok(body)) => body,
+        Ok(Err(_)) => return rejected_request(),
+        Err(_) => return request_timed_out(),
     };
     if !logout_body.is_empty() {
         return rejected_request();
@@ -336,6 +448,93 @@ fn rejected_request() -> Response {
 
 fn internal_error() -> Response {
     plain_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error\n")
+}
+
+fn request_timed_out() -> Response {
+    plain_response(StatusCode::REQUEST_TIMEOUT, "request timed out\n")
+}
+
+fn service_unavailable() -> Response {
+    plain_response(StatusCode::SERVICE_UNAVAILABLE, "service unavailable\n")
+}
+
+async fn run_connection(
+    stream: TcpStream,
+    peer: SocketAddr,
+    _permit: OwnedSemaphorePermit,
+    runtime: ConnectionRuntime,
+) {
+    let ConnectionRuntime {
+        router,
+        request_slots,
+        shutdown,
+        header_read_timeout,
+        request_timeout,
+    } = runtime;
+    let service = service_fn(move |request: hyper::Request<Incoming>| {
+        dispatch_request(
+            router.clone(),
+            request_slots.clone(),
+            peer,
+            request,
+            request_timeout,
+        )
+    });
+    let mut builder = http1::Builder::new();
+    builder
+        .timer(TokioTimer::new())
+        .header_read_timeout(header_read_timeout)
+        .max_headers(HTTP_MAX_HEADERS)
+        .max_buf_size(HTTP_MAX_BUFFER_BYTES);
+    let connection = builder.serve_connection(TokioIo::new(stream), service);
+    tokio::pin!(connection);
+    tokio::select! {
+        _ = &mut connection => {}
+        () = shutdown.cancelled() => {
+            connection.as_mut().graceful_shutdown();
+            let _ = connection.await;
+        }
+    }
+}
+
+struct ConnectionRuntime {
+    router: Router,
+    request_slots: Arc<Semaphore>,
+    shutdown: CancellationToken,
+    header_read_timeout: Duration,
+    request_timeout: Duration,
+}
+
+async fn dispatch_request(
+    router: Router,
+    request_slots: Arc<Semaphore>,
+    peer: SocketAddr,
+    request: hyper::Request<Incoming>,
+    request_timeout: Duration,
+) -> Result<Response, Infallible> {
+    let path = request.uri().path().to_owned();
+    let response = tokio::time::timeout(request_timeout, async move {
+        let Ok(_permit) = request_slots.acquire_owned().await else {
+            return service_unavailable();
+        };
+        let (parts, incoming) = request.into_parts();
+        let mut request = Request::from_parts(parts, Body::new(incoming));
+        request.extensions_mut().insert(ConnectInfo(peer));
+        match router.oneshot(request).await {
+            Ok(response) => response,
+            Err(error) => match error {},
+        }
+    })
+    .await;
+    let response = match response {
+        Ok(response) => response,
+        Err(_) => {
+            let mut response = request_timed_out();
+            apply_response_security_headers(&path, &mut response);
+            response
+        }
+    };
+    Ok(response)
 }
 
 fn plain_response(status: StatusCode, body: &'static str) -> Response {

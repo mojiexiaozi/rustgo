@@ -8,7 +8,7 @@ use std::{
 };
 
 use rustgo_config::{
-    ClientConfig, ServerConfig, TelemetryConfig, TunnelProtocol, WebConfig,
+    ClientConfig, ServerConfig, TelemetryConfig, TunnelProtocol, WebConfig, WebOrigin,
     check_client_references, check_server_references, load_client, load_client_with_lookup,
     load_server,
 };
@@ -271,6 +271,7 @@ fn observability_section_defaults_match_the_documented_reference_values() {
         WebConfig {
             enabled: false,
             bind: "127.0.0.1:7450".to_owned(),
+            external_origin: None,
             admin_username: "admin".to_owned(),
             admin_password: "replace-with-at-least-16-characters".to_owned(),
             cookie_secure: true,
@@ -293,7 +294,7 @@ fn observability_section_defaults_match_the_documented_reference_values() {
 fn enabled_web_configuration_resolves_its_database_relative_to_the_toml_file() {
     let dir = TempDir::new();
     let config = format!(
-        "{}\n[web]\nenabled = true\nadmin_password = \"a-password-that-is-at-least-sixteen-bytes\"\ndatabase_path = \"history/metrics.db\"\n",
+        "{}\n[web]\nenabled = true\nexternal_origin = \"https://dashboard.example\"\nadmin_password = \"a-password-that-is-at-least-sixteen-bytes\"\ndatabase_path = \"history/metrics.db\"\n",
         valid_server()
     );
 
@@ -302,6 +303,71 @@ fn enabled_web_configuration_resolves_its_database_relative_to_the_toml_file() {
 
     assert_eq!(web.bind, "127.0.0.1:7450");
     assert_eq!(web.database_path, dir.path.join("history/metrics.db"));
+}
+
+#[test]
+fn enabled_web_origin_policy_is_canonical_and_scheme_bound() {
+    let dir = TempDir::new();
+    let secure = load_server_text(
+        &dir,
+        &format!(
+            "{}\n[web]\nenabled = true\nexternal_origin = \"HTTPS://Dashboard.Example.COM:443\"\nadmin_password = \"a-password-that-is-at-least-sixteen-bytes\"\n",
+            valid_server()
+        ),
+    )
+    .unwrap();
+    let secure_origin = WebOrigin::from_config(secure.web.as_ref().unwrap()).unwrap();
+    assert_eq!(secure_origin.as_str(), "https://dashboard.example.com");
+    assert!(secure_origin.matches_authority("DASHBOARD.EXAMPLE.COM:443"));
+    assert!(secure_origin.matches_authority("dashboard.example.com"));
+
+    let direct = load_server_text(
+        &dir,
+        &format!(
+            "{}\n[web]\nenabled = true\ncookie_secure = false\nadmin_password = \"a-password-that-is-at-least-sixteen-bytes\"\n",
+            valid_server()
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        WebOrigin::from_config(direct.web.as_ref().unwrap())
+            .unwrap()
+            .as_str(),
+        "http://127.0.0.1:7450"
+    );
+
+    let ipv6 = WebOrigin::parse("http://[0:0:0:0:0:0:0:1]:80").unwrap();
+    assert_eq!(ipv6.as_str(), "http://[::1]");
+    assert!(ipv6.matches_authority("[::1]:80"));
+}
+
+#[test]
+fn enabled_web_origin_policy_rejects_missing_mismatched_or_non_origin_values() {
+    let dir = TempDir::new();
+    let prefix = format!(
+        "{}\n[web]\nenabled = true\nadmin_password = \"a-password-that-is-at-least-sixteen-bytes\"\n",
+        valid_server()
+    );
+    assert!(load_server_text(&dir, &prefix).is_err());
+
+    for origin in [
+        "http://dashboard.example",
+        "https://user@dashboard.example",
+        "https://dashboard.example/",
+        "https://dashboard.example/path",
+        "https://dashboard.example?query",
+        "https://dashboard.example#fragment",
+        "https://dashboard.example:0",
+        "https://-bad.example",
+    ] {
+        let config = format!("{prefix}external_origin = \"{origin}\"\n");
+        let error = load_server_text(&dir, &config).unwrap_err();
+        assert!(error.to_string().contains("external_origin"), "{error}");
+    }
+
+    let insecure_https =
+        format!("{prefix}cookie_secure = false\nexternal_origin = \"https://dashboard.example\"\n");
+    assert!(load_server_text(&dir, &insecure_https).is_err());
 }
 
 #[test]
@@ -367,7 +433,7 @@ fn enabled_web_configuration_rejects_group_or_world_readable_toml() {
     let config_path = dir.write(
         "server.toml",
         &format!(
-            "{}\n[web]\nenabled = true\nadmin_password = \"a-password-that-is-at-least-sixteen-bytes\"\n",
+            "{}\n[web]\nenabled = true\nexternal_origin = \"https://dashboard.example\"\nadmin_password = \"a-password-that-is-at-least-sixteen-bytes\"\n",
             valid_server()
         ),
     );
@@ -393,7 +459,7 @@ fn enabled_web_configuration_reports_a_structured_windows_acl_warning() {
     let config_path = dir.write(
         "server.toml",
         &format!(
-            "{}\n[web]\nenabled = true\nadmin_password = \"a-password-that-is-at-least-sixteen-bytes\"\n",
+            "{}\n[web]\nenabled = true\nexternal_origin = \"https://dashboard.example\"\nadmin_password = \"a-password-that-is-at-least-sixteen-bytes\"\n",
             valid_server()
         ),
     );

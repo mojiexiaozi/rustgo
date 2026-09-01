@@ -95,6 +95,7 @@ pub enum TunnelProtocol {
 pub struct WebConfig {
     pub enabled: bool,
     pub bind: String,
+    pub external_origin: Option<String>,
     pub admin_username: String,
     pub admin_password: String,
     pub cookie_secure: bool,
@@ -108,6 +109,7 @@ impl Default for WebConfig {
         Self {
             enabled: false,
             bind: "127.0.0.1:7450".to_owned(),
+            external_origin: None,
             admin_username: "admin".to_owned(),
             admin_password: "replace-with-at-least-16-characters".to_owned(),
             cookie_secure: true,
@@ -124,6 +126,7 @@ impl fmt::Debug for WebConfig {
             .debug_struct("WebConfig")
             .field("enabled", &self.enabled)
             .field("bind", &self.bind)
+            .field("external_origin", &self.external_origin)
             .field("admin_username", &self.admin_username)
             .field("admin_password", &"[REDACTED]")
             .field("cookie_secure", &self.cookie_secure)

@@ -233,7 +233,6 @@ impl SessionTable {
 struct LoginRateLimiter {
     global: VecDeque<Instant>,
     peers: HashMap<IpAddr, PeerAttempts>,
-    next_sequence: u64,
     window: Duration,
     per_peer_limit: usize,
     global_limit: usize,
@@ -245,7 +244,6 @@ impl LoginRateLimiter {
         Self {
             global: VecDeque::with_capacity(limits.max_global_login_attempts),
             peers: HashMap::with_capacity(limits.max_tracked_login_peers),
-            next_sequence: 0,
             window: limits.login_window,
             per_peer_limit: limits.max_login_attempts_per_peer,
             global_limit: limits.max_global_login_attempts,
@@ -272,36 +270,20 @@ impl LoginRateLimiter {
         }
 
         if !self.peers.contains_key(&peer) && self.peers.len() == self.max_peers {
-            let oldest = self
-                .peers
-                .iter()
-                .min_by_key(|(address, attempts)| {
-                    (attempts.last_seen, attempts.sequence, **address)
-                })
-                .map(|(address, _)| *address);
-            if let Some(oldest) = oldest {
-                self.peers.remove(&oldest);
-            }
+            return false;
         }
 
         self.global.push_back(now);
-        let sequence = self.next_sequence;
-        self.next_sequence = self.next_sequence.saturating_add(1);
         let attempts = self.peers.entry(peer).or_insert_with(|| PeerAttempts {
             attempts: VecDeque::with_capacity(self.per_peer_limit),
-            last_seen: now,
-            sequence,
         });
         attempts.attempts.push_back(now);
-        attempts.last_seen = now;
         true
     }
 }
 
 struct PeerAttempts {
     attempts: VecDeque<Instant>,
-    last_seen: Instant,
-    sequence: u64,
 }
 
 fn prune_attempts(attempts: &mut VecDeque<Instant>, now: Instant, window: Duration) {
