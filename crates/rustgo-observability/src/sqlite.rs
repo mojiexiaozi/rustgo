@@ -45,14 +45,17 @@ const MAX_BATCH_WRITE_ATTEMPTS: usize = 3;
 const MAX_BATCHES_PER_TRANSACTION: usize = 64;
 const MAX_TRANSACTION_BYTES: usize = 4 * 1024 * 1024;
 const RETENTION_DELETE_LIMIT: usize = 1024;
-const CAP_DELETE_LIMIT: usize = 512;
+const CAP_DELETE_LIMIT: usize = 4096;
 const VACUUM_PAGE_LIMIT: usize = 64;
 const MIB: u64 = 1024 * 1024;
 const OWNERSHIP_MARKER_SUFFIX: &str = ".rustgo-owner";
 const OWNERSHIP_MARKER_HEADER: &str = "rustgo-observability-history-v2";
+const LEGACY_OWNERSHIP_MARKER_CONTENT: &[u8] = b"rustgo-observability-history-v1\n";
 const RUSTGO_APPLICATION_ID: i64 = 0x5253_474f;
 const OWNER_NONCE_BYTES: usize = 32;
 const MAINTENANCE_BUCKET_LIMIT: usize = 64;
+const CAP_SCAN_ROW_LIMIT: usize = 8192;
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryConfig {
@@ -392,6 +395,7 @@ pub struct HistoryHealth {
     pub dropped_late_points: u64,
     pub history_failures: u64,
     pub worker_running: bool,
+    pub maximum_maintenance_scan_rows: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -542,6 +546,7 @@ struct Shared {
     dropped_late_points: AtomicU64,
     history_failures: AtomicU64,
     worker_running: AtomicBool,
+    maximum_maintenance_scan_rows: AtomicU64,
     maximum_database_bytes: u64,
 }
 
@@ -560,6 +565,7 @@ impl Shared {
             dropped_late_points: AtomicU64::new(0),
             history_failures: AtomicU64::new(0),
             worker_running: AtomicBool::new(false),
+            maximum_maintenance_scan_rows: AtomicU64::new(0),
             maximum_database_bytes,
         }
     }
@@ -1004,6 +1010,10 @@ impl HistoryService {
             dropped_late_points: self.shared.dropped_late_points.load(Ordering::Relaxed),
             history_failures: self.shared.history_failures.load(Ordering::Relaxed),
             worker_running: self.shared.worker_running.load(Ordering::Acquire),
+            maximum_maintenance_scan_rows: self
+                .shared
+                .maximum_maintenance_scan_rows
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -1424,6 +1434,11 @@ struct OpenedDatabase {
     recovered_interrupted_quarantine: bool,
 }
 
+enum ExistingDatabaseIdentity {
+    Current(String),
+    LegacyV4,
+}
+
 fn open_database(config: &HistoryConfig) -> Result<OpenedDatabase, DatabaseError> {
     if is_protected_history_path(&config.database_path) {
         return Err(DatabaseError::UnsafePath(
@@ -1460,6 +1475,16 @@ fn open_database(config: &HistoryConfig) -> Result<OpenedDatabase, DatabaseError
     let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
         | OpenFlags::SQLITE_OPEN_NO_MUTEX
         | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+    let existing_identity = if existed {
+        Some(validate_existing_database_read_only(&config.database_path)?)
+    } else {
+        None
+    };
+    let held_identity = if existed {
+        Some(SameFileHandle::from_path(&config.database_path)?)
+    } else {
+        None
+    };
     let connection = Connection::open_with_flags(&config.database_path, flags)?;
     if let Some(reserved) = &reserved_database {
         let reserved_handle = SameFileHandle::from_file(reserved.try_clone()?)?;
@@ -1470,19 +1495,29 @@ fn open_database(config: &HistoryConfig) -> Result<OpenedDatabase, DatabaseError
             ));
         }
     }
-    connection.busy_timeout(Duration::from_secs(2))?;
-    if existed {
-        let nonce = verify_internal_ownership(&connection)?;
-        quick_check(&connection)?;
-        validate_schema(&connection)?;
-        match read_ownership_marker(&config.database_path)? {
-            Some(marker) if marker.nonce == nonce => {}
-            Some(_) => {
-                return Err(DatabaseError::Ownership(
-                    "external marker nonce does not match the database".to_owned(),
-                ));
+    connection.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
+    if let Some(held) = held_identity {
+        if held != SameFileHandle::from_path(&config.database_path)? {
+            return Err(DatabaseError::Ownership(
+                "database path changed between ownership proof and writable open".to_owned(),
+            ));
+        }
+    }
+    if let Some(identity) = existing_identity {
+        match identity {
+            ExistingDatabaseIdentity::Current(expected_nonce) => {
+                let nonce = verify_internal_ownership(&connection)?;
+                if nonce != expected_nonce {
+                    return Err(DatabaseError::Ownership(
+                        "database owner nonce changed before writable open".to_owned(),
+                    ));
+                }
+                quick_check(&connection)?;
+                validate_schema(&connection)?;
             }
-            None => write_ownership_marker(&config.database_path, &nonce)?,
+            ExistingDatabaseIdentity::LegacyV4 => {
+                migrate_legacy_v4(&connection, &config.database_path)?
+            }
         }
     } else {
         let objects: i64 = connection.query_row(
@@ -1512,6 +1547,45 @@ fn open_database(config: &HistoryConfig) -> Result<OpenedDatabase, DatabaseError
         connection,
         recovered_interrupted_quarantine,
     })
+}
+
+fn validate_existing_database_read_only(
+    path: &Path,
+) -> Result<ExistingDatabaseIdentity, DatabaseError> {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
+    connection.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
+    let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    let application_id: i64 =
+        connection.pragma_query_value(None, "application_id", |row| row.get(0))?;
+    if version == HISTORY_SCHEMA_VERSION && application_id == RUSTGO_APPLICATION_ID {
+        let nonce = verify_internal_ownership(&connection)?;
+        quick_check(&connection)?;
+        validate_schema(&connection)?;
+        match read_ownership_marker(path)? {
+            Some(marker) if marker.nonce == nonce => Ok(ExistingDatabaseIdentity::Current(nonce)),
+            Some(_) => Err(DatabaseError::Ownership(
+                "external marker nonce does not match the database".to_owned(),
+            )),
+            None => Err(DatabaseError::Ownership(
+                "owned history database is missing its external marker".to_owned(),
+            )),
+        }
+    } else if version == 4 && application_id == 0 && has_legacy_ownership_marker(path)? {
+        quick_check(&connection)?;
+        validate_legacy_v4_schema(&connection)?;
+        Ok(ExistingDatabaseIdentity::LegacyV4)
+    } else if version > HISTORY_SCHEMA_VERSION {
+        Err(DatabaseError::IncompatibleSchema(version))
+    } else {
+        Err(DatabaseError::Ownership(
+            "existing SQLite file lacks verifiable Rustgo history ownership".to_owned(),
+        ))
+    }
 }
 
 fn configure_database(connection: &Connection) -> Result<(), DatabaseError> {
@@ -1585,9 +1659,22 @@ const HISTORY_HEALTH_TABLE_SQL: &str = "CREATE TABLE history_health (
                      AND owner_nonce NOT GLOB '*[^0-9a-f]*'
                  ),
                  last_maintenance_ms INTEGER NOT NULL CHECK (last_maintenance_ms >= 0),
-                 probe_nonce INTEGER NOT NULL,
-                 raw_admission_floor_ms INTEGER NOT NULL CHECK (raw_admission_floor_ms >= 0)
+                 probe_nonce INTEGER NOT NULL
              )";
+const LEGACY_HISTORY_HEALTH_TABLE_SQL: &str = "CREATE TABLE history_health (
+                 id INTEGER PRIMARY KEY CHECK (id = 1),
+                 last_maintenance_ms INTEGER NOT NULL CHECK (last_maintenance_ms >= 0),
+                 probe_nonce INTEGER NOT NULL
+             )";
+const METRIC_TOMBSTONES_TABLE_SQL: &str = "CREATE TABLE metric_deletion_tombstones (
+                 scope INTEGER NOT NULL CHECK (scope BETWEEN 0 AND 1),
+                 client_name TEXT NOT NULL,
+                 resolution INTEGER NOT NULL CHECK (resolution BETWEEN 0 AND 2),
+                 timestamp_ms INTEGER NOT NULL CHECK (timestamp_ms >= 0),
+                 deleted_ms INTEGER NOT NULL CHECK (deleted_ms >= 0),
+                 CHECK ((scope = 0 AND client_name = '') OR scope = 1),
+                 PRIMARY KEY (scope, client_name, resolution, timestamp_ms)
+             ) WITHOUT ROWID";
 
 fn initialize_schema(connection: &Connection, owner_nonce: &str) -> Result<(), DatabaseError> {
     let transaction = connection.unchecked_transaction()?;
@@ -1597,12 +1684,15 @@ fn initialize_schema(connection: &Connection, owner_nonce: &str) -> Result<(), D
          {CLIENT_LIFECYCLE_TABLE_SQL};
          {SESSION_SUMMARIES_TABLE_SQL};
          {HISTORY_HEALTH_TABLE_SQL};
+         {METRIC_TOMBSTONES_TABLE_SQL};
          CREATE INDEX server_metric_query
              ON server_metric_points (resolution, metric, timestamp_ms);
          CREATE INDEX client_metric_query
              ON client_metric_points (resolution, metric, timestamp_ms, client_name);
          CREATE INDEX client_metric_retention
-             ON client_metric_points (resolution, timestamp_ms, client_name);
+             ON client_metric_points (resolution, timestamp_ms, client_name, metric);
+         CREATE INDEX metric_tombstones_retention
+             ON metric_deletion_tombstones (deleted_ms, timestamp_ms, resolution, scope, client_name);
          CREATE INDEX client_lifecycle_time
              ON client_lifecycle (timestamp_ms, id);
          CREATE INDEX client_lifecycle_latest
@@ -1612,14 +1702,182 @@ fn initialize_schema(connection: &Connection, owner_nonce: &str) -> Result<(), D
     ))?;
     transaction.execute(
         "INSERT INTO history_health
-         (id, owner_nonce, last_maintenance_ms, probe_nonce, raw_admission_floor_ms)
-         VALUES (1, ?1, 0, 0, 0)",
+         (id, owner_nonce, last_maintenance_ms, probe_nonce)
+         VALUES (1, ?1, 0, 0)",
         [owner_nonce],
     )?;
     transaction.pragma_update(None, "application_id", RUSTGO_APPLICATION_ID)?;
     transaction.pragma_update(None, "user_version", HISTORY_SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
+}
+
+fn migrate_legacy_v4(connection: &Connection, path: &Path) -> Result<(), DatabaseError> {
+    validate_legacy_v4_schema(connection)?;
+    if !has_legacy_ownership_marker(path)? {
+        return Err(DatabaseError::Ownership(
+            "legacy Rustgo ownership marker changed before migration".to_owned(),
+        ));
+    }
+    let nonce = generate_owner_nonce()?;
+    let transaction = connection.unchecked_transaction()?;
+    transaction.execute_batch(&format!(
+        "ALTER TABLE history_health RENAME TO legacy_history_health;
+         {HISTORY_HEALTH_TABLE_SQL};
+         INSERT INTO history_health (id, owner_nonce, last_maintenance_ms, probe_nonce)
+             SELECT id, '{nonce}', last_maintenance_ms, probe_nonce
+             FROM legacy_history_health;
+         DROP TABLE legacy_history_health;
+         {METRIC_TOMBSTONES_TABLE_SQL};
+         DROP INDEX client_metric_retention;
+         CREATE INDEX client_metric_retention
+             ON client_metric_points (resolution, timestamp_ms, client_name, metric);
+         CREATE INDEX metric_tombstones_retention
+             ON metric_deletion_tombstones (deleted_ms, timestamp_ms, resolution, scope, client_name);"
+    ))?;
+    transaction.pragma_update(None, "application_id", RUSTGO_APPLICATION_ID)?;
+    transaction.pragma_update(None, "user_version", HISTORY_SCHEMA_VERSION)?;
+    transaction.commit()?;
+    quick_check(connection)?;
+    validate_schema(connection)?;
+    replace_legacy_ownership_marker(path, &nonce)?;
+    Ok(())
+}
+
+fn validate_legacy_v4_schema(connection: &Connection) -> Result<(), DatabaseError> {
+    let auto_vacuum: i64 = connection.pragma_query_value(None, "auto_vacuum", |row| row.get(0))?;
+    if auto_vacuum != 2 {
+        return Err(DatabaseError::SchemaDamage(
+            "legacy incremental auto-vacuum is not enabled".to_owned(),
+        ));
+    }
+    validate_table(
+        connection,
+        "server_metric_points",
+        SERVER_METRIC_TABLE_SQL,
+        &[
+            column("resolution", "INTEGER", true, 1),
+            column("timestamp_ms", "INTEGER", true, 2),
+            column("metric", "TEXT", true, 3),
+            column("value", "REAL", true, 0),
+            column("sample_count", "INTEGER", true, 0),
+        ],
+    )?;
+    validate_table(
+        connection,
+        "client_metric_points",
+        CLIENT_METRIC_TABLE_SQL,
+        &[
+            column("client_name", "TEXT", true, 1),
+            column("resolution", "INTEGER", true, 2),
+            column("timestamp_ms", "INTEGER", true, 3),
+            column("metric", "TEXT", true, 4),
+            column("value", "REAL", true, 0),
+            column("sample_count", "INTEGER", true, 0),
+        ],
+    )?;
+    validate_table(
+        connection,
+        "client_lifecycle",
+        CLIENT_LIFECYCLE_TABLE_SQL,
+        &[
+            column("id", "INTEGER", false, 1),
+            column("client_name", "TEXT", true, 0),
+            column("generation", "TEXT", true, 0),
+            column("event_kind", "TEXT", true, 0),
+            column("timestamp_ms", "INTEGER", true, 0),
+            column("version", "TEXT", false, 0),
+        ],
+    )?;
+    validate_table(
+        connection,
+        "session_summaries",
+        SESSION_SUMMARIES_TABLE_SQL,
+        &[
+            column("session_id", "TEXT", true, 1),
+            column("client_name", "TEXT", true, 0),
+            column("peer", "TEXT", false, 0),
+            column("tunnel", "TEXT", false, 0),
+            column("export_name", "TEXT", false, 0),
+            column("kind", "TEXT", true, 0),
+            column("path", "TEXT", true, 0),
+            column("received_bytes", "TEXT", true, 0),
+            column("sent_bytes", "TEXT", true, 0),
+            column("opened_ms", "INTEGER", true, 2),
+            column("closed_ms", "INTEGER", false, 0),
+            column("terminal_reason", "TEXT", false, 0),
+        ],
+    )?;
+    validate_table(
+        connection,
+        "history_health",
+        LEGACY_HISTORY_HEALTH_TABLE_SQL,
+        &[
+            column("id", "INTEGER", false, 1),
+            column("last_maintenance_ms", "INTEGER", true, 0),
+            column("probe_nonce", "INTEGER", true, 0),
+        ],
+    )?;
+    validate_named_index(
+        connection,
+        "server_metric_points",
+        "server_metric_query",
+        &[
+            index_column("resolution", false),
+            index_column("metric", false),
+            index_column("timestamp_ms", false),
+        ],
+    )?;
+    validate_named_index(
+        connection,
+        "client_metric_points",
+        "client_metric_query",
+        &[
+            index_column("resolution", false),
+            index_column("metric", false),
+            index_column("timestamp_ms", false),
+            index_column("client_name", false),
+        ],
+    )?;
+    validate_named_index(
+        connection,
+        "client_metric_points",
+        "client_metric_retention",
+        &[
+            index_column("resolution", false),
+            index_column("timestamp_ms", false),
+            index_column("client_name", false),
+        ],
+    )?;
+    validate_named_index(
+        connection,
+        "client_lifecycle",
+        "client_lifecycle_time",
+        &[
+            index_column("timestamp_ms", false),
+            index_column("id", false),
+        ],
+    )?;
+    validate_named_index(
+        connection,
+        "client_lifecycle",
+        "client_lifecycle_latest",
+        &[
+            index_column("client_name", false),
+            index_column("timestamp_ms", true),
+            index_column("id", true),
+        ],
+    )?;
+    validate_named_index(
+        connection,
+        "session_summaries",
+        "session_summaries_time",
+        &[
+            index_column("closed_ms", false),
+            index_column("opened_ms", false),
+            index_column("session_id", false),
+        ],
+    )
 }
 
 fn verify_internal_ownership(connection: &Connection) -> Result<String, DatabaseError> {
@@ -1791,7 +2049,18 @@ fn validate_schema(connection: &Connection) -> Result<(), DatabaseError> {
             column("owner_nonce", "TEXT", true, 0),
             column("last_maintenance_ms", "INTEGER", true, 0),
             column("probe_nonce", "INTEGER", true, 0),
-            column("raw_admission_floor_ms", "INTEGER", true, 0),
+        ],
+    )?;
+    validate_table(
+        connection,
+        "metric_deletion_tombstones",
+        METRIC_TOMBSTONES_TABLE_SQL,
+        &[
+            column("scope", "INTEGER", true, 1),
+            column("client_name", "TEXT", true, 2),
+            column("resolution", "INTEGER", true, 3),
+            column("timestamp_ms", "INTEGER", true, 4),
+            column("deleted_ms", "INTEGER", true, 0),
         ],
     )?;
 
@@ -1823,6 +2092,19 @@ fn validate_schema(connection: &Connection) -> Result<(), DatabaseError> {
         &[
             index_column("resolution", false),
             index_column("timestamp_ms", false),
+            index_column("client_name", false),
+            index_column("metric", false),
+        ],
+    )?;
+    validate_named_index(
+        connection,
+        "metric_deletion_tombstones",
+        "metric_tombstones_retention",
+        &[
+            index_column("deleted_ms", false),
+            index_column("timestamp_ms", false),
+            index_column("resolution", false),
+            index_column("scope", false),
             index_column("client_name", false),
         ],
     )?;
@@ -2182,6 +2464,45 @@ fn write_ownership_marker(path: &Path, nonce: &str) -> Result<(), DatabaseError>
     Ok(())
 }
 
+fn has_legacy_ownership_marker(path: &Path) -> Result<bool, DatabaseError> {
+    let marker = ownership_marker_path(path);
+    match fs::symlink_metadata(&marker) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.file_type().is_file() => {
+            Ok(false)
+        }
+        Ok(_) => Ok(fs::read(marker)? == LEGACY_OWNERSHIP_MARKER_CONTENT),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn replace_legacy_ownership_marker(path: &Path, nonce: &str) -> Result<(), DatabaseError> {
+    if !has_legacy_ownership_marker(path)? {
+        return Err(DatabaseError::Ownership(
+            "legacy Rustgo ownership marker changed during migration".to_owned(),
+        ));
+    }
+    let marker = ownership_marker_path(path);
+    let held = SameFileHandle::from_path(&marker)?;
+    if held != SameFileHandle::from_path(&marker)? {
+        return Err(DatabaseError::Ownership(
+            "legacy Rustgo ownership marker was replaced during migration".to_owned(),
+        ));
+    }
+    let mut file = OpenOptions::new().write(true).open(&marker)?;
+    if held != SameFileHandle::from_file(file.try_clone()?)? {
+        return Err(DatabaseError::Ownership(
+            "legacy Rustgo ownership marker was replaced before rewrite".to_owned(),
+        ));
+    }
+    file.set_len(0)?;
+    file.write_all(marker_content(nonce).as_bytes())?;
+    file.flush()?;
+    file.sync_all()?;
+    sync_parent_directory(&marker)?;
+    Ok(())
+}
+
 fn verify_ownership_pair(path: &Path, marker: &Path) -> Result<bool, DatabaseError> {
     let Some(marker) = read_marker_file(marker)? else {
         return Ok(false);
@@ -2209,15 +2530,7 @@ fn persist_batches(
 ) -> Result<(), DatabaseError> {
     let transaction_now_unix_millis = unix_millis_now();
     let transaction = connection.transaction()?;
-    let persisted_floor: i64 = transaction.query_row(
-        "SELECT raw_admission_floor_ms FROM history_health WHERE id = 1",
-        [],
-        |row| row.get(0),
-    )?;
-    let persisted_floor = u64::try_from(persisted_floor)
-        .map_err(|_| DatabaseError::SchemaDamage("negative raw admission floor".to_owned()))?;
-    let raw_cutoff_unix_millis =
-        raw_admission_cutoff(transaction_now_unix_millis).max(persisted_floor);
+    let raw_cutoff_unix_millis = raw_admission_cutoff(transaction_now_unix_millis);
     let mut server_minutes = BTreeSet::new();
     let mut server_five_minutes = BTreeSet::new();
     let mut client_minutes = BTreeSet::new();
@@ -2226,7 +2539,9 @@ fn persist_batches(
     for queued in batches {
         let batch = &queued.batch;
         for sample in &batch.server_points {
-            if sample.timestamp_unix_millis < raw_cutoff_unix_millis {
+            if sample.timestamp_unix_millis < raw_cutoff_unix_millis
+                || sample_intersects_tombstone(&transaction, 0, "", sample.timestamp_unix_millis)?
+            {
                 shared.dropped_late_points.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
@@ -2241,7 +2556,14 @@ fn persist_batches(
             ));
         }
         for sample in &batch.client_points {
-            if sample.timestamp_unix_millis < raw_cutoff_unix_millis {
+            if sample.timestamp_unix_millis < raw_cutoff_unix_millis
+                || sample_intersects_tombstone(
+                    &transaction,
+                    1,
+                    sample.client.name(),
+                    sample.timestamp_unix_millis,
+                )?
+            {
                 shared.dropped_late_points.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
@@ -2289,6 +2611,37 @@ fn persist_batches(
         shared.size_floor_reached.store(false, Ordering::Relaxed);
     }
     Ok(())
+}
+
+fn sample_intersects_tombstone(
+    transaction: &Transaction<'_>,
+    scope: i64,
+    client_name: &str,
+    timestamp: u64,
+) -> Result<bool, DatabaseError> {
+    let raw = sqlite_integer(timestamp, "raw tombstone timestamp")?;
+    let minute = sqlite_integer(
+        bucket_start(timestamp, MINUTE_BUCKET_MILLIS),
+        "minute tombstone timestamp",
+    )?;
+    let five_minutes = sqlite_integer(
+        bucket_start(timestamp, FIVE_MINUTE_BUCKET_MILLIS),
+        "five-minute tombstone timestamp",
+    )?;
+    let mut statement = transaction.prepare_cached(
+        "SELECT EXISTS (
+             SELECT 1 FROM metric_deletion_tombstones
+             WHERE scope = ?1 AND client_name = ?2
+               AND ((resolution = 0 AND timestamp_ms = ?3)
+                 OR (resolution = 1 AND timestamp_ms = ?4)
+                 OR (resolution = 2 AND timestamp_ms = ?5))
+         )",
+    )?;
+    let blocked: i64 = statement.query_row(
+        params![scope, client_name, raw, minute, five_minutes],
+        |row| row.get(0),
+    )?;
+    Ok(blocked != 0)
 }
 
 fn insert_server_sample(
@@ -2639,6 +2992,7 @@ enum MaintenancePhase {
     FiveMinutes,
     Lifecycle,
     Sessions,
+    Tombstones,
     RecordCompletion,
     Cap(CapState),
     Done,
@@ -2689,7 +3043,12 @@ fn maintenance_step(
 ) -> Result<bool, DatabaseError> {
     match &mut job.phase {
         MaintenancePhase::Raw => {
-            if delete_metric_bucket_chunk(connection, 0, job.raw_cutoff_unix_millis)? {
+            if delete_metric_bucket_chunk(
+                connection,
+                0,
+                job.raw_cutoff_unix_millis,
+                job.now_unix_millis,
+            )? {
                 job.phase = MaintenancePhase::OneMinute;
             }
         }
@@ -2699,6 +3058,7 @@ fn maintenance_step(
                 1,
                 job.now_unix_millis
                     .saturating_sub(ONE_MINUTE_RETENTION_MILLIS),
+                job.now_unix_millis,
             )? {
                 job.phase = MaintenancePhase::FiveMinutes;
             }
@@ -2709,6 +3069,7 @@ fn maintenance_step(
                 2,
                 job.now_unix_millis
                     .saturating_sub(config.retention_millis()),
+                job.now_unix_millis,
             )? {
                 job.phase = MaintenancePhase::Lifecycle;
             }
@@ -2750,6 +3111,31 @@ fn maintenance_step(
                 params![cutoff, RETENTION_DELETE_LIMIT as i64],
             )?;
             if deleted < RETENTION_DELETE_LIMIT {
+                job.phase = MaintenancePhase::Tombstones;
+            }
+        }
+        MaintenancePhase::Tombstones => {
+            let deleted = connection.execute(
+                "DELETE FROM metric_deletion_tombstones
+                 WHERE (scope, client_name, resolution, timestamp_ms) IN (
+                     SELECT scope, client_name, resolution, timestamp_ms
+                     FROM metric_deletion_tombstones
+                     WHERE deleted_ms < ?1 AND timestamp_ms < ?2
+                     ORDER BY deleted_ms ASC, timestamp_ms ASC, resolution ASC,
+                              scope ASC, client_name ASC
+                     LIMIT ?3
+                 )",
+                params![
+                    sqlite_integer(
+                        job.now_unix_millis
+                            .saturating_sub(config.retention_millis()),
+                        "tombstone retention cutoff",
+                    )?,
+                    sqlite_integer(job.raw_cutoff_unix_millis, "tombstone replay cutoff")?,
+                    RETENTION_DELETE_LIMIT as i64,
+                ],
+            )?;
+            if deleted < RETENTION_DELETE_LIMIT {
                 job.phase = MaintenancePhase::RecordCompletion;
             }
         }
@@ -2784,9 +3170,9 @@ fn delete_metric_bucket_chunk(
     connection: &mut Connection,
     resolution: i64,
     cutoff: u64,
+    deleted_at: u64,
 ) -> Result<bool, DatabaseError> {
-    let cutoff_unix_millis = cutoff;
-    let cutoff = sqlite_integer(cutoff_unix_millis, "retention cutoff")?;
+    let cutoff = sqlite_integer(cutoff, "retention cutoff")?;
     let server_buckets = {
         let mut statement = connection.prepare(
             "SELECT DISTINCT timestamp_ms FROM server_metric_points
@@ -2815,24 +3201,30 @@ fn delete_metric_bucket_chunk(
             .collect::<Result<Vec<_>, _>>()?
     };
     let transaction = connection.transaction()?;
-    if resolution == 0 {
-        transaction.execute(
-            "UPDATE history_health
-             SET raw_admission_floor_ms = MAX(raw_admission_floor_ms, ?1)
-             WHERE id = 1",
-            [sqlite_integer(
-                cutoff_unix_millis,
-                "retention raw admission floor",
-            )?],
-        )?;
-    }
+    let deleted_at = sqlite_integer(deleted_at, "metric deletion timestamp")?;
     for timestamp in &server_buckets {
+        transaction.execute(
+            "INSERT OR IGNORE INTO metric_deletion_tombstones
+             (scope, client_name, resolution, timestamp_ms, deleted_ms)
+             SELECT 0, '', ?1, ?2, ?3
+             FROM server_metric_points
+             WHERE resolution = ?1 AND timestamp_ms = ?2 LIMIT 1",
+            params![resolution, timestamp, deleted_at],
+        )?;
         transaction.execute(
             "DELETE FROM server_metric_points WHERE resolution = ?1 AND timestamp_ms = ?2",
             params![resolution, timestamp],
         )?;
     }
     for (client, timestamp) in &client_buckets {
+        transaction.execute(
+            "INSERT OR IGNORE INTO metric_deletion_tombstones
+             (scope, client_name, resolution, timestamp_ms, deleted_ms)
+             SELECT 1, ?1, ?2, ?3, ?4
+             FROM client_metric_points
+             WHERE client_name = ?1 AND resolution = ?2 AND timestamp_ms = ?3 LIMIT 1",
+            params![client, resolution, timestamp, deleted_at],
+        )?;
         transaction.execute(
             "DELETE FROM client_metric_points
              WHERE client_name = ?1 AND resolution = ?2 AND timestamp_ms = ?3",
@@ -2858,6 +3250,20 @@ fn checkpoint_database(
 #[derive(Default)]
 struct CapState {
     active: bool,
+    phase: CapPhase,
+    prune: CapPruneState,
+    vacuum_pending: bool,
+}
+
+#[derive(Default)]
+enum CapPhase {
+    #[default]
+    Measure,
+    Checkpoint,
+    Vacuum,
+    VacuumCheckpoint,
+    CheckSize,
+    Prune,
 }
 
 fn enforce_size_cap_step(
@@ -2867,50 +3273,57 @@ fn enforce_size_cap_step(
     state: &mut CapState,
 ) -> Result<bool, DatabaseError> {
     let maximum = config.maximum_bytes();
-    let target = maximum.saturating_mul(9) / 10;
-    let mut total = database_family_size(&config.database_path)?;
-    if !state.active && total <= maximum {
-        shared.total_database_bytes.store(total, Ordering::Relaxed);
-        return Ok(true);
-    }
-    if !state.active {
-        state.active = true;
-        shared.size_floor_reached.store(false, Ordering::Relaxed);
-    }
-    checkpoint_truncate(connection)?;
-    let vacuumed = incremental_vacuum(connection)?;
-    total = database_family_size(&config.database_path)?;
-    if total <= target {
-        shared.total_database_bytes.store(total, Ordering::Relaxed);
-        return Ok(true);
-    }
-    let deleted = prune_cap_batch(connection)?;
-    if !deleted {
-        if vacuumed {
+    match state.phase {
+        CapPhase::Measure => {
+            let total = database_family_size(&config.database_path)?;
             shared.total_database_bytes.store(total, Ordering::Relaxed);
-            return Ok(false);
+            if !state.active && total <= maximum {
+                return Ok(true);
+            }
+            if !state.active {
+                state.active = true;
+                shared.size_floor_reached.store(false, Ordering::Relaxed);
+            }
+            state.phase = CapPhase::Checkpoint;
         }
-        shared.size_floor_reached.store(true, Ordering::Relaxed);
-        shared.total_database_bytes.store(total, Ordering::Relaxed);
-        return Ok(true);
-    }
-    checkpoint_truncate(connection)?;
-    let _ = incremental_vacuum(connection)?;
-    total = database_family_size(&config.database_path)?;
-    shared.total_database_bytes.store(total, Ordering::Relaxed);
-    Ok(total <= target)
-}
-
-fn prune_cap_batch(connection: &mut Connection) -> Result<bool, DatabaseError> {
-    for resolution in [2_i64, 1, 0] {
-        if prune_metric_tier(connection, resolution)? {
-            return Ok(true);
+        CapPhase::Checkpoint => {
+            checkpoint_truncate(connection)?;
+            state.phase = CapPhase::Vacuum;
+        }
+        CapPhase::Vacuum => {
+            state.vacuum_pending = incremental_vacuum(connection)?;
+            state.phase = CapPhase::VacuumCheckpoint;
+        }
+        CapPhase::VacuumCheckpoint => {
+            checkpoint_truncate(connection)?;
+            state.phase = CapPhase::CheckSize;
+        }
+        CapPhase::CheckSize => {
+            let total = database_family_size(&config.database_path)?;
+            shared.total_database_bytes.store(total, Ordering::Relaxed);
+            if total <= maximum {
+                return Ok(true);
+            }
+            state.phase = if state.vacuum_pending {
+                CapPhase::Vacuum
+            } else {
+                CapPhase::Prune
+            };
+        }
+        CapPhase::Prune => {
+            match prune_cap_batch_step(connection, config, shared, &mut state.prune)? {
+                CapPruneResult::Deleted => state.phase = CapPhase::Checkpoint,
+                CapPruneResult::Scanning => {}
+                CapPruneResult::Exhausted => {
+                    let total = database_family_size(&config.database_path)?;
+                    shared.total_database_bytes.store(total, Ordering::Relaxed);
+                    shared.size_floor_reached.store(true, Ordering::Relaxed);
+                    return Ok(true);
+                }
+            }
         }
     }
-    if prune_lifecycle(connection)? {
-        return Ok(true);
-    }
-    prune_sessions(connection)
+    Ok(false)
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -2934,96 +3347,274 @@ impl PartialOrd for MetricPruneCandidate {
     }
 }
 
-fn prune_metric_tier(connection: &mut Connection, resolution: i64) -> Result<bool, DatabaseError> {
-    let bucket_limit = (CAP_DELETE_LIMIT / 13).max(1);
-    let mut candidates = {
-        let mut statement = connection.prepare(
-            "SELECT candidate.timestamp_ms
-             FROM server_metric_points AS candidate
-             WHERE candidate.resolution = ?1
-               AND EXISTS (
-                   SELECT 1 FROM server_metric_points AS newer
-                   WHERE newer.resolution = ?1
-                     AND newer.timestamp_ms > candidate.timestamp_ms
-               )
-             GROUP BY candidate.timestamp_ms
-             ORDER BY candidate.timestamp_ms ASC
-             LIMIT ?2",
+#[derive(Default)]
+struct MetricScanCursor {
+    server_timestamp: i64,
+    server_metric: String,
+    server_done: bool,
+    client_timestamp: i64,
+    client_name: String,
+    client_metric: String,
+    client_done: bool,
+    pending: Vec<MetricPruneCandidate>,
+}
+
+#[derive(Default)]
+struct CapPruneState {
+    tier: usize,
+    metric_cursor: MetricScanCursor,
+}
+
+enum CapPruneResult {
+    Deleted,
+    Scanning,
+    Exhausted,
+}
+
+fn prune_cap_batch_step(
+    connection: &mut Connection,
+    config: &HistoryConfig,
+    shared: &Shared,
+    state: &mut CapPruneState,
+) -> Result<CapPruneResult, DatabaseError> {
+    if state.tier < 3 {
+        let resolution = [2_i64, 1, 0][state.tier];
+        match prune_metric_tier_step(connection, resolution, shared, &mut state.metric_cursor)? {
+            CapPruneResult::Exhausted => {
+                state.tier += 1;
+                state.metric_cursor = MetricScanCursor::default();
+                Ok(CapPruneResult::Scanning)
+            }
+            result => Ok(result),
+        }
+    } else if state.tier == 3 {
+        if prune_lifecycle(connection)? {
+            Ok(CapPruneResult::Deleted)
+        } else {
+            state.tier += 1;
+            Ok(CapPruneResult::Scanning)
+        }
+    } else if state.tier == 4 {
+        if prune_sessions(connection)? {
+            Ok(CapPruneResult::Deleted)
+        } else {
+            state.tier += 1;
+            Ok(CapPruneResult::Scanning)
+        }
+    } else if state.tier == 5 {
+        let now = unix_millis_now();
+        let deleted = connection.execute(
+            "DELETE FROM metric_deletion_tombstones
+             WHERE (scope, client_name, resolution, timestamp_ms) IN (
+                 SELECT scope, client_name, resolution, timestamp_ms
+                 FROM metric_deletion_tombstones
+                 WHERE deleted_ms < ?1 AND timestamp_ms < ?2
+                 ORDER BY deleted_ms ASC, timestamp_ms ASC, resolution ASC,
+                          scope ASC, client_name ASC
+                 LIMIT ?3
+             )",
+            params![
+                sqlite_integer(
+                    now.saturating_sub(config.retention_millis()),
+                    "cap tombstone age"
+                )?,
+                sqlite_integer(raw_admission_cutoff(now), "cap tombstone replay cutoff")?,
+                CAP_DELETE_LIMIT as i64,
+            ],
         )?;
-        statement
-            .query_map(params![resolution, bucket_limit as i64], |row| {
-                Ok(MetricPruneCandidate {
-                    timestamp: row.get(0)?,
-                    client: None,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?
-    };
-    let client_candidates = {
-        let mut statement = connection.prepare(
-            "SELECT candidate.client_name, candidate.timestamp_ms
-             FROM client_metric_points AS candidate
-             WHERE candidate.resolution = ?1
-               AND EXISTS (
-                   SELECT 1 FROM client_metric_points AS newer
-                   WHERE newer.client_name = candidate.client_name
-                     AND newer.resolution = ?1
-                     AND newer.timestamp_ms > candidate.timestamp_ms
-               )
-             GROUP BY candidate.timestamp_ms, candidate.client_name
-             ORDER BY candidate.timestamp_ms ASC, candidate.client_name ASC
-             LIMIT ?2",
-        )?;
-        statement
-            .query_map(params![resolution, bucket_limit as i64], |row| {
-                Ok(MetricPruneCandidate {
-                    timestamp: row.get(1)?,
-                    client: Some(row.get(0)?),
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?
-    };
-    candidates.extend(client_candidates);
-    candidates.sort();
-    candidates.truncate(bucket_limit);
-    if candidates.is_empty() {
-        return Ok(false);
+        if deleted > 0 {
+            Ok(CapPruneResult::Deleted)
+        } else {
+            state.tier += 1;
+            Ok(CapPruneResult::Scanning)
+        }
+    } else {
+        Ok(CapPruneResult::Exhausted)
     }
-    let transaction = connection.transaction()?;
-    if resolution == 0 {
-        let raw_floor = candidates
+}
+
+fn prune_metric_tier_step(
+    connection: &mut Connection,
+    resolution: i64,
+    shared: &Shared,
+    cursor: &mut MetricScanCursor,
+) -> Result<CapPruneResult, DatabaseError> {
+    let half = (CAP_SCAN_ROW_LIMIT / 2) as i64;
+    let server_rows = if cursor.server_done {
+        Vec::new()
+    } else {
+        let mut statement = connection.prepare(
+            "SELECT timestamp_ms, metric FROM server_metric_points
+             WHERE resolution = ?1
+               AND (timestamp_ms > ?2 OR (timestamp_ms = ?2 AND metric > ?3))
+             ORDER BY timestamp_ms ASC, metric ASC LIMIT ?4",
+        )?;
+        statement
+            .query_map(
+                params![
+                    resolution,
+                    cursor.server_timestamp,
+                    cursor.server_metric,
+                    half
+                ],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    if let Some((timestamp, metric)) = server_rows.last() {
+        cursor.server_timestamp = *timestamp;
+        cursor.server_metric.clone_from(metric);
+    }
+    if server_rows.len() < half as usize {
+        cursor.server_done = true;
+    }
+
+    let client_rows = if cursor.client_done {
+        Vec::new()
+    } else {
+        let mut statement = connection.prepare(
+            "SELECT timestamp_ms, client_name, metric FROM client_metric_points
+             WHERE resolution = ?1 AND (
+                 timestamp_ms > ?2 OR
+                 (timestamp_ms = ?2 AND client_name > ?3) OR
+                 (timestamp_ms = ?2 AND client_name = ?3 AND metric > ?4)
+             )
+             ORDER BY timestamp_ms ASC, client_name ASC, metric ASC LIMIT ?5",
+        )?;
+        statement
+            .query_map(
+                params![
+                    resolution,
+                    cursor.client_timestamp,
+                    cursor.client_name,
+                    cursor.client_metric,
+                    half
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    if let Some((timestamp, client, metric)) = client_rows.last() {
+        cursor.client_timestamp = *timestamp;
+        cursor.client_name.clone_from(client);
+        cursor.client_metric.clone_from(metric);
+    }
+    if client_rows.len() < half as usize {
+        cursor.client_done = true;
+    }
+    let scanned = server_rows.len().saturating_add(client_rows.len()) as u64;
+    shared
+        .maximum_maintenance_scan_rows
+        .fetch_max(scanned, Ordering::Relaxed);
+
+    let server_buckets = server_rows
+        .into_iter()
+        .map(|(timestamp, _)| timestamp)
+        .collect::<BTreeSet<_>>();
+    for timestamp in server_buckets {
+        let has_newer: i64 = connection.query_row(
+            "SELECT EXISTS (SELECT 1 FROM server_metric_points
+             WHERE resolution = ?1 AND timestamp_ms > ?2 LIMIT 1)",
+            params![resolution, timestamp],
+            |row| row.get(0),
+        )?;
+        if has_newer != 0 {
+            cursor.pending.push(MetricPruneCandidate {
+                timestamp,
+                client: None,
+            });
+        }
+    }
+    let client_buckets = client_rows
+        .into_iter()
+        .map(|(timestamp, client, _)| (timestamp, client))
+        .collect::<BTreeSet<_>>();
+    for (timestamp, client) in client_buckets {
+        let has_newer: i64 = connection.query_row(
+            "SELECT EXISTS (SELECT 1 FROM client_metric_points
+             WHERE client_name = ?1 AND resolution = ?2 AND timestamp_ms > ?3 LIMIT 1)",
+            params![client, resolution, timestamp],
+            |row| row.get(0),
+        )?;
+        if has_newer != 0 {
+            cursor.pending.push(MetricPruneCandidate {
+                timestamp,
+                client: Some(client),
+            });
+        }
+    }
+    cursor.pending.sort();
+    cursor.pending.dedup();
+    let server_frontier = if cursor.server_done {
+        i64::MAX
+    } else {
+        cursor.server_timestamp
+    };
+    let client_frontier = if cursor.client_done {
+        i64::MAX
+    } else {
+        cursor.client_timestamp
+    };
+    let safe_frontier = server_frontier.min(client_frontier);
+    let mut safe_count = cursor
+        .pending
+        .partition_point(|candidate| candidate.timestamp <= safe_frontier)
+        .min((CAP_DELETE_LIMIT / 13).max(1));
+    if safe_count > 1 {
+        let first_is_client = cursor.pending[0].client.is_some();
+        if let Some(scope_boundary) = cursor.pending[1..safe_count]
             .iter()
-            .filter_map(|candidate| u64::try_from(candidate.timestamp).ok())
-            .map(|timestamp| {
-                bucket_start(timestamp, FIVE_MINUTE_BUCKET_MILLIS)
-                    .saturating_add(FIVE_MINUTE_BUCKET_MILLIS)
-            })
-            .max()
-            .unwrap_or(0);
-        transaction.execute(
-            "UPDATE history_health
-             SET raw_admission_floor_ms = MAX(raw_admission_floor_ms, ?1)
-             WHERE id = 1",
-            [sqlite_integer(raw_floor, "cap raw admission floor")?],
-        )?;
+            .position(|candidate| candidate.client.is_some() != first_is_client)
+        {
+            safe_count = scope_boundary + 1;
+        }
     }
-    for candidate in &candidates {
-        if let Some(client) = &candidate.client {
+    if safe_count == 0 {
+        return Ok(if cursor.server_done && cursor.client_done {
+            CapPruneResult::Exhausted
+        } else {
+            CapPruneResult::Scanning
+        });
+    }
+    let candidates = cursor.pending.drain(..safe_count).collect::<Vec<_>>();
+    let deleted_at = sqlite_integer(unix_millis_now(), "cap deletion timestamp")?;
+    let transaction = connection.transaction()?;
+    for candidate in candidates {
+        if let Some(client) = candidate.client {
             transaction.execute(
-                "DELETE FROM client_metric_points
-                 WHERE client_name = ?1 AND resolution = ?2 AND timestamp_ms = ?3",
+                "INSERT OR IGNORE INTO metric_deletion_tombstones
+                 (scope, client_name, resolution, timestamp_ms, deleted_ms)
+                 SELECT 1, ?1, ?2, ?3, ?4
+                 FROM client_metric_points
+                 WHERE client_name = ?1 AND resolution = ?2 AND timestamp_ms = ?3 LIMIT 1",
+                params![client, resolution, candidate.timestamp, deleted_at],
+            )?;
+            transaction.execute(
+                "DELETE FROM client_metric_points WHERE client_name = ?1 AND resolution = ?2 AND timestamp_ms = ?3",
                 params![client, resolution, candidate.timestamp],
             )?;
         } else {
             transaction.execute(
-                "DELETE FROM server_metric_points
-                 WHERE resolution = ?1 AND timestamp_ms = ?2",
+                "INSERT OR IGNORE INTO metric_deletion_tombstones
+                 (scope, client_name, resolution, timestamp_ms, deleted_ms)
+                 SELECT 0, '', ?1, ?2, ?3
+                 FROM server_metric_points WHERE resolution = ?1 AND timestamp_ms = ?2 LIMIT 1",
+                params![resolution, candidate.timestamp, deleted_at],
+            )?;
+            transaction.execute(
+                "DELETE FROM server_metric_points WHERE resolution = ?1 AND timestamp_ms = ?2",
                 params![resolution, candidate.timestamp],
             )?;
         }
     }
     transaction.commit()?;
-    Ok(true)
+    Ok(CapPruneResult::Deleted)
 }
 
 fn prune_lifecycle(connection: &mut Connection) -> Result<bool, DatabaseError> {
@@ -3083,17 +3674,17 @@ fn checkpoint_truncate(connection: &Connection) -> Result<(), DatabaseError> {
 }
 
 fn incremental_vacuum(connection: &Connection) -> Result<bool, DatabaseError> {
-    let mut vacuumed = false;
     for _ in 0..VACUUM_PAGE_LIMIT {
         let free_pages: i64 =
             connection.pragma_query_value(None, "freelist_count", |row| row.get(0))?;
         if free_pages == 0 {
-            break;
+            return Ok(false);
         }
         connection.execute_batch("PRAGMA incremental_vacuum(1)")?;
-        vacuumed = true;
     }
-    Ok(vacuumed)
+    let free_pages: i64 =
+        connection.pragma_query_value(None, "freelist_count", |row| row.get(0))?;
+    Ok(free_pages > 0)
 }
 
 fn database_family_size(path: &Path) -> Result<u64, DatabaseError> {
@@ -3156,6 +3747,10 @@ fn quarantine_database(path: &Path) -> Result<bool, DatabaseError> {
             Err(error) => return Err(error.into()),
         }
     }
+    let held_sources = sources
+        .iter()
+        .map(|source| Ok((source.clone(), SameFileHandle::from_path(source)?)))
+        .collect::<Result<Vec<_>, DatabaseError>>()?;
 
     let mut quarantine = None;
     for counter in 0..1000_u16 {
@@ -3179,7 +3774,7 @@ fn quarantine_database(path: &Path) -> Result<bool, DatabaseError> {
         ))
     })?;
     let mut linked = Vec::new();
-    for source in &sources {
+    for (source, held) in &held_sources {
         let target = quarantine.join(source.file_name().ok_or_else(|| {
             DatabaseError::UnsafePath("history family member has no literal file name")
         })?);
@@ -3191,6 +3786,11 @@ fn quarantine_database(path: &Path) -> Result<bool, DatabaseError> {
             return Err(error.into());
         }
         sync_regular_file(&target)?;
+        if held != &SameFileHandle::from_path(&target)? {
+            return Err(DatabaseError::Ownership(
+                "quarantined history member does not match the held source".to_owned(),
+            ));
+        }
         linked.push(target);
     }
     sync_directory(&quarantine)?;
@@ -3214,11 +3814,13 @@ fn quarantine_database(path: &Path) -> Result<bool, DatabaseError> {
         return Ok(false);
     }
 
-    for source in &sources {
+    for (source, held) in &held_sources {
         let target = quarantine.join(source.file_name().ok_or_else(|| {
             DatabaseError::UnsafePath("history family member has no literal file name")
         })?);
-        if !same_file_identity(source, &target)? {
+        if held != &SameFileHandle::from_path(source)?
+            || held != &SameFileHandle::from_path(&target)?
+        {
             return Err(DatabaseError::Ownership(
                 "history family changed during quarantine".to_owned(),
             ));
@@ -3232,27 +3834,37 @@ fn quarantine_database(path: &Path) -> Result<bool, DatabaseError> {
         }
     }
 
-    for source in sources
+    for (source, held) in held_sources
         .iter()
-        .filter(|source| source.as_path() != marker.as_path())
+        .filter(|(source, _)| source.as_path() != marker.as_path())
     {
         let target = quarantine.join(source.file_name().ok_or_else(|| {
             DatabaseError::UnsafePath("history family member has no literal file name")
         })?);
-        if !same_file_identity(source, &target)? {
+        if held != &SameFileHandle::from_path(source)?
+            || held != &SameFileHandle::from_path(&target)?
+        {
             return Err(DatabaseError::Ownership(
                 "history family changed before quarantine cleanup".to_owned(),
             ));
         }
         fs::remove_file(source)?;
+        sync_parent_directory(source)?;
     }
-    if !same_file_identity(&marker, &quarantined_marker)? {
+    let marker_handle = held_sources
+        .iter()
+        .find(|(source, _)| source == &marker)
+        .map(|(_, handle)| handle)
+        .ok_or_else(|| DatabaseError::Ownership("history marker disappeared".to_owned()))?;
+    if marker_handle != &SameFileHandle::from_path(&marker)?
+        || marker_handle != &SameFileHandle::from_path(&quarantined_marker)?
+    {
         return Err(DatabaseError::Ownership(
             "history owner marker changed before quarantine cleanup".to_owned(),
         ));
     }
     fs::remove_file(&marker)?;
-    sync_parent_directory(path)?;
+    sync_parent_directory(&marker)?;
     Ok(true)
 }
 
@@ -3273,6 +3885,7 @@ fn remove_resumed_sidecar(path: &Path, quarantine: &Path) -> Result<(), Database
         (Err(source), Ok(_)) if source.kind() == io::ErrorKind::NotFound => Ok(()),
         (Ok(_), Ok(_)) if same_file_identity(path, &target)? => {
             fs::remove_file(path)?;
+            sync_parent_directory(path)?;
             Ok(())
         }
         (Ok(_), Err(target)) if target.kind() == io::ErrorKind::NotFound => {
@@ -3355,7 +3968,7 @@ fn resume_interrupted_quarantine(path: &Path) -> Result<bool, DatabaseError> {
             ));
         }
         fs::remove_file(&marker)?;
-        sync_parent_directory(path)?;
+        sync_parent_directory(&marker)?;
         return Ok(true);
     }
     Ok(false)
