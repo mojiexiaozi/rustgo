@@ -80,7 +80,10 @@ impl HostSampler {
         metrics.network_rx_bytes_per_sec = rates.map(|rates| rates.received_bytes);
         metrics.network_tx_bytes_per_sec = rates.map(|rates| rates.sent_bytes);
 
-        self.previous_networks = (!current_networks.is_empty()).then_some(current_networks);
+        // Preserve an empty baseline after the first sample. `None` means no
+        // earlier interval exists; an empty map means eligible interfaces were
+        // absent in the earlier interval and must zero the next rate.
+        self.previous_networks = Some(current_networks);
         self.previous_sampled_at = Some(sampled_at);
         metrics
     }
@@ -125,10 +128,11 @@ impl HostSampler {
     }
 }
 
-#[derive(Clone, Copy, Default)]
-struct NetworkCounters {
-    received_bytes: u64,
-    sent_bytes: u64,
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct NetworkCounters {
+    pub(super) received_bytes: u64,
+    pub(super) sent_bytes: u64,
+    pub(super) identity: Option<[u8; 6]>,
 }
 
 fn aggregate_disks(disks: &Disks) -> (u64, u64, bool) {
@@ -154,11 +158,13 @@ fn aggregate_networks(networks: &Networks) -> BTreeMap<String, NetworkCounters> 
         .iter()
         .filter(|(name, _)| !is_loopback_interface(name))
         .map(|(name, data)| {
+            let mac_address = data.mac_address();
             (
                 name.to_string(),
                 NetworkCounters {
                     received_bytes: data.total_received(),
                     sent_bytes: data.total_transmitted(),
+                    identity: (!mac_address.is_unspecified()).then_some(mac_address.0),
                 },
             )
         })
@@ -169,7 +175,7 @@ fn is_loopback_interface(name: &str) -> bool {
     matches!(name, "lo" | "lo0") || name.to_ascii_lowercase().contains("loopback")
 }
 
-fn network_rates(
+pub(super) fn network_rates(
     previous: Option<&BTreeMap<String, NetworkCounters>>,
     current: &BTreeMap<String, NetworkCounters>,
     elapsed: Option<Duration>,
@@ -186,6 +192,13 @@ fn network_rates(
         let Some(previous_counters) = previous.get(name) else {
             return Some(NetworkCounters::default());
         };
+        if previous_counters.identity != current_counters.identity
+            && (previous_counters.identity.is_some() || current_counters.identity.is_some())
+        {
+            // A supplied MAC is a stable interface identity. If it appears,
+            // disappears, or changes, the old counters cannot safely be used.
+            return Some(NetworkCounters::default());
+        }
         if current_counters.received_bytes < previous_counters.received_bytes
             || current_counters.sent_bytes < previous_counters.sent_bytes
         {
@@ -206,6 +219,7 @@ fn network_rates(
     Some(NetworkCounters {
         received_bytes: bytes_per_second(received_delta, elapsed),
         sent_bytes: bytes_per_second(sent_delta, elapsed),
+        identity: None,
     })
 }
 
