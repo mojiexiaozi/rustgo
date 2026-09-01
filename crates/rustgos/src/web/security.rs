@@ -77,5 +77,5 @@ fn single_header(headers: &HeaderMap, name: HeaderName, max_bytes: usize) -> Opt
 }
 
 fn requires_no_store(path: &str) -> bool {
-    matches!(path, "/login" | "/logout" | "/api") || path.starts_with("/api/")
+    matches!(path, "/" | "/login" | "/logout" | "/api") || path.starts_with("/api/")
 }

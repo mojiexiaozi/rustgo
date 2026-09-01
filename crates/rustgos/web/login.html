@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark light">
+    <title>Rustgo dashboard sign in</title>
+    <link rel="stylesheet" href="/app.css">
+    <script src="/login.js" defer></script>
+  </head>
+  <body class="login-page">
+    <main class="login-card" aria-labelledby="login-title">
+      <p class="eyebrow">Rustgo</p>
+      <h1 id="login-title">Dashboard sign in</h1>
+      <p class="muted">Use the configured administrator account.</p>
+      <form id="login-form" method="post" action="/login">
+        <label for="username">Username</label>
+        <input id="username" name="username" type="text" autocomplete="username" maxlength="64" required autofocus>
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password" autocomplete="current-password" maxlength="256" required>
+        <button class="button" type="submit">Sign in</button>
+        <p id="login-status" class="form-status" role="status" aria-live="polite"></p>
+      </form>
+    </main>
+  </body>
+</html>

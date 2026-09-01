@@ -1,6 +1,7 @@
 //! Loopback-only HTTP authentication and read-only API for the Rustgo dashboard.
 
 mod api;
+mod assets;
 mod auth;
 mod dto;
 mod security;
@@ -322,13 +323,16 @@ fn build_router(state: Arc<WebState>) -> Router {
         .route("/healthz", get(healthz))
         .route(
             "/login",
-            post(login).layer(DefaultBodyLimit::max(MAX_LOGIN_BODY_BYTES)),
+            post(login)
+                .get(assets::login_page)
+                .layer(DefaultBodyLimit::max(MAX_LOGIN_BODY_BYTES)),
         )
         .route(
             "/logout",
             post(logout).layer(DefaultBodyLimit::max(MAX_LOGOUT_BODY_BYTES)),
         )
         .merge(api::routes())
+        .merge(assets::routes())
         .route("/api", any(api_boundary))
         .route("/api/{*path}", any(api_boundary))
         .fallback(protected_not_found)
