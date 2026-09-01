@@ -10,6 +10,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    task::{Context, Poll},
     time::Duration,
 };
 
@@ -25,7 +26,7 @@ use rustgo_protocol::{
     ServerChallenge, TelemetryReport, TunnelResults,
 };
 use rustgo_transport::TlsServer;
-use rustgoc::{ClientApp, TelemetryRuntimeHook};
+use rustgoc::{ClientApp, TelemetryControlWriteGate, TelemetryRuntimeHook};
 use tempfile::TempDir;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -367,16 +368,34 @@ async fn saturated_watch_coalesces_to_newest_without_duplicate_sequence() -> Res
 }
 
 #[derive(Default)]
-struct BlockingWriteHook {
+struct BlockingWriteGate {
+    armed: AtomicBool,
     started: Notify,
 }
 
-impl TelemetryRuntimeHook for BlockingWriteHook {
-    fn before_write(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-        Box::pin(async move {
+impl TelemetryControlWriteGate for BlockingWriteGate {
+    fn arm(&self) {
+        self.armed.store(true, Ordering::SeqCst);
+    }
+
+    fn poll_write(&self, _context: &mut Context<'_>) -> Poll<()> {
+        if self.armed.load(Ordering::SeqCst) {
             self.started.notify_one();
-            std::future::pending::<()>().await;
-        })
+            Poll::Pending
+        } else {
+            Poll::Ready(())
+        }
+    }
+}
+
+#[derive(Default)]
+struct BlockingWriteHook {
+    gate: Arc<BlockingWriteGate>,
+}
+
+impl TelemetryRuntimeHook for BlockingWriteHook {
+    fn control_write_gate(&self) -> Option<Arc<dyn TelemetryControlWriteGate>> {
+        Some(self.gate.clone())
     }
 }
 
@@ -398,9 +417,9 @@ async fn blocked_telemetry_write_fail_stops_before_heartbeat_deadline() -> Resul
     let app_task = tokio::spawn(app.run_until(shutdown.clone()));
     let mut server = accept_registered_session(&tls_server, ProtocolVersion::V0_3).await?;
 
-    tokio::time::timeout(Duration::from_secs(1), hook.started.notified())
+    tokio::time::timeout(Duration::from_secs(1), hook.gate.started.notified())
         .await
-        .expect("test hook must enter the telemetry write path");
+        .expect("actual control AsyncWrite::poll_write must become pending");
     let blocked_at = tokio::time::Instant::now();
     let closed = tokio::time::timeout(Duration::from_millis(500), server.receive())
         .await

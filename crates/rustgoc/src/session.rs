@@ -11,7 +11,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     ClientError, ControlEvent, ControlSession,
-    telemetry::{GenerationTelemetry, TelemetryRuntimeHook, latest_telemetry_channel},
+    telemetry::{
+        GenerationTelemetry, TelemetryControlWriteGate, TelemetryRuntimeHook,
+        latest_telemetry_channel,
+    },
 };
 
 const CHILD_CONTROL_CAPACITY: usize = 1024;
@@ -182,6 +185,12 @@ impl ControlSession {
         let (control_outbound, mut child_control) = mpsc::channel(CHILD_CONTROL_CAPACITY);
         let (telemetry_outbound, mut telemetry_control) = latest_telemetry_channel();
         let telemetry_hook = telemetry.as_ref().and_then(GenerationTelemetry::hook);
+        let telemetry_write_gate = telemetry_hook
+            .as_ref()
+            .and_then(|hook| hook.control_write_gate());
+        if let Some(gate) = &telemetry_write_gate {
+            self.framed.install_telemetry_write_gate(gate.clone());
+        }
         let child_context = ChildSessionContext {
             generation,
             session_id: Arc::from(self.session_id.clone()),
@@ -213,6 +222,7 @@ impl ControlSession {
                 &mut children,
                 &mut child_signals,
                 telemetry_hook.as_ref(),
+                telemetry_write_gate.as_ref(),
             )
             .await;
 
@@ -254,6 +264,7 @@ impl ControlSession {
         children: &mut JoinSet<()>,
         child_signals: &mut ChildSignals<'_>,
         telemetry_hook: Option<&Arc<dyn TelemetryRuntimeHook>>,
+        telemetry_write_gate: Option<&Arc<dyn TelemetryControlWriteGate>>,
     ) -> Result<(), ClientError> {
         let heartbeat_timeout = self
             .heartbeat_interval
@@ -405,14 +416,12 @@ impl ControlSession {
                         .clone()
                         .ok_or(ClientError::InvalidState)?;
                     telemetry_pending = false;
-                    let write = async {
-                        if let Some(hook) = telemetry_hook {
-                            hook.before_write().await;
-                        }
-                        self.framed
-                            .send(self.version, Message::TelemetryReport(report))
-                            .await
-                    };
+                    if let Some(gate) = telemetry_write_gate {
+                        gate.arm();
+                    }
+                    let write = self
+                        .framed
+                        .send(self.version, Message::TelemetryReport(report));
                     match tokio::time::timeout(TELEMETRY_WRITE_BUDGET, write).await {
                         Ok(result) => result?,
                         // `write_all` may have emitted a partial frame. Never resume this

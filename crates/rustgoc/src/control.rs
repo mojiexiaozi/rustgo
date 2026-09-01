@@ -1,4 +1,11 @@
-use std::{collections::HashMap, io, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    io,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+    time::Duration,
+};
 
 use bytes::BytesMut;
 use rustgo_config::{ClientConfig, TunnelProtocol as ConfigTunnelProtocol};
@@ -12,7 +19,9 @@ use rustgo_protocol::{
 use rustgo_rendezvous::{ObservationGrant, PeerRelayFrame, RendezvousEnvelope};
 use rustgo_transport::{TlsClient, TlsError};
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+
+use crate::telemetry::TelemetryControlWriteGate;
 
 pub const CLIENT_VERSION: ProtocolVersion = ProtocolVersion::SUPPORTED;
 const MAX_CONTROL_PAYLOAD: usize = 70 * 1024;
@@ -520,6 +529,43 @@ trait ControlIo: AsyncRead + AsyncWrite + Unpin + Send {}
 
 impl<T> ControlIo for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 
+struct GatedControlIo {
+    inner: Box<dyn ControlIo>,
+    gate: Arc<dyn TelemetryControlWriteGate>,
+}
+
+impl AsyncRead for GatedControlIo {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.inner).poll_read(context, buffer)
+    }
+}
+
+impl AsyncWrite for GatedControlIo {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if self.gate.poll_write(context).is_pending() {
+            Poll::Pending
+        } else {
+            Pin::new(&mut *self.inner).poll_write(context, buffer)
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.inner).poll_flush(context)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.inner).poll_shutdown(context)
+    }
+}
+
 pub(crate) struct FramedControl {
     stream: Box<dyn ControlIo>,
     read_buffer: BytesMut,
@@ -536,6 +582,15 @@ impl FramedControl {
             read_buffer: BytesMut::new(),
             codec: FrameCodec::new(MAX_CONTROL_PAYLOAD),
         }
+    }
+
+    pub(crate) fn install_telemetry_write_gate(
+        &mut self,
+        gate: Arc<dyn TelemetryControlWriteGate>,
+    ) {
+        let (placeholder, _) = tokio::io::duplex(1);
+        let inner = std::mem::replace(&mut self.stream, Box::new(placeholder));
+        self.stream = Box::new(GatedControlIo { inner, gate });
     }
 
     pub(crate) async fn receive(&mut self) -> Result<Frame, ClientError> {

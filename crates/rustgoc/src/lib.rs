@@ -31,4 +31,4 @@ pub use session::{
     PeerGenerationHandler, SessionGeneration,
 };
 #[doc(hidden)]
-pub use telemetry::TelemetryRuntimeHook;
+pub use telemetry::{TelemetryControlWriteGate, TelemetryRuntimeHook};

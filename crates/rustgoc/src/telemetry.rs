@@ -1,4 +1,10 @@
-use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+    time::Duration,
+};
 
 use rustgo_config::TelemetryConfig;
 use rustgo_observability::{HostMetrics, HostSampler};
@@ -7,6 +13,14 @@ use tokio::{sync::watch, task::JoinHandle, time::MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 
 use crate::ClientError;
+
+/// Internal AsyncWrite gate used to make the real framed control write
+/// deterministically pending in process-level integration coverage.
+#[doc(hidden)]
+pub trait TelemetryControlWriteGate: Send + Sync + 'static {
+    fn arm(&self);
+    fn poll_write(&self, context: &mut Context<'_>) -> Poll<()>;
+}
 
 /// Internal integration seam for deterministically exercising telemetry
 /// coalescing and write backpressure without depending on kernel socket sizes.
@@ -20,8 +34,8 @@ pub trait TelemetryRuntimeHook: Send + Sync + 'static {
         Box::pin(async {})
     }
 
-    fn before_write(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-        Box::pin(async {})
+    fn control_write_gate(&self) -> Option<Arc<dyn TelemetryControlWriteGate>> {
+        None
     }
 }
 
