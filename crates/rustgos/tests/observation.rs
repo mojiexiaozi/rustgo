@@ -71,6 +71,7 @@ fn server_config(pki: &TestPki) -> ServerConfig {
             max_udp_payload_bytes: 1200,
         },
         clients: Vec::new(),
+        web: None,
     }
 }
 

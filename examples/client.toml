@@ -43,3 +43,12 @@ name = "office-ssh"
 peer = "office-pc"
 export = "ssh"
 listen_addr = "127.0.0.1:2222"
+
+# Optional V0.3 host telemetry. Disabled by default. Telemetry is authenticated
+# and sent only when the server negotiates V0.3 protocol support.
+# [telemetry]
+# enabled = true
+# # Collect host metrics every 5-300 seconds.
+# sample_interval_secs = 10
+# # Send aggregated reports every 10-600 seconds (must be >= sample_interval).
+# report_interval_secs = 30

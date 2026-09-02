@@ -1,8 +1,8 @@
-# Rustgo V0.2 operations
+# Rustgo V0.3 operations
 
 ## Scope and topology
 
-Rustgo V0.2 preserves the V0.1 relay protocol and adds authenticated P2P.
+Rustgo V0.3 preserves V0.1 relay and V0.2 P2P protocols and adds an optional embedded Web dashboard for observability. V0.2 and V0.1 clients remain fully compatible.
 `rustgoc` maintains one TLS control connection to `rustgos`; configured legacy
 `[[tunnels]]` remain relay mappings. P2P `[[forwards]]` request named
 `[[exports]]`, attempt fixed-port QUIC/UDP or native-TCP direct paths, and use
@@ -210,9 +210,7 @@ co-hosted) were neither restarted nor reconfigured.
 
 ## Logs
 
-V0.2 emits human-readable, single-line text only. JSON logging and a web status
-UI are not supported. Levels are `error`, `warn`, `info`, `debug`, and `trace`;
-the default is `info`. Set `RUST_LOG` before process startup, for example:
+V0.3 emits human-readable, single-line text only. V0.3 includes an optional authenticated read-only Web dashboard and JSON API (see [web-dashboard.md](web-dashboard.md)), while logs remain text and runtime configuration remains immutable. Levels are `error`, `warn`, `info`, `debug`, and `trace`; the default is `info`. Set `RUST_LOG` before process startup, for example:
 
 ```text
 RUST_LOG=info rustgos -c /etc/rustgo/server.toml
@@ -268,8 +266,13 @@ client and restore the old public/private references as one coordinated change.
 | tunnel rejected with port conflict | Find the process or another Rustgo tunnel already owning that TCP/UDP port; one failed tunnel does not invalidate unrelated tunnels. |
 | TCP connects but local service fails | Verify `local_addr` is listening on the client host and allows the Rustgo service identity. |
 | UDP receives no reply | Check both-direction UDP firewall/NAT rules, the local UDP target, payload limits, and bounded-session/queue warnings. |
-| configuration edit has no effect | Restart the affected V0.1 process; live reload is not implemented. |
-| logs appear silent | Start with `RUST_LOG=info`, then temporarily raise the relevant crate to `debug`; V0.1 has no JSON/status endpoint. |
+| configuration edit has no effect | Restart the affected process; live reload is not implemented. |
+| logs appear silent | Start with `RUST_LOG=info`, then temporarily raise the relevant crate to `debug`. |
+| dashboard login fails | Verify `admin_username` and `admin_password` match configured values; check for rate limiting. |
+| dashboard shows `history_unavailable` | SQLite cannot open or write; check filesystem permissions, disk space, and database path. |
+| client card shows stale/gray | Client disconnected or telemetry disabled; verify client connectivity and `[telemetry]` enabled. |
+
+For complete Web dashboard documentation, configuration, security, and troubleshooting, see [web-dashboard.md](web-dashboard.md).
 
 ## Release gates
 

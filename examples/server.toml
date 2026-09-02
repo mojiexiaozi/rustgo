@@ -22,3 +22,22 @@ name = "home-pc"
 public_key = "${RUSTGO_DEVICE_PUBLIC_KEY}"
 enabled = true
 # Add one entry per peer. Client names and device public keys must both be unique.
+
+# Optional V0.3 Web dashboard. Disabled by default. Never bind to a public address.
+# [web]
+# enabled = true
+# bind = "127.0.0.1:7450"
+# admin_username = "admin"
+# # CRITICAL: Replace with a strong password (16+ characters). Protect server.toml
+# # file permissions: readable only by the rustgos service account.
+# admin_password = "CHANGE_ME_STRONG_PASSWORD_HERE"
+# # Set to true when accessing through HTTPS reverse proxy (Caddy, Nginx).
+# # May be false only for direct loopback HTTP access.
+# cookie_secure = true
+# # Required when cookie_secure=true. Must match the browser's HTTPS origin.
+# external_origin = "https://tunnel.example.com"
+# # Retain aggregated metrics for 1-30 days.
+# history_days = 7
+# database_path = "./rustgo-metrics.db"
+# # SQLite cap in MiB (main + WAL + SHM together). Range: 16-4096.
+# database_max_mib = 256

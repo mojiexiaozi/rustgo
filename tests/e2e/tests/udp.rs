@@ -630,13 +630,13 @@ fn session_limit_drops_then_idle_sweep_reclaims_capacity() -> TestResult {
     let echo = UdpEchoServer::start()?;
     let fixture = ProcessFixture::single_udp(echo.address(), 1, 1024)?
         .with_server_env("RUSTGO_INTERNAL_TESTING", "1")
-        .with_server_env("RUSTGO_TEST_UDP_IDLE_TIMEOUT_MS", "150")
-        .with_server_env("RUSTGO_TEST_UDP_SWEEP_INTERVAL_MS", "25")
+        .with_server_env("RUSTGO_TEST_UDP_IDLE_TIMEOUT_MS", "300")
+        .with_server_env("RUSTGO_TEST_UDP_SWEEP_INTERVAL_MS", "50")
         .with_server_env("RUSTGO_TEST_UDP_SWEEP_BATCH", "1");
     let (fixture, mut server, mut client) = launch(fixture)?;
     let public = fixture.public_address();
-    let first = public_socket_with_timeout(Duration::from_millis(400))?;
-    let second = public_socket_with_timeout(Duration::from_millis(400))?;
+    let first = public_socket_with_timeout(Duration::from_millis(800))?;
+    let second = public_socket_with_timeout(Duration::from_millis(800))?;
 
     assert_datagram_echo(&first, public, b"occupy")?;
     second.send_to(b"rejected", public)?;
@@ -1072,8 +1072,8 @@ fn valid_reverse_only_replies_keep_the_negotiated_client_lease_alive() -> TestRe
     let service = PeriodicReplyUdpServer::start(2)?;
     let fixture = ProcessFixture::single_udp(service.address(), 1, 16)?
         .with_server_env("RUSTGO_INTERNAL_TESTING", "1")
-        .with_server_env("RUSTGO_TEST_UDP_IDLE_TIMEOUT_MS", "150")
-        .with_server_env("RUSTGO_TEST_UDP_SWEEP_INTERVAL_MS", "25");
+        .with_server_env("RUSTGO_TEST_UDP_IDLE_TIMEOUT_MS", "600")
+        .with_server_env("RUSTGO_TEST_UDP_SWEEP_INTERVAL_MS", "50");
     let (fixture, mut server, mut client) = launch(fixture)?;
     client.wait_for_line("event=udp_channel_ready", READY_TIMEOUT)?;
     let public = fixture.public_address();

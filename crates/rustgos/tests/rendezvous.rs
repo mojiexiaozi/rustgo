@@ -113,6 +113,7 @@ fn server_config(pki: &TestPki, clients: Vec<AuthorizedClient>) -> ServerConfig 
             max_udp_payload_bytes: 65_507,
         },
         clients,
+        web: None,
     }
 }
 

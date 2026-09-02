@@ -1,16 +1,10 @@
 # Rustgo
 
-Rustgo V0.2 is a self-hosted, fixed-port TCP, UDP, and authenticated P2P tunnel. A private-network
-client (`rustgoc`) connects to a public relay server (`rustgos`) over TLS 1.3,
-authenticates with an independent Ed25519 device key, and exposes explicitly
-configured ports.
+Rustgo V0.3 is a self-hosted, fixed-port TCP, UDP, and authenticated P2P tunnel with optional embedded observability. A private-network client (`rustgoc`) connects to a public relay server (`rustgos`) over TLS 1.3, authenticates with an independent Ed25519 device key, and exposes explicitly configured ports.
 
-V0.2 keeps the V0.1 relay protocol compatible and adds named `[[exports]]` and
-`[[forwards]]`. Peers authenticate with their server-authorized device keys,
-try QUIC/UDP or native-TCP direct paths from fixed client port ranges, and fall
-back to the encrypted server relay when policy permits. Complex NAT can still
-prevent a direct path; relay fallback is a supported operating mode, not an
-authentication bypass.
+V0.3 adds an optional read-only Web dashboard for real-time server and client monitoring, host telemetry, P2P path visibility, and bounded historical trends. The dashboard is loopback-only, HTTPS-ready via reverse proxy, and fully backward compatible with V0.2 and V0.1 clients.
+
+V0.2 introduced named `[[exports]]` and `[[forwards]]`. Peers authenticate with their server-authorized device keys, try QUIC/UDP or native-TCP direct paths from fixed client port ranges, and fall back to the encrypted server relay when policy permits. Complex NAT can still prevent a direct path; relay fallback is a supported operating mode, not an authentication bypass.
 
 ## Build and validate
 

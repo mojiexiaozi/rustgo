@@ -200,6 +200,7 @@ fn client_fixture(pki: &TestPki, server_addr: String) -> Result<Fixture, AnyErro
             ],
             exports: Vec::new(),
             forwards: Vec::new(),
+            telemetry: None,
         },
         verification_key,
     })
@@ -232,6 +233,7 @@ fn real_server_config(
             public_key: key.public_key().to_string(),
             enabled: true,
         }],
+        web: None,
     }
 }
 
@@ -1166,6 +1168,7 @@ async fn real_server_heartbeat_echo_keeps_one_generation_active() -> Result<(), 
         tunnels: Vec::new(),
         exports: Vec::new(),
         forwards: Vec::new(),
+        telemetry: None,
     };
     let control = ControlClient::from_config(config)?;
     let app = ClientApp::with_runtime(
@@ -1222,9 +1225,10 @@ async fn client_control_api_requests_grants_and_decodes_rendezvous_events() -> R
         tunnels: Vec::new(),
         exports: Vec::new(),
         forwards: Vec::new(),
+        telemetry: None,
     };
     let mut session = ControlClient::from_config(config)?.connect().await?;
-    assert_eq!(session.protocol_version(), ProtocolVersion::V0_2);
+    assert_eq!(session.protocol_version(), ProtocolVersion::V0_3);
 
     session.request_observation_grant().await?;
     let ControlEvent::ObservationGrant(grant) = session.next_control_event().await? else {
@@ -1233,7 +1237,7 @@ async fn client_control_api_requests_grants_and_decodes_rendezvous_events() -> R
     let _: ObservationGrant = grant;
 
     let mut request = RendezvousEnvelope {
-        version: ProtocolVersion::V0_2,
+        version: ProtocolVersion::V0_3,
         session_id: SessionId::from([0x91; 32]),
         sender: BoundedString::try_from("home-pc")?,
         target: BoundedString::try_from("home-pc")?,
