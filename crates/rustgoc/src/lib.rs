@@ -32,3 +32,4 @@ pub use session::{
 };
 #[doc(hidden)]
 pub use telemetry::{TelemetryControlWriteGate, TelemetryRuntimeHook};
+pub use telemetry::{TrafficHandle, TrafficSnapshot};

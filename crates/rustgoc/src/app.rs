@@ -12,7 +12,9 @@ use crate::{
     ChildSessionSupervisor, ClientError, ControlClient, ExportRegistry, PeerGenerationHandler,
     RegisteredTunnel, SessionGeneration,
     orchestration::ProductionPeerRuntime,
-    telemetry::{LogicalTraffic, TelemetryRuntime, TelemetryRuntimeHook},
+    telemetry::{
+        LogicalTraffic, TelemetryRuntime, TelemetryRuntimeHook, TrafficHandle, TrafficSnapshot,
+    },
     udp::RelaySessionSupervisor,
 };
 
@@ -197,6 +199,20 @@ impl ClientApp {
 
     pub fn exports(&self) -> &ExportRegistry {
         &self.exports
+    }
+
+    /// Current logical-traffic totals, or `None` when telemetry is explicitly
+    /// disabled (`[telemetry] enabled = false`), which also disables recording.
+    pub fn traffic_snapshot(&self) -> Option<TrafficSnapshot> {
+        self.logical_traffic
+            .as_ref()
+            .map(|traffic| traffic.snapshot())
+    }
+
+    /// Shareable handle for polling traffic totals while the client runs;
+    /// `None` when telemetry is explicitly disabled.
+    pub fn traffic_handle(&self) -> Option<TrafficHandle> {
+        self.logical_traffic.clone().map(TrafficHandle)
     }
 
     pub async fn run(self) -> Result<(), ClientError> {
