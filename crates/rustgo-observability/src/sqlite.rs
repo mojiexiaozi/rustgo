@@ -954,15 +954,15 @@ impl HistoryWorkerHandle {
 impl Drop for HistoryWorkerHandle {
     fn drop(&mut self) {
         self.shared.close();
-        if let Some(thread) = self.thread.take() {
-            if let Err(error) = self.reaper.send(thread) {
-                let worker = error.0;
-                let _ = thread::Builder::new()
-                    .name("rustgo-sqlite-history-reaper-fallback".to_owned())
-                    .spawn(move || {
-                        let _ = worker.join();
-                    });
-            }
+        if let Some(thread) = self.thread.take()
+            && let Err(error) = self.reaper.send(thread)
+        {
+            let worker = error.0;
+            let _ = thread::Builder::new()
+                .name("rustgo-sqlite-history-reaper-fallback".to_owned())
+                .spawn(move || {
+                    let _ = worker.join();
+                });
         }
     }
 }
@@ -4096,7 +4096,7 @@ fn validate_constraint_index(
     }
     let expected = expected_columns
         .iter()
-        .map(|name| index_column(*name, false))
+        .map(|name| index_column(name, false))
         .collect::<Vec<_>>();
     validate_index_columns(connection, &matching[0].0, &expected)
 }
@@ -6362,9 +6362,7 @@ fn encode_durable_retirement_floor(cutoff_unix_millis: u64) -> Result<u64, Datab
 }
 
 fn decode_durable_retirement_floor(evidence: u64) -> u64 {
-    evidence
-        .checked_sub(DURABLE_RETIREMENT_FLOOR_TAG)
-        .unwrap_or_default()
+    evidence.saturating_sub(DURABLE_RETIREMENT_FLOOR_TAG)
 }
 
 fn prune_metric_tier_step(
@@ -6568,12 +6566,9 @@ fn checkpoint_bounded(connection: &Connection) -> Result<bool, DatabaseError> {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
         ready.notify_one();
     }
-    watchdog.join().map_err(|_| {
-        DatabaseError::Io(io::Error::new(
-            io::ErrorKind::Other,
-            "SQLite checkpoint watchdog panicked",
-        ))
-    })?;
+    watchdog
+        .join()
+        .map_err(|_| DatabaseError::Io(io::Error::other("SQLite checkpoint watchdog panicked")))?;
     let (busy, log_frames, checkpointed_frames) = match result {
         Ok(result) => result,
         Err(rusqlite::Error::SqliteFailure(code, _))

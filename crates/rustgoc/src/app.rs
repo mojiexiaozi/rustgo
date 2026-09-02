@@ -285,19 +285,19 @@ impl ClientApp {
                     let supervisor = self.supervisor.clone();
                     let backoff = &mut self.backoff;
                     let result = session
-                        .run_generation_with_peer(
+                        .run_generation_with_peer(crate::session::GenerationConfig {
                             generation,
-                            generation_telemetry,
-                            shutdown.clone(),
+                            telemetry: generation_telemetry,
+                            shutdown: shutdown.clone(),
                             supervisor,
-                            Some(peer_runtime.clone()),
-                            move || {
+                            peer_handler: Some(peer_runtime.clone()),
+                            on_control_ended: move || {
                                 backoff.mark_disconnected();
                             },
-                            move || {
+                            on_inactive: move || {
                                 status.send_replace(ClientStatus::default());
                             },
-                        )
+                        })
                         .await;
                     if shutdown.is_cancelled() {
                         return Ok(());

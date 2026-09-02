@@ -119,8 +119,11 @@ where
         kind: error.kind(),
     })?;
     let expanded = interpolate(path, &contents, environment)?;
-    toml::from_str(&expanded).map_err(|_| ConfigError::TomlParse {
-        path: path.to_path_buf(),
+    toml::from_str(&expanded).map_err(|error| {
+        eprintln!("TOML parse error: {}", error);
+        ConfigError::TomlParse {
+            path: path.to_path_buf(),
+        }
     })
 }
 
@@ -185,7 +188,9 @@ where
             return Err(interpolation_error(path, "invalid placeholder"));
         }
         let value = environment(variable).ok_or_else(|| interpolation_error(path, variable))?;
-        expanded.push_str(&value);
+        // Escape backslashes for TOML strings (Windows paths compatibility)
+        let escaped = value.replace('\\', "\\\\");
+        expanded.push_str(&escaped);
         remaining = &after_open[end + 1..];
     }
     expanded.push_str(remaining);

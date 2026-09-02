@@ -142,6 +142,20 @@ impl ChildSessionSupervisor for NoopChildSessionSupervisor {
     }
 }
 
+pub(crate) struct GenerationConfig<C, F>
+where
+    C: FnOnce(),
+    F: FnOnce(),
+{
+    pub generation: SessionGeneration,
+    pub telemetry: Option<GenerationTelemetry>,
+    pub shutdown: CancellationToken,
+    pub supervisor: Arc<dyn ChildSessionSupervisor>,
+    pub peer_handler: Option<Arc<dyn PeerGenerationHandler>>,
+    pub on_control_ended: C,
+    pub on_inactive: F,
+}
+
 impl ControlSession {
     #[cfg(test)]
     pub(crate) async fn run_generation<F>(
@@ -154,32 +168,35 @@ impl ControlSession {
     where
         F: FnOnce(),
     {
-        self.run_generation_with_peer(
+        self.run_generation_with_peer(GenerationConfig {
             generation,
-            None,
+            telemetry: None,
             shutdown,
             supervisor,
-            None,
-            || {},
+            peer_handler: None,
+            on_control_ended: || {},
             on_inactive,
-        )
+        })
         .await
     }
 
     pub(crate) async fn run_generation_with_peer<C, F>(
         mut self,
-        generation: SessionGeneration,
-        mut telemetry: Option<GenerationTelemetry>,
-        shutdown: CancellationToken,
-        supervisor: Arc<dyn ChildSessionSupervisor>,
-        peer_handler: Option<Arc<dyn PeerGenerationHandler>>,
-        on_control_ended: C,
-        on_inactive: F,
+        config: GenerationConfig<C, F>,
     ) -> Result<(), ClientError>
     where
         C: FnOnce(),
         F: FnOnce(),
     {
+        let GenerationConfig {
+            generation,
+            mut telemetry,
+            shutdown,
+            supervisor,
+            peer_handler,
+            on_control_ended,
+            on_inactive,
+        } = config;
         let child_shutdown = CancellationToken::new();
         let mut children = JoinSet::new();
         let (control_outbound, mut child_control) = mpsc::channel(CHILD_CONTROL_CAPACITY);

@@ -77,7 +77,7 @@ pub(super) fn routes() -> Router<Arc<WebState>> {
 
 async fn overview(State(state): State<Arc<WebState>>, headers: HeaderMap) -> Response {
     if let Err(response) = authenticate(&state, &headers) {
-        return response;
+        return *response;
     }
     let snapshot = state.observability.snapshot();
     let now = now_unix_millis();
@@ -104,7 +104,7 @@ async fn overview(State(state): State<Arc<WebState>>, headers: HeaderMap) -> Res
 
 async fn server_metrics(State(state): State<Arc<WebState>>, headers: HeaderMap) -> Response {
     if let Err(response) = authenticate(&state, &headers) {
-        return response;
+        return *response;
     }
     let snapshot = state.observability.snapshot();
     let response = ServerMetricsResponse {
@@ -122,7 +122,7 @@ async fn clients(
     RawQuery(raw_query): RawQuery,
 ) -> Response {
     if let Err(response) = authenticate(&state, &headers) {
-        return response;
+        return *response;
     }
     let snapshot = state.observability.snapshot();
     let query = match parse_query(raw_query.as_deref(), &["search", "sort", "order", "limit"]) {
@@ -191,7 +191,7 @@ async fn client(
     OriginalUri(uri): OriginalUri,
 ) -> Response {
     if let Err(response) = authenticate(&state, &headers) {
-        return response;
+        return *response;
     }
     let snapshot = state.observability.snapshot();
     let name = match client_name_from_path(uri.path()) {
@@ -215,7 +215,7 @@ async fn client(
         .iter()
         .filter(|session| session.client.as_str() == name)
         .collect();
-    client_sessions.sort_by(|left, right| session_recency(right).cmp(&session_recency(left)));
+    client_sessions.sort_by_key(|left| std::cmp::Reverse(session_recency(left)));
     let total = client_sessions.len();
     let sessions = client_sessions
         .into_iter()
@@ -238,7 +238,7 @@ async fn sessions(
     RawQuery(raw_query): RawQuery,
 ) -> Response {
     if let Err(response) = authenticate(&state, &headers) {
-        return response;
+        return *response;
     }
     let snapshot = state.observability.snapshot();
     let query = match parse_query(
@@ -331,7 +331,7 @@ async fn history(
     RawQuery(raw_query): RawQuery,
 ) -> Response {
     if let Err(response) = authenticate(&state, &headers) {
-        return response;
+        return *response;
     }
     let snapshot = state.observability.snapshot();
     let parsed = match parse_query(
@@ -408,7 +408,7 @@ async fn history(
 
 async fn method_not_allowed(State(state): State<Arc<WebState>>, headers: HeaderMap) -> Response {
     if let Err(response) = authenticate(&state, &headers) {
-        return response;
+        return *response;
     }
     method_not_allowed_response()
 }
@@ -427,7 +427,7 @@ pub(super) fn method_not_allowed_response() -> Response {
 
 async fn api_not_found(State(state): State<Arc<WebState>>, headers: HeaderMap) -> Response {
     if let Err(response) = authenticate(&state, &headers) {
-        return response;
+        return *response;
     }
     not_found()
 }
@@ -436,14 +436,14 @@ pub(super) fn not_found() -> Response {
     error_response(StatusCode::NOT_FOUND, "not_found", "resource was not found")
 }
 
-fn authenticate(state: &WebState, headers: &HeaderMap) -> Result<(), Response> {
+fn authenticate(state: &WebState, headers: &HeaderMap) -> Result<(), Box<Response>> {
     if state
         .authentication
         .authenticate_cookie(single_cookie_header(headers))
     {
         Ok(())
     } else {
-        Err(authentication_required())
+        Err(Box::new(authentication_required()))
     }
 }
 

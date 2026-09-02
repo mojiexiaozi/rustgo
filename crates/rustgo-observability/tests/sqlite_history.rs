@@ -863,7 +863,7 @@ async fn dropped_expensive_query_is_interrupted_before_following_write_and_shutd
             HistoryScope::Server,
             HistoryMetric::CpuBasisPoints,
             0,
-            u64::MAX.min(i64::MAX as u64),
+            i64::MAX as u64,
             HistoryResolution::Raw,
         )),
     )

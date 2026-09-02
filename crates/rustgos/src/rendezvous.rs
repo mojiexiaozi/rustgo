@@ -160,7 +160,7 @@ struct CoordinatorState {
 
 enum SessionRecord {
     Active(Box<StoredSession>),
-    Tombstone(SessionTombstone),
+    Tombstone(Box<SessionTombstone>),
 }
 
 struct StoredSession {
@@ -1365,7 +1365,7 @@ fn tombstone_session(state: &mut CoordinatorState, session_id: SessionId) -> Opt
             let session = *session;
             state.sessions.insert(
                 session_id,
-                SessionRecord::Tombstone(SessionTombstone::from_session(&session)),
+                SessionRecord::Tombstone(Box::new(SessionTombstone::from_session(&session))),
             );
             Some(session)
         }
