@@ -131,7 +131,10 @@ impl eframe::App for GuiApp {
                 let log_strings: Vec<String> = log_lines
                     .iter()
                     .map(|line| {
-                        format!("{} {} {} {}", line.timestamp, line.level, line.target, line.message)
+                        format!(
+                            "{} {} {} {}",
+                            line.timestamp, line.level, line.target, line.message
+                        )
                     })
                     .collect();
                 self.logs_panel.show(ui, &log_strings);

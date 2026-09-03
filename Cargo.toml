@@ -17,7 +17,7 @@ chacha20poly1305 = "0.10.1"
 clap = { version = "4.5.47", features = ["derive"] }
 ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
 eframe = { version = "0.36.0", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
-egui_plot = "0.36.0"
+egui_plot = "0.37.0"
 hkdf = "0.12.4"
 hmac = "0.12.1"
 http = "1.5.0"
