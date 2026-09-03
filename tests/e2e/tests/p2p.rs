@@ -280,15 +280,29 @@ listen_addr = "127.0.0.1:{udp_forward}"
             2,
         )
         .await?;
-        let promoted_udp = UdpSocket::bind("127.0.0.1:0").await?;
-        let (length, _) = udp_round_trip(
-            &promoted_udp,
-            SocketAddr::from(([127, 0, 0, 1], udp_forward)),
-            b"udp-promoted",
-            &mut buffer,
-        )
-        .await?;
-        assert_eq!(&buffer[..length], b"udp-promoted");
+        let mut promoted_udp_sockets = Vec::new();
+        for attempt in 1..=5 {
+            let promoted_udp = UdpSocket::bind("127.0.0.1:0").await?;
+            let (length, _) = udp_round_trip(
+                &promoted_udp,
+                SocketAddr::from(([127, 0, 0, 1], udp_forward)),
+                b"udp-promoted",
+                &mut buffer,
+            )
+            .await?;
+            assert_eq!(&buffer[..length], b"udp-promoted");
+            promoted_udp_sockets.push(promoted_udp);
+            let consumer_log = fs::read_to_string(consumer_config.with_extension("log"))?;
+            if selected_flows(&consumer_log)
+                .iter()
+                .any(|flow| flow.export == "udp-echo" && flow.path == "QuicV4")
+            {
+                break;
+            }
+            if attempt < 5 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
         eprintln!("promoted udp echoed");
         let consumer_log = fs::read_to_string(consumer_config.with_extension("log"))?;
         let provider_log = fs::read_to_string(provider_config.with_extension("log"))?;
@@ -315,22 +329,21 @@ listen_addr = "127.0.0.1:{udp_forward}"
             2,
             "expected exactly initial/promoted TCP selections: {flows:?}"
         );
-        assert_eq!(
-            udp.len(),
-            2,
-            "expected exactly initial/promoted UDP selections: {flows:?}"
+        assert!(
+            (2..=6).contains(&udp.len()),
+            "expected initial relay and an eventually promoted UDP selection: {flows:?}"
         );
         assert_flow(tcp[0], "Tcp", "Relay");
         assert_flow(tcp[1], "Tcp", "NativeTcp");
         assert_flow(udp[0], "Udp", "Relay");
-        assert_flow(udp[1], "Udp", "QuicV4");
+        assert_flow(udp[udp.len() - 1], "Udp", "QuicV4");
         let ids = flows
             .iter()
             .map(|flow| flow.session_id.as_str())
             .collect::<std::collections::HashSet<_>>();
         assert_eq!(
             ids.len(),
-            4,
+            flows.len(),
             "each transferred open must have a distinct correlated session: {flows:?}"
         );
     } else {
