@@ -261,14 +261,14 @@ listen_addr = "127.0.0.1:{udp_forward}"
     }
 
     let udp = UdpSocket::bind("127.0.0.1:0").await?;
-    udp.send_to(
-        b"udp-process-e2e",
+    let mut buffer = [0_u8; 64];
+    let (length, _) = udp_round_trip(
+        &udp,
         SocketAddr::from(([127, 0, 0, 1], udp_forward)),
+        b"udp-process-e2e",
+        &mut buffer,
     )
     .await?;
-    let mut buffer = [0_u8; 64];
-    let (length, _) =
-        tokio::time::timeout(Duration::from_secs(15), udp.recv_from(&mut buffer)).await??;
     assert_eq!(&buffer[..length], b"udp-process-e2e");
     eprintln!("initial udp echoed");
 
@@ -281,15 +281,13 @@ listen_addr = "127.0.0.1:{udp_forward}"
         )
         .await?;
         let promoted_udp = UdpSocket::bind("127.0.0.1:0").await?;
-        promoted_udp
-            .send_to(
-                b"udp-promoted",
-                SocketAddr::from(([127, 0, 0, 1], udp_forward)),
-            )
-            .await?;
-        let (length, _) =
-            tokio::time::timeout(Duration::from_secs(15), promoted_udp.recv_from(&mut buffer))
-                .await??;
+        let (length, _) = udp_round_trip(
+            &promoted_udp,
+            SocketAddr::from(([127, 0, 0, 1], udp_forward)),
+            b"udp-promoted",
+            &mut buffer,
+        )
+        .await?;
         assert_eq!(&buffer[..length], b"udp-promoted");
         eprintln!("promoted udp echoed");
         let consumer_log = fs::read_to_string(consumer_config.with_extension("log"))?;
@@ -383,6 +381,24 @@ listen_addr = "127.0.0.1:{udp_forward}"
         root_path.display()
     );
     Ok(())
+}
+
+async fn udp_round_trip(
+    socket: &UdpSocket,
+    forward: SocketAddr,
+    payload: &[u8],
+    buffer: &mut [u8],
+) -> Result<(usize, SocketAddr), Box<dyn Error + Send + Sync>> {
+    Ok(tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            socket.send_to(payload, forward).await?;
+            match tokio::time::timeout(Duration::from_millis(250), socket.recv_from(buffer)).await {
+                Ok(received) => return received,
+                Err(_) => continue,
+            }
+        }
+    })
+    .await??)
 }
 
 #[derive(Debug)]
