@@ -1,0 +1,16 @@
+services:
+  rustgos:
+    image: gcr.io/distroless/cc-debian12@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f
+    network_mode: host
+    restart: unless-stopped
+    read_only: true
+    user: "65532:65532"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    working_dir: /data
+    command: [/app/rustgos, -c, /config/server.toml]
+    volumes:
+      - ./rustgos:/app/rustgos:ro
+      - ./server.toml:/config/server.toml:ro
+      - ./secrets:/run/secrets:ro
+      - ./data:/data
