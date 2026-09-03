@@ -88,12 +88,24 @@ fn ensure_binaries() -> TestResult<Binaries> {
         if profile == BinaryProfile::Release {
             build_arguments.push("--release");
         }
-        let status = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
-            .current_dir(&root)
-            .args(build_arguments)
-            .status()
-            .map_err(|error| format!("could not launch cargo build: {error}"))?;
-        if !status.success() {
+        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        let mut last_status = None;
+        for attempt in 1..=3 {
+            let status = Command::new(&cargo)
+                .current_dir(&root)
+                .args(&build_arguments)
+                .status()
+                .map_err(|error| format!("could not launch cargo build: {error}"))?;
+            if status.success() {
+                last_status = None;
+                break;
+            }
+            last_status = Some(status);
+            if attempt < 3 {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        }
+        if let Some(status) = last_status {
             return Err(format!(
                 "cargo build for process fixtures failed with {status}"
             ));

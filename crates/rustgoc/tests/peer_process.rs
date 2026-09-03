@@ -590,14 +590,20 @@ fn spawn(
 }
 
 fn build_process_binaries() -> Result<(), Box<dyn Error>> {
-    let status = Command::new("cargo")
-        .current_dir(workspace())
-        .args(["build", "--quiet", "-p", "rustgos", "-p", "rustgoc"])
-        .status()?;
-    if !status.success() {
-        return Err("failed to build rustgos and rustgoc process fixtures".into());
+    let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    for attempt in 1..=3 {
+        let status = Command::new(&cargo)
+            .current_dir(workspace())
+            .args(["build", "--quiet", "-p", "rustgos", "-p", "rustgoc"])
+            .status()?;
+        if status.success() {
+            return Ok(());
+        }
+        if attempt < 3 {
+            std::thread::sleep(Duration::from_secs(1));
+        }
     }
-    Ok(())
+    Err("failed to build rustgos and rustgoc process fixtures after 3 attempts".into())
 }
 
 fn workspace() -> PathBuf {
