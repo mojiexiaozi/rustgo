@@ -7,6 +7,7 @@ mod control;
 mod exports;
 mod forwards;
 mod orchestration;
+mod path_status;
 mod peer;
 mod session;
 mod tcp;
@@ -22,6 +23,7 @@ pub use forwards::{
     BoxPeerDatagramSession, BoxPeerStream, ForwardConnector, ForwardError, ForwardRuntime,
     ForwardRuntimeOptions, PeerDatagramSession, PeerFuture, PeerIo,
 };
+pub use path_status::{PathKindStatus, PathStatus, PathStatusStore};
 pub use peer::{
     PeerRelayChannel, PeerRuntimeError, PeerSessionHandle, PeerSessionRuntime,
     PeerSessionRuntimeOptions,
