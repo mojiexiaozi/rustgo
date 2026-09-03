@@ -35,6 +35,47 @@ attempt, verifies the recorded starttime only after that open, and sends TERM
 and any bounded KILL escalation through that same process object. Missing
 support or an unreadable identity fails the E2E run without a PID-only signal.
 
+## Releases
+
+Pushing a version tag such as `v0.3` builds `rustgoc` and `rustgos` for Windows
+x86_64, Linux x86_64, and Linux ARM64. The GitHub Release contains:
+
+```text
+rustgoc-win-x86-v0.3.zip
+rustgos-win-x86-v0.3.zip
+rustgoc-linux-x86-v0.3.zip
+rustgos-linux-x86-v0.3.zip
+rustgoc-linux-arm64-v0.3.zip
+rustgos-linux-arm64-v0.3.zip
+SHA256SUMS
+```
+
+Each ZIP contains one conventionally named executable and its matching
+`client.toml` or `server.toml`. Linux ZIPs also contain
+`docker-compose.yaml`. The configuration is an example: replace endpoints and
+provide your own certificates and keys before startup. Releases never contain
+generated credentials.
+
+Verify checksums after downloading all seven assets. On Linux:
+
+```text
+sha256sum --check SHA256SUMS
+```
+
+On PowerShell:
+
+```text
+Get-Content SHA256SUMS | ForEach-Object {
+    $hash, $name = $_ -split '  ', 2
+    if ((Get-FileHash -Algorithm SHA256 -LiteralPath $name).Hash.ToLowerInvariant() -ne $hash) {
+        throw "Checksum mismatch: $name"
+    }
+}
+```
+
+See [docs/operations.md](docs/operations.md) for Compose deployment and the
+maintainer release procedure.
+
 ## Start safely
 
 Generate a key pair on the client host:

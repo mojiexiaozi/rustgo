@@ -340,15 +340,20 @@ permissions:
 
 Download all intermediate artifacts into one input directory. Run `finalize`
 into a separate output directory. Assert the directory contains seven regular
-files, then create the release with:
+files, create a draft, download its assets into a clean audit directory, verify
+the count and checksums, then publish it with:
 
 ```text
-gh release create "${{ github.ref_name }}" release-out/* --verify-tag --generate-notes --title "Rustgo ${{ github.ref_name }}"
+gh release create "${{ github.ref_name }}" release-out/* --verify-tag --generate-notes --title "Rustgo ${{ github.ref_name }}" --draft
+mkdir release-audit
+gh release download "${{ github.ref_name }}" --dir release-audit
+test "$(find release-audit -maxdepth 1 -type f | wc -l)" -eq 7
+(cd release-audit && sha256sum --check SHA256SUMS)
+gh release edit "${{ github.ref_name }}" --draft=false
 ```
 
-Set `GH_TOKEN: ${{ github.token }}` only on this step. Since `gh release create`
-is the final state-changing step, validation failures cannot create a partial
-Release.
+Set `GH_TOKEN: ${{ github.token }}` only on this step. A failed upload or audit
+can leave a diagnostic draft but cannot create a partial public Release.
 
 - [ ] **Step 7: Review without executing the workflow**
 

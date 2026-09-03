@@ -274,6 +274,62 @@ client and restore the old public/private references as one coordinated change.
 
 For complete Web dashboard documentation, configuration, security, and troubleshooting, see [web-dashboard.md](web-dashboard.md).
 
+## Deploy a Linux ZIP with Docker Compose
+
+Extract the matching Linux archive on its target architecture, enter the
+extracted directory, and restore the executable bit:
+
+```text
+chmod 755 rustgoc
+mkdir -p secrets
+```
+
+For a server package use `chmod 755 rustgos` and also `mkdir -p data`. Put only
+the required certificate and key files in `secrets/`. Edit `client.toml` or
+`server.toml` so container paths point beneath `/run/secrets`; for dashboard
+history use `database_path = "/data/rustgo-metrics.db"`.
+
+Validate and start the package:
+
+```text
+docker compose config --quiet
+docker compose up -d
+docker compose logs -f
+```
+
+Stop it with `docker compose down`. The Compose service uses host networking,
+so Docker publishes no ports on its behalf. Configure the host firewall for
+the fixed relay, observation, tunnel, and P2P ranges described above. The
+container is non-root with a read-only root filesystem; only the server's
+`./data` mount is writable.
+
+For an upgrade, verify the new ZIP checksum, run the new executable's `check`
+command against a protected copy of the current configuration, stop the old
+Compose service, replace the executable and reviewed Compose file, then start
+and inspect registration and tunnel logs. Keep the previous verified ZIP for
+rollback.
+
+## Maintainer GitHub release procedure
+
+1. Set `[workspace.package].version` to the intended semantic version. The
+   short tag `vMAJOR.MINOR` is permitted only for a zero patch version.
+2. Commit the release implementation and run every gate below plus
+   `scripts/release_acceptance.py` with binaries from all three build targets.
+3. Push the commit without a version tag and require the complete ordinary CI
+   workflow to pass.
+4. Create an annotated tag, for example `git tag -a v0.3 -m "Rustgo v0.3"`,
+   then push that tag.
+5. Require the Release workflow to build all three targets. It creates a draft,
+   downloads all seven assets again, verifies `SHA256SUMS`, and only then makes
+   the Release public.
+6. Download the public assets and independently verify the six ZIP names,
+   checksum manifest, archive members, executable help output, and real config
+   checks.
+
+Never manually fill a missing platform in a partial release. Fix the source or
+workflow and rerun the complete pipeline. A failed job may leave a draft for
+diagnosis, but it must not become the current public release.
+
 ## Release gates
 
 Run all commands from a clean checkout with the intended stable toolchain:

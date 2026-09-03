@@ -131,8 +131,10 @@ use forward slashes, and cannot escape the archive root.
 After all six archives exist, the publication job generates one `SHA256SUMS`
 file containing exactly one entry per ZIP, sorted by archive name. It then
 recomputes and verifies every entry before publication. The GitHub Release is
-created only after validation succeeds and receives the six ZIP files plus
-`SHA256SUMS` in one publication step.
+first created as a draft after local validation. The workflow downloads all
+seven draft assets, re-verifies the exact member count and `SHA256SUMS`, and
+only then makes the Release public. Upload or remote-audit failure leaves a
+non-public draft rather than a partial public release.
 
 GitHub workflow permissions are minimal: build jobs need read-only repository
 contents, while only the final publication job receives `contents: write`.
