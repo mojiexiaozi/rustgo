@@ -22,6 +22,51 @@ use tokio_util::sync::CancellationToken;
 
 use crate::ClientError;
 
+/// Point-in-time client logical-traffic totals in application bytes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TrafficSnapshot {
+    sent_bytes: u64,
+    received_bytes: u64,
+}
+
+impl TrafficSnapshot {
+    pub const fn new(sent_bytes: u64, received_bytes: u64) -> Self {
+        Self {
+            sent_bytes,
+            received_bytes,
+        }
+    }
+
+    pub const fn sent_bytes(&self) -> u64 {
+        self.sent_bytes
+    }
+
+    pub const fn received_bytes(&self) -> u64 {
+        self.received_bytes
+    }
+}
+
+/// Shareable handle that stays valid for the lifetime of a running
+/// [`ClientApp`](crate::ClientApp), letting embedders poll traffic totals at
+/// any time.
+#[derive(Clone)]
+pub struct TrafficHandle(pub(crate) Arc<LogicalTraffic>);
+
+impl TrafficHandle {
+    pub fn snapshot(&self) -> TrafficSnapshot {
+        self.0.snapshot()
+    }
+}
+
+impl std::fmt::Debug for TrafficHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TrafficHandle")
+            .field("snapshot", &self.0.snapshot())
+            .finish()
+    }
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct LogicalTraffic {
     // Leases only gate recording. A byte updates its counter once regardless of
@@ -62,6 +107,14 @@ impl LogicalTraffic {
             self.sent.load(Ordering::Acquire),
             self.received.load(Ordering::Acquire),
         )
+    }
+
+    pub(crate) fn snapshot(&self) -> TrafficSnapshot {
+        let (sent_bytes, received_bytes) = self.totals();
+        TrafficSnapshot {
+            sent_bytes,
+            received_bytes,
+        }
     }
 }
 

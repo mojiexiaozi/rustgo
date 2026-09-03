@@ -1,8 +1,10 @@
 # Rustgo
 
-Rustgo V0.3 is a self-hosted, fixed-port TCP, UDP, and authenticated P2P tunnel with optional embedded observability. A private-network client (`rustgoc`) connects to a public relay server (`rustgos`) over TLS 1.3, authenticates with an independent Ed25519 device key, and exposes explicitly configured ports.
+Rustgo V0.4 is a self-hosted, fixed-port TCP, UDP, and authenticated P2P tunnel with optional embedded observability. A private-network client (`rustgoc` CLI or `rustgoc-gui`) connects to a public relay server (`rustgos`) over TLS 1.3, authenticates with an independent Ed25519 device key, and exposes explicitly configured ports.
 
-V0.3 adds an optional read-only Web dashboard for real-time server and client monitoring, host telemetry, P2P path visibility, and bounded historical trends. The dashboard is loopback-only, HTTPS-ready via reverse proxy, and fully backward compatible with V0.2 and V0.1 clients.
+V0.4 adds a cross-platform GUI client (`rustgoc-gui`) with real-time connection monitoring, tunnel display, traffic charts, P2P path visibility, and bounded resource usage. The GUI shares the same headless `rustgoc` library and connects to V0.1/V0.2/V0.3 servers without modification. On Windows, the GUI provides a system tray with minimize-to-tray support.
+
+V0.3 added an optional read-only Web dashboard for real-time server and client monitoring, host telemetry, P2P path visibility, and bounded historical trends. The dashboard is loopback-only, HTTPS-ready via reverse proxy, and fully backward compatible with V0.2 and V0.1 clients.
 
 V0.2 introduced named `[[exports]]` and `[[forwards]]`. Peers authenticate with their server-authorized device keys, try QUIC/UDP or native-TCP direct paths from fixed client port ranges, and fall back to the encrypted server relay when policy permits. Complex NAT can still prevent a direct path; relay fallback is a supported operating mode, not an authentication bypass.
 
@@ -17,23 +19,39 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-The binaries are `target/release/rustgos` and `target/release/rustgoc` (with
-`.exe` on Windows). The platform smoke gates exercise real release processes,
-ephemeral credentials, and both transports:
+The binaries are `target/release/rustgos`, `target/release/rustgoc`, and `target/release/rustgoc-gui` (with `.exe` on Windows). The platform smoke gates exercise real release processes, ephemeral credentials, and both transports:
 
 ```text
 bash scripts/e2e.sh
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/e2e.ps1
 ```
 
-Each script creates one private temporary directory and removes only that
-directory. Credentials are never written into Cargo or CI cache paths. The
-Bash entry point is Linux-only and requires readable `/proc/<pid>/stat`, a
-kernel with `pidfd_open`/`pidfd_send_signal`, and Python 3.10+ exposing
-`os.pidfd_open` and `signal.pidfd_send_signal`. It opens one pidfd per cleanup
-attempt, verifies the recorded starttime only after that open, and sends TERM
-and any bounded KILL escalation through that same process object. Missing
-support or an unreadable identity fails the E2E run without a PID-only signal.
+Each script creates one private temporary directory and removes only that directory. Credentials are never written into Cargo or CI cache paths. The Bash entry point is Linux-only and requires readable `/proc/<pid>/stat`, a kernel with `pidfd_open`/`pidfd_send_signal`, and Python 3.10+ exposing `os.pidfd_open` and `signal.pidfd_send_signal`. It opens one pidfd per cleanup attempt, verifies the recorded starttime only after that open, and sends TERM and any bounded KILL escalation through that same process object. Missing support or an unreadable identity fails the E2E run without a PID-only signal.
+
+## GUI Client
+
+The GUI client (`rustgoc-gui`) provides:
+- Real-time connection status and generation display
+- Live tunnel monitoring with protocol and port information
+- Bounded log view (1,000 most recent lines)
+- Traffic totals and network activity
+- System tray integration on Windows (minimize to tray, quit from tray)
+
+Run the GUI with:
+
+```text
+rustgoc-gui -c ./client.toml
+```
+
+The GUI uses the same configuration format as the CLI client. Use `--selfcheck` to validate configuration and connectivity:
+
+```text
+rustgoc-gui --selfcheck -c ./client.toml
+```
+
+The selfcheck waits up to 30 seconds for an active connection, prints traffic and path status snapshots, then exits 0 on success. This is wired into the E2E scripts for automated validation.
+
+All GUI-owned collections are bounded: 1,000 log lines, 300 telemetry chart points, 64 tray events. The GUI enforces `#![forbid(unsafe_code)]` and uses no GTK or AppIndicator dependencies on Linux.
 
 ## Releases
 
@@ -82,56 +100,39 @@ Generate a key pair on the client host:
 
 ```text
 rustgoc keygen -o ./keys
+# or with the GUI client:
+rustgoc-gui keygen -o ./keys
 ```
 
-Keep `keys/device.key` on the client. Copy only `keys/device.pub` to the server
-operator and place its `ed25519:...` value in the matching server authorization
-entry. Create a TLS server certificate whose SAN contains the real DNS name
-used by clients, and configure every client with that same `server_name` plus
-an explicit CA certificate file.
+Keep `keys/device.key` on the client. Copy only `keys/device.pub` to the server operator and place its `ed25519:...` value in the matching server authorization entry. Create a TLS server certificate whose SAN contains the real DNS name used by clients, and configure every client with that same `server_name` plus an explicit CA certificate file.
 
-Copy [examples/server.toml](examples/server.toml) and
-[examples/client.toml](examples/client.toml), provide their documented
-environment variables, then validate without binding or contacting the peer:
+Copy [examples/server.toml](examples/server.toml) and [examples/client.toml](examples/client.toml), provide their documented environment variables, then validate without binding or contacting the peer:
 
 ```text
 rustgos check -c ./server.toml
 rustgoc check -c ./client.toml
+rustgoc-gui --selfcheck -c ./client.toml
 ```
 
-`check` uses the production credential loaders. The server parses every
-certificate in its TLS chain, validates the TLS private-key encoding and
-leaf/key match, and rejects malformed or weak Ed25519 authorization keys. The
-client parses every explicit CA certificate and its Rustgo device private key.
-These checks perform no bind or connect operation.
+`check` uses the production credential loaders. The server parses every certificate in its TLS chain, validates the TLS private-key encoding and leaf/key match, and rejects malformed or weak Ed25519 authorization keys. The client parses every explicit CA certificate and its Rustgo device private key. These checks perform no bind or connect operation.
 
-With conventional filenames in the current directory, no-argument startup is
-equivalent to explicit `-c`:
+With conventional filenames in the current directory, no-argument startup is equivalent to explicit `-c`:
 
 ```text
 rustgos                 # rustgos -c ./server.toml
 rustgoc                 # rustgoc -c ./client.toml
+rustgoc-gui             # rustgoc-gui -c ./client.toml
 ```
 
-Configuration is never searched in parent or platform-specific directories,
-and missing files are not generated implicitly.
+Configuration is never searched in parent or platform-specific directories, and missing files are not generated implicitly.
 
-See [docs/operations.md](docs/operations.md) for certificate commands,
-firewalls, service restarts, logging, key rotation, troubleshooting, and the
-complete release checklist.
+See [docs/operations.md](docs/operations.md) for certificate commands, firewalls, service restarts, logging, key rotation, troubleshooting, and the complete release checklist.
 
 ## P2P ports and policy
 
-The standard server layout uses `7443/tcp` for TLS control and relay traffic,
-`7443/udp` plus `7444/udp` for authenticated NAT observation. Each client also
-needs inbound/outbound access for its configured `p2p.udp_port_range` and
-`p2p.tcp_port_range`; choose non-overlapping ranges when several clients share
-one host. An export with omitted or empty `allowed_peers` permits every
-authenticated client and emits `P2P_EXPORT_ALLOW_ALL`. Set an explicit list for
-least privilege.
+The standard server layout uses `7443/tcp` for TLS control and relay traffic, `7443/udp` plus `7444/udp` for authenticated NAT observation. Each client also needs inbound/outbound access for its configured `p2p.udp_port_range` and `p2p.tcp_port_range`; choose non-overlapping ranges when several clients share one host. An export with omitted or empty `allowed_peers` permits every authenticated client and emits `P2P_EXPORT_ALLOW_ALL`. Set an explicit list for least privilege.
 
-Human-readable logs report observation, selected path, promotion, and fallback
-events. Rustgo intentionally has no JSON log mode or web UI.
+Human-readable logs report observation, selected path, promotion, and fallback events. The GUI client displays P2P path status (direct vs relay) in real-time via the public path-status store.
 
 ## Security and diagnostics
 

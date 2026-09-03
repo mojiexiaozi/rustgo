@@ -12,7 +12,10 @@ use crate::{
     ChildSessionSupervisor, ClientError, ControlClient, ExportRegistry, PeerGenerationHandler,
     RegisteredTunnel, SessionGeneration,
     orchestration::ProductionPeerRuntime,
-    telemetry::{LogicalTraffic, TelemetryRuntime, TelemetryRuntimeHook},
+    path_status::PathStatusStore,
+    telemetry::{
+        LogicalTraffic, TelemetryRuntime, TelemetryRuntimeHook, TrafficHandle, TrafficSnapshot,
+    },
     udp::RelaySessionSupervisor,
 };
 
@@ -83,6 +86,7 @@ pub struct ClientApp {
     telemetry_report_interval_override: Option<Duration>,
     telemetry_hook: Option<Arc<dyn TelemetryRuntimeHook>>,
     logical_traffic: Option<Arc<LogicalTraffic>>,
+    path_status_store: PathStatusStore,
     last_generation: u64,
 }
 
@@ -165,6 +169,7 @@ impl ClientApp {
             telemetry_report_interval_override: None,
             telemetry_hook: None,
             logical_traffic,
+            path_status_store: PathStatusStore::new(),
             last_generation: 0,
         }
     }
@@ -199,6 +204,28 @@ impl ClientApp {
         &self.exports
     }
 
+    /// Current logical-traffic totals, or `None` when telemetry is explicitly
+    /// disabled (`[telemetry] enabled = false`), which also disables recording.
+    pub fn traffic_snapshot(&self) -> Option<TrafficSnapshot> {
+        self.logical_traffic
+            .as_ref()
+            .map(|traffic| traffic.snapshot())
+    }
+
+    /// Shareable handle for polling traffic totals while the client runs;
+    /// `None` when telemetry is explicitly disabled.
+    pub fn traffic_handle(&self) -> Option<TrafficHandle> {
+        self.logical_traffic.clone().map(TrafficHandle)
+    }
+
+    /// Path-status store for observing current P2P path selections.
+    ///
+    /// The GUI client polls this to display which exports are using direct
+    /// paths versus relay fallback.
+    pub fn path_status_store(&self) -> &PathStatusStore {
+        &self.path_status_store
+    }
+
     pub async fn run(self) -> Result<(), ClientError> {
         let shutdown = CancellationToken::new();
         let mut runtime = Box::pin(self.run_until(shutdown.clone()));
@@ -228,6 +255,7 @@ impl ClientApp {
                 self.control.keypair(),
                 self.exports.clone(),
                 self.logical_traffic.clone(),
+                self.path_status_store.clone(),
             ))
         });
         let result = self

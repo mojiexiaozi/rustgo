@@ -47,6 +47,7 @@ use crate::{
     BoxPeerDatagramSession, BoxPeerStream, ChildSessionContext, ClientError, ControlEvent,
     ExportRegistry, ForwardConnector, ForwardRuntime, PeerDatagramSession, PeerFuture,
     PeerGenerationHandler, PeerOpenRequest, PeerRelayChannel,
+    path_status::{PathKindStatus, PathStatus, PathStatusStore},
     telemetry::{LogicalTraffic, LogicalTrafficActivation},
 };
 
@@ -70,6 +71,7 @@ pub(crate) struct ProductionPeerRuntime {
     keypair: Arc<DeviceKeypair>,
     exports: ExportRegistry,
     traffic: Option<Arc<LogicalTraffic>>,
+    path_status_store: PathStatusStore,
     owner: Arc<tokio::sync::Mutex<Option<PeerRuntimeOwner>>>,
     lifetime: CancellationToken,
 }
@@ -85,6 +87,7 @@ impl ProductionPeerRuntime {
         keypair: Arc<DeviceKeypair>,
         exports: ExportRegistry,
         traffic: Option<Arc<LogicalTraffic>>,
+        path_status_store: PathStatusStore,
     ) -> Self {
         let (commands, receiver) = mpsc::channel(ACTOR_CAPACITY);
         Self {
@@ -94,6 +97,7 @@ impl ProductionPeerRuntime {
             keypair,
             exports,
             traffic,
+            path_status_store,
             owner: Arc::new(tokio::sync::Mutex::new(None)),
             lifetime: CancellationToken::new(),
         }
@@ -512,6 +516,18 @@ impl Actor {
                             protocol,
                         ));
                         tracing::info!(generation = session.generation.get(), path = ?kind, "fresh direct path promoted for subsequent service opens; existing relay I/O remains fenced");
+
+                        // Record promoted direct path
+                        if kind.is_direct() {
+                            let address = format!("{:?}", kind);
+                            self.runtime.path_status_store.record(
+                                session.export.clone(),
+                                PathStatus {
+                                    kind: PathKindStatus::Direct { address },
+                                    updated_unix_millis: unix_millis_now(),
+                                },
+                            );
+                        }
                     }
                     Ok(())
                 }
@@ -767,6 +783,17 @@ impl Actor {
             return Err(invalid());
         }
         session.relay_ready = Some(ready.clone());
+
+        // Record initial relay state
+        let export_name = session.export.clone();
+        self.runtime.path_status_store.record(
+            export_name,
+            PathStatus {
+                kind: PathKindStatus::Relay,
+                updated_unix_millis: unix_millis_now(),
+            },
+        );
+
         let manager = Arc::new(PathManager::new(
             PathManagerConfig::new(
                 Duration::from_secs(p2p.direct_timeout_secs.max(2)),
@@ -1697,6 +1724,14 @@ impl Actor {
                 tracing::warn!(session_id = %session_log_id(id), error = %error, "direct path attempt failed; using relay fallback");
                 if let Some(session) = self.sessions.get_mut(&id) {
                     session.direct_failed = true;
+                    // Record relay fallback
+                    self.runtime.path_status_store.record(
+                        session.export.clone(),
+                        PathStatus {
+                            kind: PathKindStatus::Relay,
+                            updated_unix_millis: unix_millis_now(),
+                        },
+                    );
                 }
                 self.ensure_relay_request(id).await
             }
@@ -1769,6 +1804,28 @@ impl Actor {
                 if promoted_open && path.kind().is_direct() {
                     tracing::info!(path = ?path.kind(), generation = session.generation.get(), peer = %peer, export = %export, "selected promoted direct path for new service open");
                 }
+
+                // Record path selection
+                if path.kind() == PathKind::Relay {
+                    self.runtime.path_status_store.record(
+                        export.clone(),
+                        PathStatus {
+                            kind: PathKindStatus::Relay,
+                            updated_unix_millis: unix_millis_now(),
+                        },
+                    );
+                } else if path.kind().is_direct() {
+                    // Record direct path with the remote address
+                    let address = format!("{:?}", path.kind());
+                    self.runtime.path_status_store.record(
+                        export.clone(),
+                        PathStatus {
+                            kind: PathKindStatus::Direct { address },
+                            updated_unix_millis: unix_millis_now(),
+                        },
+                    );
+                }
+
                 if path.kind() == PathKind::Relay {
                     session.selected_kind = Some(PathKind::Relay);
                     let relay_reply = session.reply.take();
@@ -2136,6 +2193,10 @@ impl Actor {
         let Some(mut session) = self.sessions.remove(&id) else {
             return;
         };
+
+        // Remove path status entry
+        self.runtime.path_status_store.remove(&session.export);
+
         session.cancellation.cancel();
         if let Some(manager) = session.manager.take() {
             let _ = manager.close().await;
@@ -3064,6 +3125,13 @@ fn now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |value| value.as_secs())
 }
+
+fn unix_millis_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis() as u64)
+}
+
 fn protocol_to_wire(value: TunnelProtocol) -> rustgo_protocol::TunnelProtocol {
     match value {
         TunnelProtocol::Tcp => rustgo_protocol::TunnelProtocol::TCP,
