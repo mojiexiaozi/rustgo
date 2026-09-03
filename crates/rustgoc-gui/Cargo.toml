@@ -1,0 +1,28 @@
+[package]
+name = "rustgoc-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rustgoc-gui"
+path = "src/main.rs"
+
+[dependencies]
+rustgoc = { path = "../rustgoc" }
+rustgo-config = { path = "../rustgo-config" }
+anyhow.workspace = true
+clap.workspace = true
+eframe.workspace = true
+egui_plot.workspace = true
+time.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+tray-icon = "0.20.0"
+
+[lints.rust]
+unsafe_code = "forbid"
