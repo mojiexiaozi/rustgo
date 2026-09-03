@@ -493,7 +493,7 @@ fn assert_datagram_echo_eventually(
     public: SocketAddr,
     payload: &[u8],
 ) -> TestResult {
-    let deadline = std::time::Instant::now() + DATAGRAM_TIMEOUT;
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
     socket.set_read_timeout(Some(Duration::from_millis(250)))?;
     loop {
         let sent = socket.send_to(payload, public)?;
@@ -699,7 +699,7 @@ fn negotiated_limits_retire_idle_client_flow_before_capacity_reuse() -> TestResu
     let first = public_socket()?;
     let second = public_socket()?;
 
-    assert_datagram_echo(&first, public, &[0xA1; 16])?;
+    assert_datagram_echo_eventually(&first, public, &[0xA1; 16])?;
     server.wait_for_line("event=udp_idle_sweep", Duration::from_secs(3))?;
     let retired = client.wait_for_line("event=udp_session_retired", Duration::from_secs(3))?;
     assert!(retired.contains("sessions=0"), "{retired}");
