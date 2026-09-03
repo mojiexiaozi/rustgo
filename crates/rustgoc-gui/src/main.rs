@@ -4,6 +4,7 @@ mod runtime;
 mod selfcheck;
 mod state;
 mod tray;
+mod tray_events;
 mod ui;
 
 use clap::Parser;
@@ -11,8 +12,10 @@ use state::connection::ConnectionViewModel;
 use state::logs::LogRing;
 use state::tunnels::TunnelRow;
 use std::path::PathBuf;
+use std::sync::mpsc;
 use std::time::Duration;
 use tokio::sync::watch;
+use tray_events::TrayEvent;
 use ui::connection::ConnectionPanel;
 use ui::logs::LogsPanel;
 use ui::tunnels::TunnelsPanel;
@@ -64,12 +67,23 @@ struct GuiApp {
     connection_vm: ConnectionViewModel,
     tunnels: Vec<TunnelRow>,
     log_ring: LogRing,
+    tray_rx: mpsc::Receiver<TrayEvent>,
+    _tray: Option<tray::platform::TrayIcon>,
+    should_quit: bool,
 }
 
 impl GuiApp {
     fn new() -> Self {
         let (status_tx, status_rx) = watch::channel(rustgoc::ClientStatus::default());
         drop(status_tx);
+
+        let (tray_tx, tray_rx) = mpsc::sync_channel(64);
+
+        #[cfg(windows)]
+        let tray = tray::platform::TrayIcon::new(tray_tx).ok();
+
+        #[cfg(not(windows))]
+        let tray = None;
 
         Self {
             active_tab: Tab::Connection,
@@ -79,6 +93,9 @@ impl GuiApp {
             connection_vm: ConnectionViewModel::new(status_rx),
             tunnels: Vec::new(),
             log_ring: LogRing::new(),
+            tray_rx,
+            _tray: tray,
+            should_quit: false,
         }
     }
 }
@@ -86,6 +103,21 @@ impl GuiApp {
 impl eframe::App for GuiApp {
     fn ui(&mut self, ui: &mut eframe::egui::Ui, _frame: &mut eframe::Frame) {
         self.connection_vm.update();
+
+        while let Ok(event) = self.tray_rx.try_recv() {
+            match event {
+                TrayEvent::Show => {}
+                TrayEvent::Connect => {}
+                TrayEvent::Disconnect => {}
+                TrayEvent::Quit => {
+                    self.should_quit = true;
+                }
+            }
+        }
+
+        if self.should_quit {
+            std::process::exit(0);
+        }
 
         eframe::egui::Panel::top("tabs").show(ui, |ui| {
             ui.horizontal(|ui| {

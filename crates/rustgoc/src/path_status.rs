@@ -212,7 +212,9 @@ mod tests {
         let snap = store.snapshot();
         assert_eq!(snap.len(), 1);
         let status = snap.get("export1").unwrap();
-        assert!(matches!(&status.kind, PathKindStatus::Direct { address } if address == "10.0.0.3:7002"));
+        assert!(
+            matches!(&status.kind, PathKindStatus::Direct { address } if address == "10.0.0.3:7002")
+        );
         assert_eq!(status.updated_unix_millis, 2000);
     }
 
