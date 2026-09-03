@@ -2,6 +2,7 @@
 
 mod runtime;
 mod selfcheck;
+mod state;
 mod tray;
 
 use clap::Parser;
