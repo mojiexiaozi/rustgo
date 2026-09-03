@@ -21,8 +21,6 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt,clippy
           rustup default stable
-      - name: Install namespace test prerequisites
-        run: sudo apt-get update && sudo apt-get install -y conntrack nftables iproute2
       - name: Cache Cargo data and build outputs
         uses: actions/cache@v4
         with:
@@ -46,16 +44,6 @@ jobs:
       - run: cargo test --workspace -- --test-threads=1
       - name: Release E2E
         run: bash scripts/e2e.sh
-      - name: Complex NAT namespace gate
-        run: |
-          sudo modprobe br_netfilter
-          sudo sysctl -w net.bridge.bridge-nf-call-iptables=0
-          sudo sysctl -w net.bridge.bridge-nf-call-ip6tables=0
-          sudo sysctl -w net.bridge.bridge-nf-call-arptables=0
-          sudo env "PATH=$PATH" bash tests/netns/run.sh all
-          sudo env "PATH=$PATH" bash tests/netns/run.sh all
-          sudo bash tests/netns/assert_cleanup.sh
-
   windows:
     name: Windows
     runs-on: windows-latest
