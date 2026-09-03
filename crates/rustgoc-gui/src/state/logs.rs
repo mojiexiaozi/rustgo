@@ -26,6 +26,12 @@ pub struct LogRing {
     inner: Arc<Mutex<LogRingInner>>,
 }
 
+impl Default for LogRing {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LogRing {
     pub fn new() -> Self {
         Self {
