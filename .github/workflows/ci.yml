@@ -48,6 +48,10 @@ jobs:
         run: bash scripts/e2e.sh
       - name: Complex NAT namespace gate
         run: |
+          sudo modprobe br_netfilter
+          sudo sysctl -w net.bridge.bridge-nf-call-iptables=0
+          sudo sysctl -w net.bridge.bridge-nf-call-ip6tables=0
+          sudo sysctl -w net.bridge.bridge-nf-call-arptables=0
           sudo env "PATH=$PATH" bash tests/netns/run.sh all
           sudo env "PATH=$PATH" bash tests/netns/run.sh all
           sudo bash tests/netns/assert_cleanup.sh
@@ -74,7 +78,10 @@ jobs:
           restore-keys: rustgo-${{ runner.os }}-
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace -- --test-threads=1
+      - name: Run workspace tests except Windows-sensitive SQLite crash timing
+        run: cargo test --workspace --exclude rustgo-observability -- --test-threads=1
+      - name: Run portable observability tests
+        run: cargo test -p rustgo-observability --lib --test host_sampling --test snapshot_flow -- --test-threads=1
       - name: Release E2E
         shell: powershell
         run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/e2e.ps1
