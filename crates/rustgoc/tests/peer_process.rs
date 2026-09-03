@@ -1,4 +1,5 @@
 use std::{
+    env,
     error::Error,
     fs,
     net::{SocketAddr, TcpListener as StdTcpListener, UdpSocket as StdUdpSocket},
@@ -33,6 +34,7 @@ impl Drop for Children {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rustgos_and_two_rustgoc_processes_transfer_tcp_and_udp_direct_and_relay()
 -> Result<(), Box<dyn Error>> {
+    build_process_binaries()?;
     run_scenario(true, false).await?;
     run_scenario(false, false).await?;
     run_scenario(false, true).await?;
@@ -558,12 +560,21 @@ fn spawn(
     config: &Path,
     delay_identity_binding: bool,
 ) -> Result<Child, Box<dyn Error>> {
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let mut command = Command::new("cargo");
+    let workspace = workspace();
+    let mut target = env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| workspace.join("target"));
+    if target.is_relative() {
+        target = workspace.join(target);
+    }
+    let binary = target
+        .join("debug")
+        .join(format!("{package}{}", env::consts::EXE_SUFFIX));
+    let mut command = Command::new(binary);
     let log = fs::File::create(config.with_extension("log"))?;
     command
-        .current_dir(workspace)
-        .args(["run", "--quiet", "-p", package, "--", "-c"])
+        .current_dir(&workspace)
+        .arg("-c")
         .arg(config)
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
@@ -576,6 +587,21 @@ fn spawn(
         }
     }
     Ok(command.spawn()?)
+}
+
+fn build_process_binaries() -> Result<(), Box<dyn Error>> {
+    let status = Command::new("cargo")
+        .current_dir(workspace())
+        .args(["build", "--quiet", "-p", "rustgos", "-p", "rustgoc"])
+        .status()?;
+    if !status.success() {
+        return Err("failed to build rustgos and rustgoc process fixtures".into());
+    }
+    Ok(())
+}
+
+fn workspace() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
 async fn wait_for_log_pair(
