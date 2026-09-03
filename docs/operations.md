@@ -1,17 +1,12 @@
-# Rustgo V0.3 operations
+# Rustgo V0.4 operations
 
 ## Scope and topology
 
-Rustgo V0.3 preserves V0.1 relay and V0.2 P2P protocols and adds an optional embedded Web dashboard for observability. V0.2 and V0.1 clients remain fully compatible.
-`rustgoc` maintains one TLS control connection to `rustgos`; configured legacy
-`[[tunnels]]` remain relay mappings. P2P `[[forwards]]` request named
-`[[exports]]`, attempt fixed-port QUIC/UDP or native-TCP direct paths, and use
-the encrypted relay when direct connectivity fails and fallback is enabled.
+Rustgo V0.4 adds a cross-platform GUI client (`rustgoc-gui`) with real-time monitoring, traffic visualization, and Windows system tray integration. The GUI shares the same headless `rustgoc` library and connects to V0.1/V0.2/V0.3 servers without modification. V0.3 preserves V0.1 relay and V0.2 P2P protocols and adds an optional embedded Web dashboard for observability. V0.2 and V0.1 clients remain fully compatible.
 
-The server needs a stable DNS name and public address. In the examples below,
-`tunnel.example.com` resolves to the server, TCP 7443 is the TLS control/data
-listener, TCP 2222 is a public forwarded port, and UDP 27015 is a public
-forwarded port.
+`rustgoc` and `rustgoc-gui` maintain one TLS control connection to `rustgos`; configured legacy `[[tunnels]]` remain relay mappings. P2P `[[forwards]]` request named `[[exports]]`, attempt fixed-port QUIC/UDP or native-TCP direct paths, and use the encrypted relay when direct connectivity fails and fallback is enabled.
+
+The server needs a stable DNS name and public address. In the examples below, `tunnel.example.com` resolves to the server, TCP 7443 is the TLS control/data listener, TCP 2222 is a public forwarded port, and UDP 27015 is a public forwarded port.
 
 ## Install
 
@@ -21,11 +16,36 @@ Build on each target OS or install the corresponding release artifacts:
 cargo build --workspace --release
 ```
 
-Install `rustgos` only on the public server and `rustgoc` on each authorized
-private host. Run each process as a dedicated unprivileged service identity.
-Keep server TLS private keys and client device private keys readable only by
-their owning service account. Do not place credentials below a Cargo `target`
-directory or another cached build directory.
+Install `rustgos` only on the public server and `rustgoc` or `rustgoc-gui` on each authorized private host. Run each process as a dedicated unprivileged service identity. Keep server TLS private keys and client device private keys readable only by their owning service account. Do not place credentials below a Cargo `target` directory or another cached build directory.
+
+The GUI client (`rustgoc-gui`) provides real-time monitoring with bounded resource usage:
+- Connection status with generation display
+- Live tunnel monitoring (name, protocol, ports, forward target)
+- Bounded log view (1,000 most recent lines)
+- Traffic totals (when telemetry is enabled)
+- Windows system tray integration (minimize to tray, quit from tray)
+
+## CLI flags
+
+Both `rustgoc` and `rustgoc-gui` accept:
+- `-c <path>` or `--config <path>`: Specify configuration file (default: `./client.toml`)
+- `keygen -o <directory>`: Generate device keypair
+- `check -c <path>`: Validate configuration without connecting
+
+`rustgoc-gui` additionally supports:
+- `--selfcheck`: Validate configuration and connectivity, then exit 0 on success
+
+The selfcheck mode:
+- Loads and validates configuration
+- Connects to the configured server
+- Waits up to 30 seconds for active status
+- Prints traffic totals and P2P path status
+- Exits 0 only on full success
+
+Use selfcheck for automated validation:
+```text
+rustgoc-gui --selfcheck -c ./client.toml
+```
 
 ## Create the TLS identity
 
@@ -66,6 +86,8 @@ Run key generation on the client host:
 
 ```text
 rustgoc keygen -o ./keys
+# or with the GUI client:
+rustgoc-gui keygen -o ./keys
 ```
 
 This creates `device.key` and `device.pub` without overwriting an existing

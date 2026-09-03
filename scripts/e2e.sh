@@ -722,6 +722,54 @@ for invocation in default explicit; do
     stop_managed "$server_pid"
 done
 
+# GUI selfcheck stage
+gui_binary=$workspace/target/release/rustgoc-gui
+gui_selfcheck_directory=$temporary_directory/gui-selfcheck
+mkdir -p "$gui_selfcheck_directory"
+gui_server_config=$gui_selfcheck_directory/server.toml
+gui_client_config=$gui_selfcheck_directory/client.toml
+gui_server_port=$("$port_allocator")
+
+server_lines=(
+    '[server]'
+    "certificate_file = \"$server_certificate\""
+    "private_key_file = \"$server_private_key\""
+    "udp_bind_ip = \"127.0.0.1\""
+    ''
+    '[server.control]'
+    "tcp_bind = \"127.0.0.1:$gui_server_port\""
+    ''
+    '[[server.authorized]]'
+    "device_public_key = \"$device_public_key\""
+)
+printf '%s\n' "${server_lines[@]}" >"$gui_server_config"
+
+start_managed gui-selfcheck-server "$gui_selfcheck_directory" "$server_binary" -c server.toml
+gui_server_pid=$started_pid
+gui_server_stdout=$started_stdout
+gui_server_stderr=$started_stderr
+server_output=$(wait_for_output "$gui_server_pid" "$gui_server_stdout" "$gui_server_stderr" event=server_listening)
+server_address=$(printf '%s\n' "$server_output" | grep -oP 'address=\K[^\s]+' | head -1)
+if [ -z "$server_address" ]; then
+    echo "Could not recover listening address from GUI selfcheck server output" >&2
+    exit 1
+fi
+
+client_lines=(
+    '[client]'
+    'name = "home-pc"'
+    "server_addr = \"$server_address\""
+    'server_name = "localhost"'
+    "certificate_authority_file = \"$certificate_authority\""
+    "private_key_file = \"$device_private_key\""
+    'heartbeat_interval_secs = 2'
+)
+printf '%s\n' "${client_lines[@]}" >"$gui_client_config"
+
+echo "Running GUI selfcheck..."
+"$gui_binary" --selfcheck -c "$gui_client_config"
+stop_managed "$gui_server_pid"
+
 if [ "$startup_gate_only" = false ]; then
     cargo test -p rustgo-e2e --test tcp tcp_echo -- --exact --test-threads=1
     cargo test -p rustgo-e2e --test udp udp_echo -- --exact --test-threads=1

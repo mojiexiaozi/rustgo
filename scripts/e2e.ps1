@@ -255,6 +255,30 @@ try {
         Stop-ManagedProcess -Record $server
     }
 
+    # GUI selfcheck stage
+    $guiBinary = Join-Path $workspace "target\release\rustgoc-gui.exe"
+    $guiSelfcheckDirectory = Join-Path $resolvedTemporaryDirectory "gui-selfcheck"
+    New-Item -ItemType Directory -Path $guiSelfcheckDirectory | Out-Null
+    $guiServerConfig = Join-Path $guiSelfcheckDirectory "server.toml"
+    $guiClientConfig = Join-Path $guiSelfcheckDirectory "client.toml"
+    $guiServerPort = & $portAllocator
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not allocate a loopback TCP port for GUI selfcheck"
+    }
+    Write-StartupServerConfig -Path $guiServerConfig -CertificateFile $serverCertificate.Replace('\', '/') -PrivateKeyFile $serverPrivateKey.Replace('\', '/') -PublicKey $devicePublicKey -Port ([int]$guiServerPort.Trim())
+
+    $guiServer = Start-ManagedProcess -Name "gui-selfcheck-server" -FilePath $serverBinary -WorkingDirectory $guiSelfcheckDirectory -Arguments @("-c", "server.toml")
+    $guiServerOutput = Wait-ForManagedOutput -Record $guiServer -Pattern "event=server_listening"
+    $guiAddressMatch = [regex]::Match($guiServerOutput, "address=([^\s]+)")
+    if (-not $guiAddressMatch.Success) {
+        throw ("Could not recover listening address from GUI selfcheck server output:{0}{1}" -f [Environment]::NewLine, $guiServerOutput)
+    }
+    Write-StartupClientConfig -Path $guiClientConfig -ServerAddress $guiAddressMatch.Groups[1].Value -CertificateAuthorityFile $certificateAuthority.Replace('\', '/') -PrivateKeyFile $devicePrivateKey.Replace('\', '/')
+
+    Write-Host "Running GUI selfcheck..."
+    Invoke-Native -FilePath $guiBinary -Arguments @("--selfcheck", "-c", $guiClientConfig)
+    Stop-ManagedProcess -Record $guiServer
+
     if (-not $StartupGateOnly) {
         Invoke-Native -FilePath "cargo" -Arguments @("test", "-p", "rustgo-e2e", "--test", "tcp", "tcp_echo", "--", "--exact", "--test-threads=1")
         Invoke-Native -FilePath "cargo" -Arguments @("test", "-p", "rustgo-e2e", "--test", "udp", "udp_echo", "--", "--exact", "--test-threads=1")
