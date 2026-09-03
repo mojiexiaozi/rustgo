@@ -232,7 +232,21 @@ listen_addr = "127.0.0.1:{udp_forward}"
             1,
         )
         .await?;
-        let _promoted = tcp_round_trip(forward, b"tcp-promoted").await?;
+        let mut promoted_tcp_streams = Vec::new();
+        for attempt in 1..=5 {
+            let promoted = tcp_round_trip(forward, b"tcp-promoted").await?;
+            promoted_tcp_streams.push(promoted);
+            let consumer_log = fs::read_to_string(consumer_config.with_extension("log"))?;
+            if selected_flows(&consumer_log)
+                .iter()
+                .any(|flow| flow.export == "tcp-echo" && flow.path == "NativeTcp")
+            {
+                break;
+            }
+            if attempt < 5 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
         eprintln!("promoted tcp echoed");
     }
 
