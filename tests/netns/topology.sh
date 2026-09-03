@@ -141,6 +141,7 @@ create_topology() {
         ip -n "$ns" link set lo up
     done
     ip link add "$RG_BRIDGE" type bridge
+    ip link set dev "$RG_BRIDGE" type bridge stp_state 0 forward_delay 0
     ip link set "$RG_BRIDGE" up
     create_link "rgs${RG_TAG}" "$RG_SERVER_NS" ext0
     create_link "rga${RG_TAG}" "$RG_NAT_A_NS" ext0

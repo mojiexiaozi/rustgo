@@ -488,6 +488,34 @@ fn assert_datagram_echo(socket: &UdpSocket, public: SocketAddr, payload: &[u8]) 
     receive_datagram(socket, public, payload)
 }
 
+fn assert_datagram_echo_eventually(
+    socket: &UdpSocket,
+    public: SocketAddr,
+    payload: &[u8],
+) -> TestResult {
+    let deadline = std::time::Instant::now() + DATAGRAM_TIMEOUT;
+    socket.set_read_timeout(Some(Duration::from_millis(250)))?;
+    loop {
+        let sent = socket.send_to(payload, public)?;
+        if sent != payload.len() {
+            return Err(format!("sent {sent} of {} UDP bytes", payload.len()).into());
+        }
+        match receive_datagram(socket, public, payload) {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if error.downcast_ref::<io::Error>().is_some_and(|error| {
+                    matches!(
+                        error.kind(),
+                        io::ErrorKind::TimedOut
+                            | io::ErrorKind::WouldBlock
+                            | io::ErrorKind::ConnectionReset
+                    )
+                }) && std::time::Instant::now() < deadline => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 fn receive_datagram(socket: &UdpSocket, public: SocketAddr, payload: &[u8]) -> TestResult {
     let mut received = vec![0_u8; MAX_UDP_PAYLOAD + 1];
     let (length, source) = socket.recv_from(&mut received)?;
@@ -675,7 +703,7 @@ fn negotiated_limits_retire_idle_client_flow_before_capacity_reuse() -> TestResu
     server.wait_for_line("event=udp_idle_sweep", Duration::from_secs(3))?;
     let retired = client.wait_for_line("event=udp_session_retired", Duration::from_secs(3))?;
     assert!(retired.contains("sessions=0"), "{retired}");
-    assert_datagram_echo(&second, public, &[0xB2; 16])?;
+    assert_datagram_echo_eventually(&second, public, &[0xB2; 16])?;
 
     client.terminate()?;
     server.terminate()?;
