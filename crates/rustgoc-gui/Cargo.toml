@@ -17,6 +17,7 @@ rustgoc = { path = "../rustgoc" }
 rustgos = { path = "../rustgos" }
 rustgo-config = { path = "../rustgo-config" }
 rustgo-crypto = { path = "../rustgo-crypto" }
+rustgo-observability = { path = "../rustgo-observability" }
 anyhow.workspace = true
 clap.workspace = true
 eframe.workspace = true
