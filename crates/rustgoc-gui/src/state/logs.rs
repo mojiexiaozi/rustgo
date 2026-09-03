@@ -93,9 +93,15 @@ impl Write for LogRingWriter {
                 )
             } else {
                 let now = OffsetDateTime::now_utc();
-                let ts = now.format(&time::format_description::well_known::Rfc3339)
+                let ts = now
+                    .format(&time::format_description::well_known::Rfc3339)
                     .unwrap_or_else(|_| "unknown".to_string());
-                (ts, "INFO".to_string(), "gui".to_string(), message.trim().to_string())
+                (
+                    ts,
+                    "INFO".to_string(),
+                    "gui".to_string(),
+                    message.trim().to_string(),
+                )
             };
 
             self.ring.push(LogLine {

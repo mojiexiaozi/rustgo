@@ -1,11 +1,11 @@
 #![forbid(unsafe_code)]
 
-use rustgoc::{ClientApp, ClientStatus};
 use rustgo_config::{
     AuthorizedClient, ClientConfig, ClientSection, Limits, ServerConfig, ServerSection,
     TelemetryConfig, TunnelConfig, TunnelProtocol,
 };
 use rustgo_crypto::{DeviceKeypair, generate_key_file};
+use rustgoc::{ClientApp, ClientStatus};
 use rustgoc_gui::state::connection::{ConnectionState, ConnectionViewModel};
 use rustgoc_gui::state::tunnels::TunnelRow;
 use rustgos::ServerApp;
