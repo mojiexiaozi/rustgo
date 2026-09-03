@@ -24,10 +24,10 @@ pub mod platform {
         pub fn new(event_tx: mpsc::SyncSender<TrayEvent>) -> anyhow::Result<Self> {
             let menu = Menu::new();
 
-            let show_item = MenuItem::with_id("1", "Show", true, None);
-            let connect_item = MenuItem::with_id("2", "Connect", true, None);
-            let disconnect_item = MenuItem::with_id("3", "Disconnect", true, None);
-            let quit_item = MenuItem::with_id("4", "Quit", true, None);
+            let show_item = MenuItem::with_id("1", "显示", true, None);
+            let connect_item = MenuItem::with_id("2", "连接", true, None);
+            let disconnect_item = MenuItem::with_id("3", "断开", true, None);
+            let quit_item = MenuItem::with_id("4", "退出", true, None);
 
             menu.append(&show_item)?;
             menu.append(&connect_item)?;
@@ -36,7 +36,7 @@ pub mod platform {
 
             let tray = TrayIconBuilder::new()
                 .with_menu(Box::new(menu))
-                .with_tooltip("Rustgo Client")
+                .with_tooltip("Rustgo 客户端")
                 .build()?;
 
             let menu_rx = MenuEvent::receiver();

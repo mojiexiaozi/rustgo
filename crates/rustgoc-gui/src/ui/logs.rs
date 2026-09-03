@@ -10,11 +10,11 @@ impl LogsPanel {
     }
 
     pub fn show(&mut self, ui: &mut Ui, log_lines: &[String]) {
-        ui.heading("Logs");
+        ui.heading("日志");
         ui.separator();
 
         if log_lines.is_empty() {
-            ui.label("No log entries");
+            ui.label("无日志条目");
             return;
         }
 

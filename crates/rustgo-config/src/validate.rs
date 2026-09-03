@@ -455,11 +455,6 @@ fn validate_web(web: &crate::WebConfig) -> Result<(), ValidationError> {
         .bind
         .parse::<SocketAddr>()
         .map_err(|_| ValidationError::new("web.bind must be an IP address with a port"))?;
-    if !bind.ip().is_loopback() {
-        return Err(ValidationError::new(
-            "web.bind must use a loopback IP address",
-        ));
-    }
     if bind.port() == 0 {
         return Err(ValidationError::new(
             "web.bind must use a port between 1 and 65535",

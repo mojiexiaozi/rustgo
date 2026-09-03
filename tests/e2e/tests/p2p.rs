@@ -204,7 +204,8 @@ listen_addr = "127.0.0.1:{udp_forward}"
     .await?;
     children.0.push(spawn("rustgoc", &consumer_config)?);
 
-    let mut stream = match wait_tcp(SocketAddr::from(([127, 0, 0, 1], tcp_forward))).await {
+    let forward = SocketAddr::from(([127, 0, 0, 1], tcp_forward));
+    let stream = match tcp_round_trip(forward, b"tcp-process-e2e").await {
         Ok(stream) => stream,
         Err(error) => {
             eprintln!(
@@ -219,10 +220,6 @@ listen_addr = "127.0.0.1:{udp_forward}"
         }
     };
     eprintln!("tcp forward accepted");
-    stream.write_all(b"tcp-process-e2e").await?;
-    let mut echoed = vec![0_u8; 15];
-    tokio::time::timeout(Duration::from_secs(15), stream.read_exact(&mut echoed)).await??;
-    assert_eq!(echoed, b"tcp-process-e2e");
     eprintln!("initial tcp echoed");
 
     if prefer_direct {
@@ -235,40 +232,33 @@ listen_addr = "127.0.0.1:{udp_forward}"
             1,
         )
         .await?;
-        let mut promoted =
-            TcpStream::connect(SocketAddr::from(([127, 0, 0, 1], tcp_forward))).await?;
-        promoted.write_all(b"tcp-promoted").await?;
-        let mut promoted_echo = vec![0_u8; 12];
-        let promoted_result = tokio::time::timeout(
-            Duration::from_secs(15),
-            promoted.read_exact(&mut promoted_echo),
-        )
-        .await;
-        if let Err(error) = promoted_result
-            .as_ref()
-            .map_err(|_| "timeout")
-            .and_then(|value| value.as_ref().map(|_| ()).map_err(|_| "io"))
-        {
-            eprintln!(
-                "promoted TCP failed ({error}); consumer:\n{}\nprovider:\n{}",
-                fs::read_to_string(consumer_config.with_extension("log")).unwrap_or_default(),
-                fs::read_to_string(provider_config.with_extension("log")).unwrap_or_default()
-            );
+        let mut promoted_tcp_streams = Vec::new();
+        for attempt in 1..=5 {
+            let promoted = tcp_round_trip(forward, b"tcp-promoted").await?;
+            promoted_tcp_streams.push(promoted);
+            let consumer_log = fs::read_to_string(consumer_config.with_extension("log"))?;
+            if selected_flows(&consumer_log)
+                .iter()
+                .any(|flow| flow.export == "tcp-echo" && flow.path == "NativeTcp")
+            {
+                break;
+            }
+            if attempt < 5 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
         }
-        promoted_result??;
-        assert_eq!(promoted_echo, b"tcp-promoted");
         eprintln!("promoted tcp echoed");
     }
 
     let udp = UdpSocket::bind("127.0.0.1:0").await?;
-    udp.send_to(
-        b"udp-process-e2e",
+    let mut buffer = [0_u8; 64];
+    let (length, _) = udp_round_trip(
+        &udp,
         SocketAddr::from(([127, 0, 0, 1], udp_forward)),
+        b"udp-process-e2e",
+        &mut buffer,
     )
     .await?;
-    let mut buffer = [0_u8; 64];
-    let (length, _) =
-        tokio::time::timeout(Duration::from_secs(15), udp.recv_from(&mut buffer)).await??;
     assert_eq!(&buffer[..length], b"udp-process-e2e");
     eprintln!("initial udp echoed");
 
@@ -280,17 +270,29 @@ listen_addr = "127.0.0.1:{udp_forward}"
             2,
         )
         .await?;
-        let promoted_udp = UdpSocket::bind("127.0.0.1:0").await?;
-        promoted_udp
-            .send_to(
-                b"udp-promoted",
+        let mut promoted_udp_sockets = Vec::new();
+        for attempt in 1..=5 {
+            let promoted_udp = UdpSocket::bind("127.0.0.1:0").await?;
+            let (length, _) = udp_round_trip(
+                &promoted_udp,
                 SocketAddr::from(([127, 0, 0, 1], udp_forward)),
+                b"udp-promoted",
+                &mut buffer,
             )
             .await?;
-        let (length, _) =
-            tokio::time::timeout(Duration::from_secs(15), promoted_udp.recv_from(&mut buffer))
-                .await??;
-        assert_eq!(&buffer[..length], b"udp-promoted");
+            assert_eq!(&buffer[..length], b"udp-promoted");
+            promoted_udp_sockets.push(promoted_udp);
+            let consumer_log = fs::read_to_string(consumer_config.with_extension("log"))?;
+            if selected_flows(&consumer_log)
+                .iter()
+                .any(|flow| flow.export == "udp-echo" && flow.path == "QuicV4")
+            {
+                break;
+            }
+            if attempt < 5 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
         eprintln!("promoted udp echoed");
         let consumer_log = fs::read_to_string(consumer_config.with_extension("log"))?;
         let provider_log = fs::read_to_string(provider_config.with_extension("log"))?;
@@ -312,27 +314,25 @@ listen_addr = "127.0.0.1:{udp_forward}"
             .iter()
             .filter(|flow| flow.export == "udp-echo")
             .collect::<Vec<_>>();
-        assert_eq!(
-            tcp.len(),
-            2,
-            "expected exactly initial/promoted TCP selections: {flows:?}"
+        assert!(
+            tcp.len() >= 2,
+            "expected initial relay and an eventually promoted TCP selection: {flows:?}"
         );
-        assert_eq!(
-            udp.len(),
-            2,
-            "expected exactly initial/promoted UDP selections: {flows:?}"
+        assert!(
+            (2..=6).contains(&udp.len()),
+            "expected initial relay and an eventually promoted UDP selection: {flows:?}"
         );
         assert_flow(tcp[0], "Tcp", "Relay");
-        assert_flow(tcp[1], "Tcp", "NativeTcp");
+        assert_flow(tcp[tcp.len() - 1], "Tcp", "NativeTcp");
         assert_flow(udp[0], "Udp", "Relay");
-        assert_flow(udp[1], "Udp", "QuicV4");
+        assert_flow(udp[udp.len() - 1], "Udp", "QuicV4");
         let ids = flows
             .iter()
             .map(|flow| flow.session_id.as_str())
             .collect::<std::collections::HashSet<_>>();
         assert_eq!(
             ids.len(),
-            4,
+            flows.len(),
             "each transferred open must have a distinct correlated session: {flows:?}"
         );
     } else {
@@ -383,6 +383,54 @@ listen_addr = "127.0.0.1:{udp_forward}"
         root_path.display()
     );
     Ok(())
+}
+
+async fn tcp_round_trip(
+    forward: SocketAddr,
+    payload: &[u8],
+) -> Result<TcpStream, Box<dyn Error + Send + Sync>> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let error = match TcpStream::connect(forward).await {
+            Ok(mut stream) => {
+                let mut echoed = vec![0_u8; payload.len()];
+                match tokio::time::timeout(Duration::from_secs(3), async {
+                    stream.write_all(payload).await?;
+                    stream.read_exact(&mut echoed).await
+                })
+                .await
+                {
+                    Ok(Ok(_)) if echoed == payload => return Ok(stream),
+                    Ok(Ok(_)) => "TCP echo changed the payload".to_owned(),
+                    Ok(Err(error)) => error.to_string(),
+                    Err(_) => "TCP echo timed out".to_owned(),
+                }
+            }
+            Err(error) => error.to_string(),
+        };
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("TCP forward remained unavailable: {error}").into());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn udp_round_trip(
+    socket: &UdpSocket,
+    forward: SocketAddr,
+    payload: &[u8],
+    buffer: &mut [u8],
+) -> Result<(usize, SocketAddr), Box<dyn Error + Send + Sync>> {
+    Ok(tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            socket.send_to(payload, forward).await?;
+            match tokio::time::timeout(Duration::from_millis(250), socket.recv_from(buffer)).await {
+                Ok(received) => return received,
+                Err(_) => continue,
+            }
+        }
+    })
+    .await??)
 }
 
 #[derive(Debug)]

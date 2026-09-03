@@ -155,21 +155,19 @@ fn check_accepts_enabled_web_defaults_when_its_toml_is_private() {
 }
 
 #[test]
-fn check_rejects_non_loopback_web_bind_before_starting_a_listener() {
+fn check_accepts_non_loopback_web_bind() {
     let material = TestMaterial::generate();
     let path = material.directory.path().join("web.toml");
     fs::write(
         &path,
         format!(
-            "{}\n[web]\nenabled = true\nbind = \"0.0.0.0:7450\"\nadmin_password = \"a-password-that-is-at-least-sixteen-bytes\"\n",
+            "{}\n[web]\nenabled = true\nbind = \"0.0.0.0:7450\"\nadmin_password = \"a-password-that-is-at-least-sixteen-bytes\"\ncookie_secure = false\n",
             valid_config(&material.public_key)
         ),
     )
     .unwrap();
 
-    check(&path, material.directory.path())
-        .failure()
-        .stderr(predicates::str::contains("loopback"));
+    check(&path, material.directory.path()).success();
 }
 
 #[cfg(windows)]

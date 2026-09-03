@@ -47,7 +47,7 @@ impl LogRing {
         (guard.lines.iter().cloned().collect(), guard.dropped)
     }
 
-    fn push(&self, line: LogLine) {
+    pub fn push(&self, line: LogLine) {
         let mut guard = self.inner.lock().unwrap();
         if guard.lines.len() >= MAX_LOG_LINES {
             guard.lines.pop_front();

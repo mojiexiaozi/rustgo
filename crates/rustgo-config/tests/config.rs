@@ -408,12 +408,14 @@ fn enabled_web_origin_policy_rejects_missing_mismatched_or_non_origin_values() {
 }
 
 #[test]
-fn enabled_web_configuration_rejects_non_loopback_and_weak_credentials() {
+fn enabled_web_configuration_allows_non_loopback_and_rejects_weak_credentials() {
     let dir = TempDir::new();
     let valid_web = "\n[web]\nenabled = true\nbind = \"127.0.0.1:7450\"\nadmin_username = \"admin\"\nadmin_password = \"a-password-that-is-at-least-sixteen-bytes\"\ncookie_secure = false\nhistory_days = 90\ndatabase_path = \"metrics.db\"\ndatabase_max_mib = 4096\n";
 
+    let non_loopback = valid_web.replace("127.0.0.1:7450", "0.0.0.0:7450");
+    assert!(load_server_text(&dir, &format!("{}{}", valid_server(), non_loopback)).is_ok());
+
     for invalid in [
-        valid_web.replace("127.0.0.1:7450", "0.0.0.0:7450"),
         valid_web.replace("admin_username = \"admin\"", "admin_username = \"\""),
         valid_web.replace(
             "admin_password = \"a-password-that-is-at-least-sixteen-bytes\"",

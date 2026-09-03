@@ -7,7 +7,8 @@ fn bash_cleanup_self_test_protects_reaped_pid_reuse_and_delete_failures() {
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(std::path::Path::parent)
-        .unwrap();
+        .unwrap()
+        .to_path_buf();
     let script = workspace.join("scripts/e2e.sh");
     let output = Command::new("bash")
         .arg(&script)

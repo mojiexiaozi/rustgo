@@ -746,19 +746,20 @@ async fn runtime_limits_reject_zero_oversized_and_incoherent_deadlines()
 }
 
 #[tokio::test]
-async fn binding_fails_closed_and_is_independent_from_the_relay_listener()
+async fn binding_allows_non_loopback_and_is_independent_from_the_relay_listener()
 -> Result<(), Box<dyn Error>> {
-    let invalid_address = unused_address()?;
-    let mut invalid = server_config(invalid_address, false);
-    invalid.web.as_mut().expect("web config exists").bind =
-        format!("0.0.0.0:{}", invalid_address.port());
-    let error = WebServer::bind(&invalid)
-        .await
-        .expect_err("a non-loopback web address must fail validation");
-    let message = error.to_string();
-    assert!(message.contains("loopback"));
-    assert!(!message.contains(PASSWORD));
-    assert!(TcpStream::connect(invalid_address).await.is_err());
+    let wildcard_port = unused_address()?.port();
+    let wildcard_address = format!("0.0.0.0:{wildcard_port}");
+    let mut wildcard = server_config(unused_address()?, false);
+    wildcard.web.as_mut().expect("web config exists").bind = wildcard_address;
+    let wildcard_web = WebServer::bind(&wildcard).await?;
+    assert!(wildcard_web.local_addr()?.ip().is_unspecified());
+    assert!(
+        TcpStream::connect(("127.0.0.1", wildcard_port))
+            .await
+            .is_ok()
+    );
+    drop(wildcard_web);
 
     let relay_reservation = StdTcpListener::bind("127.0.0.1:0")?;
     let relay_address = relay_reservation.local_addr()?;

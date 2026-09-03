@@ -5,7 +5,7 @@ use crate::ui::formatting::format_bytes;
 use eframe::egui::Ui;
 
 pub struct ConnectionPanel {
-    server_address: String,
+    pub server_address: String,
 }
 
 impl ConnectionPanel {
@@ -22,31 +22,35 @@ impl ConnectionPanel {
         sent_bytes: Option<u64>,
         received_bytes: Option<u64>,
     ) {
-        ui.heading("Connection");
+        ui.heading("连接");
         ui.separator();
 
         ui.horizontal(|ui| {
-            ui.label("Server:");
-            ui.monospace(&self.server_address);
+            ui.label("服务器：");
+            ui.add(
+                eframe::egui::TextEdit::singleline(&mut self.server_address)
+                    .desired_width(300.0)
+                    .hint_text("例如: 127.0.0.1:8443"),
+            );
         });
 
         ui.add_space(10.0);
 
         let state = vm.current();
         ui.horizontal(|ui| {
-            ui.label("Status:");
+            ui.label("状态：");
             match state {
                 ConnectionState::Disconnected => {
-                    ui.label("Disconnected");
+                    ui.label("已断开");
                 }
                 ConnectionState::Connecting => {
-                    ui.label("Connecting...");
+                    ui.label("连接中...");
                 }
                 ConnectionState::Connected { generation } => {
-                    ui.label(format!("Connected (generation {})", generation));
+                    ui.label(format!("已连接 (代 {})", generation));
                 }
                 ConnectionState::Backoff { seconds } => {
-                    ui.label(format!("Backoff (retry in {}s)", seconds));
+                    ui.label(format!("重试中 ({}秒后重试)", seconds));
                 }
             }
         });
@@ -58,14 +62,14 @@ impl ConnectionPanel {
             let can_disconnect = matches!(state, ConnectionState::Connected { .. });
 
             if ui
-                .add_enabled(can_connect, eframe::egui::Button::new("Connect"))
+                .add_enabled(can_connect, eframe::egui::Button::new("连接"))
                 .clicked()
             {
                 *on_connect = true;
             }
 
             if ui
-                .add_enabled(can_disconnect, eframe::egui::Button::new("Disconnect"))
+                .add_enabled(can_disconnect, eframe::egui::Button::new("断开"))
                 .clicked()
             {
                 *on_disconnect = true;
@@ -74,22 +78,22 @@ impl ConnectionPanel {
 
         ui.add_space(10.0);
 
-        ui.heading("Traffic");
+        ui.heading("流量");
         ui.separator();
 
         match (sent_bytes, received_bytes) {
             (Some(sent), Some(received)) => {
                 ui.horizontal(|ui| {
-                    ui.label("Sent:");
+                    ui.label("发送：");
                     ui.monospace(format_bytes(sent));
                 });
                 ui.horizontal(|ui| {
-                    ui.label("Received:");
+                    ui.label("接收：");
                     ui.monospace(format_bytes(received));
                 });
             }
             _ => {
-                ui.label("Traffic counters not available");
+                ui.label("流量统计不可用");
             }
         }
     }

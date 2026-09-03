@@ -165,9 +165,6 @@ impl WebServer {
             .bind
             .parse::<SocketAddr>()
             .map_err(|_| WebError::InvalidBindAddress)?;
-        if !configured_address.ip().is_loopback() {
-            return Err(WebError::NonLoopbackBind);
-        }
         Ok(configured_address)
     }
 
@@ -201,11 +198,6 @@ impl WebServer {
             AuthenticationState::new(&web.admin_username, &web.admin_password, &limits)
                 .map_err(|_| WebError::Authentication)?;
         let listener = TcpListener::bind(configured_address).await?;
-        let bound_address = listener.local_addr()?;
-        if !bound_address.ip().is_loopback() {
-            return Err(WebError::NonLoopbackBind);
-        }
-
         let state = Arc::new(WebState {
             authentication,
             expected_origin,
