@@ -48,12 +48,15 @@ async fn authenticated_routes_expose_bounded_explicit_redacted_dtos() -> Result<
     let mut rig = TestRig::start(true, 3).await?;
     let cookie = rig.web.login().await?;
 
-    let anonymous = rig.web.request("GET", "/api/v1/overview", &[], "").await?;
-    assert_eq!(anonymous.status, 401);
-    assert_eq!(
-        anonymous.json()?["error"]["code"],
-        "authentication_required"
-    );
+    for path in ["/api/v1/overview", "/api", "/api/unknown-route"] {
+        let anonymous = rig.web.request("GET", path, &[], "").await?;
+        assert_eq!(anonymous.status, 401, "{path}");
+        assert_eq!(
+            anonymous.json()?["error"]["code"],
+            "authentication_required",
+            "{path}"
+        );
+    }
 
     let overview = rig.web.api("GET", "/api/v1/overview", &cookie).await?;
     assert_json_response(&overview, 200)?;

@@ -1,24 +1,24 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="dark light">
-    <title>Rustgo dashboard sign in</title>
+    <title>登录 Rustgo 仪表盘</title>
     <link rel="stylesheet" href="/app.css">
     <script src="/login.js" defer></script>
   </head>
   <body class="login-page">
     <main class="login-card" aria-labelledby="login-title">
       <p class="eyebrow">Rustgo</p>
-      <h1 id="login-title">Dashboard sign in</h1>
-      <p class="muted">Use the configured administrator account.</p>
+      <h1 id="login-title">登录仪表盘</h1>
+      <p class="muted">请使用已配置的管理员账户。</p>
       <form id="login-form" method="post" action="/login">
-        <label for="username">Username</label>
+        <label for="username">用户名</label>
         <input id="username" name="username" type="text" autocomplete="username" maxlength="64" required autofocus>
-        <label for="password">Password</label>
+        <label for="password">密码</label>
         <input id="password" name="password" type="password" autocomplete="current-password" maxlength="256" required>
-        <button class="button" type="submit">Sign in</button>
+        <button class="button" type="submit">登录</button>
         <p id="login-status" class="form-status" role="status" aria-live="polite"></p>
       </form>
     </main>

@@ -8,14 +8,14 @@ use axum::{
     extract::State,
     http::{
         HeaderMap, HeaderValue, StatusCode,
-        header::{CACHE_CONTROL, CONTENT_TYPE, ETAG, IF_NONE_MATCH},
+        header::{CACHE_CONTROL, CONTENT_TYPE, ETAG, IF_NONE_MATCH, LOCATION},
     },
     response::{IntoResponse, Response},
     routing::get,
 };
 use sha2::{Digest, Sha256};
 
-use super::{WebState, api, security::single_cookie_header};
+use super::{WebState, security::single_cookie_header};
 
 struct Asset {
     bytes: &'static [u8],
@@ -66,7 +66,7 @@ async fn index(State(state): State<Arc<WebState>>, headers: HeaderMap) -> Respon
         .authentication
         .authenticate_cookie(single_cookie_header(&headers))
     {
-        return api::authentication_required();
+        return (StatusCode::FOUND, [(LOCATION, "/login")]).into_response();
     }
     asset_response(&INDEX, &headers, true)
 }

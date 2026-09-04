@@ -52,6 +52,9 @@ async fn login_uses_indistinguishable_digest_checks_and_guards_every_api_route()
 
     let anonymous_api = server.request("GET", "/api/v1/overview", &[], "").await?;
     assert_eq!(anonymous_api.status, 401);
+    let anonymous_dashboard = server.request("GET", "/", &[], "").await?;
+    assert_eq!(anonymous_dashboard.status, 302);
+    assert_eq!(anonymous_dashboard.header("location"), Some("/login"));
     let authenticated_api = server
         .request("GET", "/api/v1/overview", &[("Cookie", &cookie)], "")
         .await?;
@@ -105,6 +108,11 @@ async fn sessions_expire_on_idle_and_absolute_deadlines_and_evict_at_capacity()
         .ok_or("idle login did not set a cookie")?;
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert_eq!(idle_server.api(&idle_cookie).await?.status, 401);
+    let expired_dashboard = idle_server
+        .request("GET", "/", &[("Cookie", &idle_cookie)], "")
+        .await?;
+    assert_eq!(expired_dashboard.status, 302);
+    assert_eq!(expired_dashboard.header("location"), Some("/login"));
 
     let absolute_server = RunningWebServer::start(
         WebRuntimeLimits {

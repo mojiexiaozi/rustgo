@@ -26,11 +26,20 @@ async fn embedded_assets_are_allowlisted_cacheable_and_csp_compatible() -> Resul
     assert_eq!(login.status, 200);
     assert_page_headers(&login, "text/html; charset=utf-8")?;
     assert!(login.body.contains("id=\"login-form\""));
+    assert!(login.body.contains("lang=\"zh-CN\""));
+    assert!(login.body.contains("登录仪表盘"));
     assert!(login.body.contains("src=\"/login.js\""));
     assert!(!login.body.contains("<script>"));
 
     let anonymous_dashboard = server.request("GET", "/", &[], "").await?;
-    assert_eq!(anonymous_dashboard.status, 401);
+    assert_eq!(anonymous_dashboard.status, 302);
+    assert_eq!(anonymous_dashboard.header("location"), Some("/login"));
+
+    let invalid_cookie_dashboard = server
+        .request("GET", "/", &[("Cookie", "rustgo_session=invalid")], "")
+        .await?;
+    assert_eq!(invalid_cookie_dashboard.status, 302);
+    assert_eq!(invalid_cookie_dashboard.header("location"), Some("/login"));
 
     let cookie = server.login().await?;
     let dashboard = server
@@ -43,6 +52,8 @@ async fn embedded_assets_are_allowlisted_cacheable_and_csp_compatible() -> Resul
         Some("text/html; charset=utf-8")
     );
     assert!(dashboard.body.contains("id=\"client-grid\""));
+    assert!(dashboard.body.contains("lang=\"zh-CN\""));
+    assert!(dashboard.body.contains("服务器总览"));
     assert!(dashboard.body.contains("id=\"chart-cpu\""));
     assert!(dashboard.body.contains("id=\"sessions-table\""));
     assert!(dashboard.body.contains("src=\"/app.js\""));
@@ -122,12 +133,16 @@ fn checked_in_dashboard_uses_only_relative_allowlisted_resources() {
     assert!(script.contains("requestPoll"));
     assert!(script.contains("BigInt(a.traffic_sort_bytes)"));
     assert!(script.contains("client.active_path"));
-    assert!(script.contains("Units:"));
-    assert!(script.contains("minimum"));
-    assert!(script.contains("maximum"));
-    assert!(script.contains("rising"));
-    assert!(script.contains("primaryLabel: \"Download\""));
-    assert!(script.contains("secondaryLabel: \"Upload\""));
+    assert!(script.contains("单位："));
+    assert!(script.contains("最低"));
+    assert!(script.contains("最高"));
+    assert!(script.contains("上升"));
+    assert!(script.contains("primaryLabel: \"下载\""));
+    assert!(script.contains("secondaryLabel: \"上传\""));
+    assert!(script.contains("toLocaleString(\"zh-CN\")"));
+    assert!(script.contains("sessionPathLabel(session.path)"));
+    assert!(script.contains("sessionStateLabel(session.state)"));
+    assert!(login_script.contains("登录失败，请稍后重试。"));
     assert!(script.contains("createElementNS(\"http://www.w3.org/2000/svg\", \"title\")"));
     assert!(script.contains("createElementNS(\"http://www.w3.org/2000/svg\", \"desc\")"));
     assert!(stylesheet.contains(".chart polyline"));

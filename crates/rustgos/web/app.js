@@ -24,7 +24,7 @@
   const text = (id, value) => { const node = $(id); if (node) node.textContent = value; };
 
   function formatBytes(value) {
-    if (!Number.isFinite(value) || value < 0) return "Unavailable";
+    if (!Number.isFinite(value) || value < 0) return "不可用";
     const units = ["B", "KiB", "MiB", "GiB", "TiB"];
     let amount = value;
     let unit = 0;
@@ -33,31 +33,31 @@
   }
 
   function formatRate(value) {
-    return value == null ? "Unavailable" : `${formatBytes(value)}/s`;
+    return value == null ? "不可用" : `${formatBytes(value)}/s`;
   }
 
   function formatPercent(basisPoints) {
-    return basisPoints == null ? "Unavailable" : `${(basisPoints / 100).toFixed(1)}%`;
+    return basisPoints == null ? "不可用" : `${(basisPoints / 100).toFixed(1)}%`;
   }
 
   function formatTime(timestamp) {
-    return Number.isFinite(timestamp) && timestamp > 0 ? new Date(timestamp).toLocaleString() : "Unavailable";
+    return Number.isFinite(timestamp) && timestamp > 0 ? new Date(timestamp).toLocaleString("zh-CN") : "不可用";
   }
 
   function formatAge(millis) {
-    if (millis == null) return "unavailable";
-    if (millis < 1000) return "just now";
-    if (millis < 60000) return `${Math.floor(millis / 1000)}s ago`;
-    if (millis < 3600000) return `${Math.floor(millis / 60000)}m ago`;
-    return `${Math.floor(millis / 3600000)}h ago`;
+    if (millis == null) return "不可用";
+    if (millis < 1000) return "刚刚";
+    if (millis < 60000) return `${Math.floor(millis / 1000)} 秒前`;
+    if (millis < 3600000) return `${Math.floor(millis / 60000)} 分钟前`;
+    return `${Math.floor(millis / 3600000)} 小时前`;
   }
 
   function formatDuration(millis) {
-    if (!Number.isFinite(millis)) return "Unavailable";
+    if (!Number.isFinite(millis)) return "不可用";
     const seconds = Math.floor(millis / 1000);
-    if (seconds < 60) return `${seconds}s`;
-    if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
-    return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
+    if (seconds < 60) return `${seconds} 秒`;
+    if (seconds < 3600) return `${Math.floor(seconds / 60)} 分钟`;
+    return `${Math.floor(seconds / 3600)} 小时 ${Math.floor((seconds % 3600) / 60)} 分钟`;
   }
 
   function setStatus(message, kind) {
@@ -75,9 +75,9 @@
       const response = await fetch(path, { credentials: "same-origin", signal: controller.signal });
       if (response.status === 401) {
         window.location.assign("/login");
-        throw new Error("authentication required");
+        throw new Error("需要登录");
       }
-      if (!response.ok) throw new Error(`request failed (${response.status})`);
+      if (!response.ok) throw new Error(`请求失败（${response.status}）`);
       return await response.json();
     } finally {
       if (controllers.get(key) === controller) controllers.delete(key);
@@ -104,28 +104,28 @@
   }
 
   function metricNote(metrics) {
-    if (!metrics?.available) return "Metrics unavailable";
-    if (metrics.clock_skew) return "Clock skew detected";
-    return metrics.stale ? `Stale · ${formatAge(metrics.age_millis)}` : `Sampled ${formatAge(metrics.age_millis)}`;
+    if (!metrics?.available) return "指标不可用";
+    if (metrics.clock_skew) return "检测到时钟偏差";
+    return metrics.stale ? `数据陈旧 · ${formatAge(metrics.age_millis)}` : `采样于 ${formatAge(metrics.age_millis)}`;
   }
 
   function renderOverview(overview) {
     const server = overview.server;
     const metrics = server.metrics;
-    text("snapshot-summary", `Snapshot ${formatTime(overview.generated_unix_millis)} · ${server.online_clients} online clients · ${server.active_sessions.active} active sessions`);
+    text("snapshot-summary", `快照时间 ${formatTime(overview.generated_unix_millis)} · ${server.online_clients} 个客户端在线 · ${server.active_sessions.active} 个活跃会话`);
     text("server-cpu", formatPercent(metrics.cpu_basis_points));
     text("server-cpu-note", metricNote(metrics));
-    text("server-memory", metrics.memory_used_bytes == null ? "Unavailable" : `${formatBytes(metrics.memory_used_bytes)} / ${formatBytes(metrics.memory_total_bytes)}`);
+    text("server-memory", metrics.memory_used_bytes == null ? "不可用" : `${formatBytes(metrics.memory_used_bytes)} / ${formatBytes(metrics.memory_total_bytes)}`);
     text("server-memory-note", metricNote(metrics));
-    text("server-storage", metrics.disk_used_bytes == null ? "Unavailable" : `${formatBytes(metrics.disk_used_bytes)} / ${formatBytes(metrics.disk_total_bytes)}`);
+    text("server-storage", metrics.disk_used_bytes == null ? "不可用" : `${formatBytes(metrics.disk_used_bytes)} / ${formatBytes(metrics.disk_total_bytes)}`);
     text("server-storage-note", metricNote(metrics));
     text("server-upload", formatRate(metrics.network_sent_bytes_per_second));
-    text("server-upload-note", `${formatBytes(server.traffic.sent_bytes)} logical sent`);
+    text("server-upload-note", `逻辑发送量 ${formatBytes(server.traffic.sent_bytes)}`);
     text("server-download", formatRate(metrics.network_received_bytes_per_second));
-    text("server-download-note", `${formatBytes(server.traffic.received_bytes)} logical received`);
+    text("server-download-note", `逻辑接收量 ${formatBytes(server.traffic.received_bytes)}`);
     const healthy = !overview.snapshot_stale && overview.observability.dropped_events === 0;
-    text("service-health", healthy ? "Healthy" : "Degraded");
-    text("service-health-note", overview.history.available ? `${overview.observability.event_queue_depth} queued events` : "History unavailable");
+    text("service-health", healthy ? "正常" : "降级");
+    text("service-health-note", overview.history.available ? `${overview.observability.event_queue_depth} 个排队事件` : "历史数据不可用");
     renderClientGrid(overview.clients);
   }
 
@@ -177,7 +177,19 @@
   }
 
   function activePathLabel(path) {
-    return ({ relay: "Relay", "p2p-direct": "Direct P2P", "p2p-fallback": "Fallback P2P", mixed: "Mixed active paths", none: "No active path" })[path] || "Unavailable";
+    return ({ relay: "中继", "p2p-direct": "P2P 直连", "p2p-fallback": "P2P 回退", mixed: "多种活跃路径", none: "无活跃路径" })[path] || "不可用";
+  }
+
+  function sessionPathLabel(path) {
+    return ({ relay: "中继", "p2p-direct": "P2P 直连", "p2p-fallback": "P2P 回退" })[path] || "未知";
+  }
+
+  function sessionStateLabel(sessionState) {
+    return ({ active: "活跃", closed: "已关闭" })[sessionState] || "未知";
+  }
+
+  function protocolLabel(kind) {
+    return ({ tcp: "TCP", udp: "UDP", p2p: "P2P" })[kind] || "未知";
   }
 
   function clientCard(client) {
@@ -189,22 +201,22 @@
     link.href = `#client/${encodeURIComponent(client.name)}`;
     link.textContent = client.name;
     title.append(link);
-    top.append(title, badge(client.online ? "Online" : "Offline", client.online ? "badge-online" : "badge-offline"));
+    top.append(title, badge(client.online ? "在线" : "离线", client.online ? "badge-online" : "badge-offline"));
     const badges = document.createElement("div"); badges.className = "badges";
-    if (client.telemetry.stale || client.heartbeat.stale) badges.append(badge("Stale", "badge-stale"));
-    if (!client.telemetry.available) badges.append(badge("Metrics unavailable", "badge-warning"));
-    if (client.reconnects > 0) badges.append(badge(`${client.reconnects} reconnects`, "badge-warning"));
+    if (client.telemetry.stale || client.heartbeat.stale) badges.append(badge("数据陈旧", "badge-stale"));
+    if (!client.telemetry.available) badges.append(badge("指标不可用", "badge-warning"));
+    if (client.reconnects > 0) badges.append(badge(`重连 ${client.reconnects} 次`, "badge-warning"));
     const details = document.createElement("dl");
-    appendDefinition(details, "Version", client.version || "Unavailable");
-    appendDefinition(details, "Heartbeat", formatAge(client.heartbeat.age_millis));
+    appendDefinition(details, "版本", client.version || "不可用");
+    appendDefinition(details, "心跳", formatAge(client.heartbeat.age_millis));
     appendDefinition(details, "CPU", formatPercent(client.telemetry.cpu_basis_points));
-    appendDefinition(details, "Memory", client.telemetry.memory_used_bytes == null ? "Unavailable" : formatBytes(client.telemetry.memory_used_bytes));
-    appendDefinition(details, "Storage", client.telemetry.disk_used_bytes == null ? "Unavailable" : formatBytes(client.telemetry.disk_used_bytes));
-    appendDefinition(details, "Upload / download", `${formatRate(client.telemetry.network_sent_bytes_per_second)} / ${formatRate(client.telemetry.network_received_bytes_per_second)}`);
-    appendDefinition(details, "Logical traffic", `${formatBytes(client.traffic.sent_bytes)} / ${formatBytes(client.traffic.received_bytes)}`);
-    appendDefinition(details, "Exports / forwards", `${client.inventory.exports.total} / ${client.inventory.forwards.total}`);
-    appendDefinition(details, "Sessions", `${client.sessions.active} active · ${client.sessions.total} total`);
-    appendDefinition(details, "Active path", activePathLabel(client.active_path));
+    appendDefinition(details, "内存", client.telemetry.memory_used_bytes == null ? "不可用" : formatBytes(client.telemetry.memory_used_bytes));
+    appendDefinition(details, "存储", client.telemetry.disk_used_bytes == null ? "不可用" : formatBytes(client.telemetry.disk_used_bytes));
+    appendDefinition(details, "上传 / 下载", `${formatRate(client.telemetry.network_sent_bytes_per_second)} / ${formatRate(client.telemetry.network_received_bytes_per_second)}`);
+    appendDefinition(details, "逻辑流量", `${formatBytes(client.traffic.sent_bytes)} / ${formatBytes(client.traffic.received_bytes)}`);
+    appendDefinition(details, "导出 / 转发", `${client.inventory.exports.total} / ${client.inventory.forwards.total}`);
+    appendDefinition(details, "会话", `${client.sessions.active} 个活跃 · 共 ${client.sessions.total} 个`);
+    appendDefinition(details, "活跃路径", activePathLabel(client.active_path));
     article.append(top, badges, details);
     return article;
   }
@@ -216,16 +228,16 @@
     const items = sortedClients(clients);
     grid.replaceChildren(...items.map(clientCard));
     empty.hidden = items.length !== 0;
-    text("clients-summary", `${items.length} shown of ${clients.total} clients`);
+    text("clients-summary", `显示 ${items.length} 个客户端，共 ${clients.total} 个`);
   }
 
   function describeSeries(label, points, formatValue) {
     const values = points.map((point) => point.value).filter(Number.isFinite);
-    if (!values.length) return `${label}: no data`;
+    if (!values.length) return `${label}：无数据`;
     const first = values[0];
     const latest = values[values.length - 1];
-    const trend = latest > first ? "rising" : latest < first ? "falling" : "steady";
-    return `${label}: latest ${formatValue(latest)}, minimum ${formatValue(Math.min(...values))}, maximum ${formatValue(Math.max(...values))}, ${trend}`;
+    const trend = latest > first ? "上升" : latest < first ? "下降" : "平稳";
+    return `${label}：最新 ${formatValue(latest)}，最低 ${formatValue(Math.min(...values))}，最高 ${formatValue(Math.max(...values))}，趋势${trend}`;
   }
 
   function chartNode(id, primary, secondary, options) {
@@ -233,7 +245,7 @@
     if (!container) return;
     const { title, unit, range, primaryLabel, secondaryLabel = "", formatValue } = options;
     const summary = [
-      `${title}. Range: ${range}. Units: ${unit}.`,
+      `${title}。范围：${range}。单位：${unit}。`,
       describeSeries(primaryLabel, primary, formatValue),
       secondaryLabel ? describeSeries(secondaryLabel, secondary, formatValue) : "",
     ].filter(Boolean).join(" ");
@@ -243,7 +255,7 @@
     if (!all.length) {
       const empty = document.createElement("p");
       empty.className = "chart-empty";
-      empty.textContent = `${title}: no history is available for ${range} (${unit}).`;
+      empty.textContent = `${title}：${range}内没有可用历史数据（${unit}）。`;
       container.append(empty);
       return;
     }
@@ -288,7 +300,7 @@
   }
 
   function historyRangeLabel(range) {
-    return range === 3600000 ? "1 hour" : range === 604800000 ? "7 days" : "24 hours";
+    return range === 3600000 ? "1 小时" : range === 604800000 ? "7 天" : "24 小时";
   }
 
   function historyDue(cache, key) {
@@ -328,17 +340,17 @@
       if (state.serverHistory.generation !== generation) return true;
       markHistorySuccess(state.serverHistory, key);
       const rangeLabel = historyRangeLabel(range);
-      chartNode("chart-cpu", cpu.points, [], { title: "Server CPU history", unit: "percent", range: rangeLabel, primaryLabel: "CPU", formatValue: formatPercent });
-      chartNode("chart-memory", memory.points, [], { title: "Server memory history", unit: "bytes", range: rangeLabel, primaryLabel: "Memory", formatValue: formatBytes });
-      chartNode("chart-network", received.points, sent.points, { title: "Server network history", unit: "bytes per second", range: rangeLabel, primaryLabel: "Download", secondaryLabel: "Upload", formatValue: formatRate });
-      chartNode("chart-traffic", trafficReceived.points, trafficSent.points, { title: "Server Rustgo traffic history", unit: "bytes", range: rangeLabel, primaryLabel: "Logical download", secondaryLabel: "Logical upload", formatValue: formatBytes });
+      chartNode("chart-cpu", cpu.points, [], { title: "服务器 CPU 历史", unit: "百分比", range: rangeLabel, primaryLabel: "CPU", formatValue: formatPercent });
+      chartNode("chart-memory", memory.points, [], { title: "服务器内存历史", unit: "字节", range: rangeLabel, primaryLabel: "内存", formatValue: formatBytes });
+      chartNode("chart-network", received.points, sent.points, { title: "服务器网络历史", unit: "字节/秒", range: rangeLabel, primaryLabel: "下载", secondaryLabel: "上传", formatValue: formatRate });
+      chartNode("chart-traffic", trafficReceived.points, trafficSent.points, { title: "服务器 Rustgo 流量历史", unit: "字节", range: rangeLabel, primaryLabel: "逻辑下载", secondaryLabel: "逻辑上传", formatValue: formatBytes });
       return true;
     } catch (error) {
       if (error.name === "AbortError") throw error;
       if (state.serverHistory.generation !== generation) return true;
       markHistoryFailure(state.serverHistory, key);
       const rangeLabel = historyRangeLabel(range);
-      for (const id of ["chart-cpu", "chart-memory", "chart-network", "chart-traffic"]) chartNode(id, [], [], { title: "History unavailable", unit: "data", range: rangeLabel, primaryLabel: "History", formatValue: String });
+      for (const id of ["chart-cpu", "chart-memory", "chart-network", "chart-traffic"]) chartNode(id, [], [], { title: "历史数据不可用", unit: "数据", range: rangeLabel, primaryLabel: "历史", formatValue: String });
       return false;
     }
   }
@@ -346,11 +358,11 @@
   function renderClientDetail(detail) {
     const client = detail.client;
     text("client-title", client.name);
-    text("client-detail-summary", `${client.online ? "Online" : "Offline"} · heartbeat ${formatAge(client.heartbeat.age_millis)} · ${client.sessions.active} active sessions`);
+    text("client-detail-summary", `${client.online ? "在线" : "离线"} · 心跳 ${formatAge(client.heartbeat.age_millis)} · ${client.sessions.active} 个活跃会话`);
     const metrics = $("client-detail-metrics");
     if (metrics) {
       metrics.replaceChildren();
-      const values = [["CPU", formatPercent(client.telemetry.cpu_basis_points), metricNote(client.telemetry)], ["Memory", formatBytes(client.telemetry.memory_used_bytes), metricNote(client.telemetry)], ["Storage", formatBytes(client.telemetry.disk_used_bytes), metricNote(client.telemetry)], ["Upload", formatRate(client.telemetry.network_sent_bytes_per_second), `${formatBytes(client.traffic.sent_bytes)} logical sent`], ["Download", formatRate(client.telemetry.network_received_bytes_per_second), `${formatBytes(client.traffic.received_bytes)} logical received`], ["Path", activePathLabel(client.active_path), `${client.reconnects} reconnects`]];
+      const values = [["CPU", formatPercent(client.telemetry.cpu_basis_points), metricNote(client.telemetry)], ["内存", formatBytes(client.telemetry.memory_used_bytes), metricNote(client.telemetry)], ["存储", formatBytes(client.telemetry.disk_used_bytes), metricNote(client.telemetry)], ["上传", formatRate(client.telemetry.network_sent_bytes_per_second), `逻辑发送量 ${formatBytes(client.traffic.sent_bytes)}`], ["下载", formatRate(client.telemetry.network_received_bytes_per_second), `逻辑接收量 ${formatBytes(client.traffic.received_bytes)}`], ["路径", activePathLabel(client.active_path), `重连 ${client.reconnects} 次`]];
       for (const [label, value, note] of values) {
         const card = document.createElement("article"); card.className = "metric-card";
         const heading = document.createElement("h2"); heading.textContent = label;
@@ -360,13 +372,13 @@
       }
     }
     const inventory = $("client-inventory");
-    if (inventory) { inventory.replaceChildren(); appendDefinition(inventory, "Exports", `${client.inventory.exports.total} (${client.inventory.exports.items.join(", ") || "none"})`); appendDefinition(inventory, "Forwards", `${client.inventory.forwards.total} (${client.inventory.forwards.items.join(", ") || "none"})`); appendDefinition(inventory, "Tunnels", `${client.inventory.tunnels.total} (${client.inventory.tunnels.items.join(", ") || "none"})`); }
+    if (inventory) { inventory.replaceChildren(); appendDefinition(inventory, "导出", `${client.inventory.exports.total}（${client.inventory.exports.items.join("、") || "无"}）`); appendDefinition(inventory, "转发", `${client.inventory.forwards.total}（${client.inventory.forwards.items.join("、") || "无"}）`); appendDefinition(inventory, "隧道", `${client.inventory.tunnels.total}（${client.inventory.tunnels.items.join("、") || "无"}）`); }
     const paths = $("client-paths");
-    if (paths) { paths.replaceChildren(); appendDefinition(paths, "Direct P2P", String(client.paths.p2p_direct)); appendDefinition(paths, "Fallback P2P", String(client.paths.p2p_fallback)); appendDefinition(paths, "Relay", String(client.paths.relay)); appendDefinition(paths, "TCP / UDP / P2P", `${client.sessions.tcp} / ${client.sessions.udp} / ${client.sessions.p2p}`); }
+    if (paths) { paths.replaceChildren(); appendDefinition(paths, "P2P 直连", String(client.paths.p2p_direct)); appendDefinition(paths, "P2P 回退", String(client.paths.p2p_fallback)); appendDefinition(paths, "中继", String(client.paths.relay)); appendDefinition(paths, "TCP / UDP / P2P", `${client.sessions.tcp} / ${client.sessions.udp} / ${client.sessions.p2p}`); }
     const sessions = $("client-sessions");
     if (sessions) {
       const list = document.createElement("ol"); list.className = "session-list";
-      for (const session of detail.sessions.items) { const item = document.createElement("li"); item.textContent = `${session.id} · ${session.kind} · ${session.path} · ${session.state} · ${formatBytes(session.traffic.sent_bytes + session.traffic.received_bytes)}`; list.append(item); }
+      for (const session of detail.sessions.items) { const item = document.createElement("li"); item.textContent = `${session.id} · ${protocolLabel(session.kind)} · ${sessionPathLabel(session.path)} · ${sessionStateLabel(session.state)} · ${formatBytes(session.traffic.sent_bytes + session.traffic.received_bytes)}`; list.append(item); }
       sessions.replaceChildren(list);
     }
   }
@@ -385,16 +397,16 @@
       if (state.clientHistory.generation !== generation) return true;
       markHistorySuccess(state.clientHistory, key);
       const rangeLabel = historyRangeLabel(range);
-      chartNode("client-chart-cpu", cpu.points, [], { title: "Client CPU history", unit: "percent", range: rangeLabel, primaryLabel: "CPU", formatValue: formatPercent });
-      chartNode("client-chart-traffic", received.points, sent.points, { title: "Client traffic history", unit: "bytes", range: rangeLabel, primaryLabel: "Logical download", secondaryLabel: "Logical upload", formatValue: formatBytes });
+      chartNode("client-chart-cpu", cpu.points, [], { title: "客户端 CPU 历史", unit: "百分比", range: rangeLabel, primaryLabel: "CPU", formatValue: formatPercent });
+      chartNode("client-chart-traffic", received.points, sent.points, { title: "客户端流量历史", unit: "字节", range: rangeLabel, primaryLabel: "逻辑下载", secondaryLabel: "逻辑上传", formatValue: formatBytes });
       return true;
     } catch (error) {
       if (error.name === "AbortError") throw error;
       if (state.clientHistory.generation !== generation) return true;
       markHistoryFailure(state.clientHistory, key);
       const rangeLabel = historyRangeLabel(range);
-      chartNode("client-chart-cpu", [], [], { title: "Client history unavailable", unit: "data", range: rangeLabel, primaryLabel: "History", formatValue: String });
-      chartNode("client-chart-traffic", [], [], { title: "Client history unavailable", unit: "data", range: rangeLabel, primaryLabel: "History", formatValue: String });
+      chartNode("client-chart-cpu", [], [], { title: "客户端历史数据不可用", unit: "数据", range: rangeLabel, primaryLabel: "历史", formatValue: String });
+      chartNode("client-chart-traffic", [], [], { title: "客户端历史数据不可用", unit: "数据", range: rangeLabel, primaryLabel: "历史", formatValue: String });
       return false;
     }
   }
@@ -412,11 +424,11 @@
     body.replaceChildren();
     for (const session of data.sessions.items) {
       const row = document.createElement("tr");
-      const cells = [session.id, session.client, session.kind, session.path, session.state, formatBytes(session.traffic.sent_bytes + session.traffic.received_bytes), formatTime(session.opened_unix_millis), formatDuration(session.duration_millis)];
+      const cells = [session.id, session.client, protocolLabel(session.kind), sessionPathLabel(session.path), sessionStateLabel(session.state), formatBytes(session.traffic.sent_bytes + session.traffic.received_bytes), formatTime(session.opened_unix_millis), formatDuration(session.duration_millis)];
       for (const value of cells) { const cell = document.createElement("td"); cell.textContent = value; row.append(cell); }
       body.append(row);
     }
-    text("sessions-summary", `${data.sessions.returned} shown of ${data.sessions.total} sessions. Only shortened session identifiers are shown.`);
+    text("sessions-summary", `显示 ${data.sessions.returned} 个会话，共 ${data.sessions.total} 个。仅显示缩短后的会话标识。`);
   }
 
   async function refreshCurrentRoute() {
@@ -464,13 +476,13 @@
       const overview = await requestJson("/api/v1/overview", "overview");
       state.overview = overview;
       const viewSucceeded = await refreshCurrentRoute();
-      if (!viewSucceeded) throw new Error("current dashboard view did not refresh");
+      if (!viewSucceeded) throw new Error("当前仪表盘视图刷新失败");
       state.failures = 0;
-      setStatus(overview.snapshot_stale ? "Live snapshot is stale" : "Live · updates every 2 seconds", overview.snapshot_stale ? "stale" : "live");
+      setStatus(overview.snapshot_stale ? "实时快照已陈旧" : "实时 · 每 2 秒更新", overview.snapshot_stale ? "stale" : "live");
     } catch (error) {
       if (error.name !== "AbortError") {
         state.failures += 1;
-        setStatus(`Data is stale · retrying in ${Math.min(MAX_BACKOFF_MILLIS, POLL_MILLIS * 2 ** state.failures) / 1000}s`, "stale");
+        setStatus(`数据已陈旧 · ${Math.min(MAX_BACKOFF_MILLIS, POLL_MILLIS * 2 ** state.failures) / 1000} 秒后重试`, "stale");
       }
     } finally {
       if (generation === state.pollGeneration) state.pollInFlight = false;
@@ -506,8 +518,8 @@
   }
 
   $("client-search")?.addEventListener("input", (event) => { state.clientSearch = event.target.value; if (state.overview) renderClientGrid(state.overview.clients); });
-  $("client-sort")?.addEventListener("change", (event) => { state.clientSort = event.target.value; state.clientDescending = event.target.value !== "name"; text("client-order", state.clientDescending ? "Descending" : "Ascending"); if (state.overview) renderClientGrid(state.overview.clients); });
-  $("client-order")?.addEventListener("click", () => { state.clientDescending = !state.clientDescending; text("client-order", state.clientDescending ? "Descending" : "Ascending"); if (state.overview) renderClientGrid(state.overview.clients); });
+  $("client-sort")?.addEventListener("change", (event) => { state.clientSort = event.target.value; state.clientDescending = event.target.value !== "name"; text("client-order", state.clientDescending ? "降序" : "升序"); if (state.overview) renderClientGrid(state.overview.clients); });
+  $("client-order")?.addEventListener("click", () => { state.clientDescending = !state.clientDescending; text("client-order", state.clientDescending ? "降序" : "升序"); if (state.overview) renderClientGrid(state.overview.clients); });
   $("history-range")?.addEventListener("change", () => { resetHistory(); requestPoll(); });
   $("session-filters")?.addEventListener("submit", (event) => { event.preventDefault(); abortSupersededViewRequests(); if (activeRoute().view === "sessions") requestPoll(); });
   $("logout-button")?.addEventListener("click", async () => { try { await fetch("/logout", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, credentials: "same-origin", body: "" }); } finally { window.location.assign("/login"); } });

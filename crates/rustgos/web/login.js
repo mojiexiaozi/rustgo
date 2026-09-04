@@ -7,7 +7,7 @@
 
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
-    status.textContent = "Signing in…";
+    status.textContent = "正在登录…";
     const formData = new FormData(form);
     const body = new URLSearchParams();
     body.set("username", String(formData.get("username") || ""));
@@ -22,7 +22,7 @@
       if (!response.ok) throw new Error("sign in failed");
       window.location.assign("/");
     } catch (_) {
-      status.textContent = "Sign in failed. Check the administrator credentials and try again.";
+      status.textContent = "登录失败，请稍后重试。";
     }
   });
 })();
