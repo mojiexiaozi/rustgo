@@ -21,9 +21,9 @@
 
 ## 实现设计
 
-静态 HTML 中的固定文字直接替换为简体中文。JavaScript 运行时生成的文字也直接使用中文常量，避免为了单语言界面引入文案表或依赖。动态数据、设备名、隧道名和协议值保持原值；仅其周围的标签和描述中文化。
+静态 HTML 中的固定文字直接替换为简体中文。JavaScript 运行时生成的文字也直接使用中文常量，避免为了单语言界面引入文案表或依赖。设备名、隧道名及其他自由文本动态数据保持原值；`active`、`closed`、路径类型等有限枚举在前端映射为中文，TCP、UDP、P2P、QUIC 等协议缩写保留。不得为中文显示修改 API JSON。
 
-页面鉴权与 API 鉴权保持分层：`assets::index` 在 Cookie 验证失败时生成临时重定向响应；`api_boundary` 和各 API 路由继续调用现有的 `authentication_required` JSON 响应。登录页及其 CSS、JavaScript 仍允许匿名读取。
+页面鉴权与 API 鉴权保持分层：`assets::index` 在 Cookie 验证失败时明确返回 `StatusCode::FOUND`（302）并设置 `Location: /login`，不使用会产生 307 的临时重定向助手；`api_boundary` 和各 API 路由继续调用现有的 `authentication_required` JSON 响应。登录页及其 CSS、JavaScript 仍允许匿名读取。
 
 ## 错误与边界行为
 
@@ -34,10 +34,9 @@
 
 ## 验收
 
-遵循仓库约定，不新增单元测试，也不在编写过程中运行测试。最终验收统一运行现有 Web 资产、Web 认证和 Web API 功能测试，确认：
+遵循仓库约定，不新增单元测试，也不在编写过程中运行测试。更新既有功能测试中的英文文案断言，并增加 `/` 的 `302` 与 `Location` 回归断言。最终验收统一运行 `web_assets`、`web_auth` 和 `web_api` 功能测试，确认：
 
 1. 登录页和仪表盘不存在面向用户的英文界面文案，保留的仅为约定的技术名词、单位和动态数据。
 2. 未鉴权的 `/` 请求返回 `302` 且指向 `/login`。
 3. 未鉴权 API 仍返回 `401` JSON。
 4. 有效登录 Cookie 仍可访问 `/` 和 API，退出及会话过期行为不变。
-
