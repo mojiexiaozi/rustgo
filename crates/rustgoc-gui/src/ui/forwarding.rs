@@ -418,16 +418,19 @@ fn optional_address(ui: &mut Ui, label: &str, value: &mut Option<String>) {
     });
 }
 fn compact_card(ui: &mut Ui, content: impl FnOnce(&mut Ui)) {
-    egui::Frame::group(ui.style())
-        .inner_margin(6)
-        .show(ui, |ui| {
-            ui.set_width(310.0);
-            ui.spacing_mut().item_spacing.y = 3.0;
-            ui.vertical(|ui| {
-                ui.set_width(310.0);
-                content(ui);
-            });
-        });
+    ui.allocate_ui_with_layout(
+        egui::vec2(320.0, 0.0),
+        egui::Layout::top_down(egui::Align::Min),
+        |ui| {
+            egui::Frame::group(ui.style())
+                .inner_margin(6)
+                .show(ui, |ui| {
+                    ui.set_width(306.0);
+                    ui.spacing_mut().item_spacing.y = 3.0;
+                    ui.vertical(content);
+                });
+        },
+    );
 }
 fn parse_peers(value: &str) -> Vec<String> {
     value
