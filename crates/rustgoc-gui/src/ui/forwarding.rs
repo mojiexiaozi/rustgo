@@ -134,6 +134,19 @@ impl ForwardingPanel {
                         ui.label("远程端口");
                         ui.add(egui::DragValue::new(&mut x.remote_port).range(1..=65535));
                     });
+                    if let Some(runtime) = tunnels.iter().find(|row| row.name == x.name) {
+                        if runtime.accepted {
+                            ui.colored_label(egui::Color32::DARK_GREEN, "运行正常");
+                        } else {
+                            ui.colored_label(
+                                egui::Color32::RED,
+                                format!(
+                                    "启动失败：{}",
+                                    runtime.error.as_deref().unwrap_or("服务端拒绝该隧道")
+                                ),
+                            );
+                        }
+                    }
                 });
             }
         });
@@ -278,47 +291,117 @@ impl ForwardingPanel {
             }
         }
         if ui.button("添加").clicked() {
-            let name = self.name.trim().to_owned();
-            if name.is_empty() {
-                self.message = Some("名称不能为空".into());
-            } else {
-                match self.kind {
-                    ForwardEntryKind::TcpTunnel | ForwardEntryKind::UdpTunnel => {
-                        c.tunnels.push(TunnelConfig {
-                            name,
-                            protocol: if self.kind == ForwardEntryKind::TcpTunnel {
-                                TunnelProtocol::Tcp
-                            } else {
-                                TunnelProtocol::Udp
-                            },
-                            local_addr: self.local.trim().into(),
-                            remote_port: self.port,
-                        })
-                    }
-                    ForwardEntryKind::P2pExport => c.exports.push(ExportConfig {
-                        name,
-                        protocol: self.protocol,
-                        local_addr: self.local.trim().into(),
-                        allowed_peers: parse_peers(&self.peers),
-                    }),
-                    ForwardEntryKind::P2pForward => c.forwards.push(ForwardConfig {
-                        name,
-                        peer: self.peer.trim().into(),
-                        export: self.export.trim().into(),
-                        listen_addr: self.listen.trim().into(),
-                    }),
+            match self.validated_candidate(c) {
+                Ok(candidate) => {
+                    *c = candidate;
+                    self.name.clear();
+                    self.message = Some("已添加，点击保存并生效后应用".into());
                 }
-                self.name.clear();
-                self.message = Some("已添加，点击保存并生效后应用".into());
+                Err(reason) => {
+                    self.message = Some(format!("添加失败：{reason}"));
+                }
             }
         }
         if let Some(m) = &self.message {
-            ui.label(m);
+            if m.starts_with("添加失败") || m.starts_with("保存失败") {
+                ui.colored_label(egui::Color32::RED, m);
+            } else {
+                ui.label(m);
+            }
         }
         ui.add_space(8.0);
         if ui.button("保存并生效").clicked() {
             *save = true;
         }
+    }
+
+    fn validated_candidate(&self, current: &ClientConfig) -> Result<ClientConfig, String> {
+        let name = self.name.trim();
+        if name.is_empty() {
+            return Err("名称不能为空".into());
+        }
+        if current
+            .tunnels
+            .iter()
+            .any(|x| x.name.eq_ignore_ascii_case(name))
+            || current
+                .exports
+                .iter()
+                .any(|x| x.name.eq_ignore_ascii_case(name))
+            || current
+                .forwards
+                .iter()
+                .any(|x| x.name.eq_ignore_ascii_case(name))
+        {
+            return Err(format!("名称“{name}”已存在"));
+        }
+
+        let mut candidate = current.clone();
+        match self.kind {
+            ForwardEntryKind::TcpTunnel | ForwardEntryKind::UdpTunnel => {
+                let protocol = if self.kind == ForwardEntryKind::TcpTunnel {
+                    TunnelProtocol::Tcp
+                } else {
+                    TunnelProtocol::Udp
+                };
+                if current
+                    .tunnels
+                    .iter()
+                    .any(|x| x.protocol == protocol && x.remote_port == self.port)
+                {
+                    return Err(format!(
+                        "{} 远程端口 {} 已被占用",
+                        protocol_label(protocol),
+                        self.port
+                    ));
+                }
+                candidate.tunnels.push(TunnelConfig {
+                    name: name.into(),
+                    protocol,
+                    local_addr: self.local.trim().into(),
+                    remote_port: self.port,
+                });
+            }
+            ForwardEntryKind::P2pExport => candidate.exports.push(ExportConfig {
+                name: name.into(),
+                protocol: self.protocol,
+                local_addr: self.local.trim().into(),
+                allowed_peers: parse_peers(&self.peers),
+            }),
+            ForwardEntryKind::P2pForward => {
+                let listen = self.listen.trim();
+                if current.forwards.iter().any(|x| x.listen_addr == listen) {
+                    return Err(format!("监听地址“{listen}”已被其他转发占用"));
+                }
+                candidate.forwards.push(ForwardConfig {
+                    name: name.into(),
+                    peer: self.peer.trim().into(),
+                    export: self.export.trim().into(),
+                    listen_addr: listen.into(),
+                });
+            }
+        }
+        candidate
+            .validate()
+            .map_err(|error| format_validation_error(&error.to_string()))?;
+        Ok(candidate)
+    }
+}
+
+fn format_validation_error(error: &str) -> String {
+    let detail = error
+        .strip_prefix("invalid configuration: ")
+        .unwrap_or(error);
+    if detail.contains("must include a host and port") {
+        "地址格式错误，应填写“IP或主机名:端口”".into()
+    } else if detail.contains("must contain a valid host") {
+        "地址中的 IP 或主机名不合法".into()
+    } else if detail.contains("has an invalid port") || detail.contains("invalid remote port") {
+        "端口不合法，应在 1 到 65535 之间".into()
+    } else if detail.contains("must not target the local client") {
+        "P2P 转发不能指向当前客户端".into()
+    } else {
+        detail.into()
     }
 }
 fn optional_address(ui: &mut Ui, label: &str, value: &mut Option<String>) {
@@ -384,7 +467,7 @@ fn now_millis() -> u64 {
 }
 #[cfg(test)]
 mod tests {
-    use super::{ForwardEntryKind, parse_peers};
+    use super::{ForwardEntryKind, ForwardingPanel, parse_peers};
     #[test]
     fn selector_has_exactly_four_types() {
         let k = [
@@ -404,6 +487,60 @@ mod tests {
         assert_eq!(
             parse_peers("alpha, beta, ,gamma"),
             ["alpha", "beta", "gamma"]
+        );
+    }
+
+    #[test]
+    fn invalid_or_conflicting_entry_does_not_change_configuration() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("client.toml");
+        let mut config = crate::configuration::load_or_create(&path).unwrap();
+        config.tunnels.push(rustgo_config::TunnelConfig {
+            name: "ssh".into(),
+            protocol: rustgo_config::TunnelProtocol::Tcp,
+            local_addr: "127.0.0.1:22".into(),
+            remote_port: 2222,
+        });
+        let before = config.clone();
+
+        let mut panel = ForwardingPanel::new();
+        panel.name = "ssh".into();
+        assert_eq!(
+            panel.validated_candidate(&config).unwrap_err(),
+            "名称“ssh”已存在"
+        );
+        assert_eq!(config, before);
+
+        panel.name = "bad-address".into();
+        panel.local = "127.0.0.1".into();
+        assert!(
+            panel
+                .validated_candidate(&config)
+                .unwrap_err()
+                .contains("地址格式错误")
+        );
+        assert_eq!(config, before);
+    }
+
+    #[test]
+    fn duplicate_remote_port_is_rejected_before_add() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("client.toml");
+        let mut config = crate::configuration::load_or_create(&path).unwrap();
+        config.tunnels.push(rustgo_config::TunnelConfig {
+            name: "ssh".into(),
+            protocol: rustgo_config::TunnelProtocol::Tcp,
+            local_addr: "127.0.0.1:22".into(),
+            remote_port: 2222,
+        });
+        let mut panel = ForwardingPanel::new();
+        panel.name = "other".into();
+        panel.port = 2222;
+        assert!(
+            panel
+                .validated_candidate(&config)
+                .unwrap_err()
+                .contains("远程端口 2222 已被占用")
         );
     }
 }

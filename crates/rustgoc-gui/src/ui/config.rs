@@ -52,7 +52,7 @@ impl ConfigPanel {
     }
     pub fn set_save_error(&mut self, error: &anyhow::Error) {
         self.success = None;
-        self.error = Some(format!("保存失败: {error}"));
+        self.error = Some(format!("保存失败：{error:#}"));
     }
     pub fn show(&mut self, ui: &mut Ui, apply: &mut bool) {
         ui.heading("配置");

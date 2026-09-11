@@ -433,7 +433,7 @@ impl GuiApp {
             }
             Err(error) => {
                 self.forwarding_panel
-                    .set_message(format!("保存失败: {error}"));
+                    .set_message(format!("保存失败：{error:#}"));
                 self.config_panel.set_save_error(&error);
             }
         }
