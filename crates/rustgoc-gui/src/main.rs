@@ -122,6 +122,7 @@ struct GuiApp {
     enrollment_rx: Option<mpsc::Receiver<Result<rustgoc::EnrollmentCompletion, String>>>,
     enrollment_recovery_rx: Option<mpsc::Receiver<Result<bool, String>>>,
     auto_connect_pending: bool,
+    last_logged_connection_state: state::connection::ConnectionState,
 }
 
 impl GuiApp {
@@ -136,6 +137,11 @@ impl GuiApp {
         #[cfg(not(windows))]
         let tray = None;
 
+        let log_ring = LogRing::new();
+        let _ = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(log_ring.clone())
+            .try_init();
         let telemetry_history = state::telemetry::TelemetryHistory::new();
         let runtime = runtime::ClientRuntime::new(telemetry_history.clone()).ok();
         let path_status_store = rustgoc::PathStatusStore::new();
@@ -152,7 +158,7 @@ impl GuiApp {
             tunnels: Vec::new(),
             telemetry_history,
             p2p_vm: state::p2p::P2PViewModel::new(path_status_store.clone()),
-            log_ring: LogRing::new(),
+            log_ring,
             tray_rx,
             _tray: tray,
             should_quit: false,
@@ -165,6 +171,7 @@ impl GuiApp {
             enrollment_rx: None,
             enrollment_recovery_rx: None,
             auto_connect_pending: true,
+            last_logged_connection_state: state::connection::ConnectionState::Disconnected,
         }
     }
 }
@@ -222,6 +229,26 @@ impl eframe::App for GuiApp {
             }
         }
         let state = self.connection_vm.update();
+        if let Some(message) = state::connection::transition_message(
+            &self.last_logged_connection_state,
+            &state,
+            self.config_panel.server_address().unwrap_or("未知服务器"),
+        ) {
+            let level = if message.starts_with("连接成功") {
+                "INFO"
+            } else {
+                "WARN"
+            };
+            self.log_ring.push(state::logs::LogLine {
+                timestamp: time::OffsetDateTime::now_utc()
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_else(|_| "unknown".to_owned()),
+                level: level.to_owned(),
+                target: "connection".to_owned(),
+                message,
+            });
+        }
+        self.last_logged_connection_state = state.clone();
 
         // Update tunnels from active generation
         if matches!(state, state::connection::ConnectionState::Connected { .. })
@@ -327,9 +354,6 @@ impl eframe::App for GuiApp {
                         self.handle_enrollment_submit();
                     }
                 } else {
-                    let mut on_reconnect = false;
-                    let mut on_disconnect = false;
-
                     let (sent_bytes, received_bytes) = self
                         .traffic_handle
                         .as_ref()
@@ -342,19 +366,9 @@ impl eframe::App for GuiApp {
                     self.connection_panel.show(
                         ui,
                         &mut self.connection_vm,
-                        &mut on_reconnect,
-                        &mut on_disconnect,
                         sent_bytes,
                         received_bytes,
                     );
-
-                    if on_reconnect {
-                        self.handle_disconnect();
-                        self.handle_connect();
-                    }
-                    if on_disconnect {
-                        self.handle_disconnect();
-                    }
                 }
             }
             Tab::Forwarding => {

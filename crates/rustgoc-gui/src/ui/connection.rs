@@ -21,8 +21,6 @@ impl ConnectionPanel {
         &mut self,
         ui: &mut Ui,
         vm: &mut ConnectionViewModel,
-        on_reconnect: &mut bool,
-        on_disconnect: &mut bool,
         sent_bytes: Option<u64>,
         received_bytes: Option<u64>,
     ) {
@@ -52,23 +50,6 @@ impl ConnectionPanel {
                 ConnectionState::Backoff { seconds } => {
                     ui.label(format!("重试中 ({}秒后重试)", seconds));
                 }
-            }
-        });
-
-        ui.add_space(10.0);
-
-        ui.horizontal(|ui| {
-            let can_disconnect = matches!(state, ConnectionState::Connected { .. });
-
-            if ui.button("重新连接").clicked() {
-                *on_reconnect = true;
-            }
-
-            if ui
-                .add_enabled(can_disconnect, eframe::egui::Button::new("断开"))
-                .clicked()
-            {
-                *on_disconnect = true;
             }
         });
 
