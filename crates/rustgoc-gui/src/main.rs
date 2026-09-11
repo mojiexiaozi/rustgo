@@ -138,6 +138,7 @@ impl GuiApp {
         let log_ring = LogRing::new();
         let _ = tracing_subscriber::fmt()
             .with_ansi(false)
+            .with_timer(state::logs::GuiTimer)
             .with_writer(log_ring.clone())
             .try_init();
         let telemetry_history = state::telemetry::TelemetryHistory::new();
@@ -196,9 +197,7 @@ impl eframe::App for GuiApp {
                     self.enrollment_panel.clear_error();
                     self.config_panel.reload();
                     self.log_ring.push(state::logs::LogLine {
-                        timestamp: time::OffsetDateTime::now_utc()
-                            .format(&time::format_description::well_known::Rfc3339)
-                            .unwrap_or_else(|_| "unknown".to_owned()),
+                        timestamp: state::logs::local_timestamp(),
                         level: "INFO".to_owned(),
                         target: "gui".to_owned(),
                         message: format!(
@@ -244,9 +243,7 @@ impl eframe::App for GuiApp {
                 "WARN"
             };
             self.log_ring.push(state::logs::LogLine {
-                timestamp: time::OffsetDateTime::now_utc()
-                    .format(&time::format_description::well_known::Rfc3339)
-                    .unwrap_or_else(|_| "unknown".to_owned()),
+                timestamp: state::logs::local_timestamp(),
                 level: level.to_owned(),
                 target: "connection".to_owned(),
                 message,
@@ -444,9 +441,7 @@ impl GuiApp {
             Ok(cfg) => cfg,
             Err(e) => {
                 self.log_ring.push(state::logs::LogLine {
-                    timestamp: time::OffsetDateTime::now_utc()
-                        .format(&time::format_description::well_known::Rfc3339)
-                        .unwrap_or_else(|_| "unknown".to_string()),
+                    timestamp: state::logs::local_timestamp(),
                     level: "ERROR".to_string(),
                     target: "gui".to_string(),
                     message: format!("配置文件准备失败: {e}"),
@@ -463,9 +458,7 @@ impl GuiApp {
             Ok(EnrollmentState::Ready) => EnrollmentState::Ready,
             Ok(state) => {
                 self.log_ring.push(state::logs::LogLine {
-                    timestamp: time::OffsetDateTime::now_utc()
-                        .format(&time::format_description::well_known::Rfc3339)
-                        .unwrap_or_else(|_| "unknown".to_string()),
+                    timestamp: state::logs::local_timestamp(),
                     level: "WARN".to_string(),
                     target: "gui".to_string(),
                     message: "客户端当前需要完成设备注册".to_string(),
@@ -484,9 +477,7 @@ impl GuiApp {
             }
             Err(error) => {
                 self.log_ring.push(state::logs::LogLine {
-                    timestamp: time::OffsetDateTime::now_utc()
-                        .format(&time::format_description::well_known::Rfc3339)
-                        .unwrap_or_else(|_| "unknown".to_string()),
+                    timestamp: state::logs::local_timestamp(),
                     level: "ERROR".to_string(),
                     target: "gui".to_string(),
                     message: format!("身份配置检查失败: {error}"),
@@ -512,9 +503,7 @@ impl GuiApp {
                     runtime.connect(app, self.traffic_handle.clone());
 
                     self.log_ring.push(state::logs::LogLine {
-                        timestamp: time::OffsetDateTime::now_utc()
-                            .format(&time::format_description::well_known::Rfc3339)
-                            .unwrap_or_else(|_| "unknown".to_string()),
+                        timestamp: state::logs::local_timestamp(),
                         level: "INFO".to_string(),
                         target: "gui".to_string(),
                         message: format!("正在连接到 {}", server_address),
@@ -522,9 +511,7 @@ impl GuiApp {
                 }
             }
             Err(e) => self.log_ring.push(state::logs::LogLine {
-                timestamp: time::OffsetDateTime::now_utc()
-                    .format(&time::format_description::well_known::Rfc3339)
-                    .unwrap_or_else(|_| "unknown".to_string()),
+                timestamp: state::logs::local_timestamp(),
                 level: "ERROR".to_string(),
                 target: "gui".to_string(),
                 message: format!("客户端初始化失败: {}", e),
@@ -555,9 +542,7 @@ impl GuiApp {
                 rustgoc::EnrollmentPurpose::ReEnroll => EnrollmentState::ReEnrollmentPending,
             };
             self.log_ring.push(state::logs::LogLine {
-                timestamp: time::OffsetDateTime::now_utc()
-                    .format(&time::format_description::well_known::Rfc3339)
-                    .unwrap_or_else(|_| "unknown".to_string()),
+                timestamp: state::logs::local_timestamp(),
                 level: "INFO".to_string(),
                 target: "gui".to_string(),
                 message: "正在安全保存候选密钥并提交注册请求".to_string(),
@@ -569,9 +554,7 @@ impl GuiApp {
         if let Some(runtime) = &self.runtime {
             runtime.disconnect();
             self.log_ring.push(state::logs::LogLine {
-                timestamp: time::OffsetDateTime::now_utc()
-                    .format(&time::format_description::well_known::Rfc3339)
-                    .unwrap_or_else(|_| "unknown".to_string()),
+                timestamp: state::logs::local_timestamp(),
                 level: "INFO".to_string(),
                 target: "gui".to_string(),
                 message: "已断开连接".to_string(),

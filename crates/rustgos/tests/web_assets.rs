@@ -128,7 +128,9 @@ fn checked_in_dashboard_uses_only_relative_allowlisted_resources() {
     assert!(script.contains("cache.failed = false"));
     assert!(script.contains("return !state.serverHistory.failed"));
     assert!(script.contains("return !state.clientHistory.failed"));
-    assert!(script.contains("appendDefinition(details, \"隧道\", inventorySummary(client.inventory.tunnels))"));
+    assert!(script.contains(
+        "appendDefinition(details, \"隧道\", inventorySummary(client.inventory.tunnels))"
+    ));
     assert!(script.contains("pollInFlight"));
     assert!(script.contains("pollQueued"));
     assert!(script.contains("requestPoll"));

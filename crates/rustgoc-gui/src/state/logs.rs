@@ -4,9 +4,27 @@
 use std::collections::VecDeque;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
-use time::OffsetDateTime;
+use time::{OffsetDateTime, UtcOffset, macros::format_description};
+use tracing_subscriber::fmt::{format::Writer, time::FormatTime};
 
 const MAX_LOG_LINES: usize = 1000;
+pub struct GuiTimer;
+
+impl FormatTime for GuiTimer {
+    fn format_time(&self, writer: &mut Writer<'_>) -> std::fmt::Result {
+        writer.write_str(&local_timestamp().replace(' ', "_"))
+    }
+}
+
+pub fn local_timestamp() -> String {
+    let beijing_offset = UtcOffset::from_hms(8, 0, 0).unwrap_or(UtcOffset::UTC);
+    OffsetDateTime::now_utc()
+        .to_offset(beijing_offset)
+        .format(format_description!(
+            "[year]-[month]-[day] [hour]:[minute]:[second]"
+        ))
+        .unwrap_or_else(|_| "时间不可用".to_owned())
+}
 
 #[derive(Clone, Debug)]
 pub struct LogLine {
@@ -86,16 +104,13 @@ impl Write for LogRingWriter {
 
             let (timestamp, level, target, msg) = if parts.len() >= 4 {
                 (
-                    parts[0].to_string(),
+                    parts[0].replace('_', " "),
                     parts[1].to_string(),
                     parts[2].to_string(),
                     parts[3].to_string(),
                 )
             } else {
-                let now = OffsetDateTime::now_utc();
-                let ts = now
-                    .format(&time::format_description::well_known::Rfc3339)
-                    .unwrap_or_else(|_| "unknown".to_string());
+                let ts = local_timestamp();
                 (
                     ts,
                     "INFO".to_string(),
@@ -186,6 +201,18 @@ mod tests {
         assert_eq!(dropped, 0);
         assert!(lines[0].message.contains("First"));
         assert!(lines[1].message.contains("Second"));
+    }
+
+    #[test]
+    fn gui_timestamp_uses_readable_beijing_format() {
+        let ring = LogRing::new();
+        let mut writer = ring.make_writer();
+        write!(writer, "2026-09-12_00:24:04 INFO gui message").unwrap();
+        writer.flush().unwrap();
+        let (lines, _) = ring.snapshot();
+        assert_eq!(lines[0].timestamp, "2026-09-12 00:24:04");
+        assert!(!lines[0].timestamp.contains('T'));
+        assert!(!lines[0].timestamp.contains('Z'));
     }
 
     #[test]
