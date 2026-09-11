@@ -1,16 +1,19 @@
 use std::{
     io,
     net::SocketAddr,
+    str::FromStr,
     sync::{Arc, OnceLock},
     time::Duration,
 };
 
 use bytes::BytesMut;
+use rustgo_crypto::DevicePublicKey;
 use rustgo_observability::{HostMetrics, ObservationEvent};
 use rustgo_protocol::{
-    AuthResult, BoundedString, ClientHandshakeState, ControlMessageDirection, ErrorMessage, Frame,
-    FrameCodec, FrameError, MAX_ERROR_DETAIL_BYTES, Message, ProtocolErrorCode, ProtocolVersion,
-    TelemetryReport,
+    AuthResult, BoundedString, ClientHandshakeState, ControlMessageDirection,
+    ENROLLMENT_PROTOCOL_VERSION, EnrollmentErrorCode, EnrollmentResultMessage, ErrorMessage, Frame,
+    FrameCodec, FrameError, MAX_CLIENT_NAME_BYTES, MAX_ERROR_DETAIL_BYTES, Message,
+    ProtocolErrorCode, ProtocolVersion, TelemetryReport,
 };
 use rustgo_rendezvous::{RendezvousEnvelope, RendezvousPayload};
 use rustgo_transport::{EventRateLimit, TlsServer, safe_display, short_fingerprint};
@@ -21,8 +24,10 @@ use tokio::sync::{OwnedSemaphorePermit, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
+use crate::web::EnrollmentManagement;
 use crate::{
     auth::{AuthAttemptReservation, Authenticator, FailedAuthLimiter, TlsHandshakePermit},
+    enrollment::EnrollmentStoreError,
     observation::ObservationTokenIssuer,
     registry::{ClientRegistry, ControlSessionGuard, now_unix_millis},
     rendezvous::RendezvousCoordinator,
@@ -43,6 +48,7 @@ pub(crate) struct ControlContext {
     authenticator: Authenticator,
     registry: ClientRegistry,
     limiter: FailedAuthLimiter,
+    enrollment: Option<EnrollmentManagement>,
     runtime: ControlRuntime,
 }
 
@@ -78,6 +84,7 @@ impl ControlContext {
         authenticator: Authenticator,
         registry: ClientRegistry,
         limiter: FailedAuthLimiter,
+        enrollment: Option<EnrollmentManagement>,
         runtime: ControlRuntime,
     ) -> Self {
         Self {
@@ -85,6 +92,7 @@ impl ControlContext {
             authenticator,
             registry,
             limiter,
+            enrollment,
             runtime,
         }
     }
@@ -116,6 +124,27 @@ pub(crate) async fn serve_connection(
             result.map_err(|_| ControlError::HandshakeTimeout)??
         }
     };
+    if let Message::EnrollmentRequest(request) = first_frame.message {
+        let Some(mut auth_attempt) = context.limiter.reserve(peer.ip()) else {
+            return Ok(());
+        };
+        let result = serve_enrollment(
+            &mut framed,
+            context.enrollment,
+            request,
+            first_frame.version,
+            handshake_deadline,
+        )
+        .await;
+        if matches!(result, Ok(true)) {
+            auth_attempt.succeed();
+        } else {
+            auth_attempt.fail();
+        }
+        drop(unauthenticated_permit);
+        drop(tls_peer_permit);
+        return result.map(drop);
+    }
     if let Message::DataChannelBind(request) = first_frame.message {
         let result = if request.kind == rustgo_protocol::DataChannelKind::UDP {
             tokio::select! {
@@ -257,6 +286,135 @@ pub(crate) async fn serve_connection(
         shutdown,
     )
     .await
+}
+
+async fn serve_enrollment<S>(
+    framed: &mut FramedControl<S>,
+    management: Option<EnrollmentManagement>,
+    request: rustgo_protocol::EnrollmentRequest,
+    client_version: ProtocolVersion,
+    deadline: tokio::time::Instant,
+) -> Result<bool, ControlError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let negotiated = match SERVER_VERSION.negotiate(client_version) {
+        Ok(version) => version,
+        Err(_) => {
+            framed
+                .send(
+                    SERVER_VERSION,
+                    enrollment_failure(EnrollmentErrorCode::UnsupportedVersion),
+                )
+                .await?;
+            return Ok(false);
+        }
+    };
+    if request.protocol_version != ENROLLMENT_PROTOCOL_VERSION {
+        framed
+            .send(
+                negotiated,
+                enrollment_failure(EnrollmentErrorCode::UnsupportedVersion),
+            )
+            .await?;
+        return Ok(false);
+    }
+    let Some(management) = management else {
+        framed
+            .send(
+                negotiated,
+                enrollment_failure(EnrollmentErrorCode::Unavailable),
+            )
+            .await?;
+        return Ok(false);
+    };
+    let public_key = match std::str::from_utf8(request.public_key.as_slice())
+        .ok()
+        .and_then(|value| DevicePublicKey::from_str(value).ok())
+    {
+        Some(public_key) => public_key,
+        None => {
+            framed
+                .send(
+                    negotiated,
+                    enrollment_failure(EnrollmentErrorCode::InvalidKey),
+                )
+                .await?;
+            return Ok(false);
+        }
+    };
+    let enrollment_key = request.enrollment_key.as_str().to_owned();
+    let reenrollment = rustgo_protocol::EnrollmentKeyMaterial::decode(&enrollment_key)
+        .is_ok_and(|key| key.purpose() == rustgo_protocol::EnrollmentPurpose::ReEnroll);
+    let request_id = request.request_id.as_str().to_owned();
+    let registry = management.registry.clone();
+    let result = tokio::time::timeout_at(
+        deadline,
+        tokio::task::spawn_blocking(move || {
+            management.store.consume_token(
+                &enrollment_key,
+                &public_key,
+                &request_id,
+                std::time::SystemTime::now(),
+            )
+        }),
+    )
+    .await;
+    let (message, accepted) = match result {
+        Ok(Ok(Ok(result))) => {
+            if reenrollment && let Some(registry) = registry {
+                registry.terminate_by_name(result.display_id());
+            }
+            (
+                Message::EnrollmentResult(EnrollmentResultMessage {
+                    protocol_version: ENROLLMENT_PROTOCOL_VERSION,
+                    accepted: true,
+                    client_id: Some(
+                        BoundedString::<MAX_CLIENT_NAME_BYTES>::try_from(result.display_id())
+                            .map_err(|_| ControlError::InvalidState)?,
+                    ),
+                    revision: Some(result.revision()),
+                    error: None,
+                }),
+                true,
+            )
+        }
+        Ok(Ok(Err(error))) => (enrollment_failure(map_enrollment_error(&error)), false),
+        Ok(Err(_)) | Err(_) => (enrollment_failure(EnrollmentErrorCode::Unavailable), false),
+    };
+    tokio::time::timeout_at(deadline, framed.send(negotiated, message))
+        .await
+        .map_err(|_| ControlError::HandshakeTimeout)??;
+    Ok(accepted)
+}
+
+fn enrollment_failure(error: EnrollmentErrorCode) -> Message {
+    Message::EnrollmentResult(EnrollmentResultMessage {
+        protocol_version: ENROLLMENT_PROTOCOL_VERSION,
+        accepted: false,
+        client_id: None,
+        revision: None,
+        error: Some(error),
+    })
+}
+
+fn map_enrollment_error(error: &EnrollmentStoreError) -> EnrollmentErrorCode {
+    match error {
+        EnrollmentStoreError::TokenExpired => EnrollmentErrorCode::Expired,
+        EnrollmentStoreError::TokenAlreadyUsed => EnrollmentErrorCode::AlreadyUsed,
+        EnrollmentStoreError::PurposeMismatch => EnrollmentErrorCode::PurposeMismatch,
+        EnrollmentStoreError::ClientDisabled => EnrollmentErrorCode::Disabled,
+        EnrollmentStoreError::PublicKeyConflict | EnrollmentStoreError::StaticIdentityConflict => {
+            EnrollmentErrorCode::PublicKeyConflict
+        }
+        EnrollmentStoreError::ClientCapacity | EnrollmentStoreError::TokenCapacity => {
+            EnrollmentErrorCode::CapacityReached
+        }
+        EnrollmentStoreError::Database(_) | EnrollmentStoreError::UnsupportedSchema(_) => {
+            EnrollmentErrorCode::Unavailable
+        }
+        _ => EnrollmentErrorCode::InvalidKey,
+    }
 }
 
 async fn run_owned_control_session<S>(
@@ -787,8 +945,11 @@ mod tests {
     };
 
     use rustgo_protocol::{
-        AuthResult, BoundedString, BoundedVec, ClientHandshakeState, FrameCodec, Message,
-        ProtocolErrorCode, RegisterTunnels, TunnelProtocol, TunnelRegistration,
+        AuthResult, BoundedBytes, BoundedString, BoundedVec, ClientHandshakeState,
+        ENROLLMENT_PROTOCOL_VERSION, EnrollmentErrorCode, EnrollmentPurpose, EnrollmentRequest,
+        FrameCodec, MAX_ENROLLMENT_KEY_BYTES, MAX_ENROLLMENT_REQUEST_ID_BYTES,
+        MAX_PUBLIC_KEY_BYTES, Message, ProtocolErrorCode, RegisterTunnels, TunnelProtocol,
+        TunnelRegistration,
     };
     use tokio::{
         io::{AsyncRead, AsyncWrite, ReadBuf},
@@ -797,14 +958,19 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        ControlRuntime, FramedControl, SERVER_VERSION, run_owned_control_session, send_auth_result,
+        ControlRuntime, FramedControl, SERVER_VERSION, map_enrollment_error,
+        run_owned_control_session, send_auth_result, serve_enrollment,
     };
+    use crate::web::EnrollmentManagement;
     use crate::{
         AuthenticatedClient,
         auth::FailedAuthLimiter,
+        enrollment::{DynamicClientStore, EnrollmentStoreError, EnrollmentStoreLimits},
         registry::ClientRegistry,
         rendezvous::{RendezvousCoordinator, RendezvousLimits},
     };
+    use rustgo_crypto::DeviceKeypair;
+    use std::sync::Arc;
 
     struct RegistrationThenWriteFailure {
         input: std::io::Cursor<Vec<u8>>,
@@ -869,6 +1035,80 @@ mod tests {
         drop(attempt);
 
         assert!(limiter.reserve(peer).is_none());
+    }
+
+    #[tokio::test]
+    async fn enrollment_dispatch_consumes_token_and_returns_safe_result() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            DynamicClientStore::open(
+                directory.path().join("enrollment.db"),
+                EnrollmentStoreLimits {
+                    max_active_clients: 4,
+                    max_tokens: 4,
+                },
+            )
+            .unwrap(),
+        );
+        let client = store.create_client("Dynamic.Node").unwrap();
+        let issued = store
+            .issue_token(
+                client.internal_id(),
+                EnrollmentPurpose::Enroll,
+                "server.example:7443",
+                [3; 32],
+                Duration::from_secs(60),
+                1,
+            )
+            .unwrap()
+            .into_encoded();
+        let keypair = DeviceKeypair::from_secret_bytes([44; 32]);
+        let request = EnrollmentRequest {
+            protocol_version: ENROLLMENT_PROTOCOL_VERSION,
+            enrollment_key: BoundedString::<MAX_ENROLLMENT_KEY_BYTES>::try_from(issued.as_str())
+                .unwrap(),
+            public_key: BoundedBytes::<MAX_PUBLIC_KEY_BYTES>::try_from(
+                keypair.public_key().to_string().as_bytes(),
+            )
+            .unwrap(),
+            request_id: BoundedString::<MAX_ENROLLMENT_REQUEST_ID_BYTES>::try_from("request-1")
+                .unwrap(),
+        };
+        let management = EnrollmentManagement::new(
+            Arc::clone(&store),
+            "server.example:7443".to_owned(),
+            [3; 32],
+            Duration::from_secs(60),
+        );
+        let (server, client_stream) = tokio::io::duplex(4096);
+        let task = tokio::spawn(async move {
+            serve_enrollment(
+                &mut FramedControl::new(server),
+                Some(management),
+                request,
+                SERVER_VERSION,
+                tokio::time::Instant::now() + Duration::from_secs(2),
+            )
+            .await
+        });
+        let mut client_framed = FramedControl::new(client_stream);
+        let frame = client_framed.receive().await.unwrap();
+        let Message::EnrollmentResult(result) = frame.message else {
+            panic!("expected enrollment result");
+        };
+        assert!(result.accepted);
+        assert_eq!(result.client_id.unwrap().as_str(), "Dynamic.Node");
+        assert_eq!(result.revision, Some(2));
+        assert!(task.await.unwrap().unwrap());
+
+        assert_eq!(
+            map_enrollment_error(&EnrollmentStoreError::ClientNotFound),
+            EnrollmentErrorCode::InvalidKey
+        );
+        assert_eq!(
+            map_enrollment_error(&EnrollmentStoreError::Database("private".to_owned())),
+            EnrollmentErrorCode::Unavailable
+        );
     }
 
     #[tokio::test]

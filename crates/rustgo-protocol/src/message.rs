@@ -22,6 +22,8 @@ pub const MAX_RENDEZVOUS_ENVELOPE_BYTES: usize = 16 * 1024;
 pub const MAX_PEER_RELAY_FRAME_BYTES: usize = 65_600;
 pub const MAX_OBSERVATION_GRANT_BYTES: usize = 96;
 pub const MAX_SERVER_NOTICE_BYTES: usize = 1024;
+pub const MAX_ENROLLMENT_KEY_BYTES: usize = 512;
+pub const MAX_ENROLLMENT_REQUEST_ID_BYTES: usize = 128;
 /// The largest possible postcard encoding of [`TelemetryReport`].
 ///
 /// Eight `u64` values require at most ten bytes each and the `u16` CPU value
@@ -303,6 +305,8 @@ impl MessageId {
     pub const RENDEZVOUS_CANDIDATE_SET_V2: Self = Self(28);
     pub const PUNCH_GRANT: Self = Self(29);
     pub const TELEMETRY_REPORT: Self = Self(30);
+    pub const ENROLLMENT_REQUEST: Self = Self(31);
+    pub const ENROLLMENT_RESULT: Self = Self(32);
 
     pub const fn as_u16(self) -> u16 {
         self.0
@@ -334,6 +338,8 @@ impl MessageId {
             28 => MAX_RENDEZVOUS_ENVELOPE_BYTES,
             29 => 160,
             30 => MAX_TELEMETRY_REPORT_BYTES,
+            31 => 1024,
+            32 => 256,
             _ => 0,
         }
     }
@@ -344,7 +350,7 @@ impl TryFrom<u16> for MessageId {
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
         match value {
-            1..=30 => Ok(Self(value)),
+            1..=32 => Ok(Self(value)),
             _ => Err(value),
         }
     }
@@ -708,6 +714,51 @@ pub type OpaqueRendezvousMessage = BoundedBytes<MAX_RENDEZVOUS_ENVELOPE_BYTES>;
 pub type OpaquePeerRelayFrame = BoundedBytes<MAX_PEER_RELAY_FRAME_BYTES>;
 pub type OpaqueObservationGrant = BoundedBytes<MAX_OBSERVATION_GRANT_BYTES>;
 
+pub const ENROLLMENT_PROTOCOL_VERSION: u16 = 1;
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnrollmentRequest {
+    pub protocol_version: u16,
+    pub enrollment_key: BoundedString<MAX_ENROLLMENT_KEY_BYTES>,
+    pub public_key: BoundedBytes<MAX_PUBLIC_KEY_BYTES>,
+    pub request_id: BoundedString<MAX_ENROLLMENT_REQUEST_ID_BYTES>,
+}
+
+impl fmt::Debug for EnrollmentRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EnrollmentRequest")
+            .field("protocol_version", &self.protocol_version)
+            .field("enrollment_key", &"[REDACTED]")
+            .field("public_key", &"[REDACTED]")
+            .field("request_id", &self.request_id)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EnrollmentErrorCode {
+    InvalidKey,
+    Expired,
+    AlreadyUsed,
+    PurposeMismatch,
+    AlreadyBound,
+    Disabled,
+    PublicKeyConflict,
+    CapacityReached,
+    Unavailable,
+    UnsupportedVersion,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnrollmentResultMessage {
+    pub protocol_version: u16,
+    pub accepted: bool,
+    pub client_id: Option<BoundedString<MAX_CLIENT_NAME_BYTES>>,
+    pub revision: Option<u64>,
+    pub error: Option<EnrollmentErrorCode>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
     ClientHello(ClientHello),
@@ -740,6 +791,8 @@ pub enum Message {
     PeerIdentityLookup(PeerIdentityLookup),
     PunchGrant(PunchGrant),
     TelemetryReport(TelemetryReport),
+    EnrollmentRequest(EnrollmentRequest),
+    EnrollmentResult(EnrollmentResultMessage),
 }
 
 impl Message {
@@ -775,6 +828,8 @@ impl Message {
             Self::PeerIdentityLookup(_) => MessageId::PEER_IDENTITY_LOOKUP,
             Self::PunchGrant(_) => MessageId::PUNCH_GRANT,
             Self::TelemetryReport(_) => MessageId::TELEMETRY_REPORT,
+            Self::EnrollmentRequest(_) => MessageId::ENROLLMENT_REQUEST,
+            Self::EnrollmentResult(_) => MessageId::ENROLLMENT_RESULT,
         }
     }
 }

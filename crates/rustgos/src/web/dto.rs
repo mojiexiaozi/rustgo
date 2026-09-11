@@ -1,6 +1,32 @@
 use serde::Serialize;
 
 #[derive(Serialize)]
+pub(super) struct ManagedClient {
+    pub client_id: String,
+    pub enabled: bool,
+    pub bound: bool,
+    pub deleted: bool,
+    pub revision: u64,
+}
+
+#[derive(Serialize)]
+pub(super) struct ManagedClientResponse {
+    pub client: ManagedClient,
+}
+
+#[derive(Serialize)]
+pub(super) struct CreateClientResponse {
+    pub client: ManagedClient,
+    pub enrollment_key: String,
+}
+
+#[derive(Serialize)]
+pub(super) struct EnrollmentTokenResponse {
+    pub client: ManagedClient,
+    pub enrollment_key: String,
+}
+
+#[derive(Serialize)]
 pub(super) struct ErrorEnvelope {
     pub error: ErrorBody,
 }
@@ -20,6 +46,13 @@ pub(super) struct OverviewResponse {
     pub sessions: SessionCounts,
     pub observability: ObservabilityHealth,
     pub history: HistoryHealth,
+    pub enrollment: EnrollmentHealth,
+}
+
+#[derive(Serialize)]
+pub(super) struct EnrollmentHealth {
+    pub configured: bool,
+    pub available: bool,
 }
 
 #[derive(Serialize)]
@@ -134,6 +167,10 @@ pub(super) struct Traffic {
 #[derive(Serialize)]
 pub(super) struct Client {
     pub name: String,
+    pub identity_source: &'static str,
+    pub enabled: Option<bool>,
+    pub bound: Option<bool>,
+    pub revision: Option<u64>,
     pub online: bool,
     pub version: String,
     pub authenticated_unix_millis: u64,

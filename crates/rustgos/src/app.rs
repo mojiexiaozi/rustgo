@@ -3,7 +3,7 @@ use std::{
     future, io,
     net::SocketAddr,
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use rustgo_config::ServerConfig;
@@ -25,11 +25,12 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     auth::{Authenticator, FailedAuthLimiter, TlsHandshakeLimiter},
     control,
+    enrollment::{DynamicClientStore, EnrollmentStoreError, EnrollmentStoreLimits},
     observation::{ObservationRuntimeLimits, ObservationService, ObservationTokenIssuer},
     registry::{ClientRegistry, RegistryError},
     rendezvous::{RendezvousCoordinator, RendezvousLimits},
     udp::UdpRuntimeLimits,
-    web::{DashboardDataSources, WebError, WebRuntimeLimits, WebServer},
+    web::{DashboardDataSources, EnrollmentManagement, WebError, WebRuntimeLimits, WebServer},
 };
 
 const MAX_UNAUTHENTICATED_CONNECTIONS: usize = 1024;
@@ -51,6 +52,9 @@ const WEB_RESTART_INITIAL_BACKOFF: Duration = Duration::from_millis(50);
 const WEB_RESTART_MAX_BACKOFF: Duration = Duration::from_secs(2);
 const TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const PROJECTION_DRAIN_POLL: Duration = Duration::from_millis(10);
+const ENROLLMENT_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const ENROLLMENT_TOMBSTONE_RETENTION: Duration = Duration::from_secs(90 * 24 * 60 * 60);
+const ENROLLMENT_PURGE_BATCH: usize = 100;
 
 #[derive(Debug, Clone)]
 pub struct ServerRuntimeLimits {
@@ -190,6 +194,7 @@ pub struct ServerApp {
     rendezvous: RendezvousCoordinator,
     observability_sink: Option<ObservabilitySink>,
     dashboard: Option<DashboardRuntime>,
+    _enrollment: Option<EnrollmentManagement>,
 }
 
 struct DashboardRuntime {
@@ -208,7 +213,7 @@ impl ServerApp {
     /// Loads every local credential used by the production server without
     /// creating or binding a network socket.
     pub fn validate_credentials(config: &ServerConfig) -> Result<(), ServerError> {
-        load_authenticator(config)?;
+        load_authenticator(config, None)?;
         TlsServer::validate_identity(
             &config.server.certificate_file,
             &config.server.private_key_file,
@@ -228,6 +233,7 @@ impl ServerApp {
                 database_max_mib: web.database_max_mib,
             })?;
         }
+        let _ = load_enrollment_management(config)?;
         Ok(())
     }
 
@@ -254,7 +260,13 @@ impl ServerApp {
             .map_err(|_| ServerError::InvalidRuntimeLimits)?;
         let max_tunnels = usize::try_from(config.limits.max_tunnels_per_client)
             .map_err(|_| ServerError::InvalidRuntimeLimits)?;
-        let authenticator = load_authenticator(&config)?;
+        let mut enrollment = load_enrollment_management(&config)?;
+        let authenticator = load_authenticator(
+            &config,
+            enrollment
+                .as_ref()
+                .map(|management| Arc::clone(&management.store)),
+        )?;
         let tls_server = Arc::new(
             TlsServer::bind(
                 &config.server.bind_addr,
@@ -305,6 +317,7 @@ impl ServerApp {
                 test_disconnect_after_replies: runtime_limits.udp_test_disconnect_after_replies,
             },
         )?;
+        enrollment = enrollment.map(|management| management.with_registry(registry.clone()));
         let observation = match (
             config.server.p2p_observation_bind.as_deref(),
             config.server.p2p_observation_alternate_bind.as_deref(),
@@ -352,53 +365,56 @@ impl ServerApp {
         ));
         let tls_handshakes =
             TlsHandshakeLimiter::new(runtime_limits.max_unauthenticated_connections_per_peer);
-        let (observability_sink, dashboard) = if let Some(web) =
-            config.web.as_ref().filter(|web| web.enabled)
-        {
-            let (store, sink, projection_worker) = ObservabilityStore::new();
-            registry.install_observability_sink(sink.clone())?;
-            let (history, history_worker) = HistoryService::new(HistoryConfig {
-                database_path: web.database_path.clone(),
-                history_days: web.history_days,
-                database_max_mib: web.database_max_mib,
-            })?;
-            let web_data_sources = DashboardDataSources::new(store.clone(), Some(history.clone()));
-            let web_limits = WebRuntimeLimits {
-                test_exit_after_accepts: runtime_limits.web_test_exit_after_accepts,
-                ..WebRuntimeLimits::default()
+        let (observability_sink, dashboard) =
+            if let Some(web) = config.web.as_ref().filter(|web| web.enabled) {
+                let (store, sink, projection_worker) = ObservabilityStore::new();
+                registry.install_observability_sink(sink.clone())?;
+                let (history, history_worker) = HistoryService::new(HistoryConfig {
+                    database_path: web.database_path.clone(),
+                    history_days: web.history_days,
+                    database_max_mib: web.database_max_mib,
+                })?;
+                let mut web_data_sources =
+                    DashboardDataSources::new(store.clone(), Some(history.clone()));
+                if let Some(management) = enrollment.clone() {
+                    web_data_sources = web_data_sources.with_enrollment(management);
+                }
+                let web_limits = WebRuntimeLimits {
+                    test_exit_after_accepts: runtime_limits.web_test_exit_after_accepts,
+                    ..WebRuntimeLimits::default()
+                };
+                let web_server = WebServer::bind_with_data_sources(
+                    &config,
+                    web_limits.clone(),
+                    web_data_sources.clone(),
+                )
+                .await?;
+                let web_local_addr = web_server.local_addr()?;
+                let mut web_restart_config = config.clone();
+                web_restart_config
+                    .web
+                    .as_mut()
+                    .expect("enabled Web configuration remains present")
+                    .bind = web_local_addr.to_string();
+                let mut web_restart_limits = web_limits;
+                web_restart_limits.test_exit_after_accepts = None;
+                (
+                    Some(sink),
+                    Some(DashboardRuntime {
+                        store,
+                        projection_worker,
+                        history,
+                        history_worker,
+                        web_server,
+                        web_restart_config,
+                        web_restart_limits,
+                        web_data_sources,
+                        web_local_addr,
+                    }),
+                )
+            } else {
+                (None, None)
             };
-            let web_server = WebServer::bind_with_data_sources(
-                &config,
-                web_limits.clone(),
-                web_data_sources.clone(),
-            )
-            .await?;
-            let web_local_addr = web_server.local_addr()?;
-            let mut web_restart_config = config.clone();
-            web_restart_config
-                .web
-                .as_mut()
-                .expect("enabled Web configuration remains present")
-                .bind = web_local_addr.to_string();
-            let mut web_restart_limits = web_limits;
-            web_restart_limits.test_exit_after_accepts = None;
-            (
-                Some(sink),
-                Some(DashboardRuntime {
-                    store,
-                    projection_worker,
-                    history,
-                    history_worker,
-                    web_server,
-                    web_restart_config,
-                    web_restart_limits,
-                    web_data_sources,
-                    web_local_addr,
-                }),
-            )
-        } else {
-            (None, None)
-        };
         Ok(Self {
             tls_server,
             authenticator,
@@ -414,6 +430,7 @@ impl ServerApp {
             rendezvous,
             observability_sink,
             dashboard,
+            _enrollment: enrollment,
         })
     }
 
@@ -484,12 +501,19 @@ impl ServerApp {
         let history_worker_shutdown = runtime_root.child_token();
         let web_shutdown = runtime_root.child_token();
         let session_shutdown = runtime_root.child_token();
+        let enrollment_maintenance_shutdown = runtime_root.child_token();
         let mut rendezvous_expiry = tokio::time::interval(Duration::from_millis(250));
         rendezvous_expiry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let sampler_task = self
             .observability_sink
             .clone()
             .map(|sink| tokio::spawn(run_server_sampler(sink, sampler_shutdown.child_token())));
+        let enrollment_maintenance_task = self._enrollment.as_ref().map(|management| {
+            tokio::spawn(run_enrollment_maintenance(
+                management.store(),
+                enrollment_maintenance_shutdown.child_token(),
+            ))
+        });
 
         let mut projection_task = None;
         let mut history_projection_task = None;
@@ -567,6 +591,7 @@ impl ServerApp {
                     let authenticator = self.authenticator.clone();
                     let registry = self.registry.clone();
                     let limiter = self.limiter.clone();
+                    let enrollment = self._enrollment.clone();
                     let handshake_timeout = self.runtime_limits.handshake_timeout;
                     let heartbeat_timeout = self.heartbeat_timeout;
                     let observation_token_issuer = self.observation_token_issuer.clone();
@@ -576,6 +601,7 @@ impl ServerApp {
                         authenticator,
                         registry,
                         limiter,
+                        enrollment,
                         control::ControlRuntime::new(
                             handshake_timeout,
                             heartbeat_timeout,
@@ -633,6 +659,8 @@ impl ServerApp {
         }
 
         join_task_bounded("server sampler", sampler_task).await;
+        enrollment_maintenance_shutdown.cancel();
+        join_task_bounded("enrollment maintenance", enrollment_maintenance_task).await;
 
         if let Some(store) = dashboard_store.as_ref()
             && tokio::time::timeout(TASK_SHUTDOWN_TIMEOUT, async {
@@ -669,6 +697,37 @@ impl ServerApp {
         join_task_bounded("observability projection", projection_task).await;
         runtime_root.cancel();
         result
+    }
+}
+
+async fn run_enrollment_maintenance(store: Arc<DynamicClientStore>, shutdown: CancellationToken) {
+    let mut ticks = tokio::time::interval(ENROLLMENT_MAINTENANCE_INTERVAL);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            biased;
+            () = shutdown.cancelled() => return,
+            _ = ticks.tick() => {
+                let store = store.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    let cutoff = SystemTime::now()
+                        .checked_sub(ENROLLMENT_TOMBSTONE_RETENTION)
+                        .unwrap_or(SystemTime::UNIX_EPOCH);
+                    store.purge_tombstones(cutoff, ENROLLMENT_PURGE_BATCH)
+                }).await;
+                match result {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => tracing::warn!(
+                        error = %safe_display(&error),
+                        "enrollment tombstone cleanup failed"
+                    ),
+                    Err(error) => tracing::warn!(
+                        error = %safe_display(&error),
+                        "enrollment tombstone cleanup task failed"
+                    ),
+                }
+            }
+        }
     }
 }
 
@@ -1020,8 +1079,37 @@ fn internal_test_shutdown_delay() -> Result<Option<Duration>, ServerError> {
         .transpose()
 }
 
-fn load_authenticator(config: &ServerConfig) -> Result<Authenticator, ServerError> {
-    Authenticator::new(&config.clients).map_err(|_| ServerError::AuthenticationSetup)
+fn load_authenticator(
+    config: &ServerConfig,
+    dynamic_store: Option<Arc<DynamicClientStore>>,
+) -> Result<Authenticator, ServerError> {
+    Authenticator::new_with_dynamic(&config.clients, dynamic_store)
+        .map_err(|_| ServerError::AuthenticationSetup)
+}
+
+fn load_enrollment_management(
+    config: &ServerConfig,
+) -> Result<Option<EnrollmentManagement>, ServerError> {
+    let Some(enrollment) = config.enrollment.as_ref().filter(|value| value.enabled) else {
+        return Ok(None);
+    };
+    let store = Arc::new(DynamicClientStore::open(
+        &enrollment.database_path,
+        EnrollmentStoreLimits {
+            max_active_clients: usize::try_from(enrollment.max_active_clients)
+                .map_err(|_| ServerError::InvalidRuntimeLimits)?,
+            max_tokens: usize::try_from(enrollment.max_tokens)
+                .map_err(|_| ServerError::InvalidRuntimeLimits)?,
+        },
+    )?);
+    store.validate_static_collisions(&config.clients)?;
+    let fingerprint = TlsServer::leaf_certificate_fingerprint(&config.server.certificate_file)?;
+    Ok(Some(EnrollmentManagement::new(
+        store,
+        enrollment.public_addr.clone(),
+        fingerprint,
+        Duration::from_secs(enrollment.token_ttl_secs),
+    )))
 }
 
 impl ServerRuntimeLimits {
@@ -1097,6 +1185,8 @@ pub enum ServerError {
     Web(#[from] WebError),
     #[error("SQLite history setup failed: {0}")]
     HistoryConfiguration(#[from] HistoryConfigError),
+    #[error("dynamic enrollment authority setup failed: {0}")]
+    Enrollment(#[from] EnrollmentStoreError),
     #[error("invalid server runtime limits")]
     InvalidRuntimeLimits,
     #[error("invalid paired observation bind configuration")]

@@ -142,10 +142,10 @@ fn managed_database_path(configured_path: &Path) -> PathBuf {
     };
     let mut store_name = configured_path.file_name().unwrap().to_os_string();
     store_name.push(".rustgo-store-");
-    store_name.push(nonce);
+    store_name.push(file_nonce_component(nonce));
     let mut active_name = configured_path.file_name().unwrap().to_os_string();
     active_name.push(".active-");
-    active_name.push(active);
+    active_name.push(file_nonce_component(active));
     configured_path.with_file_name(store_name).join(active_name)
 }
 
@@ -162,15 +162,26 @@ fn pending_database_path(configured_path: &Path) -> PathBuf {
     let store = private_store_for_nonce(configured_path, nonce);
     let mut name = configured_path.file_name().unwrap().to_os_string();
     name.push(".active-");
-    name.push(active);
+    name.push(file_nonce_component(active));
     store.join(name)
 }
 
 fn private_store_for_nonce(configured_path: &Path, nonce: &str) -> PathBuf {
     let mut store_name = configured_path.file_name().unwrap().to_os_string();
     store_name.push(".rustgo-store-");
-    store_name.push(nonce);
+    store_name.push(file_nonce_component(nonce));
     configured_path.with_file_name(store_name)
+}
+
+fn file_nonce_component(nonce: &str) -> &str {
+    #[cfg(windows)]
+    {
+        &nonce[..32]
+    }
+    #[cfg(not(windows))]
+    {
+        nonce
+    }
 }
 
 fn pending_marker_bytes(nonce: &str, active: &str, legacy_sha256: &str) -> Vec<u8> {
@@ -2929,7 +2940,7 @@ async fn v5_upgrade_resumes_recorded_active_identity_after_each_crash_prefix() {
                 .file_name()
                 .unwrap()
                 .to_string_lossy()
-                .contains(active)
+                .contains(file_nonce_component(active))
         );
         assert!(!database.exists());
 
@@ -3096,7 +3107,7 @@ async fn durable_v4_migration_marker_resumes_before_and_after_internal_commit() 
             .file_name()
             .unwrap()
             .to_string_lossy()
-            .contains(active)
+            .contains(file_nonce_component(active))
     );
     fs::write(
         sidecar(&database, ".rustgo-owner"),

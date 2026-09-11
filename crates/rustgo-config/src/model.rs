@@ -13,6 +13,32 @@ pub struct ServerConfig {
     pub clients: Vec<AuthorizedClient>,
     #[serde(default)]
     pub web: Option<WebConfig>,
+    #[serde(default)]
+    pub enrollment: Option<EnrollmentConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct EnrollmentConfig {
+    pub enabled: bool,
+    pub database_path: PathBuf,
+    pub public_addr: String,
+    pub token_ttl_secs: u64,
+    pub max_active_clients: u32,
+    pub max_tokens: u32,
+}
+
+impl Default for EnrollmentConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            database_path: PathBuf::from("./rustgo-enrollment.db"),
+            public_addr: "127.0.0.1:7443".to_owned(),
+            token_ttl_secs: 900,
+            max_active_clients: 10_000,
+            max_tokens: 20_000,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -67,11 +93,30 @@ pub struct ClientConfig {
 #[serde(deny_unknown_fields)]
 pub struct ClientSection {
     pub name: String,
+    #[serde(default)]
+    pub identity_mode: Option<IdentityMode>,
     pub server_addr: String,
     pub server_name: String,
     pub certificate_authority_file: PathBuf,
+    #[serde(default)]
+    pub trust_mode: Option<TrustMode>,
+    #[serde(default)]
+    pub server_certificate_fingerprint: Option<String>,
     pub private_key_file: PathBuf,
     pub heartbeat_interval_secs: u64,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TrustMode {
+    Pinned,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum IdentityMode {
+    Static,
+    Dynamic,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]

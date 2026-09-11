@@ -12,6 +12,7 @@ use rustgo_transport::{
 };
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, ProtocolVersion, RootCertStore};
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
@@ -105,6 +106,21 @@ async fn bind_test_server(pki: &TestPki) -> Result<TlsServer, TlsError> {
     TlsServer::bind("127.0.0.1:0", &pki.certificate_file, &pki.private_key_file).await
 }
 
+#[test]
+fn leaf_fingerprint_hashes_the_first_certificate_der() -> Result<(), Box<dyn Error>> {
+    let pki = TestPki::generate()?;
+    let file = fs::File::open(&pki.certificate_file)?;
+    let leaf = rustls_pemfile::certs(&mut std::io::BufReader::new(file))
+        .next()
+        .expect("leaf certificate")?;
+    let expected: [u8; 32] = Sha256::digest(leaf.as_ref()).into();
+    assert_eq!(
+        TlsServer::leaf_certificate_fingerprint(&pki.certificate_file)?,
+        expected
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn valid_name_and_ca_negotiate_tls_1_3() -> Result<(), Box<dyn Error>> {
     let pki = TestPki::generate()?;
@@ -120,6 +136,32 @@ async fn valid_name_and_ca_negotiate_tls_1_3() -> Result<(), Box<dyn Error>> {
         Some(ProtocolVersion::TLSv1_3)
     );
     assert_eq!(server_task.await??, ProtocolVersion::TLSv1_3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn pinned_leaf_fingerprint_accepts_exact_pin_and_rejects_another()
+-> Result<(), Box<dyn Error>> {
+    let pki = TestPki::generate()?;
+    let fingerprint = TlsServer::leaf_certificate_fingerprint(&pki.certificate_file)?;
+    let server = bind_test_server(&pki).await?;
+    let address = server.local_addr()?;
+    let server_task = server_once(server).await;
+    TlsClient::from_pinned_fingerprint(SERVER_NAME, fingerprint)?
+        .connect(address)
+        .await?;
+    assert_eq!(server_task.await??, ProtocolVersion::TLSv1_3);
+
+    let server = bind_test_server(&pki).await?;
+    let address = server.local_addr()?;
+    let server_task = server_once(server).await;
+    assert!(
+        TlsClient::from_pinned_fingerprint(SERVER_NAME, [0; 32])?
+            .connect(address)
+            .await
+            .is_err()
+    );
+    assert!(server_task.await?.is_err());
     Ok(())
 }
 

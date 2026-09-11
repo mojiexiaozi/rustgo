@@ -9,6 +9,7 @@ mod tray_events;
 mod ui;
 
 use clap::Parser;
+use rustgoc::EnrollmentState;
 use state::connection::ConnectionViewModel;
 use state::logs::LogRing;
 use state::tunnels::TunnelRow;
@@ -17,7 +18,9 @@ use std::sync::mpsc;
 use std::time::Duration;
 use tokio::sync::watch;
 use tray_events::TrayEvent;
+use ui::config::ConfigPanel;
 use ui::connection::ConnectionPanel;
+use ui::enrollment::EnrollmentPanel;
 use ui::logs::LogsPanel;
 use ui::tunnels::TunnelsPanel;
 
@@ -91,16 +94,25 @@ fn main() -> anyhow::Result<()> {
 enum Tab {
     Connection,
     Tunnels,
+    Telemetry,
+    P2P,
     Logs,
+    Config,
 }
 
 struct GuiApp {
     active_tab: Tab,
     connection_panel: ConnectionPanel,
+    enrollment_panel: EnrollmentPanel,
     tunnels_panel: TunnelsPanel,
+    telemetry_panel: ui::telemetry::TelemetryPanel,
+    p2p_panel: ui::p2p::P2PPanel,
     logs_panel: LogsPanel,
+    config_panel: ConfigPanel,
     connection_vm: ConnectionViewModel,
     tunnels: Vec<TunnelRow>,
+    telemetry_history: state::telemetry::TelemetryHistory,
+    p2p_vm: state::p2p::P2PViewModel,
     log_ring: LogRing,
     tray_rx: mpsc::Receiver<TrayEvent>,
     _tray: Option<tray::platform::TrayIcon>,
@@ -108,6 +120,11 @@ struct GuiApp {
     runtime: Option<runtime::ClientRuntime>,
     config_path: PathBuf,
     _status_tx: watch::Sender<rustgoc::ClientStatus>,
+    traffic_handle: Option<rustgoc::TrafficHandle>,
+    path_status_store: rustgoc::PathStatusStore,
+    enrollment_state: EnrollmentState,
+    enrollment_rx: Option<mpsc::Receiver<Result<rustgoc::EnrollmentCompletion, String>>>,
+    enrollment_recovery_rx: Option<mpsc::Receiver<Result<bool, String>>>,
 }
 
 impl GuiApp {
@@ -122,15 +139,23 @@ impl GuiApp {
         #[cfg(not(windows))]
         let tray = None;
 
-        let runtime = runtime::ClientRuntime::new().ok();
+        let telemetry_history = state::telemetry::TelemetryHistory::new();
+        let runtime = runtime::ClientRuntime::new(telemetry_history.clone()).ok();
+        let path_status_store = rustgoc::PathStatusStore::new();
 
         Self {
             active_tab: Tab::Connection,
             connection_panel: ConnectionPanel::new("8.133.176.172:8443".to_string()),
+            enrollment_panel: EnrollmentPanel::new(),
             tunnels_panel: TunnelsPanel::new(),
+            telemetry_panel: ui::telemetry::TelemetryPanel::new(),
+            p2p_panel: ui::p2p::P2PPanel::new(),
             logs_panel: LogsPanel::new(),
+            config_panel: ConfigPanel::new(config_path.clone()),
             connection_vm: ConnectionViewModel::new(status_rx),
             tunnels: Vec::new(),
+            telemetry_history,
+            p2p_vm: state::p2p::P2PViewModel::new(path_status_store.clone()),
             log_ring: LogRing::new(),
             tray_rx,
             _tray: tray,
@@ -138,13 +163,77 @@ impl GuiApp {
             runtime,
             config_path,
             _status_tx: status_tx,
+            traffic_handle: None,
+            path_status_store,
+            enrollment_state: EnrollmentState::Ready,
+            enrollment_rx: None,
+            enrollment_recovery_rx: None,
         }
     }
 }
 
 impl eframe::App for GuiApp {
     fn ui(&mut self, ui: &mut eframe::egui::Ui, _frame: &mut eframe::Frame) {
-        self.connection_vm.update();
+        if let Some(receiver) = &self.enrollment_rx
+            && let Ok(result) = receiver.try_recv()
+        {
+            self.enrollment_rx = None;
+            match result {
+                Ok(completion) => {
+                    self.enrollment_state = EnrollmentState::Ready;
+                    self.enrollment_panel.clear_error();
+                    self.log_ring.push(state::logs::LogLine {
+                        timestamp: time::OffsetDateTime::now_utc()
+                            .format(&time::format_description::well_known::Rfc3339)
+                            .unwrap_or_else(|_| "unknown".to_owned()),
+                        level: "INFO".to_owned(),
+                        target: "gui".to_owned(),
+                        message: format!(
+                            "客户端 {} 注册完成，修订号 {}",
+                            completion.client_id, completion.revision
+                        ),
+                    });
+                }
+                Err(error) => self
+                    .enrollment_panel
+                    .set_error(format!("注册失败：{error}")),
+            }
+        }
+        let recovery = self
+            .enrollment_recovery_rx
+            .as_ref()
+            .and_then(|receiver| receiver.try_recv().ok());
+        if let Some(result) = recovery {
+            self.enrollment_recovery_rx = None;
+            match result {
+                Ok(true) => {
+                    self.enrollment_state = EnrollmentState::Ready;
+                    self.handle_connect();
+                }
+                Ok(false) => self
+                    .enrollment_panel
+                    .set_error("候选密钥尚未在服务端绑定，请输入管理员重新签发的密钥".to_owned()),
+                Err(error) => self
+                    .enrollment_panel
+                    .set_error(format!("注册恢复失败：{error}")),
+            }
+        }
+        let state = self.connection_vm.update();
+
+        // Update tunnels from active generation
+        if matches!(state, state::connection::ConnectionState::Connected { .. })
+            && let Some(active) = self._status_tx.borrow().active()
+        {
+            let new_tunnels: Vec<TunnelRow> = active
+                .registered_tunnels()
+                .iter()
+                .map(TunnelRow::from_registered)
+                .collect();
+            self.tunnels = new_tunnels;
+        }
+
+        // Update P2P paths
+        self.p2p_vm.update();
 
         while let Ok(event) = self.tray_rx.try_recv() {
             match event {
@@ -176,37 +265,112 @@ impl eframe::App for GuiApp {
                     self.active_tab = Tab::Tunnels;
                 }
                 if ui
+                    .selectable_label(matches!(self.active_tab, Tab::Telemetry), "遥测")
+                    .clicked()
+                {
+                    self.active_tab = Tab::Telemetry;
+                }
+                if ui
+                    .selectable_label(matches!(self.active_tab, Tab::P2P), "P2P")
+                    .clicked()
+                {
+                    self.active_tab = Tab::P2P;
+                }
+                if ui
                     .selectable_label(matches!(self.active_tab, Tab::Logs), "日志")
                     .clicked()
                 {
                     self.active_tab = Tab::Logs;
+                }
+                if ui
+                    .selectable_label(matches!(self.active_tab, Tab::Config), "配置")
+                    .clicked()
+                {
+                    self.active_tab = Tab::Config;
                 }
             });
         });
 
         eframe::egui::CentralPanel::default().show(ui, |ui| match self.active_tab {
             Tab::Connection => {
-                let mut on_connect = false;
-                let mut on_disconnect = false;
-                self.connection_panel.show(
-                    ui,
-                    &mut self.connection_vm,
-                    &mut on_connect,
-                    &mut on_disconnect,
-                    None,
-                    None,
-                );
+                if matches!(
+                    self.enrollment_state,
+                    EnrollmentState::RegistrationRequired | EnrollmentState::ReRegistrationRequired
+                ) {
+                    let mut on_submit = false;
+                    self.enrollment_panel.show(
+                        ui,
+                        matches!(
+                            self.enrollment_state,
+                            EnrollmentState::ReRegistrationRequired
+                        ),
+                        &mut on_submit,
+                    );
 
-                // 处理连接/断开事件
-                if on_connect {
-                    self.handle_connect();
-                }
-                if on_disconnect {
-                    self.handle_disconnect();
+                    if on_submit {
+                        self.handle_enrollment_submit();
+                    }
+                } else if matches!(
+                    self.enrollment_state,
+                    EnrollmentState::EnrollmentPending | EnrollmentState::ReEnrollmentPending
+                ) {
+                    let mut on_submit = false;
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(60.0);
+                        ui.heading("正在恢复注册状态");
+                        ui.label("候选设备密钥和恢复信息已保存，正在验证服务端绑定状态。");
+                        ui.label("关闭并重新打开客户端不会丢失该状态。");
+                    });
+                    self.enrollment_panel.show(
+                        ui,
+                        matches!(self.enrollment_state, EnrollmentState::ReEnrollmentPending),
+                        &mut on_submit,
+                    );
+                    if on_submit {
+                        self.handle_enrollment_submit();
+                    }
+                } else {
+                    let mut on_connect = false;
+                    let mut on_disconnect = false;
+
+                    let (sent_bytes, received_bytes) = self
+                        .traffic_handle
+                        .as_ref()
+                        .map(|handle| {
+                            let snapshot = handle.snapshot();
+                            (snapshot.sent_bytes(), snapshot.received_bytes())
+                        })
+                        .unzip();
+
+                    self.connection_panel.show(
+                        ui,
+                        &mut self.connection_vm,
+                        &mut on_connect,
+                        &mut on_disconnect,
+                        sent_bytes,
+                        received_bytes,
+                    );
+
+                    if on_connect {
+                        self.handle_connect();
+                    }
+                    if on_disconnect {
+                        self.handle_disconnect();
+                    }
                 }
             }
             Tab::Tunnels => {
                 self.tunnels_panel.show(ui, &self.tunnels);
+            }
+            Tab::Telemetry => {
+                self.telemetry_panel.show(ui, &self.telemetry_history);
+            }
+            Tab::P2P => {
+                let now_millis = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                self.p2p_panel.show(ui, &self.p2p_vm, now_millis);
             }
             Tab::Logs => {
                 let (log_lines, _dropped) = self.log_ring.snapshot();
@@ -220,6 +384,16 @@ impl eframe::App for GuiApp {
                     })
                     .collect();
                 self.logs_panel.show(ui, &log_strings);
+            }
+            Tab::Config => {
+                let mut on_save_and_reconnect = false;
+                self.config_panel.show(ui, &mut on_save_and_reconnect);
+
+                if on_save_and_reconnect {
+                    // Disconnect, then reconnect with new config
+                    self.handle_disconnect();
+                    self.handle_connect();
+                }
             }
         });
 
@@ -298,11 +472,59 @@ remote_port = 10022
             }
         };
 
+        self.enrollment_state = match rustgoc::classify_enrollment_state(&config, &self.config_path)
+        {
+            Ok(EnrollmentState::Ready) => EnrollmentState::Ready,
+            Ok(state) => {
+                self.log_ring.push(state::logs::LogLine {
+                    timestamp: time::OffsetDateTime::now_utc()
+                        .format(&time::format_description::well_known::Rfc3339)
+                        .unwrap_or_else(|_| "unknown".to_string()),
+                    level: "WARN".to_string(),
+                    target: "gui".to_string(),
+                    message: "客户端当前需要完成设备注册".to_string(),
+                });
+                self.enrollment_state = state;
+                if matches!(
+                    state,
+                    EnrollmentState::EnrollmentPending | EnrollmentState::ReEnrollmentPending
+                ) && self.enrollment_recovery_rx.is_none()
+                    && let Some(runtime) = &self.runtime
+                {
+                    self.enrollment_recovery_rx =
+                        Some(runtime.recover_enrollment(config, self.config_path.clone()));
+                }
+                return;
+            }
+            Err(error) => {
+                self.log_ring.push(state::logs::LogLine {
+                    timestamp: time::OffsetDateTime::now_utc()
+                        .format(&time::format_description::well_known::Rfc3339)
+                        .unwrap_or_else(|_| "unknown".to_string()),
+                    level: "ERROR".to_string(),
+                    target: "gui".to_string(),
+                    message: format!("身份配置检查失败: {error}"),
+                });
+                return;
+            }
+        };
+
         // 创建客户端应用
         match rustgoc::ClientApp::from_config(config) {
             Ok(app) => {
+                self.enrollment_state = EnrollmentState::Ready;
+
                 if let Some(runtime) = &self.runtime {
-                    runtime.connect(app);
+                    // 订阅状态并获取流量句柄和路径状态
+                    self.connection_vm = ConnectionViewModel::new(app.subscribe());
+                    self.traffic_handle = app.traffic_handle();
+                    self.path_status_store = app.path_status_store().clone();
+                    self.p2p_vm = state::p2p::P2PViewModel::new(self.path_status_store.clone());
+
+                    self.connection_vm.mark_connecting();
+
+                    runtime.connect(app, self.traffic_handle.clone());
+
                     self.log_ring.push(state::logs::LogLine {
                         timestamp: time::OffsetDateTime::now_utc()
                             .format(&time::format_description::well_known::Rfc3339)
@@ -313,16 +535,47 @@ remote_port = 10022
                     });
                 }
             }
-            Err(e) => {
-                self.log_ring.push(state::logs::LogLine {
-                    timestamp: time::OffsetDateTime::now_utc()
-                        .format(&time::format_description::well_known::Rfc3339)
-                        .unwrap_or_else(|_| "unknown".to_string()),
-                    level: "ERROR".to_string(),
-                    target: "gui".to_string(),
-                    message: format!("客户端初始化失败: {}", e),
-                });
-            }
+            Err(e) => self.log_ring.push(state::logs::LogLine {
+                timestamp: time::OffsetDateTime::now_utc()
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_else(|_| "unknown".to_string()),
+                level: "ERROR".to_string(),
+                target: "gui".to_string(),
+                message: format!("客户端初始化失败: {}", e),
+            }),
+        }
+    }
+
+    fn handle_enrollment_submit(&mut self) {
+        let Ok(config) = rustgo_config::load_client(&self.config_path) else {
+            self.enrollment_panel
+                .set_error("无法读取客户端配置".to_owned());
+            return;
+        };
+        let purpose = if matches!(
+            self.enrollment_state,
+            EnrollmentState::ReRegistrationRequired | EnrollmentState::ReEnrollmentPending
+        ) {
+            rustgoc::EnrollmentPurpose::ReEnroll
+        } else {
+            rustgoc::EnrollmentPurpose::Enroll
+        };
+        if let Ok(key) = self.enrollment_panel.take_key(purpose)
+            && let Some(runtime) = &self.runtime
+        {
+            self.enrollment_rx = Some(runtime.enroll(config, self.config_path.clone(), key));
+            self.enrollment_state = match purpose {
+                rustgoc::EnrollmentPurpose::Enroll => EnrollmentState::EnrollmentPending,
+                rustgoc::EnrollmentPurpose::ReEnroll => EnrollmentState::ReEnrollmentPending,
+            };
+            self.log_ring.push(state::logs::LogLine {
+                timestamp: time::OffsetDateTime::now_utc()
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_else(|_| "unknown".to_string()),
+                level: "INFO".to_string(),
+                target: "gui".to_string(),
+                message: "正在安全保存候选密钥并提交注册请求".to_string(),
+            });
         }
     }
 

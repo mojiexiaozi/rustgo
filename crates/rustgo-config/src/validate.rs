@@ -238,6 +238,11 @@ pub(crate) fn validate_server(config: &ServerConfig) -> Result<(), ValidationErr
     {
         validate_web(web)?;
     }
+    if let Some(enrollment) = &config.enrollment
+        && enrollment.enabled
+    {
+        validate_enrollment(enrollment)?;
+    }
 
     let mut names = HashSet::new();
     let mut public_keys = HashSet::new();
@@ -261,6 +266,20 @@ pub(crate) fn validate_client(config: &ClientConfig) -> Result<(), ValidationErr
     validate_client_name(&config.client.name)?;
     validate_host_address("client.server_addr", &config.client.server_addr)?;
     require_non_empty("client.server_name", &config.client.server_name)?;
+    match (
+        config.client.trust_mode,
+        config.client.server_certificate_fingerprint.as_deref(),
+    ) {
+        (None, None) => {}
+        (Some(crate::TrustMode::Pinned), Some(fingerprint))
+            if fingerprint.len() == 64
+                && fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit()) => {}
+        _ => {
+            return Err(ValidationError::new(
+                "client pinned trust requires a 64-character SHA-256 certificate fingerprint",
+            ));
+        }
+    }
     require_nonzero(
         "client.heartbeat_interval_secs",
         config.client.heartbeat_interval_secs,
@@ -481,6 +500,31 @@ fn validate_web(web: &crate::WebConfig) -> Result<(), ValidationError> {
     // A loopback-only listener may deliberately support direct local HTTP.
     // Reverse-proxied HTTPS deployments must set cookie_secure = true.
     let _ = web.cookie_secure;
+    Ok(())
+}
+
+fn validate_enrollment(enrollment: &crate::EnrollmentConfig) -> Result<(), ValidationError> {
+    rustgo_protocol::canonical_enrollment_server_addr(&enrollment.public_addr).map_err(|_| {
+        ValidationError::new("enrollment.public_addr must be a canonical host:port address")
+    })?;
+    if !(60..=86_400).contains(&enrollment.token_ttl_secs) {
+        return Err(ValidationError::new(
+            "enrollment.token_ttl_secs must be between 60 and 86400",
+        ));
+    }
+    for (field, value) in [
+        (
+            "enrollment.max_active_clients",
+            enrollment.max_active_clients,
+        ),
+        ("enrollment.max_tokens", enrollment.max_tokens),
+    ] {
+        if !(1..=1_000_000).contains(&value) {
+            return Err(ValidationError::new(format!(
+                "{field} must be between 1 and 1000000"
+            )));
+        }
+    }
     Ok(())
 }
 

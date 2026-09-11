@@ -5,10 +5,11 @@ use thiserror::Error;
 
 use crate::ProtocolVersion;
 use crate::message::{
-    AuthResult, BoundedBytes, ClientAuthenticate, ClientHello, DataChannelBind, ErrorMessage,
-    Heartbeat, MAX_UDP_PAYLOAD_BYTES, Message, MessageId, ObservationGrantRequest, OpenTcpStream,
-    OpenUdpChannel, RegisterTunnels, ServerChallenge, ServerNotice, SocketAddress, TcpStreamReady,
-    TelemetryReport, TunnelResults, UDP_METADATA_LEN, UdpDatagram, UdpSessionRetired,
+    AuthResult, BoundedBytes, ClientAuthenticate, ClientHello, DataChannelBind, EnrollmentRequest,
+    EnrollmentResultMessage, ErrorMessage, Heartbeat, MAX_UDP_PAYLOAD_BYTES, Message, MessageId,
+    ObservationGrantRequest, OpenTcpStream, OpenUdpChannel, RegisterTunnels, ServerChallenge,
+    ServerNotice, SocketAddress, TcpStreamReady, TelemetryReport, TunnelResults, UDP_METADATA_LEN,
+    UdpDatagram, UdpSessionRetired,
 };
 
 pub const MAGIC: [u8; 4] = *b"RSGO";
@@ -231,6 +232,8 @@ fn encode_payload(message: &Message) -> Result<Vec<u8>, FrameError> {
         Message::PeerIdentityLookup(value) => serialize(value),
         Message::PunchGrant(value) => serialize(value),
         Message::TelemetryReport(value) => serialize(value),
+        Message::EnrollmentRequest(value) => serialize(value),
+        Message::EnrollmentResult(value) => serialize(value),
     }
 }
 
@@ -321,6 +324,12 @@ fn decode_payload(message: MessageId, payload: &[u8]) -> Result<Message, FrameEr
         }
         MessageId::TELEMETRY_REPORT => {
             deserialize::<TelemetryReport>(message, payload).map(Message::TelemetryReport)
+        }
+        MessageId::ENROLLMENT_REQUEST => {
+            deserialize::<EnrollmentRequest>(message, payload).map(Message::EnrollmentRequest)
+        }
+        MessageId::ENROLLMENT_RESULT => {
+            deserialize::<EnrollmentResultMessage>(message, payload).map(Message::EnrollmentResult)
         }
         _ => unreachable!("MessageId values are validated before payload dispatch"),
     }

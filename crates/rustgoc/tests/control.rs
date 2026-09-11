@@ -177,9 +177,12 @@ fn client_fixture(pki: &TestPki, server_addr: String) -> Result<Fixture, AnyErro
         config: ClientConfig {
             client: ClientSection {
                 name: "home-pc".to_owned(),
+                identity_mode: None,
                 server_addr,
                 server_name: SERVER_NAME.to_owned(),
                 certificate_authority_file: pki.ca_file.clone(),
+                trust_mode: None,
+                server_certificate_fingerprint: None,
                 private_key_file,
                 heartbeat_interval_secs: 1,
             },
@@ -234,6 +237,7 @@ fn real_server_config(
             enabled: true,
         }],
         web: None,
+        enrollment: None,
     }
 }
 
@@ -1158,9 +1162,12 @@ async fn real_server_heartbeat_echo_keeps_one_generation_active() -> Result<(), 
     let config = ClientConfig {
         client: ClientSection {
             name: "home-pc".to_owned(),
+            identity_mode: None,
             server_addr,
             server_name: SERVER_NAME.to_owned(),
             certificate_authority_file: pki.ca_file.clone(),
+            trust_mode: None,
+            server_certificate_fingerprint: None,
             private_key_file: keys.path().join("device.key"),
             heartbeat_interval_secs: 1,
         },
@@ -1215,9 +1222,12 @@ async fn client_control_api_requests_grants_and_decodes_rendezvous_events() -> R
     let config = ClientConfig {
         client: ClientSection {
             name: "home-pc".to_owned(),
+            identity_mode: None,
             server_addr,
             server_name: SERVER_NAME.to_owned(),
             certificate_authority_file: pki.ca_file.clone(),
+            trust_mode: None,
+            server_certificate_fingerprint: None,
             private_key_file: keys.path().join("device.key"),
             heartbeat_interval_secs: 1,
         },

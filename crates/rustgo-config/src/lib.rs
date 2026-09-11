@@ -12,8 +12,9 @@ pub use load::{
     load_client, load_client_with_lookup, load_server, load_server_with_lookup,
 };
 pub use model::{
-    AuthorizedClient, ClientConfig, ClientSection, Limits, ServerConfig, ServerSection,
-    TelemetryConfig, TunnelConfig, TunnelProtocol, WebConfig,
+    AuthorizedClient, ClientConfig, ClientSection, EnrollmentConfig, IdentityMode, Limits,
+    ServerConfig, ServerSection, TelemetryConfig, TrustMode, TunnelConfig, TunnelProtocol,
+    WebConfig,
 };
 pub use p2p::{
     ConfigWarning, ExportConfig, ForwardConfig, MAX_ALLOWED_PEERS_PER_EXPORT, MAX_EXPORTS,

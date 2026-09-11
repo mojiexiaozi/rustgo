@@ -17,6 +17,7 @@
     pollInFlight: false,
     pollQueued: false,
     pollGeneration: 0,
+    secret: null,
     serverHistory: { key: "", expiresAt: 0, retryAfter: 0, failed: false, generation: 0 },
     clientHistory: { key: "", expiresAt: 0, retryAfter: 0, failed: false, generation: 0 },
   };
@@ -124,8 +125,9 @@
     text("server-download", formatRate(metrics.network_received_bytes_per_second));
     text("server-download-note", `逻辑接收量 ${formatBytes(server.traffic.received_bytes)}`);
     const healthy = !overview.snapshot_stale && overview.observability.dropped_events === 0;
-    text("service-health", healthy ? "正常" : "降级");
-    text("service-health-note", overview.history.available ? `${overview.observability.event_queue_depth} 个排队事件` : "历史数据不可用");
+    const enrollmentHealthy = !overview.enrollment?.configured || overview.enrollment.available;
+    text("service-health", healthy && enrollmentHealthy ? "正常" : "降级");
+    text("service-health-note", !enrollmentHealthy ? "动态注册数据库不可用" : (overview.history.available ? `${overview.observability.event_queue_depth} 个排队事件` : "历史数据不可用"));
     renderClientGrid(overview.clients);
   }
 
@@ -178,6 +180,47 @@
 
   function activePathLabel(path) {
     return ({ relay: "中继", "p2p-direct": "P2P 直连", "p2p-fallback": "P2P 回退", mixed: "多种活跃路径", none: "无活跃路径" })[path] || "不可用";
+  }
+
+  const csrfToken = document.querySelector('meta[name="rustgo-csrf-token"]')?.content || "";
+  const operationId = () => crypto.randomUUID().replaceAll("-", "");
+  const errorLabels = {
+    revision_conflict: "客户端状态已变化，请刷新后重试",
+    client_exists: "客户端 ID 已存在",
+    client_not_found: "客户端不存在或已删除",
+    client_state_conflict: "当前绑定状态不允许此操作",
+    client_disabled: "客户端已禁用",
+    capacity_reached: "动态客户端或密钥容量已满",
+    enrollment_unavailable: "动态客户端管理暂时不可用",
+    secret_unavailable: "操作已成功，但一次性密钥无法恢复；请重新签发",
+    invalid_client_id: "客户端 ID 格式无效",
+  };
+
+  async function managementRequest(path, body) {
+    const response = await fetch(path, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json", "X-Rustgo-CSRF-Token": csrfToken },
+      body: JSON.stringify({ ...body, operation_id: operationId() }),
+    });
+    if (response.status === 401) { window.location.assign("/login"); throw new Error("需要登录"); }
+    const value = await response.json();
+    if (!response.ok) throw new Error(errorLabels[value?.error?.code] || `操作失败（${response.status}）`);
+    return value;
+  }
+
+  function clearSecret() {
+    state.secret = null;
+    const value = $("secret-value");
+    if (value) value.value = "";
+    $("secret-dialog")?.close();
+  }
+
+  function showSecret(value) {
+    state.secret = value;
+    const field = $("secret-value");
+    if (field) field.value = value;
+    $("secret-dialog")?.showModal();
   }
 
   function sessionPathLabel(path) {
@@ -357,6 +400,9 @@
 
   function renderClientDetail(detail) {
     const client = detail.client;
+    const management = $("client-management");
+    if (management) management.hidden = client.identity_source !== "dynamic";
+    text("toggle-client-button", client.enabled ? "禁用客户端" : "启用客户端");
     text("client-title", client.name);
     text("client-detail-summary", `${client.online ? "在线" : "离线"} · 心跳 ${formatAge(client.heartbeat.age_millis)} · ${client.sessions.active} 个活跃会话`);
     const metrics = $("client-detail-metrics");
@@ -473,7 +519,11 @@
     state.pollInFlight = true;
     const generation = ++state.pollGeneration;
     try {
-      const overview = await requestJson("/api/v1/overview", "overview");
+      const [overview, clients] = await Promise.all([
+        requestJson("/api/v1/overview", "overview"),
+        requestJson("/api/v1/clients?limit=256", "managed-clients"),
+      ]);
+      overview.clients = clients.clients;
       state.overview = overview;
       const viewSucceeded = await refreshCurrentRoute();
       if (!viewSucceeded) throw new Error("当前仪表盘视图刷新失败");
@@ -520,12 +570,63 @@
   $("client-search")?.addEventListener("input", (event) => { state.clientSearch = event.target.value; if (state.overview) renderClientGrid(state.overview.clients); });
   $("client-sort")?.addEventListener("change", (event) => { state.clientSort = event.target.value; state.clientDescending = event.target.value !== "name"; text("client-order", state.clientDescending ? "降序" : "升序"); if (state.overview) renderClientGrid(state.overview.clients); });
   $("client-order")?.addEventListener("click", () => { state.clientDescending = !state.clientDescending; text("client-order", state.clientDescending ? "降序" : "升序"); if (state.overview) renderClientGrid(state.overview.clients); });
+  $("create-client-form")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const clientId = new FormData(form).get("client_id")?.toString().trim();
+    try {
+      text("management-status", "正在创建客户端…");
+      const result = await managementRequest("/api/v1/clients", { client_id: clientId });
+      form.reset();
+      text("management-status", "客户端已创建");
+      showSecret(result.enrollment_key);
+      requestPoll();
+    } catch (error) { text("management-status", error.message); }
+  });
+  $("rename-client-form")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const client = state.detail?.client;
+    if (!client) return;
+    const newId = new FormData(event.currentTarget).get("new_client_id")?.toString().trim();
+    try {
+      const result = await managementRequest(`/api/v1/clients/${encodeURIComponent(client.name)}/rename`, { new_client_id: newId, expected_revision: client.revision });
+      location.hash = `client/${encodeURIComponent(result.client.client_id)}`;
+    } catch (error) { text("client-management-status", error.message); }
+  });
+  $("toggle-client-button")?.addEventListener("click", async () => {
+    const client = state.detail?.client; if (!client) return;
+    try {
+      await managementRequest(`/api/v1/clients/${encodeURIComponent(client.name)}/state`, { enabled: !client.enabled, expected_revision: client.revision });
+      text("client-management-status", client.enabled ? "客户端已禁用，在线会话正在终止" : "客户端已启用"); requestPoll();
+    } catch (error) { text("client-management-status", error.message); }
+  });
+  async function issueToken(action) {
+    const client = state.detail?.client; if (!client) return;
+    try {
+      const result = await managementRequest(`/api/v1/clients/${encodeURIComponent(client.name)}/${action}`, { expected_revision: client.revision });
+      showSecret(result.enrollment_key);
+    } catch (error) { text("client-management-status", error.message); }
+  }
+  $("enrollment-token-button")?.addEventListener("click", () => issueToken("enrollment-token"));
+  $("reenrollment-token-button")?.addEventListener("click", () => {
+    if (confirm("重新注册会替换客户端设备私钥并中断当前连接。是否继续？")) issueToken("reenrollment-token");
+  });
+  $("delete-client-button")?.addEventListener("click", async () => {
+    const client = state.detail?.client; if (!client) return;
+    if (!confirm(`确定删除客户端“${client.name}”吗？在线会话将立即终止。`)) return;
+    if (!confirm("请再次确认：客户端将进入墓碑状态，且无法立即复用该 ID。")) return;
+    try {
+      await managementRequest(`/api/v1/clients/${encodeURIComponent(client.name)}/delete`, { expected_revision: client.revision });
+      location.hash = "overview";
+    } catch (error) { text("client-management-status", error.message); }
+  });
   $("history-range")?.addEventListener("change", () => { resetHistory(); requestPoll(); });
   $("session-filters")?.addEventListener("submit", (event) => { event.preventDefault(); abortSupersededViewRequests(); if (activeRoute().view === "sessions") requestPoll(); });
   $("logout-button")?.addEventListener("click", async () => { try { await fetch("/logout", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, credentials: "same-origin", body: "" }); } finally { window.location.assign("/login"); } });
-  window.addEventListener("hashchange", () => { abortSupersededViewRequests(); resetHistory(); requestPoll(); });
+  window.addEventListener("hashchange", () => { clearSecret(); abortSupersededViewRequests(); resetHistory(); requestPoll(); });
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) {
+      clearSecret();
       clearTimeout(state.timer);
       state.pollQueued = false;
       for (const controller of controllers.values()) controller.abort();

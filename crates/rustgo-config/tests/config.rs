@@ -8,10 +8,33 @@ use std::{
 };
 
 use rustgo_config::{
-    ClientConfig, MAX_WEB_AUTHORITY_BYTES, ServerConfig, TelemetryConfig, TunnelProtocol,
-    WebConfig, WebOrigin, check_client_references, check_server_references, load_client,
-    load_client_with_lookup, load_server,
+    ClientConfig, EnrollmentConfig, IdentityMode, MAX_WEB_AUTHORITY_BYTES, ServerConfig,
+    TelemetryConfig, TunnelProtocol, WebConfig, WebOrigin, check_client_references,
+    check_server_references, load_client, load_client_with_lookup, load_server,
 };
+
+#[test]
+fn omitted_identity_mode_preserves_legacy_detection() {
+    let loaded = load_client_fixture(&valid_client());
+
+    assert_eq!(loaded.client.identity_mode, None);
+}
+
+#[test]
+fn explicit_identity_modes_are_deserialized() {
+    for (encoded, expected) in [
+        ("static", IdentityMode::Static),
+        ("dynamic", IdentityMode::Dynamic),
+    ] {
+        let config = valid_client().replace(
+            "name = \"home-pc\"",
+            &format!("name = \"home-pc\"\nidentity_mode = \"{encoded}\""),
+        );
+        let loaded = load_client_fixture(&config);
+
+        assert_eq!(loaded.client.identity_mode, Some(expected));
+    }
+}
 
 static NEXT_TEMP_DIR: AtomicUsize = AtomicUsize::new(0);
 
@@ -261,7 +284,52 @@ fn observability_sections_are_absent_without_changing_v02_configuration() {
     let client = load_client_text(&dir, &valid_client()).unwrap();
 
     assert_eq!(server.web, None);
+    assert_eq!(server.enrollment, None);
     assert_eq!(client.telemetry, None);
+}
+
+#[test]
+fn enrollment_defaults_and_database_path_are_compatible_and_resolved() {
+    assert_eq!(
+        EnrollmentConfig::default(),
+        EnrollmentConfig {
+            enabled: false,
+            database_path: PathBuf::from("./rustgo-enrollment.db"),
+            public_addr: "127.0.0.1:7443".to_owned(),
+            token_ttl_secs: 900,
+            max_active_clients: 10_000,
+            max_tokens: 20_000,
+        }
+    );
+
+    let dir = TempDir::new();
+    let config = format!(
+        "{}\n[enrollment]\nenabled = true\ndatabase_path = \"state/enrollment.db\"\npublic_addr = \"Tunnel.Example:7443\"\n",
+        valid_server()
+    );
+    let loaded = load_server_text(&dir, &config).unwrap();
+    let enrollment = loaded.enrollment.unwrap();
+    assert_eq!(
+        enrollment.database_path,
+        dir.path.join("state/enrollment.db")
+    );
+}
+
+#[test]
+fn enabled_enrollment_rejects_invalid_address_ttl_and_capacity() {
+    let dir = TempDir::new();
+    for setting in [
+        "public_addr = \"missing-port\"",
+        "token_ttl_secs = 0",
+        "max_active_clients = 0",
+        "max_tokens = 1000001",
+    ] {
+        let config = format!(
+            "{}\n[enrollment]\nenabled = true\n{setting}\n",
+            valid_server()
+        );
+        assert!(load_server_text(&dir, &config).is_err(), "{setting}");
+    }
 }
 
 #[test]
@@ -524,6 +592,26 @@ fn client_reference_check_requires_the_explicit_ca_and_private_key() {
     fs::write(dir.path.join("certs/ca.crt"), "test CA").unwrap();
     let missing_key = check_client_references(&config_path, &config).unwrap_err();
     assert!(missing_key.to_string().contains("private key"));
+}
+
+#[test]
+fn pinned_client_reference_check_only_requires_the_private_key() {
+    let dir = TempDir::new();
+    let config_path = dir.write(
+        "client.toml",
+        &valid_client().replace(
+            "private_key_file = \"keys/device.key\"",
+            "trust_mode = \"pinned\"\nserver_certificate_fingerprint = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\nprivate_key_file = \"keys/device.key\"",
+        ),
+    );
+    let config = load_client(&config_path).unwrap();
+
+    let missing_key = check_client_references(&config_path, &config).unwrap_err();
+    assert!(missing_key.to_string().contains("private key"));
+
+    fs::create_dir_all(dir.path.join("keys")).unwrap();
+    fs::write(dir.path.join("keys/device.key"), "private key").unwrap();
+    check_client_references(&config_path, &config).unwrap();
 }
 
 #[test]

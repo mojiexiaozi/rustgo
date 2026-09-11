@@ -14,9 +14,10 @@ use rustgo_observability::{
     ObservationEvent,
 };
 use rustgo_protocol::{
-    BoundedBytes, BoundedVec, DataChannelBind, DataChannelKind, MAX_BINDING_TOKEN_BYTES,
-    MAX_TUNNELS, Message, OpenUdpChannel, ProtocolErrorCode, ProtocolVersion, RegisterTunnels,
-    TunnelProtocol, TunnelResult, TunnelResults,
+    BoundedBytes, BoundedString, BoundedVec, DataChannelBind, DataChannelKind,
+    MAX_BINDING_TOKEN_BYTES, MAX_ERROR_DETAIL_BYTES, MAX_TUNNELS, Message, OpenUdpChannel,
+    ProtocolErrorCode, ProtocolVersion, RegisterTunnels, ServerNotice, TunnelProtocol,
+    TunnelResult, TunnelResults,
 };
 use rustgo_transport::{
     BindingError, ChannelBinding, ChannelBindingStore, ChannelKind, safe_display,
@@ -88,6 +89,49 @@ impl std::fmt::Debug for ClientRegistry {
 }
 
 impl ClientRegistry {
+    pub(crate) fn terminate_by_name(&self, name: &str) -> bool {
+        let runtime = self
+            .inner
+            .lock()
+            .ok()
+            .and_then(|state| state.by_name.get(name).cloned());
+        if let Some(runtime) = runtime {
+            runtime.cancellation.cancel();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn notify_rename_and_terminate(
+        &self,
+        old_name: &str,
+        new_name: &str,
+        revision: u64,
+    ) -> bool {
+        let runtime = self
+            .inner
+            .lock()
+            .ok()
+            .and_then(|state| state.by_name.get(old_name).cloned());
+        let Some(runtime) = runtime else {
+            return false;
+        };
+        let detail = format!("identity-renamed:{new_name}:{revision}");
+        if let Ok(detail) = BoundedString::<MAX_ERROR_DETAIL_BYTES>::try_from(detail.as_str()) {
+            let _ = runtime
+                .outbound
+                .try_send(Message::ServerNotice(ServerNotice {
+                    session_id: runtime.session_id.as_slice().try_into().unwrap_or([0; 32]),
+                    code: 1001,
+                    detail,
+                    peer: None,
+                }));
+        }
+        runtime.cancellation.cancel();
+        true
+    }
+
     #[cfg(test)]
     pub(crate) fn new(
         max_clients: usize,
@@ -1120,6 +1164,36 @@ mod tests {
     use crate::{AuthenticatedClient, control::SERVER_VERSION};
 
     const SERVER_NAME: &str = "data.example.test";
+
+    #[test]
+    fn lifecycle_management_notifies_rename_and_terminates_active_session() {
+        let registry = ClientRegistry::new(
+            2,
+            2,
+            IpAddr::from([127, 0, 0, 1]),
+            2,
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let identity = AuthenticatedClient::verified(
+            "Old.Node".to_owned(),
+            "sha256:dynamic".to_owned(),
+            vec![5; 32],
+        );
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(2);
+        let guard = registry
+            .claim_with_outbound(identity, sender, SERVER_VERSION)
+            .unwrap();
+        let cancellation = guard.cancellation();
+        assert!(registry.notify_rename_and_terminate("Old.Node", "New.Node", 7));
+        assert!(cancellation.is_cancelled());
+        let notice = receiver.try_recv().unwrap();
+        let rustgo_protocol::Message::ServerNotice(notice) = notice else {
+            panic!("expected rename notice");
+        };
+        assert_eq!(notice.code, 1001);
+        assert!(notice.detail.as_str().contains("New.Node:7"));
+    }
 
     fn bind_request(
         client: &str,

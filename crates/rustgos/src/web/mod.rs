@@ -8,8 +8,16 @@ mod security;
 
 pub use api::MAX_API_RESPONSE_BYTES;
 
-use std::{convert::Infallible, fmt, io, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::VecDeque,
+    convert::Infallible,
+    fmt, io,
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
+use crate::enrollment::DynamicClientStore;
 use auth::{AuthenticationState, SESSION_COOKIE_NAME};
 use axum::{
     Form, Router,
@@ -19,7 +27,7 @@ use axum::{
         HeaderMap, HeaderValue, Method, StatusCode,
         header::{CONTENT_LENGTH, CONTENT_TYPE, SET_COOKIE},
     },
-    middleware,
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{any, get, post},
 };
@@ -28,6 +36,7 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use rustgo_config::{ServerConfig, WebOrigin};
 use rustgo_observability::{HistoryService, ObservabilityStore};
 use serde::Deserialize;
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -40,6 +49,9 @@ use tower::ServiceExt as _;
 use self::security::{
     apply_response_security_headers, response_security_headers, same_origin, single_cookie_header,
 };
+
+const CSRF_HEADER_NAME: axum::http::HeaderName =
+    axum::http::HeaderName::from_static("x-rustgo-csrf-token");
 
 const MAX_LOGIN_BODY_BYTES: usize = 1_024;
 const MAX_LOGOUT_BODY_BYTES: usize = 64;
@@ -205,6 +217,8 @@ impl WebServer {
             body_read_timeout: limits.body_read_timeout,
             observability: data_sources.observability,
             history: data_sources.history,
+            enrollment: data_sources.enrollment,
+            operations: OperationLedger::new(1_024),
         });
         let router = build_router(state);
         Ok(Self {
@@ -294,6 +308,42 @@ impl WebServer {
 pub struct DashboardDataSources {
     observability: ObservabilityStore,
     history: Option<HistoryService>,
+    enrollment: Option<EnrollmentManagement>,
+}
+
+#[derive(Clone)]
+pub struct EnrollmentManagement {
+    pub(super) store: Arc<DynamicClientStore>,
+    pub(super) server_addr: String,
+    pub(super) certificate_fingerprint: [u8; 32],
+    pub(super) token_ttl: Duration,
+    pub(super) registry: Option<crate::registry::ClientRegistry>,
+}
+
+impl EnrollmentManagement {
+    pub fn new(
+        store: Arc<DynamicClientStore>,
+        server_addr: String,
+        certificate_fingerprint: [u8; 32],
+        token_ttl: Duration,
+    ) -> Self {
+        Self {
+            store,
+            server_addr,
+            certificate_fingerprint,
+            token_ttl,
+            registry: None,
+        }
+    }
+
+    pub(crate) fn with_registry(mut self, registry: crate::registry::ClientRegistry) -> Self {
+        self.registry = Some(registry);
+        self
+    }
+
+    pub(crate) fn store(&self) -> Arc<DynamicClientStore> {
+        self.store.clone()
+    }
 }
 
 impl DashboardDataSources {
@@ -301,7 +351,13 @@ impl DashboardDataSources {
         Self {
             observability,
             history,
+            enrollment: None,
         }
+    }
+
+    pub fn with_enrollment(mut self, enrollment: EnrollmentManagement) -> Self {
+        self.enrollment = Some(enrollment);
+        self
     }
 
     fn unavailable() -> Self {
@@ -337,9 +393,126 @@ struct WebState {
     body_read_timeout: Duration,
     observability: ObservabilityStore,
     history: Option<HistoryService>,
+    enrollment: Option<EnrollmentManagement>,
+    operations: OperationLedger,
+}
+
+struct OperationLedger {
+    records: Mutex<VecDeque<OperationRecord>>,
+    capacity: usize,
+}
+
+struct OperationRecord {
+    key: [u8; 32],
+    request: [u8; 32],
+    outcome: OperationOutcome,
+}
+
+enum OperationOutcome {
+    Pending,
+    Secret,
+    Response { status: u16, body: Vec<u8> },
+}
+
+enum OperationAdmission {
+    Started([u8; 32]),
+    SecretUnavailable,
+    Replay { status: u16, body: Vec<u8> },
+    InFlight,
+    Conflict,
+    Unavailable,
+}
+
+impl OperationLedger {
+    fn new(capacity: usize) -> Self {
+        Self {
+            records: Mutex::new(VecDeque::with_capacity(capacity)),
+            capacity,
+        }
+    }
+
+    fn begin(
+        &self,
+        session: &str,
+        endpoint: &str,
+        operation_id: &str,
+        request: &[u8],
+    ) -> OperationAdmission {
+        let key: [u8; 32] = Sha256::digest(
+            [
+                session.as_bytes(),
+                b"\0",
+                endpoint.as_bytes(),
+                b"\0",
+                operation_id.as_bytes(),
+            ]
+            .concat(),
+        )
+        .into();
+        let request: [u8; 32] = Sha256::digest(request).into();
+        let Ok(mut records) = self.records.lock() else {
+            return OperationAdmission::Unavailable;
+        };
+        if let Some(record) = records.iter().find(|record| record.key == key) {
+            return if record.request != request {
+                OperationAdmission::Conflict
+            } else {
+                match &record.outcome {
+                    OperationOutcome::Pending => OperationAdmission::InFlight,
+                    OperationOutcome::Secret => OperationAdmission::SecretUnavailable,
+                    OperationOutcome::Response { status, body } => OperationAdmission::Replay {
+                        status: *status,
+                        body: body.clone(),
+                    },
+                }
+            };
+        }
+        if records.len() == self.capacity {
+            if let Some(index) = records
+                .iter()
+                .position(|record| !matches!(record.outcome, OperationOutcome::Pending))
+            {
+                records.remove(index);
+            } else {
+                return OperationAdmission::Unavailable;
+            }
+        }
+        records.push_back(OperationRecord {
+            key,
+            request,
+            outcome: OperationOutcome::Pending,
+        });
+        OperationAdmission::Started(key)
+    }
+
+    fn finish(&self, key: [u8; 32], succeeded: bool) {
+        let Ok(mut records) = self.records.lock() else {
+            return;
+        };
+        if succeeded {
+            if let Some(record) = records.iter_mut().find(|record| record.key == key) {
+                record.outcome = OperationOutcome::Secret;
+            }
+        } else if let Some(index) = records.iter().position(|record| record.key == key) {
+            records.remove(index);
+        }
+    }
+
+    fn finish_response(&self, key: [u8; 32], status: u16, body: Vec<u8>) {
+        let Ok(mut records) = self.records.lock() else {
+            return;
+        };
+        if let Some(record) = records.iter_mut().find(|record| record.key == key) {
+            record.outcome = OperationOutcome::Response { status, body };
+        }
+    }
 }
 
 fn build_router(state: Arc<WebState>) -> Router {
+    let api_routes = api::routes().route_layer(middleware::from_fn_with_state(
+        Arc::clone(&state),
+        protect_management_writes,
+    ));
     Router::new()
         .route("/healthz", get(healthz))
         .route(
@@ -352,7 +525,7 @@ fn build_router(state: Arc<WebState>) -> Router {
             "/logout",
             post(logout).layer(DefaultBodyLimit::max(MAX_LOGOUT_BODY_BYTES)),
         )
-        .merge(api::routes())
+        .merge(api_routes)
         .merge(assets::routes())
         .route("/api", any(api_boundary))
         .route("/api/{*path}", any(api_boundary))
@@ -409,10 +582,46 @@ async fn login(
         Ok(token) => token,
         Err(_) => return internal_error(),
     };
+    let csrf_cookie = format!("{SESSION_COOKIE_NAME}={token}");
+    let Some(csrf) = state.authentication.csrf_for_cookie(Some(&csrf_cookie)) else {
+        return internal_error();
+    };
     let cookie = session_cookie(&token, state.cookie_secure);
     let mut response = plain_response(StatusCode::OK, "ok\n");
     response.headers_mut().insert(SET_COOKIE, cookie);
+    response.headers_mut().insert(
+        CSRF_HEADER_NAME,
+        HeaderValue::from_str(&csrf).expect("base64url CSRF token is a valid header value"),
+    );
     response
+}
+
+async fn protect_management_writes(
+    State(state): State<Arc<WebState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let guarded = request.method() == Method::POST
+        && (request.uri().path() == "/api/v1/clients"
+            || request.uri().path().starts_with("/api/v1/clients/"));
+    if !guarded {
+        return next.run(request).await;
+    }
+    let headers = request.headers();
+    let cookie = single_cookie_header(headers);
+    if !state.authentication.authenticate_cookie(cookie) {
+        return api::authentication_required();
+    }
+    let mut csrf_values = headers.get_all(&CSRF_HEADER_NAME).iter();
+    let csrf = csrf_values.next().and_then(|value| value.to_str().ok());
+    if csrf_values.next().is_some()
+        || !same_origin(headers, &state.expected_origin)
+        || !is_json_request(headers)
+        || !csrf.is_some_and(|csrf| state.authentication.validate_csrf(cookie, csrf))
+    {
+        return api::csrf_rejected();
+    }
+    next.run(request).await
 }
 
 async fn logout(State(state): State<Arc<WebState>>, request: Request) -> Response {
@@ -502,6 +711,21 @@ fn is_form_request(headers: &HeaderMap) -> bool {
                 .trim()
                 .eq_ignore_ascii_case("application/x-www-form-urlencoded")
         })
+}
+
+fn is_json_request(headers: &HeaderMap) -> bool {
+    let mut values = headers.get_all(CONTENT_TYPE).iter();
+    let Some(value) = values.next() else {
+        return false;
+    };
+    if values.next().is_some() {
+        return false;
+    }
+    value
+        .to_str()
+        .ok()
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("application/json"))
 }
 
 fn session_cookie(token: &str, secure: bool) -> HeaderValue {
@@ -642,4 +866,299 @@ pub enum WebError {
     #[doc(hidden)]
     #[error("web listener exited at the internal lifecycle test seam")]
     UnexpectedTestExit,
+}
+
+#[cfg(test)]
+mod management_tests {
+    use super::*;
+    use axum::http::Request as HttpRequest;
+    use rustgo_crypto::DeviceKeypair;
+    use rustgo_protocol::{EnrollmentKeyMaterial, EnrollmentPurpose};
+
+    #[tokio::test]
+    async fn create_client_returns_one_time_key_without_internal_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let enrollment_store = Arc::new(
+            DynamicClientStore::open(
+                directory.path().join("enrollment.db"),
+                crate::enrollment::EnrollmentStoreLimits {
+                    max_active_clients: 4,
+                    max_tokens: 4,
+                },
+            )
+            .unwrap(),
+        );
+        let (observability, sink, worker) = ObservabilityStore::new();
+        drop(sink);
+        drop(worker);
+        let authentication =
+            AuthenticationState::new("admin", "password", &WebRuntimeLimits::default()).unwrap();
+        let token = authentication.issue_session().unwrap();
+        let cookie = format!("{SESSION_COOKIE_NAME}={token}");
+        let csrf = authentication.csrf_for_cookie(Some(&cookie)).unwrap();
+        let state = Arc::new(WebState {
+            authentication,
+            expected_origin: WebOrigin::parse("http://127.0.0.1:8080").unwrap(),
+            cookie_secure: false,
+            body_read_timeout: Duration::from_secs(1),
+            observability,
+            history: None,
+            enrollment: Some(EnrollmentManagement::new(
+                Arc::clone(&enrollment_store),
+                "server.example:7443".into(),
+                [7; 32],
+                Duration::from_secs(300),
+            )),
+            operations: OperationLedger::new(16),
+        });
+        let request = HttpRequest::builder()
+            .method("POST")
+            .uri("/api/v1/clients")
+            .header("host", "127.0.0.1:8080")
+            .header("origin", "http://127.0.0.1:8080")
+            .header("content-type", "application/json")
+            .header("cookie", cookie.clone())
+            .header("x-rustgo-csrf-token", csrf.clone())
+            .body(Body::from(
+                r#"{"client_id":"Node.One","operation_id":"create-1"}"#,
+            ))
+            .unwrap();
+        let router = build_router(Arc::clone(&state));
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(response.headers().get("cache-control").unwrap(), "no-store");
+        let body = body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["client"]["client_id"], "Node.One");
+        assert_eq!(json["client"]["revision"], 1);
+        assert!(json.get("internal_id").is_none());
+        assert!(json.get("public_key").is_none());
+        let initial_encoded = json["enrollment_key"].as_str().unwrap().to_owned();
+        let key = EnrollmentKeyMaterial::decode(&initial_encoded).unwrap();
+        assert_eq!(key.server_addr(), "server.example:7443");
+        assert_eq!(enrollment_store.list_clients().unwrap().len(), 1);
+
+        let list = HttpRequest::builder()
+            .uri("/api/v1/clients?sort=name")
+            .header("cookie", cookie.clone())
+            .body(Body::empty())
+            .unwrap();
+        let list = router.clone().oneshot(list).await.unwrap();
+        assert_eq!(list.status(), StatusCode::OK);
+        let list: serde_json::Value =
+            serde_json::from_slice(&body::to_bytes(list.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(list["clients"]["items"][0]["name"], "Node.One");
+        assert_eq!(list["clients"]["items"][0]["identity_source"], "dynamic");
+        assert_eq!(list["clients"]["items"][0]["online"], false);
+        assert!(list["clients"]["items"][0].get("internal_id").is_none());
+
+        let detail = HttpRequest::builder()
+            .uri("/api/v1/clients/Node.One")
+            .header("cookie", cookie.clone())
+            .body(Body::empty())
+            .unwrap();
+        let detail = router.clone().oneshot(detail).await.unwrap();
+        assert_eq!(detail.status(), StatusCode::OK);
+        let detail: serde_json::Value =
+            serde_json::from_slice(&body::to_bytes(detail.into_body(), 4096).await.unwrap())
+                .unwrap();
+        assert_eq!(detail["client"]["revision"], 1);
+        assert_eq!(detail["sessions"]["total"], 0);
+
+        let replay = HttpRequest::builder()
+            .method("POST")
+            .uri("/api/v1/clients")
+            .header("host", "127.0.0.1:8080")
+            .header("origin", "http://127.0.0.1:8080")
+            .header("content-type", "application/json")
+            .header("cookie", cookie.clone())
+            .header("x-rustgo-csrf-token", csrf.clone())
+            .body(Body::from(
+                r#"{"client_id":"Node.One","operation_id":"create-1"}"#,
+            ))
+            .unwrap();
+        let replay = router.clone().oneshot(replay).await.unwrap();
+        assert_eq!(replay.status(), StatusCode::CONFLICT);
+        let body = body::to_bytes(replay.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["code"], "secret_unavailable");
+        assert_eq!(enrollment_store.list_clients().unwrap().len(), 1);
+
+        let reissue = HttpRequest::builder()
+            .method("POST")
+            .uri("/api/v1/clients/Node.One/enrollment-token")
+            .header("host", "127.0.0.1:8080")
+            .header("origin", "http://127.0.0.1:8080")
+            .header("content-type", "application/json")
+            .header("cookie", cookie.clone())
+            .header("x-rustgo-csrf-token", csrf.clone())
+            .body(Body::from(
+                r#"{"expected_revision":1,"operation_id":"reissue-1"}"#,
+            ))
+            .unwrap();
+        let reissue = router.clone().oneshot(reissue).await.unwrap();
+        assert_eq!(reissue.status(), StatusCode::OK);
+        let body = body::to_bytes(reissue.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let current_encoded = json["enrollment_key"].as_str().unwrap();
+        assert_eq!(
+            EnrollmentKeyMaterial::decode(current_encoded)
+                .unwrap()
+                .purpose(),
+            EnrollmentPurpose::Enroll
+        );
+        let public_key = DeviceKeypair::from_secret_bytes([42; 32]).public_key();
+        enrollment_store
+            .consume_token(
+                current_encoded,
+                &public_key,
+                "bind-web-test",
+                std::time::SystemTime::now(),
+            )
+            .unwrap();
+
+        let reenroll = HttpRequest::builder()
+            .method("POST")
+            .uri("/api/v1/clients/node.one/reenrollment-token")
+            .header("host", "127.0.0.1:8080")
+            .header("origin", "http://127.0.0.1:8080")
+            .header("content-type", "application/json")
+            .header("cookie", cookie.clone())
+            .header("x-rustgo-csrf-token", csrf.clone())
+            .body(Body::from(
+                r#"{"expected_revision":2,"operation_id":"reenroll-1"}"#,
+            ))
+            .unwrap();
+        let reenroll = router.clone().oneshot(reenroll).await.unwrap();
+        assert_eq!(reenroll.status(), StatusCode::OK);
+        let body = body::to_bytes(reenroll.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            EnrollmentKeyMaterial::decode(json["enrollment_key"].as_str().unwrap())
+                .unwrap()
+                .purpose(),
+            EnrollmentPurpose::ReEnroll
+        );
+
+        let rename_body =
+            r#"{"new_client_id":"Renamed.Node","expected_revision":2,"operation_id":"rename-1"}"#;
+        let rename = HttpRequest::builder()
+            .method("POST")
+            .uri("/api/v1/clients/node.one/rename")
+            .header("host", "127.0.0.1:8080")
+            .header("origin", "http://127.0.0.1:8080")
+            .header("content-type", "application/json")
+            .header("cookie", cookie.clone())
+            .header("x-rustgo-csrf-token", csrf.clone())
+            .body(Body::from(rename_body))
+            .unwrap();
+        let rename = router.clone().oneshot(rename).await.unwrap();
+        assert_eq!(rename.status(), StatusCode::OK);
+        let rename_bytes = body::to_bytes(rename.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&rename_bytes).unwrap();
+        assert_eq!(json["client"]["client_id"], "Renamed.Node");
+        assert_eq!(json["client"]["revision"], 3);
+
+        let replay = HttpRequest::builder()
+            .method("POST")
+            .uri("/api/v1/clients/node.one/rename")
+            .header("host", "127.0.0.1:8080")
+            .header("origin", "http://127.0.0.1:8080")
+            .header("content-type", "application/json")
+            .header("cookie", cookie.clone())
+            .header("x-rustgo-csrf-token", csrf.clone())
+            .body(Body::from(rename_body))
+            .unwrap();
+        let replay = router.clone().oneshot(replay).await.unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        assert_eq!(
+            body::to_bytes(replay.into_body(), 4096).await.unwrap(),
+            rename_bytes
+        );
+
+        let disable = HttpRequest::builder()
+            .method("POST")
+            .uri("/api/v1/clients/Renamed.Node/state")
+            .header("host", "127.0.0.1:8080")
+            .header("origin", "http://127.0.0.1:8080")
+            .header("content-type", "application/json")
+            .header("cookie", cookie.clone())
+            .header("x-rustgo-csrf-token", csrf.clone())
+            .body(Body::from(
+                r#"{"enabled":false,"expected_revision":3,"operation_id":"state-1"}"#,
+            ))
+            .unwrap();
+        let disable = router.clone().oneshot(disable).await.unwrap();
+        assert_eq!(disable.status(), StatusCode::OK);
+        let json: serde_json::Value =
+            serde_json::from_slice(&body::to_bytes(disable.into_body(), 4096).await.unwrap())
+                .unwrap();
+        assert_eq!(json["client"]["enabled"], false);
+        assert_eq!(json["client"]["revision"], 4);
+
+        let delete = HttpRequest::builder()
+            .method("POST")
+            .uri("/api/v1/clients/Renamed.Node/delete")
+            .header("host", "127.0.0.1:8080")
+            .header("origin", "http://127.0.0.1:8080")
+            .header("content-type", "application/json")
+            .header("cookie", cookie)
+            .header("x-rustgo-csrf-token", csrf)
+            .body(Body::from(
+                r#"{"expected_revision":4,"operation_id":"delete-1"}"#,
+            ))
+            .unwrap();
+        let delete = router.oneshot(delete).await.unwrap();
+        assert_eq!(delete.status(), StatusCode::OK);
+        let json: serde_json::Value =
+            serde_json::from_slice(&body::to_bytes(delete.into_body(), 4096).await.unwrap())
+                .unwrap();
+        assert_eq!(json["client"]["deleted"], true);
+        assert_eq!(json["client"]["revision"], 5);
+        assert!(enrollment_store.list_clients().unwrap().is_empty());
+    }
+
+    #[test]
+    fn operation_ledger_bounds_inflight_and_rejects_changed_replays() {
+        let ledger = OperationLedger::new(1);
+        let key = match ledger.begin("session-a", "/create", "op-1", b"request-a") {
+            OperationAdmission::Started(key) => key,
+            _ => panic!("first operation should start"),
+        };
+        assert!(matches!(
+            ledger.begin("session-a", "/create", "op-1", b"request-a"),
+            OperationAdmission::InFlight
+        ));
+        assert!(matches!(
+            ledger.begin("session-a", "/create", "op-1", b"request-b"),
+            OperationAdmission::Conflict
+        ));
+        assert!(matches!(
+            ledger.begin("session-a", "/create", "op-2", b"request"),
+            OperationAdmission::Unavailable
+        ));
+        ledger.finish(key, true);
+        assert!(matches!(
+            ledger.begin("session-a", "/create", "op-1", b"request-a"),
+            OperationAdmission::SecretUnavailable
+        ));
+        assert!(matches!(
+            ledger.begin("session-b", "/create", "op-1", b"request-a"),
+            OperationAdmission::Started(_)
+        ));
+
+        let ledger = OperationLedger::new(1);
+        let key = match ledger.begin("session", "/rename", "op", b"request") {
+            OperationAdmission::Started(key) => key,
+            _ => panic!("regular operation should start"),
+        };
+        ledger.finish_response(key, 200, br#"{"ok":true}"#.to_vec());
+        match ledger.begin("session", "/rename", "op", b"request") {
+            OperationAdmission::Replay { status, body } => {
+                assert_eq!(status, 200);
+                assert_eq!(body, br#"{"ok":true}"#);
+            }
+            _ => panic!("regular response should replay"),
+        }
+    }
 }

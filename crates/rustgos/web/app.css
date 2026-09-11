@@ -42,3 +42,8 @@ input, select { min-height: 2.25rem; padding: .4rem .55rem; color: var(--text); 
 .login-page { display: grid; min-height: 100vh; place-items: center; padding: 1rem; }.login-card { width: min(26rem, 100%); padding: 2rem; background: var(--surface); border: 1px solid var(--border); border-radius: 1rem; box-shadow: var(--shadow); }.login-card main { padding: 0; }.login-card form { display: grid; gap: .65rem; }.login-card .button { margin-top: .6rem; }.form-status { min-height: 1.4rem; color: var(--danger); margin: 0; }
 @media (max-width: 1180px) { .metric-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }.client-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
 @media (max-width: 760px) { .site-header { flex-wrap: wrap; }.connection-status { margin-left: 0; }.view-heading, .section-heading { align-items: start; flex-direction: column; }.metric-grid, .chart-grid, .detail-grid, .client-grid { grid-template-columns: 1fr; }.client-controls { align-items: stretch; width: 100%; }.client-controls input, .client-controls select, .client-controls button { width: 100%; }.filter-bar label { width: 100%; }.filter-bar input, .filter-bar select { width: 100%; } }
+
+.button-danger { background: #b42318; color: #fff; }
+dialog { max-width: min(720px, 90vw); border: 1px solid var(--border); border-radius: 12px; background: var(--surface); color: var(--text); }
+dialog::backdrop { background: rgb(0 0 0 / 60%); }
+#secret-value { width: min(640px, 80vw); font-family: ui-monospace, monospace; overflow-wrap: anywhere; }

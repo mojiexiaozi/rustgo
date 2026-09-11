@@ -112,9 +112,12 @@ fn client_fixture(
     Ok(ClientConfig {
         client: ClientSection {
             name: "traffic-client".to_owned(),
+            identity_mode: None,
             server_addr,
             server_name: SERVER_NAME.to_owned(),
             certificate_authority_file: pki.ca_file.clone(),
+            trust_mode: None,
+            server_certificate_fingerprint: None,
             private_key_file: keys._directory.path().join("device.key"),
             heartbeat_interval_secs: 1,
         },
@@ -155,6 +158,7 @@ fn server_config(pki: &TestPki, key: &DeviceKeypair, heartbeat_timeout_secs: u64
             enabled: true,
         }],
         web: None,
+        enrollment: None,
     }
 }
 

@@ -58,6 +58,9 @@ where
     if let Some(web) = &mut config.web {
         resolve_path(path, &mut web.database_path);
     }
+    if let Some(enrollment) = &mut config.enrollment {
+        resolve_path(path, &mut enrollment.database_path);
+    }
     config.validate().map_err(|error| ConfigError::Validation {
         path: path.to_path_buf(),
         error,
@@ -101,11 +104,13 @@ pub fn check_client_references(
     config_path: &Path,
     config: &ClientConfig,
 ) -> Result<(), ConfigError> {
-    check_reference(
-        config_path,
-        "certificate authority",
-        &config.client.certificate_authority_file,
-    )?;
+    if config.client.trust_mode != Some(crate::TrustMode::Pinned) {
+        check_reference(
+            config_path,
+            "certificate authority",
+            &config.client.certificate_authority_file,
+        )?;
+    }
     check_reference(config_path, "private key", &config.client.private_key_file)
 }
 

@@ -15,7 +15,7 @@ use axum::{
 };
 use sha2::{Digest, Sha256};
 
-use super::{WebState, security::single_cookie_header};
+use super::{CSRF_HEADER_NAME, WebState, security::single_cookie_header};
 
 struct Asset {
     bytes: &'static [u8],
@@ -62,13 +62,27 @@ pub(super) async fn login_page(headers: HeaderMap) -> Response {
 }
 
 async fn index(State(state): State<Arc<WebState>>, headers: HeaderMap) -> Response {
-    if !state
+    let Some(csrf) = state
         .authentication
-        .authenticate_cookie(single_cookie_header(&headers))
-    {
+        .csrf_for_cookie(single_cookie_header(&headers))
+    else {
         return (StatusCode::FOUND, [(LOCATION, "/login")]).into_response();
-    }
-    asset_response(&INDEX, &headers, true)
+    };
+    let html = String::from_utf8_lossy(INDEX.bytes).replace("__RUSTGO_CSRF__", &csrf);
+    let mut response = (
+        StatusCode::OK,
+        [
+            (CONTENT_TYPE, INDEX.content_type),
+            (CACHE_CONTROL, "no-store"),
+        ],
+        Body::from(html),
+    )
+        .into_response();
+    response.headers_mut().insert(
+        CSRF_HEADER_NAME,
+        HeaderValue::from_str(&csrf).expect("base64url CSRF token is a valid header value"),
+    );
+    response
 }
 
 async fn style(headers: HeaderMap) -> Response {

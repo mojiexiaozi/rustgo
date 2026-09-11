@@ -1,4 +1,6 @@
+pub mod config;
 pub mod connection;
+pub mod enrollment;
 pub mod formatting;
 pub mod logs;
 pub mod p2p;

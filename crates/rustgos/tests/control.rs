@@ -109,6 +109,7 @@ fn server_config(pki: &TestPki, clients: Vec<AuthorizedClient>) -> ServerConfig 
         },
         clients,
         web: None,
+        enrollment: None,
     }
 }
 

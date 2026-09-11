@@ -9,6 +9,7 @@ use std::{
     time::Duration,
 };
 
+use crate::enrollment::DynamicClientStore;
 use rand::{TryRngCore, rngs::OsRng};
 use rustgo_config::AuthorizedClient;
 use rustgo_crypto::{AuthTranscript, DevicePublicKey, verify_auth};
@@ -69,6 +70,7 @@ pub(crate) struct Authenticator {
     entries_by_name: Arc<HashMap<String, AuthorizationEntry>>,
     names_by_fingerprint: Arc<HashMap<String, String>>,
     next_session_sequence: Arc<AtomicU64>,
+    dynamic_store: Option<Arc<DynamicClientStore>>,
 }
 
 #[derive(Clone)]
@@ -98,7 +100,10 @@ impl PendingAuthentication {
 }
 
 impl Authenticator {
-    pub(crate) fn new(clients: &[AuthorizedClient]) -> Result<Self, AuthError> {
+    pub(crate) fn new_with_dynamic(
+        clients: &[AuthorizedClient],
+        dynamic_store: Option<Arc<DynamicClientStore>>,
+    ) -> Result<Self, AuthError> {
         let mut entries_by_name = HashMap::with_capacity(clients.len());
         let mut names_by_fingerprint = HashMap::with_capacity(clients.len());
         for client in clients {
@@ -126,6 +131,7 @@ impl Authenticator {
             entries_by_name: Arc::new(entries_by_name),
             names_by_fingerprint: Arc::new(names_by_fingerprint),
             next_session_sequence: Arc::new(AtomicU64::new(0)),
+            dynamic_store,
         })
     }
 
@@ -162,18 +168,26 @@ impl Authenticator {
             .strip_prefix("sha256:")
             .ok_or(AuthError::Internal)?;
 
-        let entry = self
-            .entries_by_name
-            .get(&pending.client_name)
-            .ok_or(AuthError::Rejected)?;
-        if !entry.enabled
-            || entry.public_key != public_key
-            || entry.fingerprint != fingerprint
-            || pending.claimed_fingerprint != wire_fingerprint.as_bytes()
-            || self.names_by_fingerprint.get(&fingerprint) != Some(&pending.client_name)
-        {
+        if pending.claimed_fingerprint != wire_fingerprint.as_bytes() {
             return Err(AuthError::Rejected);
         }
+
+        let authenticated_name = self
+            .entries_by_name
+            .get(&pending.client_name)
+            .filter(|entry| {
+                entry.enabled
+                    && entry.public_key == public_key
+                    && entry.fingerprint == fingerprint
+                    && self.names_by_fingerprint.get(&fingerprint) == Some(&pending.client_name)
+            })
+            .map(|_| pending.client_name.clone())
+            .or_else(|| {
+                let store = self.dynamic_store.as_ref()?;
+                let client = store.client_by_public_key(&public_key).ok()??;
+                (client.enabled() && !client.is_deleted()).then(|| client.display_id().to_owned())
+            })
+            .ok_or(AuthError::Rejected)?;
 
         let transcript = AuthTranscript::new(
             pending.challenge,
@@ -188,7 +202,7 @@ impl Authenticator {
         )
         .map_err(|_| AuthError::Rejected)?;
         Ok(AuthenticatedClient::verified(
-            pending.client_name,
+            authenticated_name,
             fingerprint,
             pending.session_id,
         ))

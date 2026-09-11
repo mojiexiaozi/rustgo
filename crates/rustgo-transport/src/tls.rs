@@ -9,8 +9,11 @@ use rand::{TryRngCore, rngs::OsRng};
 use rustgo_protocol::{
     BoundedBytes, MAX_BINDING_TOKEN_BYTES, MAX_CLIENT_NAME_BYTES, MAX_SESSION_ID_BYTES,
 };
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::UnixTime;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
-use rustls::{ClientConfig, RootCertStore, ServerConfig};
+use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, ServerConfig, SignatureScheme};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio_rustls::client::TlsStream as ClientTlsStream;
@@ -206,6 +209,15 @@ impl std::fmt::Debug for TlsServer {
 }
 
 impl TlsServer {
+    /// Returns the SHA-256 fingerprint of the first certificate DER in the
+    /// configured chain, which is the leaf presented by this server.
+    pub fn leaf_certificate_fingerprint(
+        certificate_file: impl AsRef<Path>,
+    ) -> Result<[u8; 32], TlsError> {
+        let certificates = load_certificates(certificate_file.as_ref())?;
+        Ok(Sha256::digest(certificates[0].as_ref()).into())
+    }
+
     /// Parses a complete certificate chain and private key, then verifies that
     /// the leaf certificate and key form a usable TLS 1.3 server identity.
     /// No socket is created or bound.
@@ -281,6 +293,29 @@ impl std::fmt::Debug for TlsClient {
 }
 
 impl TlsClient {
+    pub fn from_pinned_fingerprint(
+        server_name: &str,
+        fingerprint: [u8; 32],
+    ) -> Result<Self, TlsError> {
+        let server_name = ServerName::try_from(server_name.to_owned())
+            .map_err(|_| TlsError::InvalidServerName)?;
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let verifier = Arc::new(PinnedCertificateVerifier {
+            provider: Arc::clone(&provider),
+            fingerprint,
+        });
+        let config = ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .map_err(|_| TlsError::InvalidTlsIdentity)?
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_no_client_auth();
+        Ok(Self {
+            connector: TlsConnector::from(Arc::new(config)),
+            server_name,
+        })
+    }
+
     pub fn from_ca_file(
         certificate_authority_file: impl AsRef<Path>,
         server_name: &str,
@@ -324,6 +359,72 @@ impl TlsClient {
             .connect(self.server_name.clone(), socket)
             .await
             .map_err(|_| TlsError::HandshakeFailed)
+    }
+}
+
+#[derive(Debug)]
+struct PinnedCertificateVerifier {
+    provider: Arc<rustls::crypto::CryptoProvider>,
+    fingerprint: [u8; 32],
+}
+
+impl ServerCertVerifier for PinnedCertificateVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        let actual: [u8; 32] = Sha256::digest(end_entity.as_ref()).into();
+        let different = actual
+            .iter()
+            .zip(self.fingerprint)
+            .fold(0_u8, |difference, (left, right)| {
+                difference | (left ^ right)
+            });
+        if different == 0 {
+            Ok(ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::ApplicationVerificationFailure,
+            ))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        certificate: &CertificateDer<'_>,
+        signature: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            certificate,
+            signature,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        certificate: &CertificateDer<'_>,
+        signature: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            certificate,
+            signature,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 

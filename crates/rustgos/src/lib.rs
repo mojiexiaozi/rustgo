@@ -5,6 +5,7 @@
 mod app;
 mod auth;
 mod control;
+pub mod enrollment;
 mod observation;
 mod registry;
 mod rendezvous;
@@ -22,4 +23,4 @@ pub use rendezvous::{
     RendezvousCoordinator, RendezvousCoordinatorError, RendezvousErrorCode,
     RendezvousSessionMetadata,
 };
-pub use web::{DashboardDataSources, WebError, WebRuntimeLimits, WebServer};
+pub use web::{DashboardDataSources, EnrollmentManagement, WebError, WebRuntimeLimits, WebServer};

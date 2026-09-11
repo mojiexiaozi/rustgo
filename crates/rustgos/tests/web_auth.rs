@@ -43,6 +43,10 @@ async fn login_uses_indistinguishable_digest_checks_and_guards_every_api_route()
     let cookie = login
         .session_cookie()
         .ok_or("login did not set a session cookie")?;
+    let csrf = login
+        .header("x-rustgo-csrf-token")
+        .ok_or("login omitted CSRF token")?;
+    assert_eq!(csrf.len(), 43);
     let token = cookie
         .split_once('=')
         .map(|(_, token)| token)
@@ -59,7 +63,116 @@ async fn login_uses_indistinguishable_digest_checks_and_guards_every_api_route()
         .request("GET", "/api/v1/overview", &[("Cookie", &cookie)], "")
         .await?;
     assert_eq!(authenticated_api.status, 200);
+    let dashboard = server
+        .request("GET", "/", &[("Cookie", &cookie)], "")
+        .await?;
+    assert_eq!(dashboard.header("x-rustgo-csrf-token"), Some(csrf));
+    assert_eq!(dashboard.header("cache-control"), Some("no-store"));
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn management_posts_require_session_origin_json_and_csrf() -> Result<(), Box<dyn Error>> {
+    let server = RunningWebServer::start(WebRuntimeLimits::default(), false).await?;
+    let login = server.login(USERNAME, PASSWORD, None).await?;
+    let cookie = login.session_cookie().ok_or("missing session cookie")?;
+    let csrf = login
+        .header("x-rustgo-csrf-token")
+        .ok_or("missing CSRF token")?
+        .to_owned();
+    let origin = server.origin();
+    let path = "/api/v1/clients";
+
+    assert_eq!(
+        server
+            .request("POST", path, &[("Cookie", &cookie)], "{}")
+            .await?
+            .status,
+        403
+    );
+    assert_eq!(
+        server
+            .request(
+                "POST",
+                path,
+                &[
+                    ("Cookie", &cookie),
+                    ("Origin", "http://example.invalid"),
+                    ("Content-Type", "application/json"),
+                    ("X-Rustgo-CSRF-Token", &csrf),
+                ],
+                "{}"
+            )
+            .await?
+            .status,
+        403
+    );
+    assert_eq!(
+        server
+            .request(
+                "POST",
+                path,
+                &[
+                    ("Cookie", &cookie),
+                    ("Origin", &origin),
+                    ("Content-Type", "application/json"),
+                    ("X-Rustgo-CSRF-Token", "wrong"),
+                ],
+                "{}"
+            )
+            .await?
+            .status,
+        403
+    );
+    let accepted_guard = server
+        .request(
+            "POST",
+            path,
+            &[
+                ("Cookie", &cookie),
+                ("Origin", &origin),
+                ("Content-Type", "application/json; charset=utf-8"),
+                ("X-Rustgo-CSRF-Token", &csrf),
+            ],
+            "{}",
+        )
+        .await?;
+    assert_eq!(
+        accepted_guard.status, 503,
+        "the guard should pass through to management"
+    );
+    assert_eq!(accepted_guard.header("cache-control"), Some("no-store"));
+
+    server
+        .request(
+            "POST",
+            "/logout",
+            &[
+                ("Cookie", &cookie),
+                ("Origin", &origin),
+                ("Content-Type", "application/x-www-form-urlencoded"),
+            ],
+            "",
+        )
+        .await?;
+    assert_eq!(
+        server
+            .request(
+                "POST",
+                path,
+                &[
+                    ("Cookie", &cookie),
+                    ("Origin", &origin),
+                    ("Content-Type", "application/json"),
+                    ("X-Rustgo-CSRF-Token", &csrf),
+                ],
+                "{}"
+            )
+            .await?
+            .status,
+        401
+    );
     Ok(())
 }
 
@@ -1133,5 +1246,6 @@ fn server_config(web_address: SocketAddr, cookie_secure: bool) -> ServerConfig {
             database_path: PathBuf::from("unused-history.db"),
             database_max_mib: 256,
         }),
+        enrollment: None,
     }
 }

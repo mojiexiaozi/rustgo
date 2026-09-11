@@ -8,7 +8,7 @@ use std::{
 };
 
 use bytes::BytesMut;
-use rustgo_config::{ClientConfig, TunnelProtocol as ConfigTunnelProtocol};
+use rustgo_config::{ClientConfig, TrustMode, TunnelProtocol as ConfigTunnelProtocol};
 use rustgo_crypto::{AuthTranscript, CryptoError, DeviceKeypair, sign_auth};
 use rustgo_protocol::{
     BoundedBytes, BoundedString, BoundedVec, ClientAuthenticate, ClientHandshakeState, ClientHello,
@@ -182,15 +182,39 @@ fn load_credentials(
         return Err(ClientError::InvalidConfiguration);
     }
     let keypair = DeviceKeypair::load_private_file(&config.client.private_key_file)?;
-    let tls_client = TlsClient::from_ca_file(
-        &config.client.certificate_authority_file,
-        &config.client.server_name,
-    )?;
+    let tls_client = match config.client.trust_mode {
+        Some(TrustMode::Pinned) => TlsClient::from_pinned_fingerprint(
+            &config.client.server_name,
+            decode_fingerprint(
+                config
+                    .client
+                    .server_certificate_fingerprint
+                    .as_deref()
+                    .ok_or(ClientError::InvalidConfiguration)?,
+            )?,
+        )?,
+        None => TlsClient::from_ca_file(
+            &config.client.certificate_authority_file,
+            &config.client.server_name,
+        )?,
+    };
     Ok((
         keypair,
         tls_client,
         Duration::from_secs(u64::from(heartbeat_interval_secs)),
     ))
+}
+
+fn decode_fingerprint(encoded: &str) -> Result<[u8; 32], ClientError> {
+    if encoded.len() != 64 {
+        return Err(ClientError::InvalidConfiguration);
+    }
+    let mut fingerprint = [0_u8; 32];
+    for (index, byte) in fingerprint.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&encoded[index * 2..index * 2 + 2], 16)
+            .map_err(|_| ClientError::InvalidConfiguration)?;
+    }
+    Ok(fingerprint)
 }
 
 fn negotiated_version(

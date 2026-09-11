@@ -64,6 +64,29 @@ impl AuthenticationState {
         authenticated
     }
 
+    pub(super) fn csrf_for_cookie(&self, cookie_header: Option<&str>) -> Option<String> {
+        let mut token = cookie_header.and_then(parse_session_cookie)?;
+        let credential = self.sessions.csrf_credential(&token, Instant::now());
+        token.fill(0);
+        credential.map(|credential| URL_SAFE_NO_PAD.encode(credential))
+    }
+
+    pub(super) fn validate_csrf(&self, cookie_header: Option<&str>, supplied: &str) -> bool {
+        let Some(mut token) = cookie_header.and_then(parse_session_cookie) else {
+            return false;
+        };
+        let supplied = URL_SAFE_NO_PAD
+            .decode(supplied.as_bytes())
+            .ok()
+            .and_then(|bytes| <[u8; DIGEST_BYTES]>::try_from(bytes).ok());
+        let expected = self.sessions.csrf_credential(&token, Instant::now());
+        token.fill(0);
+        match (expected, supplied) {
+            (Some(expected), Some(supplied)) => bool::from(expected.ct_eq(&supplied)),
+            _ => false,
+        }
+    }
+
     pub(super) fn revoke_cookie(&self, cookie_header: Option<&str>) -> bool {
         let Some(mut token) = cookie_header.and_then(parse_session_cookie) else {
             return false;
@@ -186,6 +209,23 @@ impl SessionStore {
             .expect("HMAC-SHA256 accepts keys of every size");
         mac.update(token);
         SessionKey(mac.finalize().into_bytes().into())
+    }
+
+    fn csrf_credential(
+        &self,
+        token: &[u8; SESSION_TOKEN_BYTES],
+        now: Instant,
+    ) -> Option<[u8; DIGEST_BYTES]> {
+        let key = self.derive_key(token);
+        let mut table = self.table.lock().ok()?;
+        table.remove_expired(now, self.idle_timeout, self.absolute_timeout);
+        let record = table.sessions.get_mut(&key)?;
+        record.last_activity = now;
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(&self.hmac_key)
+            .expect("HMAC-SHA256 accepts keys of every size");
+        mac.update(b"rustgo-web-csrf-v1\0");
+        mac.update(token);
+        Some(mac.finalize().into_bytes().into())
     }
 }
 
@@ -322,6 +362,32 @@ fn parse_session_cookie(header: &str) -> Option<[u8; SESSION_TOKEN_BYTES]> {
     }
     let decoded = URL_SAFE_NO_PAD.decode(value.as_bytes()).ok()?;
     decoded.try_into().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn csrf_credentials_are_session_bound_and_revoked_with_the_session() {
+        let authentication =
+            AuthenticationState::new("admin", "password", &WebRuntimeLimits::default()).unwrap();
+        let first = authentication.issue_session().unwrap();
+        let second = authentication.issue_session().unwrap();
+        let first_cookie = format!("{SESSION_COOKIE_NAME}={first}");
+        let second_cookie = format!("{SESSION_COOKIE_NAME}={second}");
+        let first_csrf = authentication.csrf_for_cookie(Some(&first_cookie)).unwrap();
+        let second_csrf = authentication
+            .csrf_for_cookie(Some(&second_cookie))
+            .unwrap();
+        assert_eq!(first_csrf.len(), 43);
+        assert_ne!(first_csrf, second_csrf);
+        assert!(authentication.validate_csrf(Some(&first_cookie), &first_csrf));
+        assert!(!authentication.validate_csrf(Some(&first_cookie), &second_csrf));
+        assert!(!authentication.validate_csrf(Some(&first_cookie), "malformed"));
+        assert!(authentication.revoke_cookie(Some(&first_cookie)));
+        assert!(!authentication.validate_csrf(Some(&first_cookie), &first_csrf));
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -155,9 +155,12 @@ fn client_fixture(
         config: ClientConfig {
             client: ClientSection {
                 name: "telemetry-client".to_owned(),
+                identity_mode: None,
                 server_addr,
                 server_name: SERVER_NAME.to_owned(),
                 certificate_authority_file: pki.ca_file.clone(),
+                trust_mode: None,
+                server_certificate_fingerprint: None,
                 private_key_file: keys.path().join("device.key"),
                 heartbeat_interval_secs: 1,
             },
@@ -375,9 +378,12 @@ fn relay_only_client(
     ClientConfig {
         client: ClientSection {
             name: name.to_owned(),
+            identity_mode: None,
             server_addr,
             server_name: SERVER_NAME.to_owned(),
             certificate_authority_file: pki.ca_file.clone(),
+            trust_mode: None,
+            server_certificate_fingerprint: None,
             private_key_file,
             heartbeat_interval_secs: 1,
         },
@@ -445,6 +451,7 @@ async fn production_p2p_fallback_counts_only_application_payload() -> Result<(),
             },
         ],
         web: None,
+        enrollment: None,
     };
     let (store, sink, worker) = ObservabilityStore::new();
     let server = ServerApp::bind(server_config)

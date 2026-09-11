@@ -153,10 +153,19 @@ fn checked_in_dashboard_uses_only_relative_allowlisted_resources() {
     assert!(script.contains("/api/v1/clients/"));
     assert!(script.contains("/api/v1/sessions"));
     assert!(script.contains("/api/v1/history"));
+    for management_route in [
+        "/rename",
+        "/state",
+        "\"enrollment-token\"",
+        "\"reenrollment-token\"",
+        "/delete",
+    ] {
+        assert!(script.contains(management_route));
+    }
     assert_eq!(
         script.matches("/api/v1/").count(),
-        4,
-        "the dashboard may only issue its four documented API route families"
+        10,
+        "the dashboard may only issue documented read and client-management API routes"
     );
     assert!(!assets.contains("max-age=31536000"));
     assert!(assets.contains("\"no-cache\""));
@@ -370,5 +379,6 @@ fn server_config(web_address: SocketAddr) -> ServerConfig {
             database_path: PathBuf::from("unused-history.db"),
             database_max_mib: 256,
         }),
+        enrollment: None,
     }
 }

@@ -4233,6 +4233,20 @@ fn generate_owner_nonce() -> Result<String, DatabaseError> {
     Ok(nonce)
 }
 
+fn file_nonce_component(nonce: &str) -> &str {
+    #[cfg(windows)]
+    {
+        // Keep 128 bits in path components so SQLite sidecar and durable-write
+        // names stay below the traditional Windows MAX_PATH boundary. The full
+        // 256-bit nonce remains in every ownership marker and database proof.
+        &nonce[..OWNER_NONCE_BYTES]
+    }
+    #[cfg(not(windows))]
+    {
+        nonce
+    }
+}
+
 fn validate_owner_nonce(nonce: &str) -> Result<(), DatabaseError> {
     if nonce.len() == OWNER_NONCE_BYTES * 2
         && nonce
@@ -4631,7 +4645,7 @@ fn private_store_path(path: &Path, nonce: &str) -> Result<PathBuf, DatabaseError
     ))?;
     let mut store_name = file_name.to_os_string();
     store_name.push(".rustgo-store-");
-    store_name.push(nonce);
+    store_name.push(file_nonce_component(nonce));
     Ok(path.with_file_name(store_name))
 }
 
@@ -4650,7 +4664,7 @@ fn active_database_path(path: &Path, store: &Path, active: &str) -> Result<PathB
         ))?
         .to_os_string();
     name.push(".active-");
-    name.push(active);
+    name.push(file_nonce_component(active));
     Ok(store.join(name))
 }
 
@@ -4796,7 +4810,7 @@ fn create_database_identity_link(
     }
     let temporary = store.join(format!(
         "{DATABASE_IDENTITY_FILE_NAME}.link-{}",
-        generate_owner_nonce()?
+        file_nonce_component(&generate_owner_nonce()?)
     ));
     fs::hard_link(database_path, &temporary)?;
     let held_temporary = hold_exact_file(&temporary, "temporary database identity proof")?;
@@ -4929,7 +4943,7 @@ fn write_new_durable_file(path: &Path, bytes: &[u8]) -> Result<(), DatabaseError
         ))?
         .to_os_string();
     temporary_name.push(".write-");
-    temporary_name.push(generate_owner_nonce()?);
+    temporary_name.push(file_nonce_component(&generate_owner_nonce()?));
     let temporary = path.with_file_name(temporary_name);
     let mut file = OpenOptions::new()
         .write(true)
@@ -4955,7 +4969,7 @@ fn replace_owned_durable_file_after_close(
         ))?
         .to_os_string();
     temporary_name.push(".replace-");
-    temporary_name.push(generate_owner_nonce()?);
+    temporary_name.push(file_nonce_component(&generate_owner_nonce()?));
     let temporary = path.with_file_name(temporary_name);
     let mut file = OpenOptions::new()
         .write(true)

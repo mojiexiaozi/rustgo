@@ -7,8 +7,10 @@ use std::{
 
 use axum::{
     Router,
-    body::Body,
-    extract::{OriginalUri, RawQuery, State},
+    body::{Body, Bytes},
+    extract::{
+        DefaultBodyLimit, Json, OriginalUri, Path, RawQuery, State, rejection::JsonRejection,
+    },
     http::{HeaderMap, StatusCode, header::CONTENT_TYPE},
     response::{IntoResponse, Response},
     routing::get,
@@ -20,15 +22,18 @@ use rustgo_observability::{
     MAX_AUTHENTICATED_CLIENT_NAME_BYTES, MAX_HISTORY_POINTS, OverviewSnapshot, SessionKind,
     SessionPath, SessionSnapshot, TrafficCounters,
 };
-use serde::Serialize;
+use rustgo_protocol::EnrollmentPurpose;
+use serde::{Deserialize, Serialize};
 
 use super::{
-    WebState,
+    CSRF_HEADER_NAME, EnrollmentManagement, OperationAdmission, WebState,
     dto::{
-        BoundedItems, Client, ClientResponse, ClientsResponse, ErrorBody, ErrorEnvelope, Freshness,
-        HistoryHealth, HistoryPoint, HistoryQueryMetadata, HistoryResponse, Inventory, Metrics,
-        ObservabilityHealth, OverviewResponse, PathCounts, ServerMetrics, ServerMetricsResponse,
-        Session, SessionCounts, SessionsResponse, Traffic,
+        BoundedItems, Client, ClientResponse, ClientsResponse, CreateClientResponse,
+        EnrollmentHealth, EnrollmentTokenResponse, ErrorBody, ErrorEnvelope, Freshness,
+        HistoryHealth, HistoryPoint, HistoryQueryMetadata, HistoryResponse, Inventory,
+        ManagedClient, ManagedClientResponse, Metrics, ObservabilityHealth, OverviewResponse,
+        PathCounts, ServerMetrics, ServerMetricsResponse, Session, SessionCounts, SessionsResponse,
+        Traffic,
     },
     security::single_cookie_header,
 };
@@ -59,10 +64,19 @@ pub(super) fn routes() -> Router<Arc<WebState>> {
             "/api/v1/server/metrics",
             get(server_metrics).fallback(method_not_allowed),
         )
-        .route("/api/v1/clients", get(clients).fallback(method_not_allowed))
+        .route(
+            "/api/v1/clients",
+            get(clients)
+                .post(create_client)
+                .fallback(method_not_allowed)
+                .layer(DefaultBodyLimit::max(4_096)),
+        )
         .route(
             "/api/v1/clients/{*name}",
-            get(client).fallback(method_not_allowed),
+            get(client)
+                .post(client_management)
+                .fallback(method_not_allowed)
+                .layer(DefaultBodyLimit::max(4_096)),
         )
         .route(
             "/api/v1/sessions",
@@ -80,13 +94,22 @@ async fn overview(State(state): State<Arc<WebState>>, headers: HeaderMap) -> Res
         return *response;
     }
     let snapshot = state.observability.snapshot();
+    let enrollment = enrollment_health(&state).await;
     let now = now_unix_millis();
     let total_clients = snapshot.clients.len();
     let clients = snapshot
         .clients
         .iter()
         .take(MAX_CLIENT_ITEMS)
-        .map(|client| client_dto(client, &snapshot.sessions, now, MAX_LIST_INVENTORY_ITEMS))
+        .map(|client| {
+            client_dto(
+                client,
+                &snapshot.sessions,
+                now,
+                MAX_LIST_INVENTORY_ITEMS,
+                None,
+            )
+        })
         .collect();
     let response = OverviewResponse {
         generated_unix_millis: snapshot.generated_unix_millis,
@@ -98,8 +121,25 @@ async fn overview(State(state): State<Arc<WebState>>, headers: HeaderMap) -> Res
         sessions: session_counts(&snapshot.sessions),
         observability: observability_health(&snapshot),
         history: history_health(&state),
+        enrollment,
     };
     json_response(StatusCode::OK, &response)
+}
+
+async fn enrollment_health(state: &WebState) -> EnrollmentHealth {
+    let Some(management) = state.enrollment.clone() else {
+        return EnrollmentHealth {
+            configured: false,
+            available: false,
+        };
+    };
+    let available = tokio::task::spawn_blocking(move || management.store.health_check().is_ok())
+        .await
+        .unwrap_or(false);
+    EnrollmentHealth {
+        configured: true,
+        available,
+    }
 }
 
 async fn server_metrics(State(state): State<Arc<WebState>>, headers: HeaderMap) -> Response {
@@ -124,6 +164,10 @@ async fn clients(
     if let Err(response) = authenticate(&state, &headers) {
         return *response;
     }
+    let dynamic_clients = match load_dynamic_clients(&state).await {
+        Ok(clients) => clients,
+        Err(response) => return *response,
+    };
     let snapshot = state.observability.snapshot();
     let query = match parse_query(raw_query.as_deref(), &["search", "sort", "order", "limit"]) {
         Ok(query) => query,
@@ -152,27 +196,46 @@ async fn clients(
         Ok(limit) => limit,
         Err(()) => return invalid_query(),
     };
-    let search_folded = search.as_ref().map(|value| value.to_lowercase());
-    let mut matched: Vec<&ClientSnapshot> = snapshot
+    let now = now_unix_millis();
+    let mut items: Vec<Client> = snapshot
         .clients
         .iter()
-        .filter(|client| {
-            search_folded
-                .as_ref()
-                .is_none_or(|search| client.name.as_str().to_lowercase().contains(search))
+        .map(|client| {
+            let dynamic = dynamic_clients.iter().find(|dynamic| {
+                dynamic
+                    .display_id()
+                    .eq_ignore_ascii_case(client.name.as_str())
+            });
+            client_dto(
+                client,
+                &snapshot.sessions,
+                now,
+                MAX_LIST_INVENTORY_ITEMS,
+                dynamic,
+            )
         })
         .collect();
-    matched.sort_by(|left, right| {
-        let ordering = compare_clients(left, right, sort, descending);
-        ordering.then_with(|| left.name.as_str().cmp(right.name.as_str()))
+    items.extend(
+        dynamic_clients
+            .iter()
+            .filter(|dynamic| {
+                !snapshot.clients.iter().any(|client| {
+                    dynamic
+                        .display_id()
+                        .eq_ignore_ascii_case(client.name.as_str())
+                })
+            })
+            .map(offline_dynamic_client_dto),
+    );
+    let search_folded = search.as_ref().map(|value| value.to_lowercase());
+    items.retain(|client| {
+        search_folded
+            .as_ref()
+            .is_none_or(|search| client.name.to_lowercase().contains(search))
     });
-    let total = matched.len();
-    let now = now_unix_millis();
-    let items = matched
-        .into_iter()
-        .take(limit)
-        .map(|client| client_dto(client, &snapshot.sessions, now, MAX_LIST_INVENTORY_ITEMS))
-        .collect();
+    items.sort_by(|left, right| compare_client_dtos(left, right, sort, descending));
+    let total = items.len();
+    items.truncate(limit);
     json_response(
         StatusCode::OK,
         &ClientsResponse {
@@ -198,17 +261,21 @@ async fn client(
         Ok(name) => name,
         Err(()) => return invalid_client_name(),
     };
-    let Some(client) = snapshot
+    let dynamic = match load_dynamic_client(&state, &name).await {
+        Ok(client) => client,
+        Err(response) => return *response,
+    };
+    let observed = snapshot
         .clients
         .iter()
-        .find(|client| client.name.as_str() == name)
-    else {
+        .find(|client| client.name.as_str() == name);
+    if observed.is_none() && dynamic.is_none() {
         return error_response(
             StatusCode::NOT_FOUND,
             "client_not_found",
             "client was not found",
         );
-    };
+    }
     let now = now_unix_millis();
     let mut client_sessions: Vec<&SessionSnapshot> = snapshot
         .sessions
@@ -226,7 +293,18 @@ async fn client(
         StatusCode::OK,
         &ClientResponse {
             generated_unix_millis: snapshot.generated_unix_millis,
-            client: client_dto(client, &snapshot.sessions, now, MAX_DETAIL_INVENTORY_ITEMS),
+            client: observed.map_or_else(
+                || offline_dynamic_client_dto(dynamic.as_ref().expect("checked above")),
+                |client| {
+                    client_dto(
+                        client,
+                        &snapshot.sessions,
+                        now,
+                        MAX_DETAIL_INVENTORY_ITEMS,
+                        dynamic.as_ref(),
+                    )
+                },
+            ),
             sessions: BoundedItems::new(total, sessions),
         },
     )
@@ -455,6 +533,672 @@ pub(super) fn authentication_required() -> Response {
     )
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateClientRequest {
+    client_id: String,
+    operation_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TokenRequest {
+    expected_revision: u64,
+    operation_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RenameClientRequest {
+    new_client_id: String,
+    expected_revision: u64,
+    operation_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetClientStateRequest {
+    enabled: bool,
+    expected_revision: u64,
+    operation_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeleteClientRequest {
+    expected_revision: u64,
+    operation_id: String,
+}
+
+async fn client_management(
+    State(state): State<Arc<WebState>>,
+    Path(path): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some((client_id, action)) = path.rsplit_once('/') else {
+        return not_found();
+    };
+    match action {
+        "enrollment-token" | "reenrollment-token" => {
+            let Ok(request) = serde_json::from_slice::<TokenRequest>(&body) else {
+                return invalid_management_request();
+            };
+            let (purpose, endpoint) = if action == "enrollment-token" {
+                (EnrollmentPurpose::Enroll, "enrollment-token")
+            } else {
+                (EnrollmentPurpose::ReEnroll, "reenrollment-token")
+            };
+            issue_management_token(
+                state,
+                headers,
+                client_id.to_owned(),
+                request,
+                purpose,
+                endpoint,
+            )
+            .await
+        }
+        "rename" => {
+            let Ok(request) = serde_json::from_slice::<RenameClientRequest>(&body) else {
+                return invalid_management_request();
+            };
+            rename_client(state, headers, client_id.to_owned(), request).await
+        }
+        "state" => {
+            let Ok(request) = serde_json::from_slice::<SetClientStateRequest>(&body) else {
+                return invalid_management_request();
+            };
+            set_client_state(state, headers, client_id.to_owned(), request).await
+        }
+        "delete" => {
+            let Ok(request) = serde_json::from_slice::<DeleteClientRequest>(&body) else {
+                return invalid_management_request();
+            };
+            delete_client(state, headers, client_id.to_owned(), request).await
+        }
+        _ => not_found(),
+    }
+}
+
+async fn issue_management_token(
+    state: Arc<WebState>,
+    headers: HeaderMap,
+    client_id: String,
+    request: TokenRequest,
+    purpose: EnrollmentPurpose,
+    endpoint: &'static str,
+) -> Response {
+    if let Err(response) = authenticate(&state, &headers) {
+        return *response;
+    }
+    let Some(management) = state.enrollment.clone() else {
+        return enrollment_unavailable();
+    };
+    if !valid_operation_id(&request.operation_id) {
+        return invalid_operation_id();
+    }
+    let Some(session) = headers
+        .get(&CSRF_HEADER_NAME)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return csrf_rejected();
+    };
+    let identity = format!(
+        "{}\0{}",
+        client_id.to_ascii_lowercase(),
+        request.expected_revision
+    );
+    let ledger_endpoint = format!("/api/v1/clients/{{client_id}}/{endpoint}");
+    let operation_key = match admit_secret_operation(
+        &state,
+        session,
+        &ledger_endpoint,
+        &request.operation_id,
+        identity.as_bytes(),
+    ) {
+        Ok(key) => key,
+        Err(response) => return *response,
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        let client = management
+            .store
+            .client_by_display_id(&client_id)?
+            .ok_or(crate::enrollment::EnrollmentStoreError::ClientNotFound)?;
+        let issued = management.store.issue_token(
+            client.internal_id(),
+            purpose,
+            &management.server_addr,
+            management.certificate_fingerprint,
+            management.token_ttl,
+            request.expected_revision,
+        )?;
+        Ok::<_, crate::enrollment::EnrollmentStoreError>((client, issued))
+    })
+    .await;
+    state
+        .operations
+        .finish(operation_key, matches!(&result, Ok(Ok(_))));
+    match result {
+        Ok(Ok((client, issued))) => json_response(
+            StatusCode::OK,
+            &EnrollmentTokenResponse {
+                client: managed_client(&client),
+                enrollment_key: issued.into_encoded(),
+            },
+        ),
+        Ok(Err(error)) => enrollment_store_error(error),
+        Err(_) => enrollment_unavailable(),
+    }
+}
+
+fn valid_operation_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn admit_secret_operation(
+    state: &WebState,
+    session: &str,
+    endpoint: &str,
+    operation_id: &str,
+    request: &[u8],
+) -> Result<[u8; 32], Box<Response>> {
+    match state
+        .operations
+        .begin(session, endpoint, operation_id, request)
+    {
+        OperationAdmission::Started(key) => Ok(key),
+        OperationAdmission::SecretUnavailable => Err(Box::new(error_response(
+            StatusCode::CONFLICT,
+            "secret_unavailable",
+            "operation succeeded but the enrollment key cannot be recovered",
+        ))),
+        OperationAdmission::Replay { status, body } => {
+            Err(Box::new(stored_json_response(status, body)))
+        }
+        OperationAdmission::InFlight => Err(Box::new(error_response(
+            StatusCode::CONFLICT,
+            "operation_in_flight",
+            "operation is already in progress",
+        ))),
+        OperationAdmission::Conflict => Err(Box::new(error_response(
+            StatusCode::CONFLICT,
+            "operation_conflict",
+            "operation ID was reused for a different request",
+        ))),
+        OperationAdmission::Unavailable => Err(Box::new(error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "operation_unavailable",
+            "operation tracking is unavailable",
+        ))),
+    }
+}
+
+fn managed_client(client: &crate::enrollment::DynamicClient) -> ManagedClient {
+    ManagedClient {
+        client_id: client.display_id().to_owned(),
+        enabled: client.enabled(),
+        bound: client.is_bound(),
+        deleted: client.is_deleted(),
+        revision: client.revision(),
+    }
+}
+
+async fn load_dynamic_clients(
+    state: &WebState,
+) -> Result<Vec<crate::enrollment::DynamicClient>, Box<Response>> {
+    let Some(management) = state.enrollment.clone() else {
+        return Ok(Vec::new());
+    };
+    match tokio::task::spawn_blocking(move || management.store.list_clients()).await {
+        Ok(Ok(clients)) => Ok(clients),
+        _ => Err(Box::new(enrollment_unavailable())),
+    }
+}
+
+async fn load_dynamic_client(
+    state: &WebState,
+    display_id: &str,
+) -> Result<Option<crate::enrollment::DynamicClient>, Box<Response>> {
+    let Some(management) = state.enrollment.clone() else {
+        return Ok(None);
+    };
+    let display_id = display_id.to_owned();
+    match tokio::task::spawn_blocking(move || management.store.client_by_display_id(&display_id))
+        .await
+    {
+        Ok(Ok(client)) => Ok(client),
+        Ok(Err(crate::enrollment::EnrollmentStoreError::InvalidDisplayId)) => Ok(None),
+        _ => Err(Box::new(enrollment_unavailable())),
+    }
+}
+
+async fn rename_client(
+    state: Arc<WebState>,
+    headers: HeaderMap,
+    client_id: String,
+    request: RenameClientRequest,
+) -> Response {
+    let old_client_id = client_id.clone();
+    mutate_client(
+        state,
+        headers,
+        client_id,
+        ClientMutation {
+            expected_revision: request.expected_revision,
+            operation_id: request.operation_id,
+            payload_identity: format!("rename\0{}", request.new_client_id).into_bytes(),
+            endpoint: "rename",
+        },
+        move |management, internal_id| {
+            let client = management.store.rename_client(
+                &internal_id,
+                &request.new_client_id,
+                request.expected_revision,
+            )?;
+            if let Some(registry) = &management.registry {
+                registry.notify_rename_and_terminate(
+                    &old_client_id,
+                    client.display_id(),
+                    client.revision(),
+                );
+            }
+            Ok(client)
+        },
+    )
+    .await
+}
+
+async fn set_client_state(
+    state: Arc<WebState>,
+    headers: HeaderMap,
+    client_id: String,
+    request: SetClientStateRequest,
+) -> Response {
+    let old_client_id = client_id.clone();
+    mutate_client(
+        state,
+        headers,
+        client_id,
+        ClientMutation {
+            expected_revision: request.expected_revision,
+            operation_id: request.operation_id,
+            payload_identity: vec![u8::from(request.enabled)],
+            endpoint: "state",
+        },
+        move |management, internal_id| {
+            let client = management.store.set_client_enabled(
+                &internal_id,
+                request.enabled,
+                request.expected_revision,
+            )?;
+            if !request.enabled
+                && let Some(registry) = &management.registry
+            {
+                registry.terminate_by_name(&old_client_id);
+            }
+            Ok(client)
+        },
+    )
+    .await
+}
+
+async fn delete_client(
+    state: Arc<WebState>,
+    headers: HeaderMap,
+    client_id: String,
+    request: DeleteClientRequest,
+) -> Response {
+    let old_client_id = client_id.clone();
+    mutate_client(
+        state,
+        headers,
+        client_id,
+        ClientMutation {
+            expected_revision: request.expected_revision,
+            operation_id: request.operation_id,
+            payload_identity: Vec::new(),
+            endpoint: "delete",
+        },
+        move |management, internal_id| {
+            let client = management
+                .store
+                .delete_client(&internal_id, request.expected_revision)?;
+            if let Some(registry) = &management.registry {
+                registry.terminate_by_name(&old_client_id);
+            }
+            Ok(client)
+        },
+    )
+    .await
+}
+
+struct ClientMutation {
+    expected_revision: u64,
+    operation_id: String,
+    payload_identity: Vec<u8>,
+    endpoint: &'static str,
+}
+
+async fn mutate_client<F>(
+    state: Arc<WebState>,
+    headers: HeaderMap,
+    client_id: String,
+    operation: ClientMutation,
+    mutation: F,
+) -> Response
+where
+    F: FnOnce(
+            EnrollmentManagement,
+            String,
+        )
+            -> Result<crate::enrollment::DynamicClient, crate::enrollment::EnrollmentStoreError>
+        + Send
+        + 'static,
+{
+    if let Err(response) = authenticate(&state, &headers) {
+        return *response;
+    }
+    let Some(management) = state.enrollment.clone() else {
+        return enrollment_unavailable();
+    };
+    if !valid_operation_id(&operation.operation_id) {
+        return invalid_operation_id();
+    }
+    let Some(session) = headers
+        .get(&CSRF_HEADER_NAME)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return csrf_rejected();
+    };
+    let mut identity = format!(
+        "{}\0{}\0",
+        client_id.to_ascii_lowercase(),
+        operation.expected_revision
+    )
+    .into_bytes();
+    identity.extend_from_slice(&operation.payload_identity);
+    let ledger_endpoint = format!("/api/v1/clients/{{client_id}}/{}", operation.endpoint);
+    let operation_key = match state.operations.begin(
+        session,
+        &ledger_endpoint,
+        &operation.operation_id,
+        &identity,
+    ) {
+        OperationAdmission::Started(key) => key,
+        OperationAdmission::Replay { status, body } => {
+            return stored_json_response(status, body);
+        }
+        OperationAdmission::SecretUnavailable => {
+            return error_response(
+                StatusCode::CONFLICT,
+                "operation_conflict",
+                "operation type changed",
+            );
+        }
+        OperationAdmission::InFlight => {
+            return error_response(
+                StatusCode::CONFLICT,
+                "operation_in_flight",
+                "operation is already in progress",
+            );
+        }
+        OperationAdmission::Conflict => {
+            return error_response(
+                StatusCode::CONFLICT,
+                "operation_conflict",
+                "operation ID was reused for a different request",
+            );
+        }
+        OperationAdmission::Unavailable => {
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "operation_unavailable",
+                "operation tracking is unavailable",
+            );
+        }
+    };
+    let lookup = management.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let client = lookup
+            .store
+            .client_by_display_id(&client_id)?
+            .ok_or(crate::enrollment::EnrollmentStoreError::ClientNotFound)?;
+        mutation(management, client.internal_id().to_owned())
+    })
+    .await;
+    match result {
+        Ok(Ok(client)) => {
+            let body = serde_json::to_vec(&ManagedClientResponse {
+                client: managed_client(&client),
+            })
+            .expect("managed client response serializes");
+            state
+                .operations
+                .finish_response(operation_key, StatusCode::OK.as_u16(), body.clone());
+            stored_json_response(StatusCode::OK.as_u16(), body)
+        }
+        Ok(Err(error)) => {
+            state.operations.finish(operation_key, false);
+            enrollment_store_error(error)
+        }
+        Err(_) => {
+            state.operations.finish(operation_key, false);
+            enrollment_unavailable()
+        }
+    }
+}
+
+fn invalid_management_request() -> Response {
+    error_response(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "invalid_request",
+        "request JSON is invalid",
+    )
+}
+
+fn invalid_operation_id() -> Response {
+    error_response(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "invalid_operation_id",
+        "operation ID is invalid",
+    )
+}
+
+fn enrollment_unavailable() -> Response {
+    error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "enrollment_unavailable",
+        "dynamic client management is unavailable",
+    )
+}
+
+fn enrollment_store_error(error: crate::enrollment::EnrollmentStoreError) -> Response {
+    use crate::enrollment::EnrollmentStoreError as Error;
+    match error {
+        Error::InvalidDisplayId => error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_client_id",
+            "client ID is invalid",
+        ),
+        Error::DuplicateDisplayId => error_response(
+            StatusCode::CONFLICT,
+            "client_exists",
+            "client already exists",
+        ),
+        Error::ClientNotFound => error_response(
+            StatusCode::NOT_FOUND,
+            "client_not_found",
+            "client was not found",
+        ),
+        Error::ClientDisabled => error_response(
+            StatusCode::CONFLICT,
+            "client_disabled",
+            "client is disabled",
+        ),
+        Error::RevisionConflict => error_response(
+            StatusCode::CONFLICT,
+            "revision_conflict",
+            "client revision changed",
+        ),
+        Error::PurposeMismatch => error_response(
+            StatusCode::CONFLICT,
+            "client_state_conflict",
+            "client binding state does not allow this operation",
+        ),
+        Error::ClientCapacity | Error::TokenCapacity => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "capacity_reached",
+            "dynamic client capacity is reached",
+        ),
+        _ => enrollment_unavailable(),
+    }
+}
+
+async fn create_client(
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
+    payload: Result<Json<CreateClientRequest>, JsonRejection>,
+) -> Response {
+    if let Err(response) = authenticate(&state, &headers) {
+        return *response;
+    }
+    let Some(management) = state.enrollment.clone() else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "enrollment_unavailable",
+            "dynamic client management is unavailable",
+        );
+    };
+    let Ok(Json(request)) = payload else {
+        return error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_request",
+            "request JSON is invalid",
+        );
+    };
+    if request.operation_id.is_empty()
+        || request.operation_id.len() > 128
+        || !request
+            .operation_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_operation_id",
+            "operation ID is invalid",
+        );
+    }
+    let Some(session) = headers
+        .get(&CSRF_HEADER_NAME)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return csrf_rejected();
+    };
+    let operation_key = match state.operations.begin(
+        session,
+        "/api/v1/clients",
+        &request.operation_id,
+        request.client_id.as_bytes(),
+    ) {
+        OperationAdmission::Started(key) => key,
+        OperationAdmission::SecretUnavailable => {
+            return error_response(
+                StatusCode::CONFLICT,
+                "secret_unavailable",
+                "operation succeeded but the enrollment key cannot be recovered",
+            );
+        }
+        OperationAdmission::Replay { status, body } => {
+            return stored_json_response(status, body);
+        }
+        OperationAdmission::InFlight => {
+            return error_response(
+                StatusCode::CONFLICT,
+                "operation_in_flight",
+                "operation is already in progress",
+            );
+        }
+        OperationAdmission::Conflict => {
+            return error_response(
+                StatusCode::CONFLICT,
+                "operation_conflict",
+                "operation ID was reused for a different request",
+            );
+        }
+        OperationAdmission::Unavailable => {
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "operation_unavailable",
+                "operation tracking is unavailable",
+            );
+        }
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        management.store.create_client_with_token(
+            &request.client_id,
+            &management.server_addr,
+            management.certificate_fingerprint,
+            management.token_ttl,
+        )
+    })
+    .await;
+    state
+        .operations
+        .finish(operation_key, matches!(&result, Ok(Ok(_))));
+    match result {
+        Ok(Ok((client, issued))) => json_response(
+            StatusCode::CREATED,
+            &CreateClientResponse {
+                client: ManagedClient {
+                    client_id: client.display_id().to_owned(),
+                    enabled: client.enabled(),
+                    bound: client.is_bound(),
+                    deleted: client.is_deleted(),
+                    revision: client.revision(),
+                },
+                enrollment_key: issued.into_encoded(),
+            },
+        ),
+        Ok(Err(crate::enrollment::EnrollmentStoreError::InvalidDisplayId)) => error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_client_id",
+            "client ID is invalid",
+        ),
+        Ok(Err(crate::enrollment::EnrollmentStoreError::DuplicateDisplayId)) => error_response(
+            StatusCode::CONFLICT,
+            "client_exists",
+            "client already exists",
+        ),
+        Ok(Err(
+            crate::enrollment::EnrollmentStoreError::ClientCapacity
+            | crate::enrollment::EnrollmentStoreError::TokenCapacity,
+        )) => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "capacity_reached",
+            "dynamic client capacity is reached",
+        ),
+        Ok(Err(_)) | Err(_) => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "enrollment_unavailable",
+            "dynamic client management is unavailable",
+        ),
+    }
+}
+
+pub(super) fn csrf_rejected() -> Response {
+    error_response(
+        StatusCode::FORBIDDEN,
+        "csrf_rejected",
+        "request origin or CSRF token is invalid",
+    )
+}
+
 fn invalid_query() -> Response {
     error_response(
         StatusCode::BAD_REQUEST,
@@ -524,6 +1268,16 @@ fn json_response<T: Serialize>(status: StatusCode, value: &T) -> Response {
         status,
         [(CONTENT_TYPE, "application/json; charset=utf-8")],
         Body::from(bytes),
+    )
+        .into_response()
+}
+
+fn stored_json_response(status: u16, body: Vec<u8>) -> Response {
+    let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    (
+        status,
+        [(CONTENT_TYPE, "application/json; charset=utf-8")],
+        Body::from(body),
     )
         .into_response()
 }
@@ -726,6 +1480,7 @@ fn client_dto(
     sessions: &[SessionSnapshot],
     now: u64,
     inventory_limit: usize,
+    dynamic: Option<&crate::enrollment::DynamicClient>,
 ) -> Client {
     let owned_sessions: Vec<&SessionSnapshot> = sessions
         .iter()
@@ -733,6 +1488,14 @@ fn client_dto(
         .collect();
     Client {
         name: client.name.as_str().to_owned(),
+        identity_source: if dynamic.is_some() {
+            "dynamic"
+        } else {
+            "static"
+        },
+        enabled: dynamic.map(crate::enrollment::DynamicClient::enabled),
+        bound: dynamic.map(crate::enrollment::DynamicClient::is_bound),
+        revision: dynamic.map(crate::enrollment::DynamicClient::revision),
         online: client.online,
         version: client.version.as_str().to_owned(),
         authenticated_unix_millis: client.authenticated_unix_millis,
@@ -759,6 +1522,36 @@ fn client_dto(
         active_path: active_path(&owned_sessions),
         traffic_sort_bytes: traffic_total(client.traffic).to_string(),
         reconnects: client.reconnects,
+    }
+}
+
+fn offline_dynamic_client_dto(client: &crate::enrollment::DynamicClient) -> Client {
+    Client {
+        name: client.display_id().to_owned(),
+        identity_source: "dynamic",
+        enabled: Some(client.enabled()),
+        bound: Some(client.is_bound()),
+        revision: Some(client.revision()),
+        online: false,
+        version: String::new(),
+        authenticated_unix_millis: 0,
+        disconnected_unix_millis: None,
+        heartbeat: freshness(None, now_unix_millis(), HEARTBEAT_STALE_AFTER_MILLIS),
+        telemetry: metrics_dto(None, None, now_unix_millis(), CLIENT_STALE_AFTER_MILLIS),
+        traffic: Traffic {
+            received_bytes: 0,
+            sent_bytes: 0,
+        },
+        inventory: Inventory {
+            tunnels: BoundedItems::new(0, Vec::new()),
+            exports: BoundedItems::new(0, Vec::new()),
+            forwards: BoundedItems::new(0, Vec::new()),
+        },
+        sessions: SessionCounts::default(),
+        paths: PathCounts::default(),
+        active_path: "none",
+        traffic_sort_bytes: "0".to_owned(),
+        reconnects: 0,
     }
 }
 
@@ -991,21 +1784,15 @@ impl ClientSort {
     }
 }
 
-fn compare_clients(
-    left: &ClientSnapshot,
-    right: &ClientSnapshot,
+fn compare_client_dtos(
+    left: &Client,
+    right: &Client,
     sort: ClientSort,
     descending: bool,
 ) -> Ordering {
     if sort == ClientSort::Cpu {
-        let left = left
-            .metrics
-            .as_ref()
-            .and_then(|metrics| metrics.cpu_basis_points);
-        let right = right
-            .metrics
-            .as_ref()
-            .and_then(|metrics| metrics.cpu_basis_points);
+        let left = left.telemetry.cpu_basis_points;
+        let right = right.telemetry.cpu_basis_points;
         return match (left, right) {
             (Some(left), Some(right)) if descending => left.cmp(&right).reverse(),
             (Some(left), Some(right)) => left.cmp(&right),
@@ -1016,15 +1803,17 @@ fn compare_clients(
     }
     let ordering = match sort {
         ClientSort::Online => left.online.cmp(&right.online),
-        ClientSort::Name => left.name.as_str().cmp(right.name.as_str()),
-        ClientSort::Traffic => traffic_total(left.traffic).cmp(&traffic_total(right.traffic)),
+        ClientSort::Name => left.name.cmp(&right.name),
+        ClientSort::Traffic => (left.traffic.received_bytes + left.traffic.sent_bytes)
+            .cmp(&(right.traffic.received_bytes + right.traffic.sent_bytes)),
         ClientSort::Cpu => unreachable!("CPU ordering is handled above"),
     };
-    if descending {
+    let ordering = if descending {
         ordering.reverse()
     } else {
         ordering
-    }
+    };
+    ordering.then_with(|| left.name.cmp(&right.name))
 }
 
 #[derive(Clone, Copy)]

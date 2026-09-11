@@ -4,6 +4,7 @@
 
 mod app;
 mod control;
+mod enrollment;
 mod exports;
 mod forwards;
 mod orchestration;
@@ -17,6 +18,10 @@ mod udp;
 pub use app::{ActiveGeneration, ClientApp, ClientStatus, ReconnectBackoff};
 pub use control::{
     CLIENT_VERSION, ClientError, ControlClient, ControlEvent, ControlSession, RegisteredTunnel,
+};
+pub use enrollment::{
+    EnrollmentCompletion, EnrollmentError, EnrollmentKey, EnrollmentPurpose, EnrollmentState,
+    PendingEnrollment, classify_enrollment_state, enroll, recover_pending_enrollment,
 };
 pub use exports::{AuthorizedExport, ExportError, ExportRegistry, PeerOpenRequest, PeerOpenResult};
 pub use forwards::{
