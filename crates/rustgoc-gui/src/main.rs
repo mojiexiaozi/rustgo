@@ -360,7 +360,6 @@ impl eframe::App for GuiApp {
                             (snapshot.sent_bytes(), snapshot.received_bytes())
                         })
                         .unzip();
-
                     let config = self.config_panel.config();
                     let p2p_rows = self.p2p_vm.rows(now_millis());
                     self.connection_panel.show(

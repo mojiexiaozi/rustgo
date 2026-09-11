@@ -5,7 +5,7 @@ use crate::state::p2p::{P2PPathRow, PathRowKind};
 use crate::state::telemetry::{TelemetryHistory, TelemetryPoint};
 use crate::state::tunnels::TunnelRow;
 use crate::ui::formatting::{format_bytes, format_percent, format_rate};
-use eframe::egui::{self, Color32, Frame, RichText, Stroke, Ui};
+use eframe::egui::{Color32, Frame, RichText, Stroke, Ui};
 use egui_plot::{Line, Plot, PlotPoints};
 
 pub struct ConnectionPanel {
@@ -49,7 +49,7 @@ impl ConnectionPanel {
             age.map(|v| format!("{v} 秒前"))
                 .unwrap_or_else(|| "不可用".into())
         ));
-        ui.add_space(18.0);
+        ui.add_space(10.0);
 
         let direct = data
             .p2p_rows
@@ -68,101 +68,91 @@ impl ConnectionPanel {
             .filter(|t| t.protocol.eq_ignore_ascii_case("udp"))
             .count();
         let active = data.tunnels.iter().filter(|t| t.accepted).count();
-        let width = (((ui.available_width() - 32.0) / 3.0) - 36.0).max(190.0);
-
-        egui::Grid::new("overview_metrics")
-            .num_columns(3)
-            .spacing([14.0, 14.0])
-            .show(ui, |ui| {
-                metric(
-                    ui,
-                    width,
-                    "CPU",
-                    latest.map(|p| format_percent(p.cpu_basis_points)),
-                    sample_note(age),
-                );
-                metric(
-                    ui,
-                    width,
-                    "内存",
-                    latest.map(|p| format_bytes(p.memory_bytes)),
-                    sample_note(age),
-                );
-                metric(
-                    ui,
-                    width,
-                    "存储",
-                    latest.map(|p| format_bytes(p.disk_bytes)),
-                    sample_note(age),
-                );
-                ui.end_row();
-                metric(
-                    ui,
-                    width,
-                    "上传",
-                    latest.map(|p| format_rate(p.tx_bytes_per_sec)),
+        ui.columns(3, |columns| {
+            metric(
+                &mut columns[0],
+                "CPU",
+                latest.map(|p| format_percent(p.cpu_basis_points)),
+                sample_note(age),
+            );
+            metric(
+                &mut columns[1],
+                "内存",
+                latest.map(|p| format_bytes(p.memory_bytes)),
+                sample_note(age),
+            );
+            metric(
+                &mut columns[2],
+                "存储",
+                latest.map(|p| format_bytes(p.disk_bytes)),
+                sample_note(age),
+            );
+        });
+        ui.add_space(8.0);
+        ui.columns(3, |columns| {
+            metric(
+                &mut columns[0],
+                "上传",
+                latest.map(|p| format_rate(p.tx_bytes_per_sec)),
+                format!(
+                    "逻辑发送量 {}",
+                    data.sent_bytes
+                        .map(format_bytes)
+                        .unwrap_or_else(|| "不可用".into())
+                ),
+            );
+            metric(
+                &mut columns[1],
+                "下载",
+                latest.map(|p| format_rate(p.rx_bytes_per_sec)),
+                format!(
+                    "逻辑接收量 {}",
+                    data.received_bytes
+                        .map(format_bytes)
+                        .unwrap_or_else(|| "不可用".into())
+                ),
+            );
+            metric(
+                &mut columns[2],
+                "路径",
+                Some(if data.p2p_rows.is_empty() {
+                    "无活跃路径".into()
+                } else {
+                    format!("{} 条活跃路径", data.p2p_rows.len())
+                }),
+                format!("直连 {direct} · 中继 {relay}"),
+            );
+        });
+        ui.add_space(8.0);
+        ui.columns(3, |columns| {
+            list(
+                &mut columns[0],
+                "清单",
+                &[
+                    format!("导出                         {}", data.exports),
+                    format!("转发                         {}", data.forwards),
                     format!(
-                        "逻辑发送量 {}",
-                        data.sent_bytes
-                            .map(format_bytes)
-                            .unwrap_or_else(|| "不可用".into())
+                        "隧道                         {}（活跃 {active}）",
+                        data.configured_tunnels
                     ),
-                );
-                metric(
-                    ui,
-                    width,
-                    "下载",
-                    latest.map(|p| format_rate(p.rx_bytes_per_sec)),
+                ],
+            );
+            list(
+                &mut columns[1],
+                "路径与会话",
+                &[
+                    format!("P2P 直连                    {direct}"),
+                    format!("P2P 回退                    {relay}"),
                     format!(
-                        "逻辑接收量 {}",
-                        data.received_bytes
-                            .map(format_bytes)
-                            .unwrap_or_else(|| "不可用".into())
+                        "TCP / UDP / P2P       {tcp} / {udp} / {}",
+                        data.p2p_rows.len()
                     ),
-                );
-                metric(
-                    ui,
-                    width,
-                    "路径",
-                    Some(if data.p2p_rows.is_empty() {
-                        "无活跃路径".into()
-                    } else {
-                        format!("{} 条活跃路径", data.p2p_rows.len())
-                    }),
-                    format!("直连 {direct} · 中继 {relay}"),
-                );
-                ui.end_row();
-                list(
-                    ui,
-                    width,
-                    "清单",
-                    &[
-                        format!("导出                         {}", data.exports),
-                        format!("转发                         {}", data.forwards),
-                        format!(
-                            "隧道                         {}（活跃 {active}）",
-                            data.configured_tunnels
-                        ),
-                    ],
-                );
-                list(
-                    ui,
-                    width,
-                    "路径与会话",
-                    &[
-                        format!("P2P 直连                    {direct}"),
-                        format!("P2P 回退                    {relay}"),
-                        format!(
-                            "TCP / UDP / P2P       {tcp} / {udp} / {}",
-                            data.p2p_rows.len()
-                        ),
-                    ],
-                );
-                list(ui, width, "最近会话", &["暂无会话".to_owned()]);
-                ui.end_row();
-            });
+                ],
+            );
+            list(&mut columns[2], "最近会话", &["暂无会话".to_owned()]);
+        });
 
-        ui.add_space(16.0);
+        ui.add_space(8.0);
         ui.columns(2, |columns| {
             chart(
                 &mut columns[0],
@@ -184,7 +174,7 @@ impl ConnectionPanel {
 
 fn frame(ui: &Ui) -> Frame {
     Frame::new()
-        .inner_margin(18)
+        .inner_margin(12)
         .fill(ui.visuals().faint_bg_color)
         .stroke(Stroke::new(
             1.0,
@@ -192,41 +182,49 @@ fn frame(ui: &Ui) -> Frame {
         ))
         .corner_radius(12)
 }
-fn metric(ui: &mut Ui, width: f32, title: &str, value: Option<String>, note: String) {
+fn metric(ui: &mut Ui, title: &str, value: Option<String>, note: String) {
     frame(ui).show(ui, |ui| {
-        ui.set_min_size(egui::vec2(width, 96.0));
-        ui.strong(RichText::new(title).size(18.0));
-        ui.add_space(7.0);
-        ui.label(
-            RichText::new(value.unwrap_or_else(|| "不可用".into()))
-                .size(27.0)
-                .strong(),
-        );
-        ui.label(RichText::new(note).weak());
+        ui.set_width(ui.available_width());
+        ui.set_min_height(72.0);
+        ui.vertical(|ui| {
+            ui.strong(RichText::new(title).size(18.0));
+            ui.add_space(3.0);
+            ui.label(
+                RichText::new(value.unwrap_or_else(|| "不可用".into()))
+                    .size(27.0)
+                    .strong(),
+            );
+            ui.label(RichText::new(note).weak());
+        });
     });
 }
-fn list(ui: &mut Ui, width: f32, title: &str, rows: &[String]) {
+fn list(ui: &mut Ui, title: &str, rows: &[String]) {
     frame(ui).show(ui, |ui| {
-        ui.set_min_size(egui::vec2(width, 125.0));
-        ui.strong(RichText::new(title).size(18.0));
-        ui.add_space(7.0);
-        for row in rows {
-            ui.label(row);
-        }
+        ui.set_width(ui.available_width());
+        ui.set_min_height(88.0);
+        ui.vertical(|ui| {
+            ui.strong(RichText::new(title).size(18.0));
+            ui.add_space(3.0);
+            for row in rows {
+                ui.label(row);
+            }
+        });
     });
 }
 fn chart(ui: &mut Ui, title: &str, id: &str, points: PlotPoints<'_>, color: Color32) {
     frame(ui).show(ui, |ui| {
         ui.set_width(ui.available_width());
-        ui.strong(RichText::new(title).size(18.0));
-        Plot::new(id)
-            .height(205.0)
-            .show_axes([false, false])
-            .allow_drag(false)
-            .allow_zoom(false)
-            .show(ui, |p| {
-                p.line(Line::new(title, points).color(color).width(2.0))
-            });
+        ui.vertical(|ui| {
+            ui.strong(RichText::new(title).size(18.0));
+            Plot::new(id)
+                .height(145.0)
+                .show_axes([false, false])
+                .allow_drag(false)
+                .allow_zoom(false)
+                .show(ui, |p| {
+                    p.line(Line::new(title, points).color(color).width(2.0))
+                });
+        });
     });
 }
 fn cpu_points(points: &[TelemetryPoint]) -> PlotPoints<'_> {
