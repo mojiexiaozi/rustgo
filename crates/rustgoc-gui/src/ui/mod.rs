@@ -4,4 +4,3 @@ pub mod enrollment;
 pub mod formatting;
 pub mod forwarding;
 pub mod logs;
-pub mod telemetry;

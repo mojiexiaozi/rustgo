@@ -169,6 +169,7 @@ async fn run_telemetry_sampling(
                     timestamp: metrics.sampled_unix_millis,
                     cpu_basis_points: metrics.cpu_basis_points.unwrap_or(0) as u64,
                     memory_bytes: metrics.memory_used_bytes.unwrap_or(0),
+                    disk_bytes: metrics.disk_used_bytes.unwrap_or(0),
                     tx_bytes_per_sec: 0,
                     rx_bytes_per_sec: 0,
                 });

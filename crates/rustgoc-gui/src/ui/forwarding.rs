@@ -111,82 +111,126 @@ impl ForwardingPanel {
         ui.separator();
         ui.heading("配置项");
         let mut remove = None;
-        for (i, x) in c.tunnels.iter_mut().enumerate() {
-            ui.group(|ui| {
-                ui.horizontal(|ui| {
-                    ui.strong(if x.protocol == TunnelProtocol::Tcp {
-                        "TCP 隧道"
-                    } else {
-                        "UDP 隧道"
+        egui::Grid::new("tunnel-card-grid")
+            .num_columns(2)
+            .spacing([12.0, 12.0])
+            .show(ui, |ui| {
+                for (i, x) in c.tunnels.iter_mut().enumerate() {
+                    compact_card(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.strong(if x.protocol == TunnelProtocol::Tcp {
+                                "TCP 隧道"
+                            } else {
+                                "UDP 隧道"
+                            });
+                            ui.add_sized([150.0, 24.0], egui::TextEdit::singleline(&mut x.name));
+                            if ui.small_button("删除").clicked() {
+                                remove = Some(i);
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("本地地址");
+                            ui.add_sized(
+                                [185.0, 24.0],
+                                egui::TextEdit::singleline(&mut x.local_addr),
+                            );
+                            ui.label("远程端口");
+                            ui.add(egui::DragValue::new(&mut x.remote_port).range(1..=65535));
+                        });
                     });
-                    ui.text_edit_singleline(&mut x.name);
-                    if ui.small_button("删除").clicked() {
-                        remove = Some(i);
+                    if i % 2 == 1 {
+                        ui.end_row();
                     }
-                });
-                ui.horizontal(|ui| {
-                    ui.label("本地地址");
-                    ui.text_edit_singleline(&mut x.local_addr);
-                    ui.label("远程端口");
-                    ui.add(egui::DragValue::new(&mut x.remote_port).range(1..=65535));
-                });
+                }
             });
-        }
         if let Some(i) = remove {
             c.tunnels.remove(i);
         }
         let mut remove = None;
-        for (i, x) in c.exports.iter_mut().enumerate() {
-            ui.group(|ui| {
-                ui.horizontal(|ui| {
-                    ui.strong("P2P 导出");
-                    ui.text_edit_singleline(&mut x.name);
-                    if ui.small_button("删除").clicked() {
-                        remove = Some(i);
-                    }
-                });
-                ui.horizontal(|ui| {
-                    egui::ComboBox::from_id_salt(("existing-export-protocol", i))
-                        .selected_text(protocol_label(x.protocol))
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut x.protocol, TunnelProtocol::Tcp, "TCP");
-                            ui.selectable_value(&mut x.protocol, TunnelProtocol::Udp, "UDP");
+        egui::Grid::new("export-card-grid")
+            .num_columns(2)
+            .spacing([12.0, 12.0])
+            .show(ui, |ui| {
+                for (i, x) in c.exports.iter_mut().enumerate() {
+                    compact_card(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.strong("P2P 导出");
+                            ui.add_sized([150.0, 24.0], egui::TextEdit::singleline(&mut x.name));
+                            if ui.small_button("删除").clicked() {
+                                remove = Some(i);
+                            }
                         });
-                    ui.label("本地地址");
-                    ui.text_edit_singleline(&mut x.local_addr);
-                });
-                let mut peers = x.allowed_peers.join(", ");
-                ui.horizontal(|ui| {
-                    ui.label("允许客户端");
-                    if ui.text_edit_singleline(&mut peers).changed() {
-                        x.allowed_peers = parse_peers(&peers);
+                        ui.horizontal(|ui| {
+                            egui::ComboBox::from_id_salt(("existing-export-protocol", i))
+                                .selected_text(protocol_label(x.protocol))
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut x.protocol,
+                                        TunnelProtocol::Tcp,
+                                        "TCP",
+                                    );
+                                    ui.selectable_value(
+                                        &mut x.protocol,
+                                        TunnelProtocol::Udp,
+                                        "UDP",
+                                    );
+                                });
+                            ui.label("本地地址");
+                            ui.add_sized(
+                                [180.0, 24.0],
+                                egui::TextEdit::singleline(&mut x.local_addr),
+                            );
+                        });
+                        let mut peers = x.allowed_peers.join(", ");
+                        ui.horizontal(|ui| {
+                            ui.label("允许客户端");
+                            if ui
+                                .add_sized([205.0, 24.0], egui::TextEdit::singleline(&mut peers))
+                                .changed()
+                            {
+                                x.allowed_peers = parse_peers(&peers);
+                            }
+                        });
+                    });
+                    if i % 2 == 1 {
+                        ui.end_row();
                     }
-                });
+                }
             });
-        }
         if let Some(i) = remove {
             c.exports.remove(i);
         }
         let mut remove = None;
-        for (i, x) in c.forwards.iter_mut().enumerate() {
-            ui.group(|ui| {
-                ui.horizontal(|ui| {
-                    ui.strong("P2P 转发");
-                    ui.text_edit_singleline(&mut x.name);
-                    if ui.small_button("删除").clicked() {
-                        remove = Some(i);
+        egui::Grid::new("forward-card-grid")
+            .num_columns(2)
+            .spacing([12.0, 12.0])
+            .show(ui, |ui| {
+                for (i, x) in c.forwards.iter_mut().enumerate() {
+                    compact_card(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.strong("P2P 转发");
+                            ui.add_sized([150.0, 24.0], egui::TextEdit::singleline(&mut x.name));
+                            if ui.small_button("删除").clicked() {
+                                remove = Some(i);
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("监听地址");
+                            ui.add_sized(
+                                [160.0, 24.0],
+                                egui::TextEdit::singleline(&mut x.listen_addr),
+                            );
+                            ui.label("目标客户端");
+                            ui.add_sized([100.0, 24.0], egui::TextEdit::singleline(&mut x.peer));
+                            ui.label("导出");
+                            ui.add_sized([100.0, 24.0], egui::TextEdit::singleline(&mut x.export));
+                        });
+                    });
+                    if i % 2 == 1 {
+                        ui.end_row();
                     }
-                });
-                ui.horizontal(|ui| {
-                    ui.label("监听地址");
-                    ui.text_edit_singleline(&mut x.listen_addr);
-                    ui.label("目标客户端");
-                    ui.text_edit_singleline(&mut x.peer);
-                    ui.label("导出");
-                    ui.text_edit_singleline(&mut x.export);
-                });
+                }
             });
-        }
         if let Some(i) = remove {
             c.forwards.remove(i);
         }
@@ -206,13 +250,13 @@ impl ForwardingPanel {
             });
         ui.horizontal(|ui| {
             ui.label("名称");
-            ui.text_edit_singleline(&mut self.name);
+            ui.add_sized([180.0, 24.0], egui::TextEdit::singleline(&mut self.name));
         });
         match self.kind {
             ForwardEntryKind::TcpTunnel | ForwardEntryKind::UdpTunnel => {
                 ui.horizontal(|ui| {
                     ui.label("本地地址");
-                    ui.text_edit_singleline(&mut self.local);
+                    ui.add_sized([210.0, 24.0], egui::TextEdit::singleline(&mut self.local));
                 });
                 ui.horizontal(|ui| {
                     ui.label("远程端口");
@@ -302,11 +346,23 @@ fn optional_address(ui: &mut Ui, label: &str, value: &mut Option<String>) {
     let mut text = value.clone().unwrap_or_default();
     ui.horizontal(|ui| {
         ui.label(label);
-        if ui.text_edit_singleline(&mut text).changed() {
+        if ui
+            .add_sized([210.0, 24.0], egui::TextEdit::singleline(&mut text))
+            .changed()
+        {
             let trimmed = text.trim();
             *value = (!trimmed.is_empty()).then(|| trimmed.to_owned());
         }
     });
+}
+fn compact_card(ui: &mut Ui, content: impl FnOnce(&mut Ui)) {
+    egui::Frame::group(ui.style())
+        .inner_margin(8)
+        .show(ui, |ui| {
+            ui.set_min_width(440.0);
+            ui.set_max_width(540.0);
+            content(ui);
+        });
 }
 fn parse_peers(value: &str) -> Vec<String> {
     value

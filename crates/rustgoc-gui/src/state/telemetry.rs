@@ -14,6 +14,7 @@ pub struct TelemetryPoint {
     pub timestamp: u64,
     pub cpu_basis_points: u64,
     pub memory_bytes: u64,
+    pub disk_bytes: u64,
     pub tx_bytes_per_sec: u64,
     pub rx_bytes_per_sec: u64,
 }
@@ -108,6 +109,7 @@ pub async fn sample_telemetry(
                     timestamp: metrics.sampled_unix_millis,
                     cpu_basis_points: cpu as u64,
                     memory_bytes: memory,
+                    disk_bytes: metrics.disk_used_bytes.unwrap_or(0),
                     tx_bytes_per_sec: 0,
                     rx_bytes_per_sec: 0,
                 });
@@ -129,6 +131,7 @@ mod tests {
                 timestamp: i,
                 cpu_basis_points: i * 100,
                 memory_bytes: i * 1000,
+                disk_bytes: i * 2000,
                 tx_bytes_per_sec: 0,
                 rx_bytes_per_sec: 0,
             });
@@ -148,6 +151,7 @@ mod tests {
             timestamp: 0,
             cpu_basis_points: 500,
             memory_bytes: 1_000_000,
+            disk_bytes: 2_000_000,
             tx_bytes_per_sec: 0,
             rx_bytes_per_sec: 0,
         });

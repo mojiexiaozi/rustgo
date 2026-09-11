@@ -11,6 +11,10 @@ pub struct ConfigPanel {
 }
 
 impl ConfigPanel {
+    pub fn config(&self) -> Option<&ClientConfig> {
+        self.config.as_ref()
+    }
+
     pub fn new(config_path: PathBuf) -> Self {
         let mut panel = Self {
             config: None,
@@ -72,25 +76,6 @@ impl ConfigPanel {
                 ui.end_row();
                 ui.label("服务器地址");
                 ui.text_edit_singleline(&mut c.client.server_addr);
-                ui.end_row();
-                ui.label("TLS 服务器名称");
-                ui.text_edit_singleline(&mut c.client.server_name);
-                ui.end_row();
-                ui.label("CA 证书");
-                let mut v = c
-                    .client
-                    .certificate_authority_file
-                    .to_string_lossy()
-                    .into_owned();
-                if ui.text_edit_singleline(&mut v).changed() {
-                    c.client.certificate_authority_file = v.into();
-                }
-                ui.end_row();
-                ui.label("设备私钥");
-                let mut v = c.client.private_key_file.to_string_lossy().into_owned();
-                if ui.text_edit_singleline(&mut v).changed() {
-                    c.client.private_key_file = v.into();
-                }
                 ui.end_row();
                 ui.label("心跳间隔（秒）");
                 ui.add(

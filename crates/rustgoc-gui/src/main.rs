@@ -92,7 +92,6 @@ fn main() -> anyhow::Result<()> {
 enum Tab {
     Connection,
     Forwarding,
-    Telemetry,
     Logs,
     Config,
 }
@@ -102,7 +101,6 @@ struct GuiApp {
     connection_panel: ConnectionPanel,
     enrollment_panel: EnrollmentPanel,
     forwarding_panel: ForwardingPanel,
-    telemetry_panel: ui::telemetry::TelemetryPanel,
     logs_panel: LogsPanel,
     config_panel: ConfigPanel,
     connection_vm: ConnectionViewModel,
@@ -151,7 +149,6 @@ impl GuiApp {
             connection_panel: ConnectionPanel::new("8.133.176.172:8443".to_string()),
             enrollment_panel: EnrollmentPanel::new(),
             forwarding_panel: ForwardingPanel::new(),
-            telemetry_panel: ui::telemetry::TelemetryPanel::new(),
             logs_panel: LogsPanel::new(),
             config_panel: ConfigPanel::new(config_path.clone()),
             connection_vm: ConnectionViewModel::new(status_rx),
@@ -174,6 +171,13 @@ impl GuiApp {
             last_logged_connection_state: state::connection::ConnectionState::Disconnected,
         }
     }
+}
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 impl eframe::App for GuiApp {
@@ -283,7 +287,7 @@ impl eframe::App for GuiApp {
         eframe::egui::Panel::top("tabs").show(ui, |ui| {
             ui.horizontal(|ui| {
                 if ui
-                    .selectable_label(matches!(self.active_tab, Tab::Connection), "连接")
+                    .selectable_label(matches!(self.active_tab, Tab::Connection), "概要")
                     .clicked()
                 {
                     self.active_tab = Tab::Connection;
@@ -293,12 +297,6 @@ impl eframe::App for GuiApp {
                     .clicked()
                 {
                     self.active_tab = Tab::Forwarding;
-                }
-                if ui
-                    .selectable_label(matches!(self.active_tab, Tab::Telemetry), "遥测")
-                    .clicked()
-                {
-                    self.active_tab = Tab::Telemetry;
                 }
                 if ui
                     .selectable_label(matches!(self.active_tab, Tab::Logs), "日志")
@@ -363,11 +361,22 @@ impl eframe::App for GuiApp {
                         })
                         .unzip();
 
+                    let config = self.config_panel.config();
+                    let p2p_rows = self.p2p_vm.rows(now_millis());
                     self.connection_panel.show(
                         ui,
-                        &mut self.connection_vm,
-                        sent_bytes,
-                        received_bytes,
+                        ui::connection::OverviewData {
+                            state: self.connection_vm.current(),
+                            client_name: config.map(|c| c.client.name.as_str()).unwrap_or("客户端"),
+                            history: &self.telemetry_history,
+                            sent_bytes,
+                            received_bytes,
+                            tunnels: &self.tunnels,
+                            configured_tunnels: config.map(|c| c.tunnels.len()).unwrap_or(0),
+                            exports: config.map(|c| c.exports.len()).unwrap_or(0),
+                            forwards: config.map(|c| c.forwards.len()).unwrap_or(0),
+                            p2p_rows: &p2p_rows,
+                        },
                     );
                 }
             }
@@ -383,9 +392,6 @@ impl eframe::App for GuiApp {
                 if save {
                     self.apply_configuration();
                 }
-            }
-            Tab::Telemetry => {
-                self.telemetry_panel.show(ui, &self.telemetry_history);
             }
             Tab::Logs => {
                 let (log_lines, _dropped) = self.log_ring.snapshot();

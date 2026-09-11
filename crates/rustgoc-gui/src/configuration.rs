@@ -22,12 +22,17 @@ pub fn load_or_create(path: &Path) -> Result<ClientConfig> {
         let default = default_config();
         save_validated(path, &default)?;
     }
-    rustgo_config::load_client(path).with_context(|| format!("读取配置失败: {}", path.display()))
+    let mut config = rustgo_config::load_client(path)
+        .with_context(|| format!("读取配置失败: {}", path.display()))?;
+    enforce_fixed_credentials(&mut config);
+    Ok(config)
 }
 
 pub fn save_validated(path: &Path, config: &ClientConfig) -> Result<()> {
+    let mut config = config.clone();
+    enforce_fixed_credentials(&mut config);
     config.validate().context("配置验证失败")?;
-    let contents = toml::to_string_pretty(&to_toml(config)).context("序列化配置失败")?;
+    let contents = toml::to_string_pretty(&to_toml(&config)).context("序列化配置失败")?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("创建配置目录失败: {}", parent.display()))?;
@@ -50,7 +55,7 @@ fn default_config() -> ClientConfig {
             certificate_authority_file: "server-cert.pem".into(),
             trust_mode: None,
             server_certificate_fingerprint: None,
-            private_key_file: "keys/device.key".into(),
+            private_key_file: "device.key".into(),
             heartbeat_interval_secs: 30,
         },
         p2p: None,
@@ -59,6 +64,24 @@ fn default_config() -> ClientConfig {
         exports: Vec::new(),
         forwards: Vec::new(),
     }
+}
+
+fn enforce_fixed_credentials(config: &mut ClientConfig) {
+    config.client.certificate_authority_file = "server-cert.pem".into();
+    config.client.private_key_file = "device.key".into();
+    if let Some(host) = server_host(&config.client.server_addr) {
+        config.client.server_name = host;
+    }
+}
+
+fn server_host(address: &str) -> Option<String> {
+    if let Ok(socket) = address.parse::<std::net::SocketAddr>() {
+        return Some(socket.ip().to_string());
+    }
+    address
+        .rsplit_once(':')
+        .map(|(host, _)| host.trim_matches(['[', ']']).to_owned())
+        .filter(|host| !host.is_empty())
 }
 
 fn to_toml(config: &ClientConfig) -> Value {
@@ -263,6 +286,12 @@ mod tests {
         let before = fs::read(&path).unwrap();
         let loaded = load_or_create(&path).expect("existing config");
         assert_eq!(loaded.client.server_addr, "saved.example:8443");
+        assert_eq!(loaded.client.server_name, "saved.example");
+        assert_eq!(loaded.client.private_key_file, Path::new("device.key"));
+        assert_eq!(
+            loaded.client.certificate_authority_file,
+            Path::new("server-cert.pem")
+        );
         assert_eq!(fs::read(path).unwrap(), before);
     }
 

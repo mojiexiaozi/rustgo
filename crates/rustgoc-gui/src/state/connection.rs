@@ -62,9 +62,9 @@ pub fn transition_message(
     }
     match (previous, current) {
         (_, ConnectionState::Connected { .. }) => Some(format!("连接成功：{server}")),
-        (ConnectionState::Connecting, ConnectionState::Disconnected) => Some(format!(
-            "连接失败：{server}，客户端将自动重试；详细原因见相邻错误日志"
-        )),
+        // A new ClientApp briefly publishes its default disconnected state before
+        // registration completes. Waiting for Backoff avoids a false failure log.
+        (ConnectionState::Connecting, ConnectionState::Disconnected) => None,
         (ConnectionState::Connected { .. }, ConnectionState::Disconnected) => {
             Some(format!("连接已断开：{server}，客户端将自动重试"))
         }
@@ -114,10 +114,18 @@ mod tests {
             .unwrap()
             .contains("连接成功")
         );
-        assert!(
+        assert_eq!(
             super::transition_message(
                 &ConnectionState::Connecting,
                 &ConnectionState::Disconnected,
+                "server:8443"
+            ),
+            None
+        );
+        assert!(
+            super::transition_message(
+                &ConnectionState::Connecting,
+                &ConnectionState::Backoff { seconds: 5 },
                 "server:8443"
             )
             .unwrap()
