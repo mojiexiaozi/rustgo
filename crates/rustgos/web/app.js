@@ -235,6 +235,12 @@
     return ({ tcp: "TCP", udp: "UDP", p2p: "P2P" })[kind] || "未知";
   }
 
+  function inventorySummary(inventory) {
+    const names = inventory.items.join("、") || "无";
+    const remaining = inventory.truncated ? `，另有 ${inventory.total - inventory.returned} 项` : "";
+    return `${inventory.total}（${names}${remaining}）`;
+  }
+
   function clientCard(client) {
     const article = document.createElement("article");
     article.className = "client-card";
@@ -258,6 +264,7 @@
     appendDefinition(details, "上传 / 下载", `${formatRate(client.telemetry.network_sent_bytes_per_second)} / ${formatRate(client.telemetry.network_received_bytes_per_second)}`);
     appendDefinition(details, "逻辑流量", `${formatBytes(client.traffic.sent_bytes)} / ${formatBytes(client.traffic.received_bytes)}`);
     appendDefinition(details, "导出 / 转发", `${client.inventory.exports.total} / ${client.inventory.forwards.total}`);
+    appendDefinition(details, "隧道", inventorySummary(client.inventory.tunnels));
     appendDefinition(details, "会话", `${client.sessions.active} 个活跃 · 共 ${client.sessions.total} 个`);
     appendDefinition(details, "活跃路径", activePathLabel(client.active_path));
     article.append(top, badges, details);
