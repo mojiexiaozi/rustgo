@@ -19,6 +19,7 @@ rustgo-config = { path = "../rustgo-config" }
 rustgo-crypto = { path = "../rustgo-crypto" }
 rustgo-observability = { path = "../rustgo-observability" }
 anyhow.workspace = true
+atomicwrites = "0.4.4"
 clap.workspace = true
 eframe.workspace = true
 egui_plot.workspace = true
@@ -37,7 +38,8 @@ rcgen.workspace = true
 sha2.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-tray-icon = "0.20.0"
+# The tray is Windows-only; avoid pulling in the unused GTK/glib backend.
+tray-icon = { version = "0.24.2", default-features = false }
 
 [lints.rust]
 unsafe_code = "forbid"

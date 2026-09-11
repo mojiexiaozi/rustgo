@@ -22,8 +22,8 @@ use tray_events::TrayEvent;
 use ui::config::ConfigPanel;
 use ui::connection::ConnectionPanel;
 use ui::enrollment::EnrollmentPanel;
+use ui::forwarding::ForwardingPanel;
 use ui::logs::LogsPanel;
-use ui::tunnels::TunnelsPanel;
 
 #[cfg(windows)]
 fn setup_fonts(ctx: &eframe::egui::Context) {
@@ -58,9 +58,6 @@ fn setup_fonts(_ctx: &eframe::egui::Context) {}
 #[command(name = "rustgoc-gui")]
 #[command(about = "Rustgo GUI client")]
 struct Cli {
-    #[arg(short = 'c', long, default_value = "client.toml")]
-    config: PathBuf,
-
     #[arg(long)]
     selfcheck: bool,
 }
@@ -68,11 +65,11 @@ struct Cli {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    let executable = std::env::current_exe()?;
+    let config_path = configuration::config_path_for_executable(&executable)?;
     if cli.selfcheck {
-        return selfcheck::run(&cli.config);
+        return selfcheck::run(&config_path);
     }
-
-    let config_path = cli.config.clone();
 
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
@@ -94,9 +91,8 @@ fn main() -> anyhow::Result<()> {
 
 enum Tab {
     Connection,
-    Tunnels,
+    Forwarding,
     Telemetry,
-    P2P,
     Logs,
     Config,
 }
@@ -105,9 +101,8 @@ struct GuiApp {
     active_tab: Tab,
     connection_panel: ConnectionPanel,
     enrollment_panel: EnrollmentPanel,
-    tunnels_panel: TunnelsPanel,
+    forwarding_panel: ForwardingPanel,
     telemetry_panel: ui::telemetry::TelemetryPanel,
-    p2p_panel: ui::p2p::P2PPanel,
     logs_panel: LogsPanel,
     config_panel: ConfigPanel,
     connection_vm: ConnectionViewModel,
@@ -126,6 +121,7 @@ struct GuiApp {
     enrollment_state: EnrollmentState,
     enrollment_rx: Option<mpsc::Receiver<Result<rustgoc::EnrollmentCompletion, String>>>,
     enrollment_recovery_rx: Option<mpsc::Receiver<Result<bool, String>>>,
+    auto_connect_pending: bool,
 }
 
 impl GuiApp {
@@ -148,9 +144,8 @@ impl GuiApp {
             active_tab: Tab::Connection,
             connection_panel: ConnectionPanel::new("8.133.176.172:8443".to_string()),
             enrollment_panel: EnrollmentPanel::new(),
-            tunnels_panel: TunnelsPanel::new(),
+            forwarding_panel: ForwardingPanel::new(),
             telemetry_panel: ui::telemetry::TelemetryPanel::new(),
-            p2p_panel: ui::p2p::P2PPanel::new(),
             logs_panel: LogsPanel::new(),
             config_panel: ConfigPanel::new(config_path.clone()),
             connection_vm: ConnectionViewModel::new(status_rx),
@@ -169,12 +164,17 @@ impl GuiApp {
             enrollment_state: EnrollmentState::Ready,
             enrollment_rx: None,
             enrollment_recovery_rx: None,
+            auto_connect_pending: true,
         }
     }
 }
 
 impl eframe::App for GuiApp {
     fn ui(&mut self, ui: &mut eframe::egui::Ui, _frame: &mut eframe::Frame) {
+        if self.auto_connect_pending {
+            self.auto_connect_pending = false;
+            self.handle_connect();
+        }
         if let Some(receiver) = &self.enrollment_rx
             && let Ok(result) = receiver.try_recv()
         {
@@ -183,6 +183,7 @@ impl eframe::App for GuiApp {
                 Ok(completion) => {
                     self.enrollment_state = EnrollmentState::Ready;
                     self.enrollment_panel.clear_error();
+                    self.config_panel.reload();
                     self.log_ring.push(state::logs::LogLine {
                         timestamp: time::OffsetDateTime::now_utc()
                             .format(&time::format_description::well_known::Rfc3339)
@@ -194,6 +195,7 @@ impl eframe::App for GuiApp {
                             completion.client_id, completion.revision
                         ),
                     });
+                    self.handle_connect();
                 }
                 Err(error) => self
                     .enrollment_panel
@@ -260,22 +262,16 @@ impl eframe::App for GuiApp {
                     self.active_tab = Tab::Connection;
                 }
                 if ui
-                    .selectable_label(matches!(self.active_tab, Tab::Tunnels), "隧道")
+                    .selectable_label(matches!(self.active_tab, Tab::Forwarding), "转发")
                     .clicked()
                 {
-                    self.active_tab = Tab::Tunnels;
+                    self.active_tab = Tab::Forwarding;
                 }
                 if ui
                     .selectable_label(matches!(self.active_tab, Tab::Telemetry), "遥测")
                     .clicked()
                 {
                     self.active_tab = Tab::Telemetry;
-                }
-                if ui
-                    .selectable_label(matches!(self.active_tab, Tab::P2P), "P2P")
-                    .clicked()
-                {
-                    self.active_tab = Tab::P2P;
                 }
                 if ui
                     .selectable_label(matches!(self.active_tab, Tab::Logs), "日志")
@@ -331,7 +327,7 @@ impl eframe::App for GuiApp {
                         self.handle_enrollment_submit();
                     }
                 } else {
-                    let mut on_connect = false;
+                    let mut on_reconnect = false;
                     let mut on_disconnect = false;
 
                     let (sent_bytes, received_bytes) = self
@@ -346,13 +342,14 @@ impl eframe::App for GuiApp {
                     self.connection_panel.show(
                         ui,
                         &mut self.connection_vm,
-                        &mut on_connect,
+                        &mut on_reconnect,
                         &mut on_disconnect,
                         sent_bytes,
                         received_bytes,
                     );
 
-                    if on_connect {
+                    if on_reconnect {
+                        self.handle_disconnect();
                         self.handle_connect();
                     }
                     if on_disconnect {
@@ -360,18 +357,21 @@ impl eframe::App for GuiApp {
                     }
                 }
             }
-            Tab::Tunnels => {
-                self.tunnels_panel.show(ui, &self.tunnels);
+            Tab::Forwarding => {
+                let mut save = false;
+                self.forwarding_panel.show(
+                    ui,
+                    self.config_panel.config_mut(),
+                    &self.tunnels,
+                    &self.p2p_vm,
+                    &mut save,
+                );
+                if save {
+                    self.apply_configuration();
+                }
             }
             Tab::Telemetry => {
                 self.telemetry_panel.show(ui, &self.telemetry_history);
-            }
-            Tab::P2P => {
-                let now_millis = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64;
-                self.p2p_panel.show(ui, &self.p2p_vm, now_millis);
             }
             Tab::Logs => {
                 let (log_lines, _dropped) = self.log_ring.snapshot();
@@ -391,9 +391,7 @@ impl eframe::App for GuiApp {
                 self.config_panel.show(ui, &mut on_save_and_reconnect);
 
                 if on_save_and_reconnect {
-                    // Disconnect, then reconnect with new config
-                    self.handle_disconnect();
-                    self.handle_connect();
+                    self.apply_configuration();
                 }
             }
         });
@@ -403,75 +401,43 @@ impl eframe::App for GuiApp {
 }
 
 impl GuiApp {
-    fn generate_default_config(&self) -> anyhow::Result<()> {
-        use std::io::Write;
-
-        let default_config = r#"[client]
-name = "gui-client"
-server_addr = "8.133.176.172:8443"
-server_name = "rustgo-server"
-certificate_authority_file = "ca.pem"
-private_key_file = "client-key.pem"
-heartbeat_interval_secs = 30
-
-[[tunnels]]
-name = "ssh"
-protocol = "tcp"
-local_addr = "127.0.0.1:22"
-remote_port = 10022
-"#;
-
-        let mut file = std::fs::File::create(&self.config_path)?;
-        file.write_all(default_config.as_bytes())?;
-        Ok(())
+    fn apply_configuration(&mut self) {
+        match self.config_panel.save() {
+            Ok(()) => {
+                if let Some(address) = self.config_panel.server_address() {
+                    self.connection_panel.set_server_address(address.to_owned());
+                }
+                self.forwarding_panel
+                    .set_message("配置已保存，正在重新连接");
+                self.handle_disconnect();
+                self.handle_connect();
+            }
+            Err(error) => {
+                self.forwarding_panel
+                    .set_message(format!("保存失败: {error}"));
+                self.config_panel.set_save_error(&error);
+            }
+        }
     }
 
     fn handle_connect(&mut self) {
-        let server_address = self.connection_panel.server_address.clone();
-
-        // 加载配置，如果不存在则生成默认配置
-        let config = match rustgo_config::load_client(&self.config_path) {
+        let config = match configuration::load_or_create(&self.config_path) {
             Ok(cfg) => cfg,
-            Err(_) => {
-                // 尝试生成默认配置
-                if let Err(gen_err) = self.generate_default_config() {
-                    self.log_ring.push(state::logs::LogLine {
-                        timestamp: time::OffsetDateTime::now_utc()
-                            .format(&time::format_description::well_known::Rfc3339)
-                            .unwrap_or_else(|_| "unknown".to_string()),
-                        level: "ERROR".to_string(),
-                        target: "gui".to_string(),
-                        message: format!("配置文件生成失败: {}", gen_err),
-                    });
-                    return;
-                }
-
+            Err(e) => {
                 self.log_ring.push(state::logs::LogLine {
                     timestamp: time::OffsetDateTime::now_utc()
                         .format(&time::format_description::well_known::Rfc3339)
                         .unwrap_or_else(|_| "unknown".to_string()),
-                    level: "INFO".to_string(),
+                    level: "ERROR".to_string(),
                     target: "gui".to_string(),
-                    message: format!("已生成默认配置文件: {}", self.config_path.display()),
+                    message: format!("配置文件准备失败: {e}"),
                 });
-
-                // 重新加载配置
-                match rustgo_config::load_client(&self.config_path) {
-                    Ok(cfg) => cfg,
-                    Err(e) => {
-                        self.log_ring.push(state::logs::LogLine {
-                            timestamp: time::OffsetDateTime::now_utc()
-                                .format(&time::format_description::well_known::Rfc3339)
-                                .unwrap_or_else(|_| "unknown".to_string()),
-                            level: "ERROR".to_string(),
-                            target: "gui".to_string(),
-                            message: format!("配置文件读取失败: {}", e),
-                        });
-                        return;
-                    }
-                }
+                return;
             }
         };
+        let server_address = config.client.server_addr.clone();
+        self.connection_panel
+            .set_server_address(server_address.clone());
 
         self.enrollment_state = match rustgoc::classify_enrollment_state(&config, &self.config_path)
         {
