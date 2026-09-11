@@ -419,11 +419,14 @@ fn optional_address(ui: &mut Ui, label: &str, value: &mut Option<String>) {
 }
 fn compact_card(ui: &mut Ui, content: impl FnOnce(&mut Ui)) {
     egui::Frame::group(ui.style())
-        .inner_margin(8)
+        .inner_margin(6)
         .show(ui, |ui| {
-            ui.set_min_width(360.0);
-            ui.set_max_width(430.0);
-            ui.vertical(content);
+            ui.set_width(310.0);
+            ui.spacing_mut().item_spacing.y = 3.0;
+            ui.vertical(|ui| {
+                ui.set_width(310.0);
+                content(ui);
+            });
         });
 }
 fn parse_peers(value: &str) -> Vec<String> {
