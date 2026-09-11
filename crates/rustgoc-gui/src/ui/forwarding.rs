@@ -93,50 +93,98 @@ impl ForwardingPanel {
                 ui.add(egui::DragValue::new(&mut p.reconnect_timeout_secs).range(1..=3600));
                 ui.label("秒");
             });
+            ui.horizontal(|ui| {
+                ui.label("UDP 端口范围");
+                ui.add(egui::DragValue::new(&mut p.udp_port_range.start).range(1..=65535));
+                ui.label("至");
+                ui.add(egui::DragValue::new(&mut p.udp_port_range.end).range(1..=65535));
+            });
+            ui.horizontal(|ui| {
+                ui.label("TCP 端口范围");
+                ui.add(egui::DragValue::new(&mut p.tcp_port_range.start).range(1..=65535));
+                ui.label("至");
+                ui.add(egui::DragValue::new(&mut p.tcp_port_range.end).range(1..=65535));
+            });
+            optional_address(ui, "主观测地址", &mut p.observation_primary_addr);
+            optional_address(ui, "备用观测地址", &mut p.observation_alternate_addr);
         });
         ui.separator();
         ui.heading("配置项");
         let mut remove = None;
-        for (i, x) in c.tunnels.iter().enumerate() {
-            ui.horizontal(|ui| {
-                ui.strong(if x.protocol == TunnelProtocol::Tcp {
-                    "TCP 隧道"
-                } else {
-                    "UDP 隧道"
+        for (i, x) in c.tunnels.iter_mut().enumerate() {
+            ui.group(|ui| {
+                ui.horizontal(|ui| {
+                    ui.strong(if x.protocol == TunnelProtocol::Tcp {
+                        "TCP 隧道"
+                    } else {
+                        "UDP 隧道"
+                    });
+                    ui.text_edit_singleline(&mut x.name);
+                    if ui.small_button("删除").clicked() {
+                        remove = Some(i);
+                    }
                 });
-                ui.label(format!("{}　{} → :{}", x.name, x.local_addr, x.remote_port));
-                if ui.small_button("删除").clicked() {
-                    remove = Some(i);
-                }
+                ui.horizontal(|ui| {
+                    ui.label("本地地址");
+                    ui.text_edit_singleline(&mut x.local_addr);
+                    ui.label("远程端口");
+                    ui.add(egui::DragValue::new(&mut x.remote_port).range(1..=65535));
+                });
             });
         }
         if let Some(i) = remove {
             c.tunnels.remove(i);
         }
         let mut remove = None;
-        for (i, x) in c.exports.iter().enumerate() {
-            ui.horizontal(|ui| {
-                ui.strong("P2P 导出");
-                ui.label(format!("{}　{} ({:?})", x.name, x.local_addr, x.protocol));
-                if ui.small_button("删除").clicked() {
-                    remove = Some(i);
-                }
+        for (i, x) in c.exports.iter_mut().enumerate() {
+            ui.group(|ui| {
+                ui.horizontal(|ui| {
+                    ui.strong("P2P 导出");
+                    ui.text_edit_singleline(&mut x.name);
+                    if ui.small_button("删除").clicked() {
+                        remove = Some(i);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    egui::ComboBox::from_id_salt(("existing-export-protocol", i))
+                        .selected_text(protocol_label(x.protocol))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut x.protocol, TunnelProtocol::Tcp, "TCP");
+                            ui.selectable_value(&mut x.protocol, TunnelProtocol::Udp, "UDP");
+                        });
+                    ui.label("本地地址");
+                    ui.text_edit_singleline(&mut x.local_addr);
+                });
+                let mut peers = x.allowed_peers.join(", ");
+                ui.horizontal(|ui| {
+                    ui.label("允许客户端");
+                    if ui.text_edit_singleline(&mut peers).changed() {
+                        x.allowed_peers = parse_peers(&peers);
+                    }
+                });
             });
         }
         if let Some(i) = remove {
             c.exports.remove(i);
         }
         let mut remove = None;
-        for (i, x) in c.forwards.iter().enumerate() {
-            ui.horizontal(|ui| {
-                ui.strong("P2P 转发");
-                ui.label(format!(
-                    "{}　{} → {}/{}",
-                    x.name, x.listen_addr, x.peer, x.export
-                ));
-                if ui.small_button("删除").clicked() {
-                    remove = Some(i);
-                }
+        for (i, x) in c.forwards.iter_mut().enumerate() {
+            ui.group(|ui| {
+                ui.horizontal(|ui| {
+                    ui.strong("P2P 转发");
+                    ui.text_edit_singleline(&mut x.name);
+                    if ui.small_button("删除").clicked() {
+                        remove = Some(i);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("监听地址");
+                    ui.text_edit_singleline(&mut x.listen_addr);
+                    ui.label("目标客户端");
+                    ui.text_edit_singleline(&mut x.peer);
+                    ui.label("导出");
+                    ui.text_edit_singleline(&mut x.export);
+                });
             });
         }
         if let Some(i) = remove {
@@ -228,13 +276,7 @@ impl ForwardingPanel {
                         name,
                         protocol: self.protocol,
                         local_addr: self.local.trim().into(),
-                        allowed_peers: self
-                            .peers
-                            .split(',')
-                            .map(str::trim)
-                            .filter(|v| !v.is_empty())
-                            .map(str::to_owned)
-                            .collect(),
+                        allowed_peers: parse_peers(&self.peers),
                     }),
                     ForwardEntryKind::P2pForward => c.forwards.push(ForwardConfig {
                         name,
@@ -254,6 +296,30 @@ impl ForwardingPanel {
         if ui.button("保存并生效").clicked() {
             *save = true;
         }
+    }
+}
+fn optional_address(ui: &mut Ui, label: &str, value: &mut Option<String>) {
+    let mut text = value.clone().unwrap_or_default();
+    ui.horizontal(|ui| {
+        ui.label(label);
+        if ui.text_edit_singleline(&mut text).changed() {
+            let trimmed = text.trim();
+            *value = (!trimmed.is_empty()).then(|| trimmed.to_owned());
+        }
+    });
+}
+fn parse_peers(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+fn protocol_label(protocol: TunnelProtocol) -> &'static str {
+    match protocol {
+        TunnelProtocol::Tcp => "TCP",
+        TunnelProtocol::Udp => "UDP",
     }
 }
 fn default_p2p() -> P2pConfig {
@@ -283,7 +349,7 @@ fn now_millis() -> u64 {
 }
 #[cfg(test)]
 mod tests {
-    use super::ForwardEntryKind;
+    use super::{ForwardEntryKind, parse_peers};
     #[test]
     fn selector_has_exactly_four_types() {
         let k = [
@@ -295,6 +361,14 @@ mod tests {
         assert_eq!(
             k.map(ForwardEntryKind::label),
             ["TCP 隧道", "UDP 隧道", "P2P 导出", "P2P 转发"]
+        );
+    }
+
+    #[test]
+    fn peer_editor_normalizes_comma_separated_names() {
+        assert_eq!(
+            parse_peers("alpha, beta, ,gamma"),
+            ["alpha", "beta", "gamma"]
         );
     }
 }
