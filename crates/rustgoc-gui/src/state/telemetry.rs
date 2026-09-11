@@ -27,7 +27,6 @@ struct TelemetryHistoryInner {
     points: VecDeque<TelemetryPoint>,
     last_tx_bytes: u64,
     last_rx_bytes: u64,
-    available: bool,
 }
 
 impl TelemetryHistory {
@@ -37,7 +36,6 @@ impl TelemetryHistory {
                 points: VecDeque::with_capacity(MAX_TELEMETRY_POINTS),
                 last_tx_bytes: 0,
                 last_rx_bytes: 0,
-                available: true,
             })),
         }
     }
@@ -53,16 +51,6 @@ impl TelemetryHistory {
     pub fn snapshot(&self) -> Vec<TelemetryPoint> {
         let inner = self.inner.lock().unwrap();
         inner.points.iter().cloned().collect()
-    }
-
-    pub fn mark_unavailable(&self) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.available = false;
-    }
-
-    pub fn is_available(&self) -> bool {
-        let inner = self.inner.lock().unwrap();
-        inner.available
     }
 
     pub fn update_traffic_delta(&self, sent_bytes: u64, received_bytes: u64, delta_secs: f64) {
@@ -176,15 +164,6 @@ mod tests {
         let snapshot = history.snapshot();
         assert_eq!(snapshot[0].tx_bytes_per_sec, 5_000);
         assert_eq!(snapshot[0].rx_bytes_per_sec, 10_000);
-    }
-
-    #[test]
-    fn test_mark_unavailable() {
-        let history = TelemetryHistory::new();
-        assert!(history.is_available());
-
-        history.mark_unavailable();
-        assert!(!history.is_available());
     }
 
     #[tokio::test]

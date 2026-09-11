@@ -1,19 +1,40 @@
 #![forbid(unsafe_code)]
 
+/// Format bytes using binary units (KiB, MiB, GiB, TiB) to match web client
 pub fn format_bytes(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
+    const KIB: u64 = 1024;
+    const MIB: u64 = KIB * 1024;
+    const GIB: u64 = MIB * 1024;
+    const TIB: u64 = GIB * 1024;
 
-    if bytes >= GB {
-        format!("{:.2} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.2} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.2} KB", bytes as f64 / KB as f64)
+    let (amount, unit) = if bytes >= TIB {
+        (bytes as f64 / TIB as f64, "TiB")
+    } else if bytes >= GIB {
+        (bytes as f64 / GIB as f64, "GiB")
+    } else if bytes >= MIB {
+        (bytes as f64 / MIB as f64, "MiB")
+    } else if bytes >= KIB {
+        (bytes as f64 / KIB as f64, "KiB")
     } else {
-        format!("{} B", bytes)
+        return format!("{} B", bytes);
+    };
+
+    // Use 1 decimal place if amount < 10, otherwise use integer
+    if amount >= 10.0 {
+        format!("{:.0} {}", amount, unit)
+    } else {
+        format!("{:.1} {}", amount, unit)
     }
+}
+
+/// Format bytes per second rate (matches web client formatRate)
+pub fn format_rate(bytes_per_sec: u64) -> String {
+    format!("{}/s", format_bytes(bytes_per_sec))
+}
+
+/// Format basis points as percentage (matches web client formatPercent)
+pub fn format_percent(basis_points: u64) -> String {
+    format!("{:.1}%", basis_points as f64 / 100.0)
 }
 
 #[allow(dead_code)]
@@ -50,11 +71,29 @@ mod tests {
     fn test_format_bytes() {
         assert_eq!(format_bytes(0), "0 B");
         assert_eq!(format_bytes(512), "512 B");
-        assert_eq!(format_bytes(1024), "1.00 KB");
-        assert_eq!(format_bytes(1536), "1.50 KB");
-        assert_eq!(format_bytes(1_048_576), "1.00 MB");
-        assert_eq!(format_bytes(1_073_741_824), "1.00 GB");
-        assert_eq!(format_bytes(5_368_709_120), "5.00 GB");
+        assert_eq!(format_bytes(1024), "1.0 KiB");
+        assert_eq!(format_bytes(1536), "1.5 KiB");
+        assert_eq!(format_bytes(10240), "10 KiB");
+        assert_eq!(format_bytes(1_048_576), "1.0 MiB");
+        assert_eq!(format_bytes(10_485_760), "10 MiB");
+        assert_eq!(format_bytes(1_073_741_824), "1.0 GiB");
+        assert_eq!(format_bytes(5_368_709_120), "5.0 GiB");
+    }
+
+    #[test]
+    fn test_format_rate() {
+        assert_eq!(format_rate(0), "0 B/s");
+        assert_eq!(format_rate(1024), "1.0 KiB/s");
+        assert_eq!(format_rate(2048), "2.0 KiB/s");
+        assert_eq!(format_rate(1_048_576), "1.0 MiB/s");
+    }
+
+    #[test]
+    fn test_format_percent() {
+        assert_eq!(format_percent(0), "0.0%");
+        assert_eq!(format_percent(5000), "50.0%");
+        assert_eq!(format_percent(10000), "100.0%");
+        assert_eq!(format_percent(12345), "123.5%");
     }
 
     #[test]
