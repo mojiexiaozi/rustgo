@@ -1,11 +1,9 @@
 #![forbid(unsafe_code)]
 
-use crate::tray_events::TrayEvent;
-use std::sync::mpsc;
-
 #[cfg(windows)]
 pub mod platform {
-    use super::*;
+    use crate::tray_events::TrayEvent;
+    use std::sync::mpsc;
     use tray_icon::{
         TrayIcon as SystemTrayIcon, TrayIconBuilder,
         menu::{Menu, MenuEvent, MenuItem},
@@ -102,13 +100,5 @@ pub mod platform {
 
 #[cfg(not(windows))]
 pub mod platform {
-    use super::*;
-
     pub struct TrayIcon;
-
-    impl TrayIcon {
-        pub fn new(_event_tx: mpsc::SyncSender<TrayEvent>) -> anyhow::Result<Self> {
-            Ok(Self)
-        }
-    }
 }

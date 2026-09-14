@@ -139,6 +139,9 @@ impl GuiApp {
         let tray_result = tray::platform::TrayIcon::new(tray_tx, _ctx);
 
         #[cfg(not(windows))]
+        drop(tray_tx);
+
+        #[cfg(not(windows))]
         let tray = None;
 
         let log_ring = LogRing::new();

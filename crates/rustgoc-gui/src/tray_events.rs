@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Native tray event producers are currently available only on Windows.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub enum TrayEvent {
     Show,
     Connect,
