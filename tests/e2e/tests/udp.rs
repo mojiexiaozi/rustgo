@@ -662,16 +662,31 @@ fn session_limit_drops_then_idle_sweep_reclaims_capacity() -> TestResult {
         .with_server_env("RUSTGO_TEST_UDP_SWEEP_INTERVAL_MS", "50")
         .with_server_env("RUSTGO_TEST_UDP_SWEEP_BATCH", "1");
     let (fixture, mut server, mut client) = launch(fixture)?;
+    // Control registration precedes UDP data-channel activation. Do not let
+    // startup packet loss masquerade as a capacity/idle-retirement failure.
+    client.wait_for_line("event=udp_channel_ready", READY_TIMEOUT)?;
     let public = fixture.public_address();
     let first = public_socket_with_timeout(Duration::from_millis(800))?;
     let second = public_socket_with_timeout(Duration::from_millis(800))?;
 
-    assert_datagram_echo(&first, public, b"occupy")?;
+    assert_datagram_echo(&first, public, b"occupy").map_err(|error| {
+        format!(
+            "initial capacity probe failed: {error}\nclient:\n{}\nserver:\n{}",
+            client.output(),
+            server.output()
+        )
+    })?;
     second.send_to(b"rejected", public)?;
     expect_no_datagram(&second)?;
     server.wait_for_line("reason=\"session_limit\"", Duration::from_secs(3))?;
     server.wait_for_line("event=udp_idle_sweep", Duration::from_secs(3))?;
-    assert_datagram_echo(&second, public, b"after idle")?;
+    assert_datagram_echo(&second, public, b"after idle").map_err(|error| {
+        format!(
+            "capacity reuse after idle failed: {error}\nclient:\n{}\nserver:\n{}",
+            client.output(),
+            server.output()
+        )
+    })?;
 
     client.terminate()?;
     let cleanup = server.wait_for_line("event=udp_cleanup", Duration::from_secs(5))?;
