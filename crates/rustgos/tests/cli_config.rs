@@ -166,6 +166,8 @@ fn check_accepts_non_loopback_web_bind() {
         ),
     )
     .unwrap();
+    #[cfg(unix)]
+    restrict_to_owner(&path);
 
     check(&path, material.directory.path()).success();
 }
