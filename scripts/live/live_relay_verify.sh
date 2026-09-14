@@ -24,7 +24,8 @@ protocol = "udp"
 local_addr = "127.0.0.1:28182"
 remote_port = 28183
 EOF
-/opt/rustgo/bin/rustgoc check -c "$stage/client.toml"
+cp -- /opt/rustgo/bin/rustgoc "$stage/rustgoc"
+(cd -- "$stage" && ./rustgoc check)
 python3 -u -c 'import socket,threading
 t=socket.socket(); t.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); t.bind(("127.0.0.1",28180)); t.listen()
 def a():
@@ -34,7 +35,7 @@ threading.Thread(target=a,daemon=True).start()
 u=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); u.bind(("127.0.0.1",28182))
 while True:
  d,a=u.recvfrom(65535); u.sendto(d,a)' >"$stage/echo.log" 2>&1 & echo_pid=$!
-/opt/rustgo/bin/rustgoc -c "$stage/client.toml" >"$stage/client.log" 2>&1 & client_pid=$!
+(cd -- "$stage" && exec ./rustgoc) >"$stage/client.log" 2>&1 & client_pid=$!
 cleanup() { kill "$client_pid" "$echo_pid" 2>/dev/null || true; wait "$client_pid" "$echo_pid" 2>/dev/null || true; }
 trap cleanup EXIT
 for _ in $(seq 1 100); do ss -lnt | grep -q ':28181 ' && break; sleep .1; done

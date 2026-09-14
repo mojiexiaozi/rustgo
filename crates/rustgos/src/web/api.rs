@@ -72,6 +72,16 @@ pub(super) fn routes() -> Router<Arc<WebState>> {
                 .layer(DefaultBodyLimit::max(4_096)),
         )
         .route(
+            "/api/v1/registration-requests",
+            get(registration_requests).fallback(method_not_allowed),
+        )
+        .route(
+            "/api/v1/registration-requests/{request_id}",
+            axum::routing::post(review_registration)
+                .fallback(method_not_allowed)
+                .layer(DefaultBodyLimit::max(4096)),
+        )
+        .route(
             "/api/v1/clients/{*name}",
             get(client)
                 .post(client_management)
@@ -87,6 +97,62 @@ pub(super) fn routes() -> Router<Arc<WebState>> {
             "/api/v1/{*path}",
             get(api_not_found).fallback(method_not_allowed),
         )
+}
+
+async fn registration_requests(State(state): State<Arc<WebState>>, headers: HeaderMap) -> Response {
+    if let Err(response) = authenticate(&state, &headers) {
+        return *response;
+    }
+    let Some(management) = state.enrollment.clone() else {
+        return enrollment_unavailable();
+    };
+    match tokio::task::spawn_blocking(move || management.store.pending_approvals()).await {
+        Ok(Ok(items)) => json_response(StatusCode::OK, &serde_json::json!({"items":items})),
+        Ok(Err(error)) => enrollment_store_error(error),
+        Err(_) => enrollment_unavailable(),
+    }
+}
+
+#[derive(Deserialize)]
+struct ReviewRegistration {
+    approve: bool,
+}
+
+async fn review_registration(
+    State(state): State<Arc<WebState>>,
+    Path(request_id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(response) = authenticate(&state, &headers) {
+        return *response;
+    }
+    let Ok(request) = serde_json::from_slice::<ReviewRegistration>(&body) else {
+        return invalid_management_request();
+    };
+    let Some(management) = state.enrollment.clone() else {
+        return enrollment_unavailable();
+    };
+    let registry = management.registry.clone();
+    match tokio::task::spawn_blocking(move || {
+        management
+            .store
+            .review_approval(&request_id, request.approve)
+    })
+    .await
+    {
+        Ok(Ok(result)) => {
+            if let (Some(result), Some(registry)) = (&result, registry) {
+                registry.terminate_by_name(result.display_id());
+            }
+            json_response(
+                StatusCode::OK,
+                &serde_json::json!({"approved":request.approve}),
+            )
+        }
+        Ok(Err(error)) => enrollment_store_error(error),
+        Err(_) => enrollment_unavailable(),
+    }
 }
 
 async fn overview(State(state): State<Arc<WebState>>, headers: HeaderMap) -> Response {

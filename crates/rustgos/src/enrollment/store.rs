@@ -16,6 +16,9 @@ use thiserror::Error;
 
 const MAX_AUDIT_RECORDS: usize = 10_000;
 
+mod approval;
+pub use approval::RegistrationRequest;
+
 #[derive(Clone, Copy, Debug)]
 pub struct EnrollmentStoreLimits {
     pub max_active_clients: usize,
@@ -56,6 +59,7 @@ impl DynamicClient {
 pub struct DynamicClientStore {
     connection: Mutex<Connection>,
     limits: EnrollmentStoreLimits,
+    static_identities: Mutex<Vec<(String, String)>>,
 }
 
 pub struct IssuedEnrollmentKey(String);
@@ -103,6 +107,7 @@ impl DynamicClientStore {
         Ok(Self {
             connection: Mutex::new(connection),
             limits,
+            static_identities: Mutex::new(Vec::new()),
         })
     }
 
@@ -761,6 +766,14 @@ impl DynamicClientStore {
                 return Err(EnrollmentStoreError::StaticIdentityConflict);
             }
         }
+        *self
+            .static_identities
+            .lock()
+            .map_err(|_| EnrollmentStoreError::Database("identity lock poisoned".into()))? =
+            static_clients
+                .iter()
+                .map(|c| (c.name.to_ascii_lowercase(), c.public_key.clone()))
+                .collect();
         Ok(())
     }
 
@@ -905,6 +918,10 @@ struct TokenCandidate {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum EnrollmentStoreError {
+    #[error("waiting for administrator approval")]
+    ApprovalPending,
+    #[error("registration request rejected by administrator")]
+    ApprovalRejected,
     #[error("invalid dynamic client display ID")]
     InvalidDisplayId,
     #[error("dynamic client display ID already exists")]
@@ -1034,7 +1051,7 @@ fn migrate_schema(connection: &mut Connection) -> Result<(), EnrollmentStoreErro
     let version: u32 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(database_error)?;
-    if version > 3 {
+    if version > 4 {
         return Err(EnrollmentStoreError::UnsupportedSchema(version));
     }
     let transaction = connection
@@ -1063,7 +1080,18 @@ fn migrate_schema(connection: &mut Connection) -> Result<(), EnrollmentStoreErro
             .map_err(database_error)?;
     }
     transaction
-        .pragma_update(None, "user_version", 3)
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS registration_requests (
+          request_id TEXT PRIMARY KEY, display_id TEXT NOT NULL,
+          public_key TEXT NOT NULL, purpose INTEGER NOT NULL,
+          target_id TEXT, expected_revision INTEGER, created_at INTEGER NOT NULL,
+          expires_at INTEGER NOT NULL, status INTEGER NOT NULL DEFAULT 0,
+          result_revision INTEGER
+        );",
+        )
+        .map_err(database_error)?;
+    transaction
+        .pragma_update(None, "user_version", 4)
         .map_err(database_error)?;
     transaction.commit().map_err(database_error)
 }

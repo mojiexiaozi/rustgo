@@ -125,7 +125,7 @@ where
     })?;
     let expanded = interpolate(path, &contents, environment)?;
     toml::from_str(&expanded).map_err(|error| {
-        eprintln!("TOML parse error: {}", error);
+        eprintln!("TOML 解析错误：{}", error);
         ConfigError::TomlParse {
             path: path.to_path_buf(),
         }

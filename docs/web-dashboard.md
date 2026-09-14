@@ -1,5 +1,7 @@
 # Rustgo V0.3 Web Dashboard
 
+This document describes the V0.3 observability design. The current approval-based release also supports authenticated client approval, rejection and deletion; those management actions require CSRF protection. See [operations](operations.md#create-and-authorize-a-device) for the current access workflow. Read-only restrictions below describe the original V0.3 dashboard.
+
 ## Overview
 
 V0.3 adds an optional, embedded, read-only Web dashboard to `rustgos`. The dashboard provides real-time visibility into server resources, authenticated client health, tunnel activity, P2P path selection, and bounded historical trends without requiring a separate database server, administration daemon, or log parsing.
@@ -364,7 +366,7 @@ Protocol negotiation ensures backward compatibility. Tunnel relay and P2P remain
 rustgos check -c /etc/rustgo/server.toml
 
 # Client check (does not send telemetry)
-rustgoc check -c /etc/rustgo/client.toml
+/opt/rustgo/rustgoc check  # reads /opt/rustgo/client.toml
 ```
 
 Both commands validate:

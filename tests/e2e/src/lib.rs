@@ -646,9 +646,22 @@ impl ManagedChild {
         config: &Path,
         environment: &[(String, String)],
     ) -> TestResult<Self> {
-        let mut child = Command::new(binary)
-            .arg("-c")
-            .arg(config)
+        let is_client = binary.file_stem().is_some_and(|stem| stem == "rustgoc");
+        let mut command = if is_client {
+            let directory = config.with_extension("runtime");
+            fs::create_dir_all(&directory)?;
+            let local_binary = directory.join(binary.file_name().ok_or("binary has no name")?);
+            if !local_binary.exists() && fs::hard_link(binary, &local_binary).is_err() {
+                fs::copy(binary, &local_binary)?;
+            }
+            fs::copy(config, directory.join("client.toml"))?;
+            Command::new(local_binary)
+        } else {
+            let mut command = Command::new(binary);
+            command.arg("-c").arg(config);
+            command
+        };
+        let mut child = command
             .env("RUST_LOG", "rustgos=debug,rustgoc=debug")
             .envs(environment.iter().map(|(name, value)| (name, value)))
             .current_dir(config.parent().expect("config has a parent"))

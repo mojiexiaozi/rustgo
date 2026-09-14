@@ -134,18 +134,39 @@ impl ForwardingPanel {
                         ui.label("远程端口");
                         ui.add(egui::DragValue::new(&mut x.remote_port).range(1..=65535));
                     });
-                    if let Some(runtime) = tunnels.iter().find(|row| row.name == x.name) {
-                        if runtime.accepted {
-                            ui.colored_label(egui::Color32::DARK_GREEN, "运行正常");
-                        } else {
-                            ui.colored_label(
-                                egui::Color32::RED,
-                                format!(
-                                    "启动失败：{}",
-                                    runtime.error.as_deref().unwrap_or("服务端拒绝该隧道")
-                                ),
-                            );
-                        }
+                    let runtime = tunnels.iter().find(|row| row.name == x.name);
+                    let (color, label, detail) = match runtime {
+                        Some(row) if row.error.is_some() || !row.accepted => (
+                            egui::Color32::from_rgb(220, 65, 65),
+                            "转发失败",
+                            row.error.as_deref().unwrap_or("服务端拒绝该隧道"),
+                        ),
+                        Some(_) => (
+                            egui::Color32::from_rgb(45, 170, 95),
+                            "正常转发",
+                            "隧道已获服务端接受；此状态不代表实时连通性检测结果",
+                        ),
+                        None => (ui.visuals().weak_text_color(), "未就绪", "暂无隧道运行状态"),
+                    };
+                    egui::Frame::new()
+                        .fill(color.gamma_multiply(0.12))
+                        .stroke(egui::Stroke::new(1.0, color))
+                        .corner_radius(4.0)
+                        .inner_margin(egui::Margin::symmetric(8, 4))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(8.0, 8.0),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter().circle_filled(rect.center(), 4.0, color);
+                                ui.label(egui::RichText::new(label).color(color).strong());
+                            });
+                        })
+                        .response
+                        .on_hover_text(detail);
+                    if runtime.is_some_and(|row| row.error.is_some() || !row.accepted) {
+                        ui.colored_label(color, detail);
                     }
                 });
             }

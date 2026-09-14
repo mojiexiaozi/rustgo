@@ -40,6 +40,7 @@ sha2.workspace = true
 [target.'cfg(windows)'.dependencies]
 # The tray is Windows-only; avoid pulling in the unused GTK/glib backend.
 tray-icon = { version = "0.24.2", default-features = false }
+winreg = "0.56"
 
 [lints.rust]
 unsafe_code = "forbid"

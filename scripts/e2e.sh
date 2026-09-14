@@ -651,7 +651,9 @@ export RUSTGO_DEVICE_PRIVATE_KEY_FILE="$device_private_key"
 export RUSTGO_DEVICE_PUBLIC_KEY
 
 "$server_binary" check -c "$workspace/examples/server.toml"
-"$client_binary" check -c "$workspace/examples/client.toml"
+cp -- "$client_binary" "$client_directory/rustgoc"
+cp -- "$workspace/examples/client.toml" "$client_directory/client.toml"
+"$client_directory/rustgoc" check
 
 for invocation in default explicit; do
     gate_directory="$temporary_directory/startup-$invocation"
@@ -709,11 +711,8 @@ for invocation in default explicit; do
     )
     printf '%s\n' "${client_lines[@]}" >"$client_config"
 
-    if [ "$invocation" = explicit ]; then
-        start_managed "$invocation-client" "$gate_directory" "$client_binary" -c client.toml
-    else
-        start_managed "$invocation-client" "$gate_directory" "$client_binary"
-    fi
+    cp -- "$client_binary" "$gate_directory/rustgoc"
+    start_managed "$invocation-client" "$client_directory" "$gate_directory/rustgoc"
     client_pid=$started_pid
     client_stdout=$started_stdout
     client_stderr=$started_stderr
@@ -732,15 +731,23 @@ gui_server_port=$("$port_allocator")
 
 server_lines=(
     '[server]'
+    "bind_addr = \"127.0.0.1:$gui_server_port\""
     "certificate_file = \"$server_certificate\""
     "private_key_file = \"$server_private_key\""
     "udp_bind_ip = \"127.0.0.1\""
+    'heartbeat_timeout_secs = 10'
     ''
-    '[server.control]'
-    "tcp_bind = \"127.0.0.1:$gui_server_port\""
+    '[limits]'
+    'max_clients = 4'
+    'max_tunnels_per_client = 4'
+    'max_tcp_connections_per_tunnel = 4'
+    'max_udp_sessions_per_tunnel = 4'
+    'max_udp_payload_bytes = 65507'
     ''
-    '[[server.authorized]]'
-    "device_public_key = \"$device_public_key\""
+    '[[clients]]'
+    'name = "home-pc"'
+    "public_key = \"$RUSTGO_DEVICE_PUBLIC_KEY\""
+    'enabled = true'
 )
 printf '%s\n' "${server_lines[@]}" >"$gui_server_config"
 
@@ -748,8 +755,9 @@ start_managed gui-selfcheck-server "$gui_selfcheck_directory" "$server_binary" -
 gui_server_pid=$started_pid
 gui_server_stdout=$started_stdout
 gui_server_stderr=$started_stderr
-server_output=$(wait_for_output "$gui_server_pid" "$gui_server_stdout" "$gui_server_stderr" event=server_listening)
-server_address=$(printf '%s\n' "$server_output" | grep -oP 'address=\K[^\s]+' | head -1)
+wait_for_output "$gui_server_pid" "$gui_server_stdout" "$gui_server_stderr" event=server_listening
+server_address=$(combined_output "$gui_server_stdout" "$gui_server_stderr" |
+    sed -n 's/.*address=\([^[:space:]]*\).*/\1/p' | head -n 1)
 if [ -z "$server_address" ]; then
     echo "Could not recover listening address from GUI selfcheck server output" >&2
     exit 1
@@ -767,7 +775,8 @@ client_lines=(
 printf '%s\n' "${client_lines[@]}" >"$gui_client_config"
 
 echo "Running GUI selfcheck..."
-"$gui_binary" --selfcheck -c "$gui_client_config"
+cp -- "$gui_binary" "$gui_selfcheck_directory/rustgoc-gui"
+"$gui_selfcheck_directory/rustgoc-gui" --selfcheck
 stop_managed "$gui_server_pid"
 
 if [ "$startup_gate_only" = false ]; then

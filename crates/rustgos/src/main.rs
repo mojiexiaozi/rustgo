@@ -36,7 +36,7 @@ async fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("rustgos: {}", safe_display(&error));
-            eprintln!("Use -c <path> to select a server configuration file.");
+            eprintln!("使用 -c <path> 指定服务端配置文件。");
             ExitCode::FAILURE
         }
     }
@@ -53,7 +53,7 @@ async fn execute(cli: Cli) -> Result<(), CommandError> {
         tracing::warn!(
             code = warning.code(),
             message = warning.message(),
-            "configuration warning"
+            "配置警告"
         );
     }
 
@@ -66,13 +66,13 @@ async fn execute(cli: Cli) -> Result<(), CommandError> {
                 address = %safe_display(address),
                 web_enabled = web_address.is_some(),
                 event = %"server_listening",
-                "server TLS listener ready"
+                "服务端 TLS 监听器已就绪"
             );
             if let Some(address) = web_address {
                 tracing::info!(
                     address = %safe_display(address),
                     event = %"web_listening",
-                    "Web dashboard listener ready"
+                    "Web 管理面板监听器已就绪"
                 );
             }
             server.run().await.map_err(Into::into)

@@ -9,3 +9,13 @@
 *.crt
 test-artifacts/
 test-results/
+
+# Local device configuration, credentials and generated distribution files.
+/client.toml
+/crates/rustgoc/device.pub
+/crates/rustgoc/keys/
+/deploy/client/
+/deploy/approval-release/*/
+/deploy/approval-release/SHA256SUMS.txt
+/rustgo-patched.tar.gz
+/rustgo-source.tar.gz

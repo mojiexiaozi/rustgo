@@ -16,7 +16,7 @@ fi
 payload="relay-${mode}-${RG_RUN_ID}"
 assert_tcp_payload "$payload"
 assert_selected_path Relay
-relay_line=$(grep -F "peer service flow" "$RG_STATE_DIR/consumer.log" | grep -F 'lifecycle="selected"' | grep -F "path=Relay" | tail -n 1)
+relay_line=$(grep -F "对端服务流" "$RG_STATE_DIR/consumer.log" | grep -F 'lifecycle="selected"' | grep -F "path=Relay" | tail -n 1)
 relay_session=$(sed -n 's/.*session_id=\([^ ]*\).*/\1/p' <<<"$relay_line")
 [ -n "$relay_session" ] || { echo "FAIL: relay selection lacked structured session evidence" >&2; exit 1; }
 capture_observation_mappings initial
@@ -32,8 +32,8 @@ if [ "$mode" = all-direct-drop ]; then
     assert_direct_drop_evidence "$RG_NAT_A_NS" tcp "$RG_TCP_FIRST:$RG_TCP_LAST" "$nat_a_tcp_before"
     assert_direct_drop_evidence "$RG_NAT_B_NS" tcp "$RG_TCP_FIRST:$RG_TCP_LAST" "$nat_b_tcp_before"
     allow_direct_after_relay
-    wait_log "$RG_STATE_DIR/consumer.log" "fresh direct path promoted" 25
-    [ "$(grep -Fc "authenticated NAT observation candidates ready" "$RG_STATE_DIR/consumer.log")" -ge 2 ] || {
+    wait_log "$RG_STATE_DIR/consumer.log" "新直连路径已启用" 25
+    [ "$(grep -Fc "已认证的 NAT 探测候选地址已就绪" "$RG_STATE_DIR/consumer.log")" -ge 2 ] || {
         echo "FAIL: promotion did not complete a fresh authenticated observation generation" >&2
         exit 1
     }

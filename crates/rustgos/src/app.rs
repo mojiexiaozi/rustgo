@@ -544,7 +544,7 @@ impl ServerApp {
                 Err(error) => {
                     tracing::warn!(
                         error = %safe_display(&error),
-                        "SQLite history worker could not start; live observability remains active"
+                        "SQLite 历史记录工作线程无法启动，实时监控继续运行"
                     );
                 }
             }
@@ -622,7 +622,7 @@ impl ServerApp {
                         )
                         .await
                         {
-                            tracing::debug!(peer = %safe_display(peer), error = %safe_display(&error), "control session ended");
+                            tracing::debug!(peer = %safe_display(peer), error = %safe_display(&error), "控制会话已结束");
                         }
                     });
                 }
@@ -639,11 +639,9 @@ impl ServerApp {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => tracing::warn!(
                     error = %safe_display(&error),
-                    "observation listener degraded during shutdown"
+                    "探测监听器在关闭时发生异常"
                 ),
-                Err(_) => tracing::warn!(
-                    "observation listener shutdown timed out; process exit will continue"
-                ),
+                Err(_) => tracing::warn!("探测监听器关闭超时，进程将继续退出"),
             }
         }
 
@@ -653,7 +651,7 @@ impl ServerApp {
         .await
         .is_err()
         {
-            tracing::warn!("relay session shutdown timed out; remaining sessions will be aborted");
+            tracing::warn!("中继会话关闭超时，将中止剩余会话");
             sessions.abort_all();
             while sessions.join_next().await.is_some() {}
         }
@@ -671,9 +669,7 @@ impl ServerApp {
             .await
             .is_err()
         {
-            tracing::warn!(
-                "observability projection drain timed out; final history will use the latest available snapshot"
-            );
+            tracing::warn!("等待监控视图更新完成超时，最终历史记录将使用最新可用快照");
         }
 
         history_projection_shutdown.cancel();
@@ -683,9 +679,9 @@ impl ServerApp {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => tracing::warn!(
                     error = %safe_display(&error),
-                    "SQLite history checkpoint degraded during shutdown"
+                    "SQLite 历史记录检查点操作在关闭时发生异常"
                 ),
-                Err(_) => tracing::warn!("SQLite history checkpoint timed out during shutdown"),
+                Err(_) => tracing::warn!("SQLite 历史记录检查点操作在关闭时超时"),
             }
         }
         if let Some(history) = history_service.as_ref() {
@@ -719,11 +715,11 @@ async fn run_enrollment_maintenance(store: Arc<DynamicClientStore>, shutdown: Ca
                     Ok(Ok(_)) => {}
                     Ok(Err(error)) => tracing::warn!(
                         error = %safe_display(&error),
-                        "enrollment tombstone cleanup failed"
+                        "设备注册删除标记清理失败"
                     ),
                     Err(error) => tracing::warn!(
                         error = %safe_display(&error),
-                        "enrollment tombstone cleanup task failed"
+                        "设备注册删除标记清理任务失败"
                     ),
                 }
             }
@@ -954,10 +950,10 @@ async fn run_web_supervisor(
             return;
         }
         match outcome {
-            Ok(()) => tracing::warn!("Web server exited unexpectedly; it will be restarted"),
+            Ok(()) => tracing::warn!("Web 服务意外退出，即将重启"),
             Err(error) => tracing::warn!(
                 error = %safe_display(&error),
-                "Web server failed; relay remains active and Web will be restarted"
+                "Web 服务发生故障，中继继续运行，Web 服务即将重启"
             ),
         }
         if started.elapsed() >= Duration::from_secs(30) {
@@ -976,11 +972,11 @@ async fn run_web_supervisor(
                     match restarted.local_addr() {
                         Ok(address) => tracing::info!(
                             address = %safe_display(address),
-                            "Web server restarted"
+                            "Web 服务已重启"
                         ),
                         Err(error) => tracing::info!(
                             error = %safe_display(&error),
-                            "Web server restarted"
+                            "Web 服务已重启"
                         ),
                     }
                     server = Some(restarted);
@@ -990,7 +986,7 @@ async fn run_web_supervisor(
                 Err(error) => {
                     tracing::warn!(
                         error = %safe_display(&error),
-                        "Web server restart bind failed; relay remains active"
+                        "Web 服务重启时绑定失败，中继继续运行"
                     );
                     backoff = backoff.saturating_mul(2).min(WEB_RESTART_MAX_BACKOFF);
                 }
@@ -1008,10 +1004,10 @@ async fn join_task_bounded(name: &'static str, task: Option<JoinHandle<()>>) {
         Ok(Err(error)) => tracing::warn!(
             task = name,
             error = %safe_display(&error),
-            "subordinate server task failed"
+            "服务端子任务失败"
         ),
         Err(_) => {
-            tracing::warn!(task = name, "subordinate server task shutdown timed out");
+            tracing::warn!(task = name, "服务端子任务关闭超时");
             task.abort();
             let _ = task.await;
         }
@@ -1030,15 +1026,15 @@ async fn join_result_task_bounded(
         Ok(Ok(Err(error))) => tracing::warn!(
             task = name,
             error = %safe_display(&error),
-            "subordinate server task degraded"
+            "服务端子任务发生异常"
         ),
         Ok(Err(error)) => tracing::warn!(
             task = name,
             error = %safe_display(&error),
-            "subordinate server task failed"
+            "服务端子任务失败"
         ),
         Err(_) => {
-            tracing::warn!(task = name, "subordinate server task shutdown timed out");
+            tracing::warn!(task = name, "服务端子任务关闭超时");
             task.abort();
             let _ = task.await;
         }

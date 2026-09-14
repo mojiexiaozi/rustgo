@@ -748,6 +748,8 @@ pub enum EnrollmentErrorCode {
     CapacityReached,
     Unavailable,
     UnsupportedVersion,
+    PendingApproval,
+    ApprovalRejected,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

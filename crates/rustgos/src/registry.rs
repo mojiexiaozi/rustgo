@@ -876,7 +876,7 @@ impl ControlSessionGuard {
                         tunnel = %safe_display(tunnel.name.as_str()),
                         tunnel_id = tunnel.tunnel_id,
                         error = %safe_display(&error),
-                        "event=tunnel_rejected server rejected tunnel registration"
+                        "event=tunnel_rejected 服务端拒绝了隧道注册"
                     );
                     let code = if matches!(error, RegistryError::UdpBindAddressRequired) {
                         ProtocolErrorCode::UDP_BIND_ADDRESS_REQUIRED

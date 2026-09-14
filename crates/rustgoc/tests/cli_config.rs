@@ -65,22 +65,44 @@ fn command() -> Command {
     Command::cargo_bin(env!("CARGO_PKG_NAME")).unwrap()
 }
 
-fn check(config: &Path, current_dir: &Path) -> assert_cmd::assert::Assert {
-    command()
-        .current_dir(current_dir)
-        .args(["check", "-c", config.to_str().unwrap()])
-        .assert()
+fn beside(config: &Path) -> Command {
+    let directory = config.parent().unwrap();
+    let binary = directory.join(if cfg!(windows) {
+        "rustgoc.exe"
+    } else {
+        "rustgoc"
+    });
+    if !binary.exists() {
+        let source = assert_cmd::cargo::cargo_bin(env!("CARGO_PKG_NAME"));
+        if fs::hard_link(&source, &binary).is_err() {
+            fs::copy(source, &binary).unwrap();
+        }
+    }
+    let fixed = directory.join("client.toml");
+    if config != fixed && config.exists() {
+        fs::copy(config, fixed).unwrap();
+    }
+    Command::new(binary)
 }
 
+fn check(config: &Path, current_dir: &Path) -> assert_cmd::assert::Assert {
+    beside(config)
+        .current_dir(current_dir)
+        .arg("check")
+        .assert()
+}
 #[test]
-fn default_run_reports_missing_conventional_config_and_override_flag() {
+fn default_run_reports_missing_config_beside_executable() {
     let directory = tempfile::tempdir().unwrap();
-    let output = command().current_dir(directory.path()).output().unwrap();
+    let output = beside(&directory.path().join("client.toml"))
+        .current_dir(directory.path())
+        .output()
+        .unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     assert!(!output.status.success());
     assert!(stderr.contains("client.toml"));
-    assert!(stderr.contains("-c"));
+    assert!(!stderr.contains("使用 -c"));
 }
 
 #[test]
@@ -134,18 +156,21 @@ fn check_rejects_telemetry_report_interval_shorter_than_sample_interval() {
 }
 
 #[test]
-fn explicit_config_does_not_consult_conventional_filename() {
+fn fixed_config_is_beside_executable_not_current_directory() {
     let material = TestMaterial::generate();
-    let config = material.write_config("custom.toml");
-    fs::write(
-        material.directory.path().join("client.toml"),
-        "not valid toml = [",
-    )
-    .unwrap();
-
-    check(&config, material.directory.path()).success();
+    let config = material.write_config("client.toml");
+    let other = tempfile::tempdir().unwrap();
+    fs::write(other.path().join("client.toml"), "not valid toml = [").unwrap();
+    check(&config, other.path()).success();
 }
 
+#[test]
+fn config_override_flag_is_rejected() {
+    command()
+        .args(["--config", "other.toml"])
+        .assert()
+        .failure();
+}
 #[test]
 fn check_rejects_malformed_ca_certificate_chain() {
     let material = TestMaterial::generate();
@@ -193,17 +218,16 @@ fn wire_overflow_is_rejected_by_check_and_run_before_opening_a_socket() {
     let config = material.directory.path().join("overflow.toml");
     fs::write(&config, contents).unwrap();
 
-    let check_output = command()
+    let check_output = beside(&config)
         .current_dir(material.directory.path())
-        .args(["check", "-c", config.to_str().unwrap()])
+        .arg("check")
         .output()
         .unwrap();
     assert!(!check_output.status.success());
     assert!(String::from_utf8_lossy(&check_output.stderr).contains("invalid configuration"));
 
-    let run = command()
+    let run = beside(&config)
         .current_dir(material.directory.path())
-        .args(["-c", config.to_str().unwrap()])
         .output()
         .unwrap();
     assert!(!run.status.success());

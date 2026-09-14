@@ -16,6 +16,7 @@ pub struct ClientRuntime {
 }
 
 struct RuntimeState {
+    enrollment_shutdown: Option<CancellationToken>,
     shutdown: Option<CancellationToken>,
     generation: u64,
     traffic_handle: Option<TrafficHandle>,
@@ -26,14 +27,39 @@ impl ClientRuntime {
         &self,
         mut config: rustgo_config::ClientConfig,
         config_path: std::path::PathBuf,
-        key: String,
+        purpose: rustgoc::EnrollmentPurpose,
+        rotate: bool,
     ) -> std::sync::mpsc::Receiver<Result<rustgoc::EnrollmentCompletion, String>> {
         let (sender, receiver) = std::sync::mpsc::channel();
         if let Some(runtime) = &self.runtime {
+            let shutdown = CancellationToken::new();
+            {
+                let mut guard = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(previous) = guard.enrollment_shutdown.replace(shutdown.clone()) {
+                    previous.cancel();
+                }
+            }
             runtime.spawn(async move {
-                let result = rustgoc::enroll(&mut config, &config_path, key.trim())
-                    .await
-                    .map_err(|error| error.to_string());
+                let result = loop {
+                    let result=tokio::select! {
+                        biased;
+                        ()=shutdown.cancelled()=>return,
+                        result=async {
+                            if rotate { rustgoc::request_key_rotation(&mut config,&config_path).await }
+                            else { rustgoc::request_registration(&mut config, &config_path, purpose).await }
+                        }=>result,
+                    };
+                    match result {
+                        Err(rustgoc::EnrollmentError::Network)
+                        | Err(rustgoc::EnrollmentError::Rejected(rustgoc::EnrollmentErrorCode::PendingApproval | rustgoc::EnrollmentErrorCode::Unavailable | rustgoc::EnrollmentErrorCode::CapacityReached)) => {
+                            tokio::select! {biased; ()=shutdown.cancelled()=>return, ()=tokio::time::sleep(Duration::from_secs(5))=>{}}
+                        }
+                        result => break result.map_err(|error| error.to_string()),
+                    }
+                };
                 let _ = sender.send(result);
             });
         } else {
@@ -66,6 +92,7 @@ impl ClientRuntime {
             .build()?;
 
         let state = Arc::new(Mutex::new(RuntimeState {
+            enrollment_shutdown: None,
             shutdown: None,
             generation: 0,
             traffic_handle: None,
@@ -105,7 +132,10 @@ impl ClientRuntime {
             // Spawn client task
             let client_shutdown = shutdown.clone();
             runtime.spawn(async move {
-                let result = app.run_until(client_shutdown).await;
+                let result = app
+                    .with_approval_recovery()
+                    .run_until(client_shutdown)
+                    .await;
 
                 let mut guard = state
                     .lock()
@@ -116,7 +146,7 @@ impl ClientRuntime {
                 }
 
                 if let Err(e) = result {
-                    tracing::error!("Client error: {}", e);
+                    tracing::error!("客户端错误：{}", e);
                 }
             });
         }
@@ -129,6 +159,9 @@ impl ClientRuntime {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             guard.traffic_handle = None;
+            if let Some(pending) = guard.enrollment_shutdown.take() {
+                pending.cancel();
+            }
             guard.shutdown.take()
         };
         if let Some(token) = shutdown {

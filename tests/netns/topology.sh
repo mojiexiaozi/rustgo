@@ -423,6 +423,8 @@ EOF
 }
 
 start_stack() {
+    cp -- "$RG_BIN_DIR/rustgoc" "$RG_STATE_DIR/provider/rustgoc"
+    cp -- "$RG_BIN_DIR/rustgoc" "$RG_STATE_DIR/consumer/rustgoc"
     start_in_ns "$RG_SERVER_NS" server "$RG_BIN_DIR/rustgos" -c "$RG_STATE_DIR/server/server.toml" >/dev/null
     wait_log "$RG_STATE_DIR/server.log" event=server_listening
     start_in_ns "$RG_CLIENT_A_NS" tcp-echo python3 -u -c 'import socket
@@ -433,9 +435,9 @@ while True:
 s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(("127.0.0.1",18081))
 while True:
  d,a=s.recvfrom(65535);s.sendto(d,a)' "$RG_PREFIX" >/dev/null
-    start_in_ns "$RG_CLIENT_A_NS" provider "$RG_BIN_DIR/rustgoc" -c "$RG_STATE_DIR/provider/client.toml" >/dev/null
+    start_in_ns "$RG_CLIENT_A_NS" provider "$RG_STATE_DIR/provider/rustgoc" >/dev/null
     wait_log "$RG_STATE_DIR/provider.log" event=registration_ready
-    start_in_ns "$RG_CLIENT_B_NS" consumer "$RG_BIN_DIR/rustgoc" -c "$RG_STATE_DIR/consumer/client.toml" >/dev/null
+    start_in_ns "$RG_CLIENT_B_NS" consumer "$RG_STATE_DIR/consumer/rustgoc" >/dev/null
     wait_log "$RG_STATE_DIR/consumer.log" event=registration_ready
     wait_log "$RG_STATE_DIR/consumer.log" event=peer_forwards_ready
 }
@@ -462,8 +464,8 @@ p=sys.argv[1].encode(); s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.set
 
 assert_selected_path() {
     local expected=$1
-    wait_log "$RG_STATE_DIR/consumer.log" "authoritative peer path selected path=$expected" 20
-    grep -F "authoritative peer path selected" "$RG_STATE_DIR/consumer.log" | grep -Fq "path=$expected"
+    wait_log "$RG_STATE_DIR/consumer.log" "已确定对端通信路径 path=$expected" 20
+    grep -F "已确定对端通信路径" "$RG_STATE_DIR/consumer.log" | grep -Fq "path=$expected"
 }
 
 capture_observation_mappings() {
@@ -550,7 +552,7 @@ assert_new_direct_flow_since() {
     local start_line=$1 expected_path=$2 relay_session=$3 evidence=$RG_STATE_DIR/promoted-flow.log deadline=$((SECONDS + 20))
     while [ "$SECONDS" -lt "$deadline" ]; do
         tail -n "+$((start_line + 1))" "$RG_STATE_DIR/consumer.log" |
-            grep -F "peer service flow" | grep -F 'lifecycle="selected"' | grep -F "path=$expected_path" >"$evidence" || true
+            grep -F "对端服务流" | grep -F 'lifecycle="selected"' | grep -F "path=$expected_path" >"$evidence" || true
         if [ -s "$evidence" ]; then
             local line session open generation
             line=$(tail -n 1 "$evidence")

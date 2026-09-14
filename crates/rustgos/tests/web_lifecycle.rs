@@ -201,7 +201,7 @@ fn check_and_disabled_mode_create_neither_web_listener_nor_history_store() -> Re
     assert!(history_artifacts(disabled.path(), database)?.is_empty());
     let logs = diagnostics(&output);
     assert!(logs.contains("web_enabled=false"), "{logs}");
-    assert!(!logs.contains("Web dashboard listener ready"), "{logs}");
+    assert!(!logs.contains("Web 管理面板监听器已就绪"), "{logs}");
     Ok(())
 }
 
@@ -231,7 +231,7 @@ fn enabled_mode_starts_both_listeners_persists_history_and_cancels_cleanly() -> 
 
     let logs = diagnostics(&output);
     assert!(logs.contains("web_enabled=true"), "{logs}");
-    assert!(logs.contains("Web dashboard listener ready"), "{logs}");
+    assert!(logs.contains("Web 管理面板监听器已就绪"), "{logs}");
     for secret in [
         ADMIN_USERNAME,
         ADMIN_PASSWORD,
@@ -308,10 +308,10 @@ fn sqlite_failure_keeps_relay_live_while_web_exit_restarts_on_the_same_port() ->
     assert!(!material.path().join("missing-parent").exists());
     let logs = diagnostics(&output);
     assert!(
-        logs.contains("SQLite history is unavailable; live observability remains active"),
+        logs.contains("SQLite 历史记录不可用，实时监控继续运行"),
         "{logs}"
     );
-    assert!(logs.contains("Web server restarted"), "{logs}");
+    assert!(logs.contains("Web 服务已重启"), "{logs}");
     assert!(logs.contains("web_enabled=true"), "{logs}");
     Ok(())
 }

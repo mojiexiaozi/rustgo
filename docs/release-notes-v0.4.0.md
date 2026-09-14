@@ -6,6 +6,13 @@ V0.4 adds a cross-platform GUI client (`rustgoc-gui`) with real-time connection 
 
 ## New Features
 
+### Approval-based access
+
+- Clients request access automatically over verified TLS; administrators approve or reject the displayed public-key fingerprint in authenticated Web management.
+- Pending request IDs and keys survive restart. Explicit key replacement preserves the active key until approval.
+- Both clients read executable-adjacent `client.toml`; `-c`/`--config` are no longer accepted. CLI key generation remains available for static authorization.
+- This access flow requires the updated server. Back up the enrollment database before migration to schema version 4; do not downgrade it directly.
+
 ### GUI Client (`rustgoc-gui`)
 
 A native desktop application built with eframe/egui 0.36.0 providing:
@@ -22,8 +29,10 @@ A native desktop application built with eframe/egui 0.36.0 providing:
 The `--selfcheck` flag validates configuration and connectivity:
 
 ```text
-rustgoc-gui --selfcheck -c ./client.toml
+rustgoc-gui --selfcheck
 ```
+
+Both clients now read `client.toml` beside the executable and reject `-c`/`--config`. Selfcheck requires an already authorized device.
 
 Selfcheck behavior:
 - Loads and validates configuration using production credential loaders

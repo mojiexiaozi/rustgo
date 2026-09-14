@@ -9,7 +9,8 @@ mod state;
 mod version;
 
 pub use enrollment::{
-    EnrollmentKeyError, EnrollmentKeyMaterial, EnrollmentPurpose, canonical_enrollment_server_addr,
+    EnrollmentKeyError, EnrollmentKeyMaterial, EnrollmentPurpose, RegistrationIntent,
+    canonical_enrollment_server_addr,
 };
 pub use frame::{Frame, FrameCodec, FrameError, HEADER_LEN, MAGIC, SUPPORTED_FLAGS};
 pub use message::*;

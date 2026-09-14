@@ -61,7 +61,7 @@ impl HostSampler {
                 metrics.memory_used_bytes = Some(self.system.used_memory().min(memory_total));
             }
         } else {
-            tracing::warn!("host resource sampling is unavailable on this platform");
+            tracing::warn!("当前平台不支持主机资源采样");
         }
 
         self.disks.refresh(true);
@@ -99,7 +99,7 @@ impl HostSampler {
         shutdown: CancellationToken,
     ) {
         if interval.is_zero() {
-            tracing::warn!("host sampler received a zero interval; stopping sampler");
+            tracing::warn!("主机采样间隔为零，正在停止采样");
             return;
         }
 
@@ -117,7 +117,7 @@ impl HostSampler {
                         () = shutdown.cancelled() => return,
                         result = sender.send(sample) => {
                             if result.is_err() {
-                                tracing::warn!("host sampler receiver closed; stopping sampler");
+                                tracing::warn!("主机采样接收端已关闭，正在停止采样");
                                 return;
                             }
                         }

@@ -40,13 +40,13 @@ The GUI client (`rustgoc-gui`) provides:
 Run the GUI with:
 
 ```text
-rustgoc-gui -c ./client.toml
+rustgoc-gui
 ```
 
-The GUI uses the same configuration format as the CLI client. Use `--selfcheck` to validate configuration and connectivity:
+The GUI and CLI both read `client.toml` beside their executable; neither accepts `-c` or `--config`. The GUI uses the same configuration format as the CLI client. Use `--selfcheck` to validate configuration and connectivity:
 
 ```text
-rustgoc-gui --selfcheck -c ./client.toml
+rustgoc-gui --selfcheck
 ```
 
 The selfcheck waits up to 30 seconds for an active connection, prints traffic and path status snapshots, then exits 0 on success. This is wired into the E2E scripts for automated validation.
@@ -100,8 +100,6 @@ Generate a key pair on the client host:
 
 ```text
 rustgoc keygen -o ./keys
-# or with the GUI client:
-rustgoc-gui keygen -o ./keys
 ```
 
 Keep `keys/device.key` on the client. Copy only `keys/device.pub` to the server operator and place its `ed25519:...` value in the matching server authorization entry. Create a TLS server certificate whose SAN contains the real DNS name used by clients, and configure every client with that same `server_name` plus an explicit CA certificate file.
@@ -110,21 +108,26 @@ Copy [examples/server.toml](examples/server.toml) and [examples/client.toml](exa
 
 ```text
 rustgos check -c ./server.toml
-rustgoc check -c ./client.toml
-rustgoc-gui --selfcheck -c ./client.toml
+rustgoc check
 ```
 
 `check` uses the production credential loaders. The server parses every certificate in its TLS chain, validates the TLS private-key encoding and leaf/key match, and rejects malformed or weak Ed25519 authorization keys. The client parses every explicit CA certificate and its Rustgo device private key. These checks perform no bind or connect operation.
 
-With conventional filenames in the current directory, no-argument startup is equivalent to explicit `-c`:
+Place `client.toml` beside each client executable. The server defaults to `server.toml` in the current directory and also accepts `-c`:
 
 ```text
 rustgos                 # rustgos -c ./server.toml
-rustgoc                 # rustgoc -c ./client.toml
-rustgoc-gui             # rustgoc-gui -c ./client.toml
+rustgoc                 # reads executable-adjacent client.toml
+rustgoc-gui             # reads executable-adjacent client.toml
 ```
 
-Configuration is never searched in parent or platform-specific directories, and missing files are not generated implicitly.
+Configuration is never searched in parent or platform-specific directories. CLI startup requires `client.toml`; missing or damaged device keys are generated for approval-based enrollment. `check` validates existing credentials without requesting access. GUI `--selfcheck` connects and requires an already authorized device.
+
+### Approval-based enrollment
+
+With server enrollment and authenticated Web management enabled, new clients automatically request access over verified TLS. The administrator checks the public-key fingerprint and approves or rejects the request. Approved clients bind their key and connect automatically; pending keys and request IDs survive restart. This flow requires an updated server.
+
+Use `rustgoc enroll` to request access, `rustgoc re-enroll` to reuse the current key, or `rustgoc re-enroll --confirm-replace-key` to explicitly request a replacement. The current key is retained until replacement approval. Back up the server enrollment database before upgrading to schema version 4. See [approval release instructions](deploy/approval-release/README.md).
 
 See [docs/operations.md](docs/operations.md) for certificate commands, firewalls, service restarts, logging, key rotation, troubleshooting, and the complete release checklist.
 

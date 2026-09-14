@@ -226,7 +226,10 @@ try {
     $env:RUSTGO_DEVICE_PUBLIC_KEY = $devicePublicKey
 
     Invoke-Native -FilePath $serverBinary -Arguments @("check", "-c", (Join-Path $workspace "examples\server.toml"))
-    Invoke-Native -FilePath $clientBinary -Arguments @("check", "-c", (Join-Path $workspace "examples\client.toml"))
+    $checkClientBinary = Join-Path $clientDirectory "rustgoc.exe"
+    Copy-Item -LiteralPath $clientBinary -Destination $checkClientBinary
+    Copy-Item -LiteralPath (Join-Path $workspace "examples\client.toml") -Destination (Join-Path $clientDirectory "client.toml")
+    Invoke-Native -FilePath $checkClientBinary -Arguments @("check")
 
     foreach ($invocation in @("default", "explicit")) {
         $gateDirectory = Join-Path $resolvedTemporaryDirectory "startup-$invocation"
@@ -248,8 +251,9 @@ try {
         }
         Write-StartupClientConfig -Path $clientConfig -ServerAddress $addressMatch.Groups[1].Value -CertificateAuthorityFile $certificateAuthority.Replace('\', '/') -PrivateKeyFile $devicePrivateKey.Replace('\', '/')
 
-        $clientArguments = if ($invocation -eq "explicit") { @("-c", "client.toml") } else { @() }
-        $client = Start-ManagedProcess -Name "$invocation-client" -FilePath $clientBinary -WorkingDirectory $gateDirectory -Arguments $clientArguments
+        $gateClientBinary = Join-Path $gateDirectory "rustgoc.exe"
+        Copy-Item -LiteralPath $clientBinary -Destination $gateClientBinary
+        $client = Start-ManagedProcess -Name "$invocation-client" -FilePath $gateClientBinary -WorkingDirectory $clientDirectory
         [void](Wait-ForManagedOutput -Record $client -Pattern "event=registration_ready")
         Stop-ManagedProcess -Record $client
         Stop-ManagedProcess -Record $server
@@ -276,7 +280,9 @@ try {
     Write-StartupClientConfig -Path $guiClientConfig -ServerAddress $guiAddressMatch.Groups[1].Value -CertificateAuthorityFile $certificateAuthority.Replace('\', '/') -PrivateKeyFile $devicePrivateKey.Replace('\', '/')
 
     Write-Host "Running GUI selfcheck..."
-    Invoke-Native -FilePath $guiBinary -Arguments @("--selfcheck", "-c", $guiClientConfig)
+    $gateGuiBinary = Join-Path $guiSelfcheckDirectory "rustgoc-gui.exe"
+    Copy-Item -LiteralPath $guiBinary -Destination $gateGuiBinary
+    Invoke-Native -FilePath $gateGuiBinary -Arguments @("--selfcheck")
     Stop-ManagedProcess -Record $guiServer
 
     if (-not $StartupGateOnly) {

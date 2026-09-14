@@ -222,7 +222,7 @@ async fn run_listener(
                 tunnel = %safe_display(&tunnel_name),
                 tunnel_id,
                 error = %safe_display(&error),
-                "event=udp_tunnel_stopped UDP tunnel control channel closed"
+                "event=udp_tunnel_stopped UDP 隧道控制通道已关闭"
             );
             return;
         }
@@ -231,7 +231,7 @@ async fn run_listener(
             tunnel = %safe_display(&tunnel_name),
             tunnel_id,
             error = %safe_display(&error),
-            "event=udp_tunnel_restarting UDP tunnel data path failed; retrying within the control generation"
+            "event=udp_tunnel_restarting UDP 隧道数据路径失败，正在当前控制代次内重试"
         );
         tokio::select! {
             biased;
@@ -246,7 +246,7 @@ async fn run_listener(
                         tunnel = %safe_display(&tunnel_name),
                         tunnel_id,
                         error = %safe_display(&error),
-                        "event=udp_tunnel_reissue_failed UDP tunnel data-channel reissue failed"
+                        "event=udp_tunnel_reissue_failed UDP 隧道数据通道重新下发失败"
                     );
                     tokio::select! {
                         biased;
@@ -317,7 +317,7 @@ async fn run_listener_inner(
         }
     };
 
-    tracing::info!(tunnel = %safe_display(tunnel_name), tunnel_id, channel_id, "event=udp_channel_ready server UDP data channel ready");
+    tracing::info!(tunnel = %safe_display(tunnel_name), tunnel_id, channel_id, "event=udp_channel_ready 服务端 UDP 数据通道已就绪");
     relay_datagrams(
         listener,
         data_channel,
@@ -629,7 +629,7 @@ impl UdpMetrics {
     fn record_drop(counter: &AtomicU64, tunnel_name: &str, reason: &'static str) {
         let total = counter.fetch_add(1, Ordering::Relaxed).saturating_add(1);
         if total == 1 || total.is_power_of_two() {
-            tracing::warn!(tunnel = %safe_display(tunnel_name), reason, total, "event=udp_drop UDP datagram dropped");
+            tracing::warn!(tunnel = %safe_display(tunnel_name), reason, total, "event=udp_drop UDP 数据报已丢弃");
         }
     }
 }
@@ -786,7 +786,7 @@ async fn relay_datagrams(
                             }
                         }
                     }
-                    tracing::debug!(tunnel = %safe_display(tunnel_name), expired = expired_count, sessions = flows.len(), "event=udp_idle_sweep expired UDP sessions");
+                    tracing::debug!(tunnel = %safe_display(tunnel_name), expired = expired_count, sessions = flows.len(), "event=udp_idle_sweep 已清理超时的 UDP 会话");
                 }
             }
             received = public.recv_from(&mut receive_buffer) => {
@@ -838,7 +838,7 @@ async fn relay_datagrams(
                                 conn = %short_id(session_id),
                                 event = %"udp_session_open"
                             );
-                            tracing::info!(parent: &session, "UDP relay session opened");
+                            tracing::info!(parent: &session, "UDP 中继会话已开启");
                             if runtime.observability_enabled() {
                                 runtime.try_observe(ObservationEvent::UdpSessionOpened {
                                     client: runtime.observability_identity().clone(),
@@ -909,7 +909,7 @@ async fn relay_datagrams(
                     tracing::warn!(
                         tunnel = %safe_display(tunnel_name),
                         forwarded_replies,
-                        "event=udp_test_data_disconnect internal test closed UDP data channel"
+                        "event=udp_test_data_disconnect 内部测试已关闭 UDP 数据通道"
                     );
                     break Err(UdpRelayError::InternalTestDisconnect);
                 }
@@ -943,7 +943,7 @@ async fn relay_datagrams(
         drops_sessions = metrics.session_drops.load(Ordering::Relaxed),
         drops_oversize = metrics.oversize_drops.load(Ordering::Relaxed),
         drops_invalid = metrics.invalid_drops.load(Ordering::Relaxed),
-        "event=udp_cleanup UDP relay state released"
+        "event=udp_cleanup UDP 中继状态已释放"
     );
     result
 }

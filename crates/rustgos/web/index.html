@@ -68,11 +68,12 @@
               <button id="client-order" class="button button-quiet" type="button" aria-label="反转客户端排序顺序">降序</button>
             </div>
           </div>
-          <form id="create-client-form" class="filter-bar">
-            <label>新客户端 ID <input name="client_id" required maxlength="64" pattern="[A-Za-z0-9._-]+" autocomplete="off"></label>
-            <button class="button" type="submit">创建客户端</button>
-            <span id="management-status" class="muted" role="status" aria-live="polite"></span>
-          </form>
+          <section class="detail-card" aria-labelledby="approval-title">
+            <h2 id="approval-title">待审批申请</h2>
+            <p class="muted">客户端自动提交申请。请核对客户端显示的公钥指纹后批准，批准时自动创建或更新客户端。</p>
+            <div id="approval-list" aria-live="polite"></div>
+            <p id="approval-status" class="muted" role="status"></p>
+          </section>
           <div id="client-grid" class="client-grid" aria-live="polite"></div>
           <p id="client-empty" class="empty-state" hidden>没有符合搜索条件的客户端。</p>
         </section>
@@ -84,11 +85,7 @@
         <section id="client-detail-metrics" class="metric-grid" aria-label="客户端指标"></section>
         <section id="client-management" class="detail-card" hidden>
           <h2>客户端管理</h2>
-          <form id="rename-client-form" class="filter-bar"><label>新客户端 ID <input name="new_client_id" required maxlength="64" pattern="[A-Za-z0-9._-]+"></label><button class="button" type="submit">重命名</button></form>
           <div class="client-controls">
-            <button id="toggle-client-button" class="button" type="button">禁用客户端</button>
-            <button id="enrollment-token-button" class="button" type="button">重新签发接入密钥</button>
-            <button id="reenrollment-token-button" class="button" type="button">生成重新注册密钥</button>
             <button id="delete-client-button" class="button button-danger" type="button">删除客户端</button>
           </div>
           <p id="client-management-status" class="muted" role="status" aria-live="polite"></p>
@@ -116,6 +113,5 @@
         <div class="table-wrap"><table><thead><tr><th>会话</th><th>客户端</th><th>协议</th><th>路径</th><th>状态</th><th>流量</th><th>开始时间</th><th>持续时间</th></tr></thead><tbody id="sessions-table"></tbody></table></div>
       </section>
     </main>
-    <dialog id="secret-dialog"><h2>一次性接入密钥</h2><p>此密钥只显示一次，请立即复制并安全交付。</p><textarea id="secret-value" readonly rows="6"></textarea><form method="dialog"><button class="button" type="submit">我已保存，关闭</button></form></dialog>
   </body>
 </html>

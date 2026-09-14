@@ -572,14 +572,20 @@ fn streams_sixteen_mib_without_a_whole_transfer_buffer() -> TestResult {
     let writer_task = thread::spawn(move || {
         let result = (|| -> TestResult {
             let first = vec![0_u8; CHUNK];
-            writer.write_all(&first)?;
+            writer
+                .write_all(&first)
+                .map_err(|error| format!("16 MiB first write failed: {error}"))?;
             first_chunk_written.send(())?;
             remainder_gate.recv()?;
             for index in 1..CHUNKS {
                 let chunk = vec![(index % 251) as u8; CHUNK];
-                writer.write_all(&chunk)?;
+                writer
+                    .write_all(&chunk)
+                    .map_err(|error| format!("16 MiB write chunk {index} failed: {error}"))?;
             }
-            writer.shutdown(Shutdown::Write)?;
+            writer
+                .shutdown(Shutdown::Write)
+                .map_err(|error| format!("16 MiB writer half-close failed: {error}"))?;
             Ok(())
         })();
         let _ = producer_complete.send(result);
@@ -590,7 +596,7 @@ fn streams_sixteen_mib_without_a_whole_transfer_buffer() -> TestResult {
     let early_read = reader.read_exact(&mut chunk);
     let producer_before_gate = producer_result.try_recv();
     allow_remainder.send(())?;
-    early_read?;
+    early_read.map_err(|error| format!("16 MiB first read failed: {error}"))?;
     if chunk.iter().any(|byte| *byte != 0) {
         return Err("16 MiB stream changed the first chunk".into());
     }
@@ -598,7 +604,9 @@ fn streams_sixteen_mib_without_a_whole_transfer_buffer() -> TestResult {
         return Err("16 MiB producer reached EOF before the early-progress gate opened".into());
     }
     for index in 1..CHUNKS {
-        reader.read_exact(&mut chunk)?;
+        reader
+            .read_exact(&mut chunk)
+            .map_err(|error| format!("16 MiB read chunk {index} failed: {error}"))?;
         if chunk.iter().any(|byte| *byte != (index % 251) as u8) {
             return Err(format!("16 MiB stream changed chunk {index}").into());
         }

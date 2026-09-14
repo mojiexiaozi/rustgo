@@ -32,6 +32,11 @@ jobs:
           key: rustgo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: rustgo-${{ runner.os }}-
       - run: cargo fmt --all -- --check
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Dashboard management regression tests
+        run: node --test crates/rustgos/tests/web_management.test.cjs
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Linux pidfd supervisor integration
         run: |

@@ -8,6 +8,7 @@ use rustgo_protocol::{
     ProtocolVersion,
 };
 use rustgo_transport::TlsClient;
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::{EnrollmentError, EnrollmentKey, EnrollmentPurpose, PendingEnrollment};
@@ -22,14 +23,106 @@ pub struct EnrollmentCompletion {
     pub revision: u64,
 }
 
+pub async fn request_registration(
+    config: &mut ClientConfig,
+    config_path: &Path,
+    purpose: EnrollmentPurpose,
+) -> Result<EnrollmentCompletion, EnrollmentError> {
+    let intent = rustgo_protocol::RegistrationIntent::new(&config.client.name, purpose)?;
+    enroll(config, config_path, &intent.encode()).await
+}
+
+/// Explicit rotation still uses a candidate key and never overwrites the active key before approval.
+pub async fn request_key_rotation(
+    config: &mut ClientConfig,
+    config_path: &Path,
+) -> Result<EnrollmentCompletion, EnrollmentError> {
+    let intent =
+        rustgo_protocol::RegistrationIntent::new(&config.client.name, EnrollmentPurpose::ReEnroll)?;
+    enroll_inner(config, config_path, &intent.encode(), false).await
+}
+
 pub async fn enroll(
     config: &mut ClientConfig,
     config_path: &Path,
     encoded_key: &str,
 ) -> Result<EnrollmentCompletion, EnrollmentError> {
-    let key = EnrollmentKey::parse(encoded_key)?;
+    enroll_inner(config, config_path, encoded_key, true).await
+}
+
+async fn enroll_inner(
+    config: &mut ClientConfig,
+    config_path: &Path,
+    encoded_key: &str,
+    reuse: bool,
+) -> Result<EnrollmentCompletion, EnrollmentError> {
+    let approval = rustgo_protocol::RegistrationIntent::decode(encoded_key).ok();
+    let legacy = if approval.is_none() {
+        Some(EnrollmentKey::parse(encoded_key)?)
+    } else {
+        None
+    };
+    let (tls, address) = if let Some(key) = &legacy {
+        (
+            TlsClient::from_pinned_fingerprint(
+                &server_name(key.server_addr())?,
+                *key.certificate_fingerprint(),
+            )
+            .map_err(|_| EnrollmentError::Network)?,
+            key.server_addr().to_owned(),
+        )
+    } else {
+        let tls = match config.client.trust_mode {
+            Some(TrustMode::Pinned) => {
+                let encoded = config
+                    .client
+                    .server_certificate_fingerprint
+                    .as_deref()
+                    .ok_or(EnrollmentError::InvalidPendingState)?;
+                if encoded.len() != 64 || !encoded.is_ascii() {
+                    return Err(EnrollmentError::InvalidPendingState);
+                }
+                let mut fingerprint = [0u8; 32];
+                for (index, byte) in fingerprint.iter_mut().enumerate() {
+                    *byte = u8::from_str_radix(&encoded[index * 2..index * 2 + 2], 16)
+                        .map_err(|_| EnrollmentError::InvalidPendingState)?;
+                }
+                TlsClient::from_pinned_fingerprint(&config.client.server_name, fingerprint)
+            }
+            None => TlsClient::from_ca_file(
+                &config.client.certificate_authority_file,
+                &config.client.server_name,
+            ),
+        }
+        .map_err(|_| EnrollmentError::Network)?;
+        (tls, config.client.server_addr.clone())
+    };
+    let stream = tokio::time::timeout(ENROLLMENT_TIMEOUT, tls.connect(&address))
+        .await
+        .map_err(|_| EnrollmentError::Network)?
+        .map_err(|_| EnrollmentError::Network)?;
+    let key = if let Some(key) = legacy {
+        key
+    } else {
+        let cert = stream
+            .get_ref()
+            .1
+            .peer_certificates()
+            .and_then(|c| c.first())
+            .ok_or(EnrollmentError::Network)?;
+        EnrollmentKey::for_verified_server(
+            approval
+                .as_ref()
+                .ok_or(EnrollmentError::InvalidFormat)?
+                .purpose,
+            &address,
+            Sha256::digest(cert.as_ref()).into(),
+        )?
+    };
     let pending = if PendingEnrollment::exists(config_path) {
         PendingEnrollment::load(config_path)?
+    } else if approval.is_some() && reuse {
+        PendingEnrollment::create_reusing(config_path, &config.client.private_key_file, &key)?
     } else {
         PendingEnrollment::create(config_path, &config.client.private_key_file, &key)?
     };
@@ -39,19 +132,27 @@ pub async fn enroll(
     {
         return Err(EnrollmentError::InvalidPendingState);
     }
-    let server_name = server_name(key.server_addr())?;
-    let tls = TlsClient::from_pinned_fingerprint(&server_name, *key.certificate_fingerprint())
-        .map_err(|_| EnrollmentError::Network)?;
+    let wire_credential = if let Some(intent) = &approval {
+        let keypair =
+            rustgo_crypto::DeviceKeypair::load_private_file(pending.candidate_private_key())
+                .map_err(|_| EnrollmentError::InvalidPendingState)?;
+        let transcript = rustgo_crypto::AuthTranscript::new(
+            b"rustgo-approval-v1".to_vec(),
+            pending.request_id().as_bytes().to_vec(),
+            1,
+            intent.encode(),
+        );
+        let signature = rustgo_crypto::sign_auth(&keypair, &transcript);
+        format!("{}:{}", intent.encode(), hex(&signature))
+    } else {
+        encoded_key.to_owned()
+    };
     let operation = async {
-        let stream = tls
-            .connect(key.server_addr())
-            .await
-            .map_err(|_| EnrollmentError::Network)?;
         let codec = FrameCodec::new(MAX_PAYLOAD);
         let request = Message::EnrollmentRequest(EnrollmentRequest {
             protocol_version: ENROLLMENT_PROTOCOL_VERSION,
             enrollment_key: BoundedString::<MAX_ENROLLMENT_KEY_BYTES>::try_from(
-                key.encoded().as_str(),
+                wire_credential.as_str(),
             )
             .map_err(|_| EnrollmentError::InvalidFormat)?,
             public_key: BoundedBytes::<MAX_PUBLIC_KEY_BYTES>::try_from(

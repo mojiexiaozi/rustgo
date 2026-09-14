@@ -24,6 +24,10 @@ struct PendingMetadata {
     certificate_fingerprint: String,
     trust_mode: String,
     public_key: String,
+    #[serde(default)]
+    reuse_existing: bool,
+    #[serde(default)]
+    allow_replace: bool,
 }
 
 pub struct PendingEnrollment {
@@ -41,9 +45,27 @@ impl PendingEnrollment {
         final_private_key: &Path,
         key: &EnrollmentKey,
     ) -> Result<Self, EnrollmentError> {
+        Self::create_inner(config_path, final_private_key, key, false)
+    }
+
+    /// Approval requests reuse a valid local key; only missing/invalid keys are generated.
+    pub fn create_reusing(
+        config_path: &Path,
+        final_private_key: &Path,
+        key: &EnrollmentKey,
+    ) -> Result<Self, EnrollmentError> {
+        Self::create_inner(config_path, final_private_key, key, true)
+    }
+
+    fn create_inner(
+        config_path: &Path,
+        final_private_key: &Path,
+        key: &EnrollmentKey,
+        reuse: bool,
+    ) -> Result<Self, EnrollmentError> {
         let metadata_path = metadata_path(config_path);
         if metadata_path.exists()
-            || (key.purpose() == EnrollmentPurpose::Enroll && final_private_key.exists())
+            || (!reuse && key.purpose() == EnrollmentPurpose::Enroll && final_private_key.exists())
         {
             return Err(EnrollmentError::DestinationExists);
         }
@@ -55,9 +77,21 @@ impl PendingEnrollment {
             .map_err(|error| pending_io("create key directory", error))?;
         let candidate_directory =
             final_parent.join(format!(".rustgo-enrollment-pending-{request_id}"));
-        let public_key = rustgo_crypto::generate_key_file(&candidate_directory)
-            .map_err(|_| EnrollmentError::InvalidPendingState)?;
-        let candidate_private_key = candidate_directory.join("device.key");
+        let existing = if reuse {
+            DeviceKeypair::load_private_file(final_private_key).ok()
+        } else {
+            None
+        };
+        let reuse_existing = existing.is_some();
+        let (public_key, candidate_private_key) = if let Some(existing) = existing {
+            (existing.public_key(), final_private_key.to_path_buf())
+        } else {
+            (
+                rustgo_crypto::generate_key_file(&candidate_directory)
+                    .map_err(|_| EnrollmentError::InvalidPendingState)?,
+                candidate_directory.join("device.key"),
+            )
+        };
         let metadata = PendingMetadata {
             format_version: FORMAT_VERSION,
             kind: match key.purpose() {
@@ -72,6 +106,8 @@ impl PendingEnrollment {
             certificate_fingerprint: hex(key.certificate_fingerprint()),
             trust_mode: "pinned".to_owned(),
             public_key: public_key.to_string(),
+            reuse_existing,
+            allow_replace: reuse || key.purpose() == EnrollmentPurpose::ReEnroll,
         };
         write_metadata(&metadata_path, &metadata)?;
         Ok(Self {
@@ -84,8 +120,16 @@ impl PendingEnrollment {
         let metadata_path = metadata_path(config_path);
         let contents =
             fs::read_to_string(&metadata_path).map_err(|error| pending_io("read", error))?;
-        let metadata: PendingMetadata =
+        let mut metadata: PendingMetadata =
             toml::from_str(&contents).map_err(|_| EnrollmentError::InvalidPendingState)?;
+        // Recover a crash after the atomic key move but before metadata cleanup.
+        if !metadata.candidate_private_key.exists()
+            && DeviceKeypair::load_private_file(&metadata.final_private_key)
+                .is_ok_and(|key| key.public_key().to_string() == metadata.public_key)
+        {
+            metadata.candidate_private_key = metadata.final_private_key.clone();
+            metadata.reuse_existing = true;
+        }
         validate_metadata(&metadata)?;
         Ok(Self {
             metadata_path,
@@ -133,10 +177,18 @@ impl PendingEnrollment {
     }
 
     pub fn promote(self) -> Result<(), EnrollmentError> {
-        if self.metadata.final_private_key.exists() {
+        validate_metadata(&self.metadata)?;
+        if self.metadata.reuse_existing {
+            return fs::remove_file(&self.metadata_path)
+                .map_err(|e| pending_io("remove metadata", e));
+        }
+        if self.metadata.final_private_key.exists()
+            && !self.metadata.allow_replace
+            && self.purpose() != EnrollmentPurpose::ReEnroll
+        {
             return Err(EnrollmentError::DestinationExists);
         }
-        fs::rename(
+        atomicwrites::replace_atomic(
             &self.metadata.candidate_private_key,
             &self.metadata.final_private_key,
         )
@@ -154,13 +206,6 @@ impl PendingEnrollment {
     }
 
     pub fn promote_replacing(self) -> Result<(), EnrollmentError> {
-        if self.purpose() != EnrollmentPurpose::ReEnroll {
-            return self.promote();
-        }
-        if self.metadata.final_private_key.exists() {
-            fs::remove_file(&self.metadata.final_private_key)
-                .map_err(|error| pending_io("remove old key", error))?;
-        }
         self.promote()
     }
 }
@@ -175,8 +220,16 @@ fn validate_metadata(metadata: &PendingMetadata) -> Result<(), EnrollmentError> 
         || metadata.request_id.len() != 32
         || metadata.server_addr.is_empty()
         || metadata.certificate_fingerprint.len() != 64
+        || !metadata
+            .certificate_fingerprint
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit())
         || metadata.trust_mode != "pinned"
-        || (metadata.kind == "enroll" && metadata.final_private_key.exists())
+        || (metadata.kind == "enroll"
+            && metadata.final_private_key.exists()
+            && !metadata.reuse_existing
+            && !metadata.allow_replace)
+        || (metadata.reuse_existing && metadata.candidate_private_key != metadata.final_private_key)
     {
         return Err(EnrollmentError::InvalidPendingState);
     }

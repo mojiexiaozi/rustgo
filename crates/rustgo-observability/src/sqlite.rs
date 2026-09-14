@@ -977,7 +977,7 @@ fn worker_reaper() -> Result<mpsc::Sender<thread::JoinHandle<()>>, HistoryWorker
         .spawn(move || {
             while let Ok(worker) = receiver.recv() {
                 if worker.join().is_err() {
-                    tracing::error!("SQLite history worker panicked during reaped shutdown");
+                    tracing::error!("SQLite 历史记录工作线程在回收关闭时发生异常");
                 }
             }
         })
@@ -1179,9 +1179,7 @@ impl HistoryWorker {
                             if !self.shared.history_available.swap(true, Ordering::AcqRel)
                                 && self.shared.history_failures.load(Ordering::Relaxed) > 0
                             {
-                                tracing::info!(
-                                    "SQLite history recovered; persisted metrics are available again"
-                                );
+                                tracing::info!("SQLite 历史记录已恢复，持久化指标重新可用");
                             }
                         } else {
                             self.shared
@@ -1204,7 +1202,7 @@ impl HistoryWorker {
                                 Ok(true) => {
                                     self.shared.recoveries.fetch_add(1, Ordering::Relaxed);
                                     tracing::warn!(
-                                        "SQLite history file was quarantined; a fresh bounded history database will be created"
+                                        "SQLite 历史记录文件已隔离，将创建新的容量受限历史数据库"
                                     );
                                     next_open_attempt = Instant::now();
                                     continue;
@@ -1533,7 +1531,7 @@ impl WarningLimiter {
         self.last_warning = Some(now);
         tracing::warn!(
             error = %error,
-            "SQLite history is unavailable; live observability remains active and history will retry"
+            "SQLite 历史记录不可用，实时监控继续运行，稍后将重试历史记录操作"
         );
     }
 }
@@ -6593,7 +6591,7 @@ fn checkpoint_bounded(connection: &Connection) -> Result<bool, DatabaseError> {
                     | rusqlite::ffi::ErrorCode::DatabaseLocked
             ) =>
         {
-            tracing::warn!("SQLite history checkpoint yielded at its wall-time or lock deadline");
+            tracing::warn!("SQLite 历史记录检查点操作已达到执行时间或锁等待期限，已让出执行");
             return Ok(false);
         }
         Err(error) => return Err(error.into()),
@@ -6603,7 +6601,7 @@ fn checkpoint_bounded(connection: &Connection) -> Result<bool, DatabaseError> {
             busy,
             log_frames,
             checkpointed_frames,
-            "SQLite history passive checkpoint remained busy; size enforcement will retry"
+            "SQLite 历史记录被动检查点仍处于忙碌状态，稍后将重试容量限制操作"
         );
         return Ok(false);
     }

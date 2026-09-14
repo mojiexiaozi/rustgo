@@ -200,15 +200,12 @@ impl ChildSessionSupervisor for UdpSessionSupervisor {
             let limits = match NegotiatedUdpLimits::try_from(&request) {
                 Ok(limits) => limits,
                 Err(error) => {
-                    tracing::warn!(tunnel_id = request.tunnel_id, error = %safe_display(&error), "invalid negotiated UDP limits");
+                    tracing::warn!(tunnel_id = request.tunnel_id, error = %safe_display(&error), "协商得到的 UDP 限制参数无效");
                     return;
                 }
             };
             let Ok(permit) = permits.try_acquire_owned() else {
-                tracing::warn!(
-                    tunnel_id = request.tunnel_id,
-                    "UDP channel admission limit reached"
-                );
+                tracing::warn!(tunnel_id = request.tunnel_id, "已达到 UDP 通道准入上限");
                 return;
             };
             let Some(target) = local_targets.get(&request.tunnel_id).cloned() else {
@@ -229,11 +226,11 @@ impl ChildSessionSupervisor for UdpSessionSupervisor {
                 result = tokio::time::timeout(UDP_SETUP_TIMEOUT, setup) => match result {
                     Ok(Ok(data)) => data,
                     Ok(Err(error)) => {
-                        tracing::warn!(tunnel_id = request.tunnel_id, error = %safe_display(&error), "UDP data setup failed");
+                        tracing::warn!(tunnel_id = request.tunnel_id, error = %safe_display(&error), "UDP 数据通道建立失败");
                         return;
                     }
                     Err(_) => {
-                        tracing::warn!(tunnel_id = request.tunnel_id, "UDP data setup timed out");
+                        tracing::warn!(tunnel_id = request.tunnel_id, "UDP 数据通道建立超时");
                         return;
                     }
                 },
@@ -246,7 +243,7 @@ impl ChildSessionSupervisor for UdpSessionSupervisor {
                 idle_timeout_millis = request.idle_timeout_millis,
                 max_payload_bytes = request.max_payload_bytes,
                 queue_capacity = request.queue_capacity,
-                "event=udp_channel_ready client UDP data channel ready"
+                "event=udp_channel_ready 客户端 UDP 数据通道已就绪"
             );
             if let Err(error) = relay_local_datagrams(
                 data,
@@ -265,7 +262,7 @@ impl ChildSessionSupervisor for UdpSessionSupervisor {
                     tunnel_id = request.tunnel_id,
                     channel_id = request.channel_id,
                     error = %safe_display(&error),
-                    "UDP local relay ended"
+                    "UDP 本地中继已结束"
                 );
             }
             drop(permit);
@@ -495,12 +492,7 @@ impl UdpMetrics {
     fn record_drop(counter: &AtomicU64, tunnel_id: u32, reason: &'static str) {
         let total = counter.fetch_add(1, Ordering::Relaxed).saturating_add(1);
         if total == 1 || total.is_power_of_two() {
-            tracing::warn!(
-                tunnel_id,
-                reason,
-                total,
-                "event=udp_drop UDP datagram dropped"
-            );
+            tracing::warn!(tunnel_id, reason, total, "event=udp_drop UDP 数据报已丢弃");
         }
     }
 }
@@ -584,7 +576,7 @@ async fn relay_local_datagrams(
                 )?;
                 if expired != 0 {
                     metrics.sessions.store(sessions.sessions.len(), Ordering::Release);
-                    tracing::debug!(tunnel_id, generation, expired, sessions = sessions.sessions.len(), "event=udp_idle_sweep expired local UDP sessions");
+                    tracing::debug!(tunnel_id, generation, expired, sessions = sessions.sessions.len(), "event=udp_idle_sweep 已清理超时的本地 UDP 会话");
                 }
             }
             joined = local_tasks.join_next(), if !local_tasks.is_empty() => {
@@ -595,7 +587,7 @@ async fn relay_local_datagrams(
                 sessions.remove_if_lease(session_id, lease);
                 metrics.sessions.store(sessions.sessions.len(), Ordering::Release);
                 if let Err(error) = result {
-                    tracing::warn!(tunnel_id, session_id, error = %safe_display(&error), "event=udp_session_end local UDP session ended");
+                    tracing::warn!(tunnel_id, session_id, error = %safe_display(&error), "event=udp_session_end 本地 UDP 会话已结束");
                 }
             }
             frame = reader.receive() => {
@@ -622,7 +614,7 @@ async fn relay_local_datagrams(
                             session_id = retired.session_id,
                             removed,
                             sessions = sessions.sessions.len(),
-                            "event=udp_session_retired server retired local UDP flow"
+                            "event=udp_session_retired 服务端已关闭本地 UDP 数据流"
                         );
                         continue;
                     }
@@ -699,7 +691,7 @@ async fn relay_local_datagrams(
                         tunnel = %safe_display(&tunnel_name),
                         conn = %short_id(datagram.session_id),
                         event = %"udp_session_open",
-                        "UDP local relay session opened"
+                        "UDP 本地中继会话已开启"
                     );
                 }
                 let Some(session) = sessions.sessions.get_mut(&datagram.session_id) else {
@@ -753,7 +745,7 @@ async fn relay_local_datagrams(
         drops_session_queue = metrics.session_queue_drops.load(Ordering::Relaxed),
         drops_sessions = metrics.session_limit_drops.load(Ordering::Relaxed),
         drops_invalid = metrics.invalid_drops.load(Ordering::Relaxed),
-        "event=udp_cleanup client UDP relay state released"
+        "event=udp_cleanup 客户端 UDP 中继状态已释放"
     );
     result
 }

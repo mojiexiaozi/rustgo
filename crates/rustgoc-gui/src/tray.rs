@@ -21,7 +21,10 @@ pub mod platform {
     }
 
     impl TrayIcon {
-        pub fn new(event_tx: mpsc::SyncSender<TrayEvent>) -> anyhow::Result<Self> {
+        pub fn new(
+            event_tx: mpsc::SyncSender<TrayEvent>,
+            ctx: eframe::egui::Context,
+        ) -> anyhow::Result<Self> {
             let menu = Menu::new();
 
             let show_item = MenuItem::with_id("1", "显示", true, None);
@@ -36,21 +39,33 @@ pub mod platform {
 
             let tray = TrayIconBuilder::new()
                 .with_menu(Box::new(menu))
+                .with_icon(rustgo_icon()?)
                 .with_tooltip("Rustgo 客户端")
                 .build()?;
 
-            let menu_rx = MenuEvent::receiver();
             let tx_clone = event_tx.clone();
-
-            std::thread::spawn(move || {
-                while let Ok(event) = menu_rx.recv() {
-                    if let Ok(id_str) = event.id().0.parse::<u32>()
-                        && let Some(tray_event) = crate::tray_events::decode_menu_id(id_str)
-                    {
-                        let _ = tx_clone.send(tray_event);
-                    }
+            let menu_ctx = ctx.clone();
+            MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+                if let Ok(id) = event.id().0.parse::<u32>()
+                    && let Some(event) = crate::tray_events::decode_menu_id(id)
+                {
+                    let _ = tx_clone.try_send(event);
+                    menu_ctx.request_repaint();
                 }
-            });
+            }));
+            let tx_clone = event_tx.clone();
+            tray_icon::TrayIconEvent::set_event_handler(Some(move |event| {
+                if matches!(
+                    event,
+                    tray_icon::TrayIconEvent::DoubleClick {
+                        button: tray_icon::MouseButton::Left,
+                        ..
+                    }
+                ) {
+                    let _ = tx_clone.try_send(TrayEvent::Show);
+                    ctx.request_repaint();
+                }
+            }));
 
             Ok(Self {
                 _tray: tray,
@@ -61,6 +76,27 @@ pub mod platform {
                 _quit_item: quit_item,
             })
         }
+    }
+
+    fn rustgo_icon() -> anyhow::Result<tray_icon::Icon> {
+        // White R on blue, rendered at native tray resolution.
+        let glyph = [
+            0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001,
+        ];
+        let mut rgba = Vec::with_capacity(32 * 32 * 4);
+        for y in 0..32 {
+            for x in 0..32 {
+                let white = (8..23).contains(&x)
+                    && (5..26).contains(&y)
+                    && glyph[(y - 5) / 3] & (1 << (4 - (x - 8) / 3)) != 0;
+                rgba.extend_from_slice(if white {
+                    &[255, 255, 255, 255]
+                } else {
+                    &[30, 100, 210, 255]
+                });
+            }
+        }
+        Ok(tray_icon::Icon::from_rgba(rgba, 32, 32)?)
     }
 }
 

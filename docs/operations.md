@@ -27,13 +27,16 @@ The GUI client (`rustgoc-gui`) provides real-time monitoring with bounded resour
 
 ## CLI flags
 
-Both `rustgoc` and `rustgoc-gui` accept:
-- `-c <path>` or `--config <path>`: Specify configuration file (default: `./client.toml`)
-- `keygen -o <directory>`: Generate device keypair
-- `check -c <path>`: Validate configuration without connecting
+Both clients read `client.toml` beside their executable and reject `-c`/`--config`.
 
-`rustgoc-gui` additionally supports:
-- `--selfcheck`: Validate configuration and connectivity, then exit 0 on success
+`rustgoc` supports:
+- `keygen -o <directory>`: Generate a device keypair for static authorization
+- `check`: Validate adjacent configuration and existing credentials without connecting
+- `enroll`: Request access and wait for administrator approval
+- `re-enroll`: Request access again using the existing key
+- `re-enroll --confirm-replace-key`: Request a new key, retaining the old one until approval
+
+`rustgoc-gui` supports `--selfcheck` to validate configuration and connectivity with an already authorized device, then exit 0 on success. Key generation and enrollment commands belong to the CLI; interactive GUI enrollment is automatic.
 
 The selfcheck mode:
 - Loads and validates configuration
@@ -44,7 +47,7 @@ The selfcheck mode:
 
 Use selfcheck for automated validation:
 ```text
-rustgoc-gui --selfcheck -c ./client.toml
+rustgoc-gui --selfcheck
 ```
 
 ## Create the TLS identity
@@ -82,12 +85,12 @@ supported, but V0.1 still requires the explicit CA bundle path.
 
 ## Create and authorize a device
 
-Run key generation on the client host:
+For approval-based access, enable server enrollment and authenticated Web management, configure a unique client name and verified TLS trust, then start the client. It generates a key when needed and waits for the administrator to approve its public-key fingerprint. Requests survive restart. Update both server and clients for this flow; back up the enrollment database before its schema version 4 migration. Do not downgrade the migrated database directly.
+
+For static authorization, run key generation on the client host:
 
 ```text
 rustgoc keygen -o ./keys
-# or with the GUI client:
-rustgoc-gui keygen -o ./keys
 ```
 
 This creates `device.key` and `device.pub` without overwriting an existing
@@ -153,21 +156,19 @@ open a socket, resolve the peer, or contact the server:
 
 ```text
 rustgos check -c C:\rustgo\server.toml
-rustgoc check -c C:\rustgo\client.toml
+C:\rustgo\rustgoc.exe check
 rustgos check -c /etc/rustgo/server.toml
-rustgoc check -c /etc/rustgo/client.toml
+/opt/rustgo/rustgoc check
 ```
 
-An explicit `-c` or `--config` selects exactly that file. With no arguments,
-the current directory must contain the conventional filename:
+The server accepts `-c` or `--config`; with no arguments it reads `server.toml` in the current directory. Clients always read `client.toml` beside their executable (in `/opt/rustgo` for the Linux example above):
 
 ```text
 rustgos              == rustgos -c ./server.toml
-rustgoc              == rustgoc -c ./client.toml
+rustgoc              # executable-adjacent client.toml
 ```
 
-There is no `run` subcommand. Missing configuration, key, certificate, or CA
-files are fatal; Rustgo does not search parent directories or generate them.
+There is no `run` subcommand. The CLI requires configuration and configured TLS trust files; normal startup generates missing or damaged device keys for approval. `check` requires existing credentials. Configuration is not searched in parent directories.
 
 ## Firewall and routing
 
@@ -243,7 +244,7 @@ PowerShell:
 
 ```text
 $env:RUST_LOG = "rustgoc=debug,rustgo_transport=info"
-.\rustgoc.exe -c C:\rustgo\client.toml
+C:\rustgo\rustgoc.exe
 ```
 
 Use `debug` or `trace` temporarily because they are verbose. Logs may contain
@@ -318,6 +319,8 @@ docker compose config --quiet
 docker compose up -d
 docker compose logs -f
 ```
+
+The client Compose template mounts `client.toml` beside `/app/rustgoc` and is intended for an already authorized device with provisioned credentials. Automatic enrollment requires a writable executable/configuration directory and writable key storage; the read-only template cannot persist approval requests or key replacements.
 
 Stop it with `docker compose down`. The Compose service uses host networking,
 so Docker publishes no ports on its behalf. Configure the host firewall for

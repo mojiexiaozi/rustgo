@@ -192,7 +192,7 @@ listen_addr = "127.0.0.1:{udp_forward}"
     children.0.push(spawn("rustgoc", &provider_config)?);
     wait_for_log(
         &provider_config.with_extension("log"),
-        "client tunnel registration ready",
+        "客户端隧道注册已就绪",
         1,
     )
     .await?;
@@ -228,7 +228,7 @@ listen_addr = "127.0.0.1:{udp_forward}"
         wait_for_log_pair(
             &consumer_config.with_extension("log"),
             &provider_config.with_extension("log"),
-            "fresh direct path promoted for subsequent service opens",
+            "新直连路径已启用，供后续服务连接使用",
             1,
         )
         .await?;
@@ -266,7 +266,7 @@ listen_addr = "127.0.0.1:{udp_forward}"
         wait_for_log_pair(
             &consumer_config.with_extension("log"),
             &provider_config.with_extension("log"),
-            "fresh direct path promoted for subsequent service opens",
+            "新直连路径已启用，供后续服务连接使用",
             2,
         )
         .await?;
@@ -298,11 +298,11 @@ listen_addr = "127.0.0.1:{udp_forward}"
         let provider_log = fs::read_to_string(provider_config.with_extension("log"))?;
         let server_log = fs::read_to_string(server_config.with_extension("log"))?;
         assert!(
-            consumer_log.contains("authenticated NAT observation candidates ready"),
+            consumer_log.contains("已认证的 NAT 探测候选地址已就绪"),
             "consumer log did not record observation success:\n{consumer_log}"
         );
         assert!(
-            consumer_log.contains("fresh direct path promoted for subsequent service opens"),
+            consumer_log.contains("新直连路径已启用，供后续服务连接使用"),
             "direct promotion missing:\nCONSUMER\n{consumer_log}\nPROVIDER\n{provider_log}\nSERVER\n{server_log}"
         );
         let flows = selected_flows(&consumer_log);
@@ -445,9 +445,7 @@ struct SelectedFlow {
 
 fn selected_flows(log: &str) -> Vec<SelectedFlow> {
     log.lines()
-        .filter(|line| {
-            line.contains("peer service flow") && line.contains("lifecycle=\"selected\"")
-        })
+        .filter(|line| line.contains("对端服务流") && line.contains("lifecycle=\"selected\""))
         .filter_map(|line| {
             Some(SelectedFlow {
                 session_id: log_field(line, "session_id")?,
@@ -522,12 +520,23 @@ fn spawn(package: &str, config: &Path) -> Result<Child, Box<dyn Error + Send + S
         "rustgoc" => client_binary_path()?,
         _ => return Err(format!("unsupported process fixture `{package}`").into()),
     };
-    let mut command = Command::new(binary);
+    let mut command = if package == "rustgoc" {
+        let directory = config.with_extension("runtime");
+        fs::create_dir_all(&directory)?;
+        let local_binary = directory.join(binary.file_name().ok_or("binary has no name")?);
+        if !local_binary.exists() && fs::hard_link(&binary, &local_binary).is_err() {
+            fs::copy(&binary, &local_binary)?;
+        }
+        fs::copy(config, directory.join("client.toml"))?;
+        Command::new(local_binary)
+    } else {
+        let mut command = Command::new(binary);
+        command.arg("-c").arg(config);
+        command
+    };
     let log = fs::File::create(config.with_extension("log"))?;
     command
         .current_dir(config.parent().ok_or("configuration has no parent")?)
-        .arg("-c")
-        .arg(config)
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
     if package == "rustgoc" {

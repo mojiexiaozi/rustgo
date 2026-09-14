@@ -49,7 +49,7 @@ fn default_config() -> ClientConfig {
     ClientConfig {
         client: rustgo_config::ClientSection {
             name: "gui-client".into(),
-            identity_mode: Some(IdentityMode::Dynamic),
+            identity_mode: None,
             server_addr: "8.133.176.172:8443".into(),
             server_name: "8.133.176.172".into(),
             certificate_authority_file: "server-cert.pem".into(),

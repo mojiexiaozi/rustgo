@@ -9,6 +9,68 @@ use rustgoc::{
     EnrollmentKey, EnrollmentPurpose, EnrollmentState, PendingEnrollment,
     classify_enrollment_state, enroll, recover_pending_enrollment,
 };
+
+#[test]
+fn approval_reuses_existing_key_and_request_survives_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let key_dir = directory.path().join("keys");
+    rustgo_crypto::generate_key_file(&key_dir).unwrap();
+    let private = key_dir.join("device.key");
+    let original = std::fs::read(&private).unwrap();
+    let config_path = directory.path().join("client.toml");
+    let encoded = encoded_key(1, "server.example:7443", [3; 32], [4; 32]);
+    let key = EnrollmentKey::parse(&encoded).unwrap();
+    let pending = PendingEnrollment::create_reusing(&config_path, &private, &key).unwrap();
+    let request_id = pending.request_id().to_owned();
+    let public = pending.public_key().to_owned();
+    drop(pending);
+    let reloaded = PendingEnrollment::load(&config_path).unwrap();
+    assert_eq!(reloaded.request_id(), request_id);
+    assert_eq!(reloaded.public_key(), public);
+    reloaded.promote().unwrap();
+    assert_eq!(std::fs::read(private).unwrap(), original);
+}
+
+#[test]
+fn corrupt_default_identity_requests_approval_instead_of_stopping() {
+    let directory = tempfile::tempdir().unwrap();
+    let private = directory.path().join("device.key");
+    std::fs::write(&private, "damaged").unwrap();
+    let config = client_config(private, None);
+    assert_eq!(
+        rustgoc::classify_enrollment_state(&config, &directory.path().join("client.toml")).unwrap(),
+        EnrollmentState::ReRegistrationRequired
+    );
+}
+
+#[test]
+fn pending_recovers_after_key_move_before_metadata_cleanup() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("client.toml");
+    let private = dir.path().join("device.key");
+    let key =
+        EnrollmentKey::parse(&encoded_key(1, "server.example:7443", [3; 32], [4; 32])).unwrap();
+    PendingEnrollment::create_reusing(&config_path, &private, &key).unwrap();
+    let metadata: toml::Value = toml::from_str(
+        &std::fs::read_to_string(config_path.with_extension("enrollment-pending.toml")).unwrap(),
+    )
+    .unwrap();
+    std::fs::rename(
+        metadata["candidate_private_key"].as_str().unwrap(),
+        &private,
+    )
+    .unwrap();
+    PendingEnrollment::load(&config_path)
+        .unwrap()
+        .promote()
+        .unwrap();
+    assert!(private.exists());
+    assert!(
+        !config_path
+            .with_extension("enrollment-pending.toml")
+            .exists()
+    );
+}
 use rustgos::{
     ServerApp,
     enrollment::{DynamicClientStore, EnrollmentStoreLimits},

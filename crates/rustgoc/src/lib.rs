@@ -2,6 +2,8 @@
 
 //! Rustgo private-network client runtime.
 
+pub use rustgo_protocol::EnrollmentErrorCode;
+
 mod app;
 mod control;
 mod enrollment;
@@ -21,7 +23,9 @@ pub use control::{
 };
 pub use enrollment::{
     EnrollmentCompletion, EnrollmentError, EnrollmentKey, EnrollmentPurpose, EnrollmentState,
-    PendingEnrollment, classify_enrollment_state, enroll, recover_pending_enrollment,
+    PendingEnrollment, classify_enrollment_state, client_config_path, enroll,
+    recover_pending_enrollment, request_key_rotation, request_registration, run_managed_client,
+    wait_for_registration,
 };
 pub use exports::{AuthorizedExport, ExportError, ExportRegistry, PeerOpenRequest, PeerOpenResult};
 pub use forwards::{

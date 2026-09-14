@@ -105,18 +105,18 @@ async fn run_listener(
             () = cancellation.cancelled() => break,
             joined = connections.join_next(), if !connections.is_empty() => {
                 if joined.is_some_and(|result| result.is_err()) {
-                    tracing::warn!(tunnel = %safe_display(&tunnel_name), "TCP relay task failed to join");
+                    tracing::warn!(tunnel = %safe_display(&tunnel_name), "等待 TCP 中继任务结束失败");
                 }
             }
             accepted = listener.accept() => {
                 let Ok((public, peer)) = accepted else {
                     if !cancellation.is_cancelled() {
-                        tracing::warn!(tunnel = %safe_display(&tunnel_name), "TCP public listener failed");
+                        tracing::warn!(tunnel = %safe_display(&tunnel_name), "TCP 公网监听器失败");
                     }
                     break;
                 };
                 let Ok(permit) = permits.clone().try_acquire_owned() else {
-                    tracing::warn!(tunnel = %safe_display(&tunnel_name), peer = %safe_display(peer), "TCP tunnel connection limit reached");
+                    tracing::warn!(tunnel = %safe_display(&tunnel_name), peer = %safe_display(peer), "已达到 TCP 隧道连接数上限");
                     drop(public);
                     continue;
                 };
@@ -146,7 +146,7 @@ async fn relay_public_connection(
     let pending = match runtime.prepare_tcp(tunnel_id) {
         Ok(pending) => pending,
         Err(error) => {
-            tracing::warn!(tunnel = %safe_display(&tunnel_name), peer = %safe_display(peer), error = %safe_display(&error), "TCP binding allocation failed");
+            tracing::warn!(tunnel = %safe_display(&tunnel_name), peer = %safe_display(peer), error = %safe_display(&error), "TCP 绑定分配失败");
             return;
         }
     };
@@ -188,7 +188,7 @@ async fn relay_public_connection(
         conn = %short_id(connection_id),
         event = %"tcp_open"
     );
-    tracing::info!(parent: &connection, peer = %safe_display(peer), "TCP relay connected");
+    tracing::info!(parent: &connection, peer = %safe_display(peer), "TCP 中继已连接");
     let result = if runtime.observability_enabled() {
         relay_observed_connection(
             &mut public,
@@ -209,7 +209,7 @@ async fn relay_public_connection(
         .await
     };
     if let Err(error) = result {
-        tracing::debug!(parent: &connection, peer = %safe_display(peer), error = %safe_display(&error), "TCP relay ended");
+        tracing::debug!(parent: &connection, peer = %safe_display(peer), error = %safe_display(&error), "TCP 中继已结束");
     }
 }
 

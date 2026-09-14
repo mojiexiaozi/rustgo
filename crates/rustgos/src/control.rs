@@ -243,7 +243,7 @@ pub(crate) async fn serve_connection(
                     client = %safe_display(guard.identity().name()),
                     fingerprint = %safe_display(short_fingerprint(guard.identity().fingerprint())),
                     event = %"auth_ok",
-                    "client authenticated"
+                    "客户端认证成功"
                 );
             } else if AUTH_FAILURE_LOG
                 .get_or_init(|| EventRateLimit::new(AUTH_FAILURE_LOG_INTERVAL))
@@ -253,7 +253,7 @@ pub(crate) async fn serve_connection(
                     client = %safe_display(&claimed_client),
                     fingerprint = %safe_display(&claimed_fingerprint),
                     event = %"auth_failed",
-                    "client authentication rejected"
+                    "客户端认证被拒绝"
                 );
             }
             let result = Message::AuthResult(AuthResult {
@@ -344,6 +344,26 @@ where
         }
     };
     let enrollment_key = request.enrollment_key.as_str().to_owned();
+    let approval = rustgo_protocol::RegistrationIntent::decode(&enrollment_key).ok();
+    if let Some(intent) = &approval {
+        let transcript = rustgo_crypto::AuthTranscript::new(
+            b"rustgo-approval-v1".to_vec(),
+            request.request_id.as_str().as_bytes().to_vec(),
+            1,
+            intent.encode(),
+        );
+        if !intent.signature.as_ref().is_some_and(|proof| {
+            rustgo_crypto::verify_auth(&public_key, &transcript, proof).is_ok()
+        }) {
+            framed
+                .send(
+                    negotiated,
+                    enrollment_failure(EnrollmentErrorCode::InvalidKey),
+                )
+                .await?;
+            return Ok(false);
+        }
+    }
     let reenrollment = rustgo_protocol::EnrollmentKeyMaterial::decode(&enrollment_key)
         .is_ok_and(|key| key.purpose() == rustgo_protocol::EnrollmentPurpose::ReEnroll);
     let request_id = request.request_id.as_str().to_owned();
@@ -351,6 +371,15 @@ where
     let result = tokio::time::timeout_at(
         deadline,
         tokio::task::spawn_blocking(move || {
+            if let Some(intent) = approval {
+                return management.store.request_approval(
+                    &intent.client_name,
+                    intent.purpose,
+                    &public_key,
+                    &request_id,
+                    std::time::SystemTime::now(),
+                );
+            }
             management.store.consume_token(
                 &enrollment_key,
                 &public_key,
@@ -379,6 +408,10 @@ where
                 true,
             )
         }
+        Ok(Ok(Err(EnrollmentStoreError::ApprovalPending))) => (
+            enrollment_failure(EnrollmentErrorCode::PendingApproval),
+            true,
+        ),
         Ok(Ok(Err(error))) => (enrollment_failure(map_enrollment_error(&error)), false),
         Ok(Err(_)) | Err(_) => (enrollment_failure(EnrollmentErrorCode::Unavailable), false),
     };
@@ -400,6 +433,8 @@ fn enrollment_failure(error: EnrollmentErrorCode) -> Message {
 
 fn map_enrollment_error(error: &EnrollmentStoreError) -> EnrollmentErrorCode {
     match error {
+        EnrollmentStoreError::ApprovalPending => EnrollmentErrorCode::PendingApproval,
+        EnrollmentStoreError::ApprovalRejected => EnrollmentErrorCode::ApprovalRejected,
         EnrollmentStoreError::TokenExpired => EnrollmentErrorCode::Expired,
         EnrollmentStoreError::TokenAlreadyUsed => EnrollmentErrorCode::AlreadyUsed,
         EnrollmentStoreError::PurposeMismatch => EnrollmentErrorCode::PurposeMismatch,
@@ -491,7 +526,7 @@ where
         protocol_major = negotiated.major,
         protocol_minor = negotiated.minor,
         local_protocol_minor = runtime.version.minor,
-        "event=registration_ready server tunnel registration ready"
+        "event=registration_ready 服务端隧道注册已就绪"
     );
     run_active_control(framed, guard, state, negotiated, outbound_rx, runtime).await
 }
@@ -668,7 +703,7 @@ where
                                     sender = guard.identity().name(),
                                     reason = "malformed_frame",
                                     event = "peer_relay_frame_rejected",
-                                    "peer relay frame rejected"
+                                    "对端中继帧被拒绝"
                                 );
                                 Err(ControlError::InvalidState)
                             }

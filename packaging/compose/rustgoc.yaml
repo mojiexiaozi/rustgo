@@ -8,8 +8,8 @@ services:
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
     working_dir: /
-    command: [/app/rustgoc, -c, /config/client.toml]
+    command: [/app/rustgoc]
     volumes:
       - ./rustgoc:/app/rustgoc:ro
-      - ./client.toml:/config/client.toml:ro
+      - ./client.toml:/app/client.toml:ro
       - ./secrets:/run/secrets:ro

@@ -1153,7 +1153,17 @@ fn oversized_reverse_replies_do_not_refresh_the_client_lease() -> TestResult {
     socket.send_to(b"start", fixture.public_address())?;
 
     client.wait_for_line("reason=\"oversize_local_reply\"", Duration::from_secs(2))?;
-    let expired = client.wait_for_line("event=udp_idle_sweep", Duration::from_millis(600))?;
+    // Drop reporting and the idle sweep are independent tasks. Waiting for the
+    // drop may already consume the sweep line, so inspect captured output first.
+    let expired = match client
+        .output()
+        .lines()
+        .find(|line| line.contains("event=udp_idle_sweep"))
+        .map(str::to_owned)
+    {
+        Some(line) => line,
+        None => client.wait_for_line("event=udp_idle_sweep", Duration::from_millis(600))?,
+    };
     assert!(expired.contains("sessions=0"), "{expired}");
 
     client.terminate()?;

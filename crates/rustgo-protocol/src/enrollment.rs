@@ -9,6 +9,66 @@ const MAX_ENCODED_BYTES: usize = 512;
 const SECRET_BYTES: usize = 32;
 const CHECKSUM_HEX_BYTES: usize = 8;
 
+#[derive(Debug)]
+pub struct RegistrationIntent {
+    pub client_name: String,
+    pub purpose: EnrollmentPurpose,
+    pub signature: Option<[u8; 64]>,
+}
+
+impl RegistrationIntent {
+    pub fn new(client_name: &str, purpose: EnrollmentPurpose) -> Result<Self, EnrollmentKeyError> {
+        if client_name.is_empty()
+            || client_name.len() > 64
+            || !client_name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        {
+            return Err(EnrollmentKeyError::InvalidFormat);
+        }
+        Ok(Self {
+            client_name: client_name.to_owned(),
+            purpose,
+            signature: None,
+        })
+    }
+    pub fn encode(&self) -> String {
+        let kind = if self.purpose == EnrollmentPurpose::Enroll {
+            "enroll"
+        } else {
+            "reenroll"
+        };
+        format!("rustgo-approval-v1.{kind}.{}", self.client_name)
+    }
+    pub fn decode(encoded: &str) -> Result<Self, EnrollmentKeyError> {
+        let (encoded, signature) = if let Some((intent, proof)) = encoded.split_once(':') {
+            if proof.len() != 128 || !proof.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(EnrollmentKeyError::InvalidFormat);
+            }
+            let mut signature = [0u8; 64];
+            for (index, byte) in signature.iter_mut().enumerate() {
+                *byte = u8::from_str_radix(&proof[index * 2..index * 2 + 2], 16)
+                    .map_err(|_| EnrollmentKeyError::InvalidFormat)?;
+            }
+            (intent, Some(signature))
+        } else {
+            (encoded, None)
+        };
+        let (purpose, name) = encoded
+            .strip_prefix("rustgo-approval-v1.")
+            .and_then(|s| s.split_once('.'))
+            .ok_or(EnrollmentKeyError::InvalidFormat)?;
+        let purpose = match purpose {
+            "enroll" => EnrollmentPurpose::Enroll,
+            "reenroll" => EnrollmentPurpose::ReEnroll,
+            _ => return Err(EnrollmentKeyError::InvalidPurpose),
+        };
+        let mut result = Self::new(name, purpose)?;
+        result.signature = signature;
+        Ok(result)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EnrollmentPurpose {
     Enroll,

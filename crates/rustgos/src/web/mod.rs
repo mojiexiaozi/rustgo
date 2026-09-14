@@ -603,7 +603,11 @@ async fn protect_management_writes(
 ) -> Response {
     let guarded = request.method() == Method::POST
         && (request.uri().path() == "/api/v1/clients"
-            || request.uri().path().starts_with("/api/v1/clients/"));
+            || request.uri().path().starts_with("/api/v1/clients/")
+            || request
+                .uri()
+                .path()
+                .starts_with("/api/v1/registration-requests/"));
     if !guarded {
         return next.run(request).await;
     }
@@ -874,6 +878,110 @@ mod management_tests {
     use axum::http::Request as HttpRequest;
     use rustgo_crypto::DeviceKeypair;
     use rustgo_protocol::{EnrollmentKeyMaterial, EnrollmentPurpose};
+
+    #[tokio::test]
+    async fn registration_review_requires_login_and_csrf_and_binds_only_on_approval() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            DynamicClientStore::open(
+                directory.path().join("db"),
+                crate::enrollment::EnrollmentStoreLimits {
+                    max_active_clients: 4,
+                    max_tokens: 4,
+                },
+            )
+            .unwrap(),
+        );
+        let public = DeviceKeypair::from_secret_bytes([5; 32]).public_key();
+        let _ = store.request_approval(
+            "Automatic.Node",
+            EnrollmentPurpose::Enroll,
+            &public,
+            "approval-1",
+            std::time::SystemTime::now(),
+        );
+        let (observability, sink, worker) = ObservabilityStore::new();
+        drop(sink);
+        drop(worker);
+        let authentication =
+            AuthenticationState::new("admin", "password", &WebRuntimeLimits::default()).unwrap();
+        let token = authentication.issue_session().unwrap();
+        let cookie = format!("{SESSION_COOKIE_NAME}={token}");
+        let csrf = authentication.csrf_for_cookie(Some(&cookie)).unwrap();
+        let state = Arc::new(WebState {
+            authentication,
+            expected_origin: WebOrigin::parse("http://127.0.0.1:8080").unwrap(),
+            cookie_secure: false,
+            body_read_timeout: Duration::from_secs(1),
+            observability,
+            history: None,
+            enrollment: Some(EnrollmentManagement::new(
+                store.clone(),
+                "server.example:7443".into(),
+                [7; 32],
+                Duration::from_secs(300),
+            )),
+            operations: OperationLedger::new(16),
+        });
+        let router = build_router(state);
+        let list = HttpRequest::builder()
+            .uri("/api/v1/registration-requests")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            router.clone().oneshot(list).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        for include_cookie in [false, true] {
+            let mut request = HttpRequest::builder()
+                .method("POST")
+                .uri("/api/v1/registration-requests/approval-1")
+                .header("host", "127.0.0.1:8080")
+                .header("origin", "http://127.0.0.1:8080")
+                .header("content-type", "application/json");
+            if include_cookie {
+                request = request.header("cookie", &cookie);
+            }
+            let response = router
+                .clone()
+                .oneshot(request.body(Body::from(r#"{"approve":true}"#)).unwrap())
+                .await
+                .unwrap();
+            assert!(matches!(
+                response.status(),
+                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+            ));
+            assert!(store.list_clients().unwrap().is_empty());
+        }
+        let list = HttpRequest::builder()
+            .uri("/api/v1/registration-requests")
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap();
+        let response = router.clone().oneshot(list).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let list: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(list["items"][0]["client_id"], "Automatic.Node");
+        for _ in 0..2 {
+            let request = HttpRequest::builder()
+                .method("POST")
+                .uri("/api/v1/registration-requests/approval-1")
+                .header("host", "127.0.0.1:8080")
+                .header("origin", "http://127.0.0.1:8080")
+                .header("content-type", "application/json")
+                .header("cookie", &cookie)
+                .header("x-rustgo-csrf-token", &csrf)
+                .body(Body::from(r#"{"approve":true}"#))
+                .unwrap();
+            assert_eq!(
+                router.clone().oneshot(request).await.unwrap().status(),
+                StatusCode::OK
+            );
+        }
+        assert_eq!(store.list_clients().unwrap().len(), 1);
+        assert_eq!(store.list_clients().unwrap()[0].revision(), 1);
+    }
 
     #[tokio::test]
     async fn create_client_returns_one_time_key_without_internal_identity() {

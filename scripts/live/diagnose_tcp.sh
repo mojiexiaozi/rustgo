@@ -27,7 +27,7 @@ fi
 assert_tcp_payload "tcp-native-${run}"
 payload_status=$?
 sleep 1
-grep -Fq 'authoritative peer path selected path=NativeTcp' "$RG_STATE_DIR/consumer.log"
+grep -Fq '已确定对端通信路径 path=NativeTcp' "$RG_STATE_DIR/consumer.log"
 path_status=$?
 for ns in "$RG_CLIENT_A_NS" "$RG_CLIENT_B_NS" "$RG_NAT_A_NS" "$RG_NAT_B_NS"; do
     ip netns exec "$ns" ss -tanop >"$out/${ns}.ss" 2>&1 || true

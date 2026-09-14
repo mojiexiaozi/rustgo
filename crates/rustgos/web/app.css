@@ -44,6 +44,10 @@ input, select { min-height: 2.25rem; padding: .4rem .55rem; color: var(--text); 
 @media (max-width: 760px) { .site-header { flex-wrap: wrap; }.connection-status { margin-left: 0; }.view-heading, .section-heading { align-items: start; flex-direction: column; }.metric-grid, .chart-grid, .detail-grid, .client-grid { grid-template-columns: 1fr; }.client-controls { align-items: stretch; width: 100%; }.client-controls input, .client-controls select, .client-controls button { width: 100%; }.filter-bar label { width: 100%; }.filter-bar input, .filter-bar select { width: 100%; } }
 
 .button-danger { background: #b42318; color: #fff; }
+.filter-bar { align-items: flex-end; }
 dialog { max-width: min(720px, 90vw); border: 1px solid var(--border); border-radius: 12px; background: var(--surface); color: var(--text); }
 dialog::backdrop { background: rgb(0 0 0 / 60%); }
 #secret-value { width: min(640px, 80vw); font-family: ui-monospace, monospace; overflow-wrap: anywhere; }
+
+.approval-item { padding: 16px 0; border-bottom: 1px solid #d8dee7; }
+.approval-fingerprint { overflow-wrap: anywhere; font-family: monospace; }

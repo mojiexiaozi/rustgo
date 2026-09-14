@@ -47,8 +47,9 @@ pub fn classify_enrollment_state(
             if !key_exists {
                 return Ok(EnrollmentState::RegistrationRequired);
             }
-            DeviceKeypair::load_private_file(private_key)
-                .map_err(|_| EnrollmentError::InvalidStaticPrivateKey)?;
+            if DeviceKeypair::load_private_file(private_key).is_err() {
+                return Ok(EnrollmentState::ReRegistrationRequired);
+            }
             Ok(EnrollmentState::Ready)
         }
     }

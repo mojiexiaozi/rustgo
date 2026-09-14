@@ -131,6 +131,11 @@ fn cli_and_toml_expose_no_json_or_log_format_interface() -> TestResult {
     let fixture = ProcessFixture::single_tcp(echo.address())?;
     let server_config = fs::read_to_string(fixture.server_config_path())?;
     let client_config = fs::read_to_string(fixture.client_config_path())?;
+    let check_directory = fixture.client_config_path().with_extension("check-runtime");
+    fs::create_dir_all(&check_directory)?;
+    let check_binary = check_directory.join(client_binary.file_name().unwrap());
+    fs::hard_link(&client_binary, &check_binary)
+        .or_else(|_| fs::copy(&client_binary, &check_binary).map(|_| ()))?;
     for (field, value) in [
         ("json", "true"),
         ("log_format", "\"json\""),
@@ -152,13 +157,10 @@ fn cli_and_toml_expose_no_json_or_log_format_interface() -> TestResult {
         );
 
         fs::write(
-            fixture.client_config_path(),
+            check_directory.join("client.toml"),
             format!("{field} = {value}\n{client_config}"),
         )?;
-        let client = Command::new(&client_binary)
-            .args(["check", "-c"])
-            .arg(fixture.client_config_path())
-            .output()?;
+        let client = Command::new(&check_binary).arg("check").output()?;
         assert!(!client.status.success(), "client accepted `{field}`");
         assert!(
             String::from_utf8_lossy(&client.stderr).contains("invalid TOML configuration"),
@@ -195,7 +197,7 @@ fn authenticated_tcp_tunnel_context_cannot_inject_physical_log_lines() -> TestRe
     client.wait_for_stderr_line("event=tcp_open", READY_TIMEOUT)?;
 
     let _second = TcpStream::connect_timeout(&fixture.public_address(), READY_TIMEOUT)?;
-    server.wait_for_stderr_line("TCP tunnel connection limit reached", READY_TIMEOUT)?;
+    server.wait_for_stderr_line("已达到 TCP 隧道连接数上限", READY_TIMEOUT)?;
 
     let server_stderr = server.stderr_bytes();
     let client_stderr = client.stderr_bytes();

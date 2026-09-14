@@ -156,18 +156,20 @@ fn checked_in_dashboard_uses_only_relative_allowlisted_resources() {
     assert!(script.contains("/api/v1/clients/"));
     assert!(script.contains("/api/v1/sessions"));
     assert!(script.contains("/api/v1/history"));
-    for management_route in [
+    for legacy_management_route in [
         "/rename",
         "/state",
         "\"enrollment-token\"",
         "\"reenrollment-token\"",
-        "/delete",
     ] {
-        assert!(script.contains(management_route));
+        assert!(!script.contains(legacy_management_route));
     }
+    assert!(script.contains("/api/v1/registration-requests"));
+    assert!(script.contains("{ approve }"));
+    assert!(script.contains("/delete"));
     assert_eq!(
         script.matches("/api/v1/").count(),
-        10,
+        8,
         "the dashboard may only issue documented read and client-management API routes"
     );
     assert!(!assets.contains("max-age=31536000"));

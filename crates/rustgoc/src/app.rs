@@ -51,9 +51,13 @@ where
 #[derive(Debug, Clone, Default)]
 pub struct ClientStatus {
     active: Option<ActiveGeneration>,
+    authentication_rejected: bool,
 }
 
 impl ClientStatus {
+    pub fn authentication_rejected(&self) -> bool {
+        self.authentication_rejected
+    }
     pub fn active(&self) -> Option<&ActiveGeneration> {
         self.active.as_ref()
     }
@@ -76,6 +80,7 @@ impl ActiveGeneration {
 }
 
 pub struct ClientApp {
+    stop_on_auth_rejection: bool,
     control: ControlClient,
     backoff: Box<dyn ReconnectBackoff>,
     supervisor: Arc<dyn ChildSessionSupervisor>,
@@ -159,6 +164,7 @@ impl ClientApp {
     {
         let (status, _) = watch::channel(ClientStatus::default());
         Self {
+            stop_on_auth_rejection: false,
             control,
             backoff: Box::new(backoff),
             supervisor,
@@ -172,6 +178,12 @@ impl ClientApp {
             path_status_store: PathStatusStore::new(),
             last_generation: 0,
         }
+    }
+
+    /// Return authentication rejection to a caller that can request administrator approval.
+    pub fn with_approval_recovery(mut self) -> Self {
+        self.stop_on_auth_rejection = true;
+        self
     }
 
     /// Overrides the production peer owner for lifecycle integration testing.
@@ -295,6 +307,7 @@ impl ClientApp {
                     self.last_generation = generation.get();
                     self.backoff.mark_connected();
                     self.status.send_replace(ClientStatus {
+                        authentication_rejected: false,
                         active: Some(ActiveGeneration {
                             generation,
                             registered_tunnels: session.registered_tunnels_shared(),
@@ -307,7 +320,7 @@ impl ClientApp {
                         protocol_minor = protocol_version.minor,
                         local_protocol_minor = local_protocol_version.minor,
                         event = %"registration_ready",
-                        "client tunnel registration ready"
+                        "客户端隧道注册已就绪"
                     );
                     let status = self.status.clone();
                     let supervisor = self.supervisor.clone();
@@ -339,7 +352,7 @@ impl ClientApp {
                             error = %safe_display(result.as_ref().expect_err("matched error")),
                             generation = generation.get(),
                             event = %"control_fail_stop",
-                            "client control runtime fail-stopped after generation ownership failure"
+                            "客户端控制运行时因代次所有权异常已故障停机"
                         );
                         return result;
                     }
@@ -349,17 +362,26 @@ impl ClientApp {
                             error = %safe_display(&error),
                             generation = generation.get(),
                             event = %"control_ended",
-                            "client control generation ended"
+                            "客户端控制连接代次已结束"
                         );
                     }
                 }
                 Err(error) => {
+                    if matches!(error, ClientError::AuthenticationRejected) {
+                        self.status.send_replace(ClientStatus {
+                            active: None,
+                            authentication_rejected: true,
+                        });
+                        if self.stop_on_auth_rejection {
+                            return Err(error);
+                        }
+                    }
                     self.status.send_replace(ClientStatus::default());
                     tracing::warn!(
                         client = %safe_display(&self.control.config().client.name),
                         error = %safe_display(&error),
                         event = %"control_connect_failed",
-                        "client control connection failed"
+                        "客户端控制连接失败"
                     );
                 }
             }

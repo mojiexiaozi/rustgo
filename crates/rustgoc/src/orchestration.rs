@@ -132,7 +132,7 @@ impl ProductionPeerRuntime {
         tracing::trace!(
             success = result.is_ok(),
             error = result.as_ref().err().map(ToString::to_string),
-            "peer open command completed"
+            "对端服务打开命令已完成"
         );
         result
     }
@@ -174,14 +174,14 @@ impl PeerGenerationHandler for ProductionPeerRuntime {
                     {
                         Ok(forward) => forward,
                         Err(error) => {
-                            tracing::error!(error = %error, "failed to start peer forwards");
+                            tracing::error!(error = %error, "启动对端转发失败");
                             runtime.lifetime.cancel();
                             let _ = actor_result(actor.await);
                             return Err(ClientError::PeerGenerationFailed);
                         }
                     };
                     *owner = Some(PeerRuntimeOwner { actor, forward });
-                    tracing::info!(event = %"peer_forwards_ready", "peer forward listeners ready");
+                    tracing::info!(event = %"peer_forwards_ready", "对端转发监听器已就绪");
                 } else {
                     runtime
                         .commands
@@ -215,7 +215,7 @@ impl PeerGenerationHandler for ProductionPeerRuntime {
                 .is_ok();
         Box::pin(async move {
             if !accepted {
-                tracing::warn!("peer event queue unavailable");
+                tracing::warn!("对端事件队列不可用");
             }
         })
     }
@@ -238,11 +238,11 @@ fn actor_result(result: Result<io::Result<()>, tokio::task::JoinError>) -> Resul
     match result {
         Ok(Ok(())) => Ok(()),
         Ok(Err(error)) => {
-            tracing::error!(error = %error, "peer orchestration generation teardown failed");
+            tracing::error!(error = %error, "对端连接编排代次清理失败");
             Err(ClientError::PeerGenerationFailed)
         }
         Err(error) => {
-            tracing::error!(error = %error, "peer orchestration actor task failed");
+            tracing::error!(error = %error, "对端连接编排任务失败");
             Err(ClientError::TaskJoin)
         }
     }
@@ -369,7 +369,7 @@ impl FlowMeta {
             peer = %self.peer,
             export = %self.export,
             lifecycle,
-            "peer service flow"
+            "对端服务流"
         );
     }
 }
@@ -483,7 +483,7 @@ impl Actor {
                     if self.control_available && self.context.generation().get() == generation {
                         self.handle_event(event).await
                     } else {
-                        tracing::warn!(generation, event = %"stale_peer_control_event", "ignored peer event from a detached control generation");
+                        tracing::warn!(generation, event = %"stale_peer_control_event", "已忽略来自已分离控制代次的对端事件");
                         Ok(())
                     }
                 }
@@ -495,7 +495,7 @@ impl Actor {
                         self.context = context;
                         self.control_available = true;
                         self.detached_deadline = None;
-                        tracing::info!(generation, event = %"peer_control_rebound", "peer data plane rebound to authenticated control generation");
+                        tracing::info!(generation, event = %"peer_control_rebound", "对端数据平面已重新绑定到通过认证的控制代次");
                         Ok(())
                     }
                 }
@@ -515,7 +515,7 @@ impl Actor {
                             session.export.clone(),
                             protocol,
                         ));
-                        tracing::info!(generation = session.generation.get(), path = ?kind, "fresh direct path promoted for subsequent service opens; existing relay I/O remains fenced");
+                        tracing::info!(generation = session.generation.get(), path = ?kind, "新直连路径已启用，供后续服务连接使用；现有中继 I/O 保持代次隔离");
 
                         // Record promoted direct path
                         if kind.is_direct() {
@@ -585,7 +585,7 @@ impl Actor {
                         }
                         tracing::info!(
                             session = ?session_id,
-                            "authenticated NAT observation candidates ready"
+                            "已认证的 NAT 探测候选地址已就绪"
                         );
                         match self.send_candidates(session_id).await {
                             Ok(()) => self.ensure_direct(session_id).await,
@@ -593,7 +593,7 @@ impl Actor {
                         }
                     }
                     Err(error) => {
-                        tracing::warn!(error = %error, "NAT observation failed; relay fallback remains available");
+                        tracing::warn!(error = %error, "NAT 探测失败，仍可回退到中继");
                         Ok(())
                     }
                 },
@@ -601,7 +601,7 @@ impl Actor {
                     tracing::info!(
                         session_id = %session_log_id(SessionId::from(binding.session_id)),
                         event = "peer_identity_binding_delay_complete",
-                        "test-delayed peer identity binding released"
+                        "测试延迟的对端身份绑定已放行"
                     );
                     self.handle_binding(binding).await
                 }
@@ -612,7 +612,7 @@ impl Actor {
                 }
             };
             if let Err(error) = result {
-                tracing::warn!(error = %error, "peer orchestration event rejected");
+                tracing::warn!(error = %error, "对端连接编排事件被拒绝");
             }
             self.remove_cancelled();
         }
@@ -639,7 +639,7 @@ impl Actor {
         {
             tracing::warn!(
                 remaining = self.tasks.len(),
-                "peer generation graceful task drain timed out; aborting remaining owned tasks"
+                "对端代次等待任务正常结束超时，正在中止其余所属任务"
             );
             forced_abort = true;
             self.tasks.abort_all();
@@ -652,7 +652,7 @@ impl Actor {
                         watchdog_fired = true;
                         tracing::error!(
                             remaining = self.tasks.len(),
-                            "peer generation abort watchdog fired; fail-stop is holding generation ownership until every task joins"
+                            "对端代次中止看门狗已触发，故障停机将保留代次所有权，直至所有任务结束"
                         );
                     }
                     _ = self.tasks.join_next() => {}
@@ -680,7 +680,7 @@ impl Actor {
         cancellation: CancellationToken,
         reply: oneshot::Sender<io::Result<OpenedIo>>,
     ) -> io::Result<()> {
-        tracing::trace!(peer = %peer, export = %export, resolve_only, "peer open command admitted");
+        tracing::trace!(peer = %peer, export = %export, resolve_only, "对端服务打开命令已获准执行");
         if !self.control_available {
             let _ = reply.send(Err(io::Error::new(
                 io::ErrorKind::NotConnected,
@@ -882,14 +882,14 @@ impl Actor {
         session.peer_candidates_digest = None;
         tracing::info!(
             generation = next.get(),
-            "starting fresh direct-path generation; active relay stays fenced for existing I/O"
+            "正在启动新的直连路径代次，现有 I/O 使用的中继保持代次隔离"
         );
         self.request_observation(id).await?;
         self.send_candidates(id).await
     }
 
     async fn handle_event(&mut self, event: ControlEvent) -> io::Result<()> {
-        tracing::trace!(kind = event_kind(&event), "peer control event admitted");
+        tracing::trace!(kind = event_kind(&event), "对端控制事件已获准处理");
         match event {
             ControlEvent::Rendezvous(envelope) => self.handle_envelope(envelope).await,
             ControlEvent::PeerIdentityBinding(binding) => {
@@ -904,7 +904,7 @@ impl Actor {
                         session_id = %session_log_id(SessionId::from(binding.session_id)),
                         delay_millis = delay,
                         event = "peer_identity_binding_delayed",
-                        "peer identity binding delayed by internal lifecycle test"
+                        "内部生命周期测试已延迟对端身份绑定"
                     );
                     let sender = self.runtime.commands.clone();
                     self.tasks.spawn(async move {
@@ -974,7 +974,7 @@ impl Actor {
                 if let Some(session) = self.sessions.get_mut(&session_id) {
                     session.cached_tcp_observed_ip = cached;
                 }
-                tracing::warn!(error = %error, "NAT observation port pool occupied; using fresh authenticated IP cache for native TCP only");
+                tracing::warn!(error = %error, "NAT 探测端口池被占用，仅为原生 TCP 使用最新的已认证 IP 缓存");
                 self.send_candidates(session_id).await?;
                 return self.ensure_direct(session_id).await;
             }
@@ -994,7 +994,7 @@ impl Actor {
             let result = match observe_nat(observer, primary, alternate, grant, cancellation).await {
                 Ok((_observer, addresses)) => Ok((socket, addresses)),
                 Err(error) => {
-                    tracing::warn!(error = %error, "NAT observation failed; retained fixed socket for local candidate and relay fallback");
+                    tracing::warn!(error = %error, "NAT 探测失败，已保留固定套接字用于本地候选地址和中继回退");
                     Ok((socket, Vec::new()))
                 }
             };
@@ -1020,7 +1020,7 @@ impl Actor {
                 cadence_millis = grant.cadence_millis,
                 reason = "unknown_session",
                 event = "punch_grant_rejected",
-                "coordinated punch grant rejected"
+                "协同打洞授权被拒绝"
             );
             return Ok(());
         };
@@ -1044,7 +1044,7 @@ impl Actor {
                 session_expired,
                 reason = "generation_mismatch",
                 event = "punch_grant_rejected",
-                "coordinated punch grant rejected"
+                "协同打洞授权被拒绝"
             );
             return Ok(());
         }
@@ -1064,7 +1064,7 @@ impl Actor {
                 session_expired,
                 reason = "invalid_window",
                 event = "punch_grant_rejected",
-                "coordinated punch grant rejected"
+                "协同打洞授权被拒绝"
             );
             return Ok(());
         }
@@ -1084,7 +1084,7 @@ impl Actor {
                 session_expired,
                 reason = "invalid_cadence",
                 event = "punch_grant_rejected",
-                "coordinated punch grant rejected"
+                "协同打洞授权被拒绝"
             );
             return Ok(());
         }
@@ -1120,7 +1120,7 @@ impl Actor {
                 session_expired,
                 reason = "candidate_digest_mismatch",
                 event = "punch_grant_rejected",
-                "coordinated punch grant rejected"
+                "协同打洞授权被拒绝"
             );
             return Ok(());
         }
@@ -1142,7 +1142,7 @@ impl Actor {
             duplicate,
             session_expired,
             event = "punch_grant_ready",
-            "authenticated coordinated punch grant accepted"
+            "已接受通过认证的协同打洞授权"
         );
         self.ensure_direct(id).await
     }
@@ -1368,9 +1368,9 @@ impl Actor {
                         .get_mut(&id)
                         .and_then(|session| session.reply.take())
                     {
-                        tracing::trace!(?protocol, "resolving peer export protocol");
+                        tracing::trace!(?protocol, "正在解析对端导出服务协议");
                         let sent = reply.send(Ok(OpenedIo::Protocol(protocol))).is_ok();
-                        tracing::trace!(sent, "peer export protocol response sent");
+                        tracing::trace!(sent, "对端导出服务协议响应已发送");
                     }
                     let (peer, expiry) = self
                         .sessions
@@ -1566,7 +1566,7 @@ impl Actor {
             generation,
             role = ?session.role,
             event = "candidate_set_sent",
-            "candidate set emitted after authoritative provider decision"
+            "已根据服务提供端的最终决策发送候选地址集"
         );
         Ok(())
     }
@@ -1650,7 +1650,7 @@ impl Actor {
             ?remote,
             role = ?session.role,
             generation = session.generation.get(),
-            "starting authenticated direct path attempt"
+            "正在尝试建立经过认证的直连路径"
         );
         let attempt: Arc<dyn PathAttempt> = match transport {
             CandidateTransport::QuicUdp => {
@@ -1721,7 +1721,7 @@ impl Actor {
     ) -> io::Result<()> {
         match result {
             Err(error) => {
-                tracing::warn!(session_id = %session_log_id(id), error = %error, "direct path attempt failed; using relay fallback");
+                tracing::warn!(session_id = %session_log_id(id), error = %error, "直连路径建立失败，正在回退到中继");
                 if let Some(session) = self.sessions.get_mut(&id) {
                     session.direct_failed = true;
                     // Record relay fallback
@@ -1756,7 +1756,7 @@ impl Actor {
                     let protocol = session.protocol.ok_or_else(invalid)?;
                     self.promoted
                         .insert((session.peer.clone(), session.export.clone(), protocol));
-                    tracing::info!(generation = session.generation.get(), path = ?kind, "fresh direct path promoted for subsequent service opens; existing relay I/O remains on its generation");
+                    tracing::info!(generation = session.generation.get(), path = ?kind, "新直连路径已启用，供后续服务连接使用；现有中继 I/O 保留在原代次");
                     return Ok(());
                 }
                 let role = self.sessions.get(&id).ok_or_else(invalid)?.role;
@@ -1800,9 +1800,9 @@ impl Actor {
                     export: export.clone(),
                 };
                 meta.log("selected");
-                tracing::info!(path = ?path.kind(), generation = session.generation.get(), peer = %peer, export = %export, promoted_open, "authoritative peer path selected");
+                tracing::info!(path = ?path.kind(), generation = session.generation.get(), peer = %peer, export = %export, promoted_open, "已确定对端通信路径");
                 if promoted_open && path.kind().is_direct() {
-                    tracing::info!(path = ?path.kind(), generation = session.generation.get(), peer = %peer, export = %export, "selected promoted direct path for new service open");
+                    tracing::info!(path = ?path.kind(), generation = session.generation.get(), peer = %peer, export = %export, "已为新服务连接选择新启用的直连路径");
                 }
 
                 // Record path selection
@@ -2077,7 +2077,7 @@ impl Actor {
         tracing::trace!(
             message_id = envelope.message_id().as_u16(),
             step = envelope.step,
-            "sending peer envelope"
+            "正在发送对端消息封包"
         );
         let message = envelope.to_protocol_message().map_err(|_| invalid())?;
         self.context
@@ -2166,7 +2166,7 @@ impl Actor {
             grace_millis = grace.as_millis(),
             retained_direct_sessions = self.sessions.len(),
             event = %"peer_control_detached",
-            "control-dependent peer work closed; authenticated direct sessions retained during reconnect grace"
+            "依赖控制连接的对端任务已关闭，重连宽限期内保留已认证的直连会话"
         );
     }
 
@@ -2186,7 +2186,7 @@ impl Actor {
                 io::Error::new(io::ErrorKind::TimedOut, "control reconnect grace expired"),
             );
         }
-        tracing::warn!(event = %"peer_control_grace_expired", "authenticated direct sessions closed after control reconnect grace expired");
+        tracing::warn!(event = %"peer_control_grace_expired", "控制连接重连宽限期已结束，已关闭通过认证的直连会话");
     }
 
     async fn finish_session(&mut self, id: SessionId) {
@@ -2315,7 +2315,7 @@ impl RecheckAttemptFactory for ActorRecheckFactory {
             result = result => result.map_err(|_| PathError::Cancelled)?.map(|attempts| attempts.into_iter().map(|inner| Arc::new(PromotionAttempt { inner, actor: self.actor.clone(), session_id: self.session_id }) as Arc<dyn PathAttempt>).collect()),
         };
         if let Err(error) = &result {
-            tracing::warn!(session_id = %session_log_id(self.session_id), error = %error, "fresh direct promotion generation could not create an attempt");
+            tracing::warn!(session_id = %session_log_id(self.session_id), error = %error, "新直连升级代次无法创建连接尝试");
         }
         result
     }
@@ -2336,7 +2336,7 @@ impl PathAttempt for PromotionAttempt {
         let path = match self.inner.connect(cancellation).await {
             Ok(path) => path,
             Err(error) => {
-                tracing::warn!(path = ?self.inner.kind(), error = %error, "fresh direct promotion attempt failed");
+                tracing::warn!(path = ?self.inner.kind(), error = %error, "新直连路径升级尝试失败");
                 return Err(error);
             }
         };
@@ -2665,7 +2665,7 @@ async fn run_direct_tcp(run: DirectTcpRun) {
     }
     .await;
     if let Err(error) = &result {
-        tracing::warn!(%error, ?role, "direct TCP service flow failed");
+        tracing::warn!(%error, ?role, "直连 TCP 服务流失败");
     }
     if let (Err(error), Some(reply)) = (result, reply) {
         let _ = reply.send(Err(error));

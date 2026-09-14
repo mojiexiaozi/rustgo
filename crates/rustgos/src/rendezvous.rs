@@ -386,7 +386,7 @@ impl RendezvousCoordinator {
                 sender = authenticated.identity().name(),
                 reason = "inactive_control_session",
                 event = "peer_relay_frame_rejected",
-                "peer relay frame rejected"
+                "对端中继帧被拒绝"
             );
             return Err(RendezvousErrorCode::IDENTITY_MISMATCH.into());
         }
@@ -408,7 +408,7 @@ impl RendezvousCoordinator {
                             expires_unix_secs = tombstone.expires_unix_secs,
                             reason = "late_frame_after_close",
                             event = "peer_relay_frame_dropped",
-                            "late peer relay frame dropped"
+                            "已丢弃迟到的对端中继帧"
                         );
                         return Ok(());
                     }
@@ -418,7 +418,7 @@ impl RendezvousCoordinator {
                         expires_unix_secs = tombstone.expires_unix_secs,
                         reason = "closed_session_wrong_participant",
                         event = "peer_relay_frame_rejected",
-                        "peer relay frame rejected"
+                        "对端中继帧被拒绝"
                     );
                     return Err(RendezvousErrorCode::NOT_PARTICIPANT.into());
                 }
@@ -428,7 +428,7 @@ impl RendezvousCoordinator {
                         sender = authenticated.identity().name(),
                         reason = "unknown_session",
                         event = "peer_relay_frame_rejected",
-                        "peer relay frame rejected"
+                        "对端中继帧被拒绝"
                     );
                     return Err(RendezvousErrorCode::UNKNOWN_SESSION.into());
                 }
@@ -456,7 +456,7 @@ impl RendezvousCoordinator {
                     frame_flags = frame.flags.bits(),
                     reason = "session_not_accepted",
                     event = "peer_relay_frame_rejected",
-                    "peer relay frame rejected"
+                    "对端中继帧被拒绝"
                 );
                 return Err(RendezvousErrorCode::INVALID_STATE.into());
             }
@@ -474,7 +474,7 @@ impl RendezvousCoordinator {
                     frame_flags = frame.flags.bits(),
                     reason = "not_participant",
                     event = "peer_relay_frame_rejected",
-                    "peer relay frame rejected"
+                    "对端中继帧被拒绝"
                 );
                 return Err(RendezvousErrorCode::NOT_PARTICIPANT.into());
             };
@@ -488,7 +488,7 @@ impl RendezvousCoordinator {
                     frame_flags = frame.flags.bits(),
                     reason = "relay_not_bilateral",
                     event = "peer_relay_frame_rejected",
-                    "peer relay frame rejected"
+                    "对端中继帧被拒绝"
                 );
                 return Err(RendezvousErrorCode::INVALID_STATE.into());
             }
@@ -502,7 +502,7 @@ impl RendezvousCoordinator {
                     frame_flags = frame.flags.bits(),
                     reason = "relay_protocol_unset",
                     event = "peer_relay_frame_rejected",
-                    "peer relay frame rejected"
+                    "对端中继帧被拒绝"
                 );
                 return Err(RendezvousErrorCode::INVALID_STATE.into());
             };
@@ -523,7 +523,7 @@ impl RendezvousCoordinator {
                     frame_flags = flags,
                     reason = "relay_flag_mismatch",
                     event = "peer_relay_frame_rejected",
-                    "peer relay frame rejected"
+                    "对端中继帧被拒绝"
                 );
                 return Err(RendezvousErrorCode::CAPACITY_REACHED.into());
             }
@@ -537,7 +537,7 @@ impl RendezvousCoordinator {
                     frame_flags = flags, frame_bytes = frame.ciphertext().len(),
                     reason = "relay_rate_or_byte_limit",
                     event = "peer_relay_frame_rejected",
-                    "peer relay frame rejected"
+                    "对端中继帧被拒绝"
                 );
                 return Err(RendezvousErrorCode::CAPACITY_REACHED.into());
             }
@@ -555,7 +555,7 @@ impl RendezvousCoordinator {
                     reason = "target_queue_or_control_unavailable",
                     coordinator_code = error.code.as_u16(),
                     event = "peer_relay_frame_rejected",
-                    "peer relay frame rejected"
+                    "对端中继帧被拒绝"
                 );
             })?;
             if self.registry.observability_enabled() {
@@ -1011,7 +1011,7 @@ impl RendezvousCoordinator {
                 phase = ?session.state.phase(),
                 expires_unix_secs = session.metadata.expires_unix_secs,
                 event = "peer_relay_admission_transition",
-                "peer relay request admitted"
+                "对端中继请求已获准处理"
             );
         }
         let (opened, preselection_traffic) = if let Some(path) = observed_path
@@ -1042,7 +1042,7 @@ impl RendezvousCoordinator {
             let provider_permit = self.reserve_to(&provider)?;
             consumer_permit.send(Message::PunchGrant(grant.clone()));
             provider_permit.send(Message::PunchGrant(grant));
-            tracing::info!(session_id = ?envelope.session_id, generation = envelope.generation.get(), event = "punch_grant_issued", "coordinated punch epoch released");
+            tracing::info!(session_id = ?envelope.session_id, generation = envelope.generation.get(), event = "punch_grant_issued", "协同打洞轮次已放行");
         }
         Ok(())
     }

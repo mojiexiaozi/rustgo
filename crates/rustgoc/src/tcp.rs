@@ -175,14 +175,14 @@ async fn run_tcp(
     let (local, data) = match setup {
         Ok(Ok(streams)) => streams,
         Ok(Err(error)) => {
-            tracing::warn!(connection_id = request.connection_id, error = %safe_display(&error), "TCP data setup failed");
+            tracing::warn!(connection_id = request.connection_id, error = %safe_display(&error), "TCP 数据通道建立失败");
             report_failure(&context, request.connection_id, &shutdown).await;
             return;
         }
         Err(_) => {
             tracing::warn!(
                 connection_id = request.connection_id,
-                "TCP data setup timed out"
+                "TCP 数据通道建立超时"
             );
             report_failure(&context, request.connection_id, &shutdown).await;
             return;
@@ -194,7 +194,7 @@ async fn run_tcp(
         tunnel = %safe_display(&target.name),
         conn = %short_id(request.connection_id),
         event = %"tcp_open",
-        "TCP local relay connected"
+        "TCP 本地中继已连接"
     );
 
     if let Some(traffic) = traffic {
@@ -318,7 +318,7 @@ async fn relay_local_connection<A, B>(
     B: AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     if let Err(error) = copy_bidirectional_bounded(local, data, TCP_IDLE_TIMEOUT, shutdown).await {
-        tracing::debug!(connection_id, error = %safe_display(&error), "TCP local relay ended");
+        tracing::debug!(connection_id, error = %safe_display(&error), "TCP 本地中继已结束");
     }
 }
 

@@ -7,6 +7,15 @@ use thiserror::Error;
 pub struct EnrollmentKey(EnrollmentKeyMaterial);
 
 impl EnrollmentKey {
+    pub(crate) fn for_verified_server(
+        purpose: EnrollmentPurpose,
+        address: &str,
+        fingerprint: [u8; 32],
+    ) -> Result<Self, EnrollmentError> {
+        EnrollmentKeyMaterial::new(purpose, address, fingerprint, [0; 32])
+            .map(Self)
+            .map_err(EnrollmentError::from)
+    }
     pub fn parse(encoded: &str) -> Result<Self, EnrollmentError> {
         EnrollmentKeyMaterial::decode(encoded)
             .map(Self)
@@ -24,9 +33,6 @@ impl EnrollmentKey {
     }
     pub fn token(&self) -> &[u8; 32] {
         self.0.token()
-    }
-    pub(crate) fn encoded(&self) -> String {
-        self.0.encode()
     }
 }
 
