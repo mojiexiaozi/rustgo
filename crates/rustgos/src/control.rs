@@ -419,6 +419,10 @@ where
             enrollment_failure(EnrollmentErrorCode::PendingApproval),
             true,
         ),
+        Ok(Ok(Err(EnrollmentStoreError::ReplacementApprovalPending))) => (
+            enrollment_failure(EnrollmentErrorCode::ReplacementApprovalPending),
+            true,
+        ),
         Ok(Ok(Err(error))) => (enrollment_failure(map_enrollment_error(&error)), false),
         Ok(Err(_)) | Err(_) => (enrollment_failure(EnrollmentErrorCode::Unavailable), false),
     };
@@ -441,14 +445,16 @@ fn enrollment_failure(error: EnrollmentErrorCode) -> Message {
 fn map_enrollment_error(error: &EnrollmentStoreError) -> EnrollmentErrorCode {
     match error {
         EnrollmentStoreError::ApprovalPending => EnrollmentErrorCode::PendingApproval,
+        EnrollmentStoreError::ReplacementApprovalPending => {
+            EnrollmentErrorCode::ReplacementApprovalPending
+        }
         EnrollmentStoreError::ApprovalRejected => EnrollmentErrorCode::ApprovalRejected,
         EnrollmentStoreError::TokenExpired => EnrollmentErrorCode::Expired,
         EnrollmentStoreError::TokenAlreadyUsed => EnrollmentErrorCode::AlreadyUsed,
         EnrollmentStoreError::PurposeMismatch => EnrollmentErrorCode::PurposeMismatch,
         EnrollmentStoreError::ClientDisabled => EnrollmentErrorCode::Disabled,
-        EnrollmentStoreError::PublicKeyConflict | EnrollmentStoreError::StaticIdentityConflict => {
-            EnrollmentErrorCode::PublicKeyConflict
-        }
+        EnrollmentStoreError::StaticIdentityConflict => EnrollmentErrorCode::AlreadyBound,
+        EnrollmentStoreError::PublicKeyConflict => EnrollmentErrorCode::PublicKeyConflict,
         EnrollmentStoreError::ClientCapacity | EnrollmentStoreError::TokenCapacity => {
             EnrollmentErrorCode::CapacityReached
         }

@@ -87,6 +87,13 @@ impl DynamicClientStore {
                 }
                 return Err(EnrollmentStoreError::RevisionConflict);
             }
+            let replacing: bool = tx
+                .query_row(
+                    "SELECT target_id IS NOT NULL FROM registration_requests WHERE request_id=?1",
+                    [request_id],
+                    |row| row.get(0),
+                )
+                .map_err(database_error)?;
             if now >= expires {
                 let active:usize=tx.query_row("SELECT COUNT(*) FROM registration_requests WHERE status=0 AND expires_at>?1",[now],|r|r.get(0)).map_err(database_error)?;
                 if active >= self.limits.max_tokens.min(256) {
@@ -100,7 +107,11 @@ impl DynamicClientStore {
                 .map_err(database_error)?;
                 tx.commit().map_err(database_error)?;
             }
-            return Err(EnrollmentStoreError::ApprovalPending);
+            return Err(if replacing {
+                EnrollmentStoreError::ReplacementApprovalPending
+            } else {
+                EnrollmentStoreError::ApprovalPending
+            });
         }
         tx.execute(
             "DELETE FROM registration_requests WHERE expires_at < ?1",
@@ -113,16 +124,13 @@ impl DynamicClientStore {
         }
         let target = tx.query_row("SELECT internal_id, revision, public_key, enabled, tombstoned FROM dynamic_clients WHERE normalized_id=?1", [name.to_ascii_lowercase()],
             |r| Ok((r.get::<_,String>(0)?,r.get::<_,u64>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,bool>(3)?,r.get::<_,bool>(4)?))).optional().map_err(database_error)?;
-        let (target_id, revision) = if let Some((id, revision, old_key, enabled, deleted)) = target
+        let (target_id, revision) = if let Some((id, revision, _old_key, enabled, deleted)) = target
         {
             if deleted {
                 return Err(EnrollmentStoreError::ClientNotFound);
             }
             if !enabled {
                 return Err(EnrollmentStoreError::ClientDisabled);
-            }
-            if old_key.is_some() && purpose != 2 {
-                return Err(EnrollmentStoreError::PurposeMismatch);
             }
             (Some(id), Some(revision))
         } else {
@@ -132,7 +140,11 @@ impl DynamicClientStore {
             params![request_id,name,public_key,purpose,target_id,revision,now,now.saturating_add(86400)]).map_err(database_error)?;
         audit(&tx, "registration_requested", request_id)?;
         tx.commit().map_err(database_error)?;
-        Err(EnrollmentStoreError::ApprovalPending)
+        Err(if target_id.is_some() {
+            EnrollmentStoreError::ReplacementApprovalPending
+        } else {
+            EnrollmentStoreError::ApprovalPending
+        })
     }
 
     pub fn pending_approvals(&self) -> Result<Vec<RegistrationRequest>, EnrollmentStoreError> {

@@ -129,7 +129,7 @@ struct GuiApp {
     traffic_handle: Option<rustgoc::TrafficHandle>,
     path_status_store: rustgoc::PathStatusStore,
     enrollment_state: EnrollmentState,
-    enrollment_rx: Option<mpsc::Receiver<Result<rustgoc::EnrollmentCompletion, String>>>,
+    enrollment_rx: Option<mpsc::Receiver<runtime::EnrollmentUpdate>>,
     managed_save_rx: Option<mpsc::Receiver<Result<u64, String>>>,
     connected_server: String,
     connected_name: String,
@@ -244,26 +244,30 @@ impl eframe::App for GuiApp {
         if let Some(receiver) = &self.enrollment_rx
             && let Ok(result) = receiver.try_recv()
         {
-            self.enrollment_rx = None;
-            match result {
-                Ok(completion) => {
-                    self.enrollment_state = EnrollmentState::Ready;
-                    self.enrollment_panel.clear_error();
-                    self.config_panel.reload();
-                    self.log_ring.push(state::logs::LogLine {
-                        timestamp: state::logs::local_timestamp(),
-                        level: "INFO".to_owned(),
-                        target: "gui".to_owned(),
-                        message: format!(
-                            "客户端 {} 注册完成，修订号 {}",
-                            completion.client_id, completion.revision
-                        ),
-                    });
-                    self.handle_connect();
+            if let runtime::EnrollmentUpdate::Progress(message) = result {
+                self.enrollment_panel.set_progress(message);
+            } else if let runtime::EnrollmentUpdate::Finished(result) = result {
+                self.enrollment_rx = None;
+                match result {
+                    Ok(completion) => {
+                        self.enrollment_state = EnrollmentState::Ready;
+                        self.enrollment_panel.clear_error();
+                        self.config_panel.reload();
+                        self.log_ring.push(state::logs::LogLine {
+                            timestamp: state::logs::local_timestamp(),
+                            level: "INFO".to_owned(),
+                            target: "gui".to_owned(),
+                            message: format!(
+                                "客户端 {} 注册完成，修订号 {}",
+                                completion.client_id, completion.revision
+                            ),
+                        });
+                        self.handle_connect();
+                    }
+                    Err(error) => self
+                        .enrollment_panel
+                        .set_error(format!("注册失败：{error}")),
                 }
-                Err(error) => self
-                    .enrollment_panel
-                    .set_error(format!("注册失败：{error}")),
             }
         }
         if let Some(receiver) = &self.managed_save_rx {

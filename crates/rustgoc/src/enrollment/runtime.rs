@@ -71,6 +71,19 @@ async fn enroll_inner(
             .map_err(|_| EnrollmentError::Network)?,
             key.server_addr().to_owned(),
         )
+    } else if PendingEnrollment::exists(config_path) {
+        let pending = PendingEnrollment::load(config_path)?;
+        if pending.server_addr() != config.client.server_addr {
+            return Err(EnrollmentError::InvalidPendingState);
+        }
+        (
+            TlsClient::from_pinned_fingerprint(
+                &config.client.server_name,
+                pending.certificate_fingerprint()?,
+            )
+            .map_err(|error| EnrollmentError::LocalCertificate(error.to_string()))?,
+            config.client.server_addr.clone(),
+        )
     } else {
         let tls = match config.client.trust_mode {
             Some(TrustMode::Pinned) => {
@@ -88,6 +101,14 @@ async fn enroll_inner(
                         .map_err(|_| EnrollmentError::InvalidPendingState)?;
                 }
                 TlsClient::from_pinned_fingerprint(&config.client.server_name, fingerprint)
+            }
+            None if !config
+                .client
+                .certificate_authority_file
+                .try_exists()
+                .map_err(|error| EnrollmentError::LocalCertificate(error.to_string()))? =>
+            {
+                TlsClient::for_initial_enrollment(&config.client.server_name)
             }
             None => TlsClient::from_ca_file(
                 &config.client.certificate_authority_file,

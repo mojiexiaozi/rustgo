@@ -15,6 +15,11 @@ pub struct ClientRuntime {
     telemetry_shutdown: CancellationToken,
 }
 
+pub enum EnrollmentUpdate {
+    Progress(String),
+    Finished(Result<rustgoc::EnrollmentCompletion, String>),
+}
+
 struct RuntimeState {
     enrollment_shutdown: Option<CancellationToken>,
     shutdown: Option<CancellationToken>,
@@ -30,7 +35,7 @@ impl ClientRuntime {
         config_path: std::path::PathBuf,
         purpose: rustgoc::EnrollmentPurpose,
         rotate: bool,
-    ) -> std::sync::mpsc::Receiver<Result<rustgoc::EnrollmentCompletion, String>> {
+    ) -> std::sync::mpsc::Receiver<EnrollmentUpdate> {
         let (sender, receiver) = std::sync::mpsc::channel();
         if let Some(runtime) = &self.runtime {
             let shutdown = CancellationToken::new();
@@ -53,18 +58,29 @@ impl ClientRuntime {
                             else { rustgoc::request_registration(&mut config, &config_path, purpose).await }
                         }=>result,
                     };
+                    if let Err(error) = &result {
+                        let message = match error {
+                            rustgoc::EnrollmentError::Rejected(rustgoc::EnrollmentErrorCode::ReplacementApprovalPending) => "服务器已存在同名客户端，已提交密钥更换申请。管理员批准后将替换原客户端密钥。",
+                            rustgoc::EnrollmentError::Rejected(rustgoc::EnrollmentErrorCode::PendingApproval) => "申请已提交，等待管理员审批。",
+                            rustgoc::EnrollmentError::Network => "连接服务器失败，正在重试；尚未确认申请状态。",
+                            _ => "正在查询申请状态…",
+                        };
+                        let _ = sender.send(EnrollmentUpdate::Progress(message.into()));
+                    }
                     match result {
                         Err(rustgoc::EnrollmentError::Network)
-                        | Err(rustgoc::EnrollmentError::Rejected(rustgoc::EnrollmentErrorCode::PendingApproval | rustgoc::EnrollmentErrorCode::Unavailable | rustgoc::EnrollmentErrorCode::CapacityReached)) => {
+                        | Err(rustgoc::EnrollmentError::Rejected(rustgoc::EnrollmentErrorCode::PendingApproval | rustgoc::EnrollmentErrorCode::ReplacementApprovalPending | rustgoc::EnrollmentErrorCode::Unavailable | rustgoc::EnrollmentErrorCode::CapacityReached)) => {
                             tokio::select! {biased; ()=shutdown.cancelled()=>return, ()=tokio::time::sleep(Duration::from_secs(5))=>{}}
                         }
                         result => break result.map_err(|error| error.to_string()),
                     }
                 };
-                let _ = sender.send(result);
+                let _ = sender.send(EnrollmentUpdate::Finished(result));
             });
         } else {
-            let _ = sender.send(Err("注册运行时不可用".to_owned()));
+            let _ = sender.send(EnrollmentUpdate::Finished(Err(
+                "注册运行时不可用".to_owned()
+            )));
         }
         receiver
     }

@@ -763,6 +763,7 @@ pub enum EnrollmentErrorCode {
     UnsupportedVersion,
     PendingApproval,
     ApprovalRejected,
+    ReplacementApprovalPending,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

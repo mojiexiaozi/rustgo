@@ -924,6 +924,8 @@ struct TokenCandidate {
 pub enum EnrollmentStoreError {
     #[error("waiting for administrator approval")]
     ApprovalPending,
+    #[error("同名客户端已存在，等待密钥更换审批")]
+    ReplacementApprovalPending,
     #[error("registration request rejected by administrator")]
     ApprovalRejected,
     #[error("invalid dynamic client display ID")]

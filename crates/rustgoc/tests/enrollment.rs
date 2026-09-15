@@ -44,7 +44,7 @@ fn corrupt_default_identity_requests_approval_instead_of_stopping() {
 }
 
 #[tokio::test]
-async fn missing_enrollment_certificate_is_a_local_error_not_pending_approval() {
+async fn invalid_existing_enrollment_certificate_is_a_local_error_not_pending_approval() {
     let directory = tempfile::tempdir().unwrap();
     let config_path = directory.path().join("client.toml");
     let mut config = client_config(
@@ -53,6 +53,11 @@ async fn missing_enrollment_certificate_is_a_local_error_not_pending_approval() 
     );
     config.client.trust_mode = None;
     config.client.certificate_authority_file = directory.path().join("missing-ca.pem");
+    std::fs::write(
+        &config.client.certificate_authority_file,
+        "invalid certificate",
+    )
+    .unwrap();
     let error =
         rustgoc::request_registration(&mut config, &config_path, EnrollmentPurpose::ReEnroll)
             .await

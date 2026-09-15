@@ -276,6 +276,7 @@ mod tests {
         assert!(config.tunnels.is_empty());
         assert!(config.exports.is_empty());
         assert!(config.forwards.is_empty());
+        assert!(!directory.path().join("server-cert.pem").exists());
     }
 
     #[test]

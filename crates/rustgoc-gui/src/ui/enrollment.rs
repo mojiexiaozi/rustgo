@@ -5,6 +5,7 @@ use eframe::egui::{self, Align, Layout, Ui};
 pub struct EnrollmentPanel {
     error_message: Option<String>,
     fingerprint: Option<String>,
+    progress: Option<String>,
 }
 
 impl EnrollmentPanel {
@@ -48,7 +49,11 @@ impl EnrollmentPanel {
                             } else {
                                 ui.horizontal(|ui| {
                                     ui.spinner();
-                                    ui.label("正在连接服务器、提交申请或查询审批状态…");
+                                    ui.label(
+                                        self.progress
+                                            .as_deref()
+                                            .unwrap_or("正在连接服务器并提交申请…"),
+                                    );
                                 });
                             }
                             ui.add_space(20.0);
@@ -63,5 +68,9 @@ impl EnrollmentPanel {
     }
     pub fn clear_error(&mut self) {
         self.error_message = None;
+        self.progress = None;
+    }
+    pub fn set_progress(&mut self, message: String) {
+        self.progress = Some(message);
     }
 }

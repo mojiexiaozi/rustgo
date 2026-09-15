@@ -33,10 +33,12 @@ fn approval_creates_client_and_replacement_is_atomic() {
             .revision(),
         1
     );
-    assert_eq!(
-        store.request_approval("node", EnrollmentPurpose::ReEnroll, &second, "replace", now),
-        Err(EnrollmentStoreError::ApprovalPending)
-    );
+    for _ in 0..2 {
+        let error = store
+            .request_approval("node", EnrollmentPurpose::Enroll, &second, "replace", now)
+            .unwrap_err();
+        assert_eq!(format!("{error:?}"), "ReplacementApprovalPending");
+    }
     assert_eq!(
         store
             .client_by_display_id("node")

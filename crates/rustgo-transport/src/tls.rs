@@ -297,6 +297,21 @@ impl TlsClient {
         server_name: &str,
         fingerprint: [u8; 32],
     ) -> Result<Self, TlsError> {
+        Self::with_certificate_pin(server_name, Some(fingerprint))
+    }
+
+    /// First-contact enrollment only: encrypts the request and verifies possession
+    /// of the presented certificate key, without authenticating server identity.
+    /// Callers must persist the observed pin and use it for all subsequent requests.
+    /// Never use this constructor for authenticated control or data connections.
+    pub fn for_initial_enrollment(server_name: &str) -> Result<Self, TlsError> {
+        Self::with_certificate_pin(server_name, None)
+    }
+
+    fn with_certificate_pin(
+        server_name: &str,
+        fingerprint: Option<[u8; 32]>,
+    ) -> Result<Self, TlsError> {
         let server_name = ServerName::try_from(server_name.to_owned())
             .map_err(|_| TlsError::InvalidServerName)?;
         let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
@@ -365,7 +380,7 @@ impl TlsClient {
 #[derive(Debug)]
 struct PinnedCertificateVerifier {
     provider: Arc<rustls::crypto::CryptoProvider>,
-    fingerprint: [u8; 32],
+    fingerprint: Option<[u8; 32]>,
 }
 
 impl ServerCertVerifier for PinnedCertificateVerifier {
@@ -377,10 +392,13 @@ impl ServerCertVerifier for PinnedCertificateVerifier {
         _ocsp_response: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
+        let Some(fingerprint) = self.fingerprint else {
+            return Ok(ServerCertVerified::assertion());
+        };
         let actual: [u8; 32] = Sha256::digest(end_entity.as_ref()).into();
         let different = actual
             .iter()
-            .zip(self.fingerprint)
+            .zip(fingerprint)
             .fold(0_u8, |difference, (left, right)| {
                 difference | (left ^ right)
             });

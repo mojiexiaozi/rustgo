@@ -49,7 +49,7 @@ async fn approval_reuses_keys_rotates_only_when_requested_and_cli_waits_without_
     let config_path = dir.path().join("client.toml");
     fs::write(
         &config_path,
-        config_text("Reuse.Node", &address, &cert_path),
+        config_text("Reuse.Node", &address, &dir.path().join("absent.pem")),
     )
     .unwrap();
     rustgo_crypto::generate_key_file(dir.path()).unwrap();
@@ -66,10 +66,22 @@ async fn approval_reuses_keys_rotates_only_when_requested_and_cli_waits_without_
         );
     }
     assert!(store.list_clients().unwrap().is_empty());
+    assert!(config.client.trust_mode.is_none());
     let requests = store.pending_approvals().unwrap();
     assert_eq!(requests.len(), 1);
     let pending = PendingEnrollment::load(&config_path).unwrap();
     assert_eq!(pending.request_id(), requests[0].request_id);
+    // Retries must use the persisted pin, never fall back to first-contact TLS.
+    let metadata_path = config_path.with_extension("enrollment-pending.toml");
+    let original_metadata = fs::read_to_string(&metadata_path).unwrap();
+    let mut metadata: toml::Value = toml::from_str(&original_metadata).unwrap();
+    metadata["certificate_fingerprint"] = toml::Value::String("00".repeat(32));
+    fs::write(&metadata_path, toml::to_string(&metadata).unwrap()).unwrap();
+    assert_eq!(
+        rustgoc::request_registration(&mut config, &config_path, EnrollmentPurpose::Enroll).await,
+        Err(EnrollmentError::Network)
+    );
+    fs::write(&metadata_path, original_metadata).unwrap();
     assert_eq!(fs::read(&private).unwrap(), original);
     store.review_approval(pending.request_id(), true).unwrap();
     rustgoc::request_registration(&mut config, &config_path, EnrollmentPurpose::Enroll)
@@ -81,7 +93,7 @@ async fn approval_reuses_keys_rotates_only_when_requested_and_cli_waits_without_
     assert_eq!(
         rustgoc::request_key_rotation(&mut config, &config_path).await,
         Err(EnrollmentError::Rejected(
-            EnrollmentErrorCode::PendingApproval
+            EnrollmentErrorCode::ReplacementApprovalPending
         ))
     );
     let pending = PendingEnrollment::load(&config_path).unwrap();
