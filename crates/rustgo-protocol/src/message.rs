@@ -311,6 +311,8 @@ impl MessageId {
     pub const MANAGED_CONFIG_REQUEST: Self = Self(33);
     pub const MANAGED_CONFIG_SNAPSHOT: Self = Self(34);
     pub const MANAGED_CONFIG_REPORT: Self = Self(35);
+    pub const MANAGED_CONFIG_UPDATE: Self = Self(36);
+    pub const MANAGED_CONFIG_UPDATE_RESULT: Self = Self(37);
 
     pub const fn as_u16(self) -> u16 {
         self.0
@@ -347,6 +349,8 @@ impl MessageId {
             33 => MAX_MANAGED_CONFIGURATION_BYTES + 3,
             34 => MAX_MANAGED_CONFIGURATION_BYTES + 14,
             35 => MAX_MANAGED_CONFIGURATION_BYTES + 13,
+            36 => MAX_MANAGED_CONFIGURATION_BYTES + 13,
+            37 => 1024 + 13,
             _ => 0,
         }
     }
@@ -357,7 +361,7 @@ impl TryFrom<u16> for MessageId {
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
         match value {
-            1..=35 => Ok(Self(value)),
+            1..=37 => Ok(Self(value)),
             _ => Err(value),
         }
     }
@@ -805,6 +809,8 @@ pub enum Message {
     ManagedConfigRequest(ManagedConfigRequest),
     ManagedConfigSnapshot(ManagedConfigSnapshot),
     ManagedConfigReport(ManagedConfigReport),
+    ManagedConfigUpdate(ManagedConfigUpdate),
+    ManagedConfigUpdateResult(ManagedConfigUpdateResult),
     EnrollmentRequest(EnrollmentRequest),
     EnrollmentResult(EnrollmentResultMessage),
 }
@@ -845,6 +851,8 @@ impl Message {
             Self::ManagedConfigRequest(_) => MessageId::MANAGED_CONFIG_REQUEST,
             Self::ManagedConfigSnapshot(_) => MessageId::MANAGED_CONFIG_SNAPSHOT,
             Self::ManagedConfigReport(_) => MessageId::MANAGED_CONFIG_REPORT,
+            Self::ManagedConfigUpdate(_) => MessageId::MANAGED_CONFIG_UPDATE,
+            Self::ManagedConfigUpdateResult(_) => MessageId::MANAGED_CONFIG_UPDATE_RESULT,
             Self::EnrollmentRequest(_) => MessageId::ENROLLMENT_REQUEST,
             Self::EnrollmentResult(_) => MessageId::ENROLLMENT_RESULT,
         }
@@ -868,4 +876,19 @@ pub struct ManagedConfigReport {
     pub revision: u64,
     /// JSON array of {kind,name,state,error} item results.
     pub results: BoundedBytes<MAX_MANAGED_CONFIGURATION_BYTES>,
+}
+
+/// A revision-checked edit sent in a separate authenticated session before tunnel registration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedConfigUpdate {
+    pub expected_revision: u64,
+    pub configuration: BoundedBytes<MAX_MANAGED_CONFIGURATION_BYTES>,
+}
+
+/// The server closes the edit session after returning this result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedConfigUpdateResult {
+    pub revision: u64,
+    /// None indicates success; otherwise the edit was rejected.
+    pub error: Option<BoundedString<1024>>,
 }

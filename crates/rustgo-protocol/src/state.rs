@@ -104,6 +104,20 @@ impl ClientHandshakeState {
         message: &Message,
     ) -> Result<Self, StateError> {
         match message {
+            Message::ManagedConfigUpdate(_) | Message::ManagedConfigUpdateResult(_) => {
+                let allowed_direction = match message {
+                    Message::ManagedConfigUpdate(_) => ControlMessageDirection::ClientToServer,
+                    _ => ControlMessageDirection::ServerToClient,
+                };
+                if matches!(self, Self::AwaitingTunnelRegistration { .. })
+                    && negotiated_version.supports_managed_editing()
+                    && direction == allowed_direction
+                {
+                    Ok(self.clone())
+                } else {
+                    Err(StateError::invalid_state())
+                }
+            }
             Message::ManagedConfigRequest(_)
             | Message::ManagedConfigSnapshot(_)
             | Message::ManagedConfigReport(_) => {

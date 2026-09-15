@@ -202,7 +202,8 @@ fn v02_is_supported_without_changing_the_major_version() {
     assert_eq!(ProtocolVersion::V0_2, ProtocolVersion::new(1, 1));
     assert_eq!(ProtocolVersion::V0_3, ProtocolVersion::new(1, 2));
     assert_eq!(ProtocolVersion::V0_4, ProtocolVersion::new(1, 3));
-    assert_eq!(ProtocolVersion::SUPPORTED, ProtocolVersion::V0_4);
+    assert_eq!(ProtocolVersion::V0_5, ProtocolVersion::new(1, 4));
+    assert_eq!(ProtocolVersion::SUPPORTED, ProtocolVersion::V0_5);
 }
 
 fn telemetry_report() -> TelemetryReport {

@@ -235,6 +235,8 @@ fn encode_payload(message: &Message) -> Result<Vec<u8>, FrameError> {
         Message::ManagedConfigRequest(value) => serialize(value),
         Message::ManagedConfigSnapshot(value) => serialize(value),
         Message::ManagedConfigReport(value) => serialize(value),
+        Message::ManagedConfigUpdate(value) => serialize(value),
+        Message::ManagedConfigUpdateResult(value) => serialize(value),
         Message::EnrollmentRequest(value) => serialize(value),
         Message::EnrollmentResult(value) => serialize(value),
     }
@@ -339,6 +341,14 @@ fn decode_payload(message: MessageId, payload: &[u8]) -> Result<Message, FrameEr
         MessageId::MANAGED_CONFIG_REPORT => {
             deserialize::<crate::ManagedConfigReport>(message, payload)
                 .map(Message::ManagedConfigReport)
+        }
+        MessageId::MANAGED_CONFIG_UPDATE => {
+            deserialize::<crate::ManagedConfigUpdate>(message, payload)
+                .map(Message::ManagedConfigUpdate)
+        }
+        MessageId::MANAGED_CONFIG_UPDATE_RESULT => {
+            deserialize::<crate::ManagedConfigUpdateResult>(message, payload)
+                .map(Message::ManagedConfigUpdateResult)
         }
         MessageId::ENROLLMENT_REQUEST => {
             deserialize::<EnrollmentRequest>(message, payload).map(Message::EnrollmentRequest)
