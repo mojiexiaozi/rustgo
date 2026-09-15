@@ -105,15 +105,6 @@ impl ForwardingPanel {
                     ),
                 );
             }
-            if ui
-                .add_enabled(
-                    !self.saving,
-                    egui::Button::new("重新加载服务器配置（丢弃草稿）"),
-                )
-                .clicked()
-            {
-                self.reload_managed = true;
-            }
         }
         let mut remote = c.clone();
         if let Some(draft) = self.managed.draft() {
@@ -387,20 +378,27 @@ impl ForwardingPanel {
                 }
             }
             ui.add_space(8.0);
-            if ui
-                .button(if is_managed {
-                    "保存到服务器并生效"
-                } else {
-                    "保存并生效"
-                })
-                .clicked()
-            {
-                if is_managed {
-                    self.save_managed = true;
-                } else {
-                    *save = true;
+            ui.horizontal(|ui| {
+                if ui
+                    .button(if is_managed {
+                        "保存到服务器并生效"
+                    } else {
+                        "保存并生效"
+                    })
+                    .clicked()
+                {
+                    if is_managed {
+                        self.save_managed = true;
+                    } else {
+                        *save = true;
+                    }
                 }
-            }
+                if is_managed
+                    && ui.button("重新加载服务器配置（丢弃草稿）").clicked()
+                {
+                    self.reload_managed = true;
+                }
+            });
         });
         if is_managed {
             let mut draft = rustgo_config::ManagedConfiguration::from_client(c);
