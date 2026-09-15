@@ -119,15 +119,15 @@ impl ForwardingPanel {
             });
         });
         ui.separator();
-        ui.heading("配置项");
+        ui.heading("隧道配置");
         let is_managed = self.managed.draft().is_some();
         if is_managed {
             ui.strong(format!(
-                "由服务器管理 · 编辑修订号 {}",
+                "客户端与服务器同步 · 配置版本 {}",
                 self.managed.draft_revision().unwrap_or(0)
             ));
             if self.managed.dirty() {
-                ui.label("有未保存的服务器配置修改");
+                ui.label("有未保存的修改");
             }
             if self.managed.revision() != self.managed.draft_revision() {
                 ui.colored_label(
