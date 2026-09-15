@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
-use eframe::egui::Ui;
-use rustgo_config::ClientConfig;
+use eframe::egui::{self, Ui};
+use rustgo_config::{ClientConfig, P2pConfig, PortRange};
 use std::path::PathBuf;
 
 pub struct ConfigPanel {
@@ -85,9 +85,73 @@ impl ConfigPanel {
                 ui.end_row();
             });
         ui.add_space(12.0);
+        ui.collapsing("P2P 全局设置", |ui| {
+            let p = c.p2p.get_or_insert_with(default_p2p);
+            ui.checkbox(&mut p.enabled, "启用 P2P");
+            ui.checkbox(&mut p.prefer_direct, "优先直连");
+            ui.checkbox(&mut p.allow_relay_fallback, "允许中继回退");
+            ui.horizontal(|ui| {
+                ui.label("直连超时");
+                ui.add(egui::DragValue::new(&mut p.direct_timeout_secs).range(1..=300));
+                ui.label("秒");
+            });
+            ui.horizontal(|ui| {
+                ui.label("重连超时");
+                ui.add(egui::DragValue::new(&mut p.reconnect_timeout_secs).range(1..=3600));
+                ui.label("秒");
+            });
+            ui.horizontal(|ui| {
+                ui.label("UDP 端口范围");
+                ui.add(egui::DragValue::new(&mut p.udp_port_range.start).range(1..=65535));
+                ui.label("至");
+                ui.add(egui::DragValue::new(&mut p.udp_port_range.end).range(1..=65535));
+            });
+            ui.horizontal(|ui| {
+                ui.label("TCP 端口范围");
+                ui.add(egui::DragValue::new(&mut p.tcp_port_range.start).range(1..=65535));
+                ui.label("至");
+                ui.add(egui::DragValue::new(&mut p.tcp_port_range.end).range(1..=65535));
+            });
+            optional_address(ui, "主观测地址", &mut p.observation_primary_addr);
+            optional_address(ui, "备用观测地址", &mut p.observation_alternate_addr);
+        });
+        ui.add_space(12.0);
         if ui.button("保存并生效").clicked() {
             *apply = true;
         }
+    }
+}
+
+fn optional_address(ui: &mut Ui, label: &str, value: &mut Option<String>) {
+    let mut text = value.clone().unwrap_or_default();
+    ui.horizontal(|ui| {
+        ui.label(label);
+        if ui
+            .add_sized([210.0, 24.0], egui::TextEdit::singleline(&mut text))
+            .changed()
+        {
+            let trimmed = text.trim();
+            *value = (!trimmed.is_empty()).then(|| trimmed.to_owned());
+        }
+    });
+}
+pub(super) fn default_p2p() -> P2pConfig {
+    P2pConfig {
+        enabled: true,
+        prefer_direct: true,
+        direct_timeout_secs: 10,
+        reconnect_timeout_secs: 30,
+        allow_relay_fallback: true,
+        udp_port_range: PortRange {
+            start: 20000,
+            end: 21023,
+        },
+        tcp_port_range: PortRange {
+            start: 22000,
+            end: 23023,
+        },
+        observation_primary_addr: None,
+        observation_alternate_addr: None,
     }
 }
 

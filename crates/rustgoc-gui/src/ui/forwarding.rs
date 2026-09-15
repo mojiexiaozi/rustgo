@@ -2,7 +2,7 @@
 use crate::state::{p2p::P2PViewModel, tunnels::TunnelRow};
 use eframe::egui::{self, Ui};
 use rustgo_config::{
-    ClientConfig, ExportConfig, ForwardConfig, P2pConfig, PortRange, TunnelConfig, TunnelProtocol,
+    ClientConfig, ExportConfig, ForwardConfig, TunnelConfig, TunnelProtocol,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,39 +86,6 @@ impl ForwardingPanel {
             ui.label("配置不可用");
             return;
         };
-        ui.add_enabled_ui(!self.saving, |ui| {
-            ui.collapsing("P2P 全局设置", |ui| {
-                let p = c.p2p.get_or_insert_with(default_p2p);
-                ui.checkbox(&mut p.enabled, "启用 P2P");
-                ui.checkbox(&mut p.prefer_direct, "优先直连");
-                ui.checkbox(&mut p.allow_relay_fallback, "允许中继回退");
-                ui.horizontal(|ui| {
-                    ui.label("直连超时");
-                    ui.add(egui::DragValue::new(&mut p.direct_timeout_secs).range(1..=300));
-                    ui.label("秒");
-                });
-                ui.horizontal(|ui| {
-                    ui.label("重连超时");
-                    ui.add(egui::DragValue::new(&mut p.reconnect_timeout_secs).range(1..=3600));
-                    ui.label("秒");
-                });
-                ui.horizontal(|ui| {
-                    ui.label("UDP 端口范围");
-                    ui.add(egui::DragValue::new(&mut p.udp_port_range.start).range(1..=65535));
-                    ui.label("至");
-                    ui.add(egui::DragValue::new(&mut p.udp_port_range.end).range(1..=65535));
-                });
-                ui.horizontal(|ui| {
-                    ui.label("TCP 端口范围");
-                    ui.add(egui::DragValue::new(&mut p.tcp_port_range.start).range(1..=65535));
-                    ui.label("至");
-                    ui.add(egui::DragValue::new(&mut p.tcp_port_range.end).range(1..=65535));
-                });
-                optional_address(ui, "主观测地址", &mut p.observation_primary_addr);
-                optional_address(ui, "备用观测地址", &mut p.observation_alternate_addr);
-            });
-        });
-        ui.separator();
         ui.heading("隧道配置");
         let is_managed = self.managed.draft().is_some();
         if is_managed {
@@ -531,19 +498,6 @@ fn format_validation_error(error: &str) -> String {
         detail.into()
     }
 }
-fn optional_address(ui: &mut Ui, label: &str, value: &mut Option<String>) {
-    let mut text = value.clone().unwrap_or_default();
-    ui.horizontal(|ui| {
-        ui.label(label);
-        if ui
-            .add_sized([210.0, 24.0], egui::TextEdit::singleline(&mut text))
-            .changed()
-        {
-            let trimmed = text.trim();
-            *value = (!trimmed.is_empty()).then(|| trimmed.to_owned());
-        }
-    });
-}
 fn compact_card(ui: &mut Ui, content: impl FnOnce(&mut Ui)) {
     ui.allocate_ui_with_layout(
         egui::vec2(320.0, 0.0),
@@ -573,25 +527,6 @@ fn protocol_label(protocol: TunnelProtocol) -> &'static str {
         TunnelProtocol::Udp => "UDP",
     }
 }
-fn default_p2p() -> P2pConfig {
-    P2pConfig {
-        enabled: true,
-        prefer_direct: true,
-        direct_timeout_secs: 10,
-        reconnect_timeout_secs: 30,
-        allow_relay_fallback: true,
-        udp_port_range: PortRange {
-            start: 20000,
-            end: 21023,
-        },
-        tcp_port_range: PortRange {
-            start: 22000,
-            end: 23023,
-        },
-        observation_primary_addr: None,
-        observation_alternate_addr: None,
-    }
-}
 fn now_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -607,7 +542,7 @@ mod tests {
         let path = directory.path().join("client.toml");
         let mut config_panel = crate::ui::config::ConfigPanel::new(path.clone());
         let config = config_panel.config_mut().unwrap();
-        config.p2p = Some(super::default_p2p());
+        config.p2p = Some(crate::ui::config::default_p2p());
         config.tunnels.push(rustgo_config::TunnelConfig {
             name: "local-tunnel".into(),
             protocol: rustgo_config::TunnelProtocol::Tcp,
