@@ -368,6 +368,21 @@
     appendDefinition(details, "会话", `${client.sessions.active} 个活跃 · 共 ${client.sessions.total} 个`);
     appendDefinition(details, "活跃路径", activePathLabel(client.active_path));
     article.append(top, badges, details);
+    if (client.identity_source === "dynamic") {
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "button button-danger";
+      remove.textContent = "删除客户端";
+      const status = document.createElement("p");
+      status.className = "muted";
+      remove.addEventListener("click", async () => {
+        remove.disabled = true;
+        try { await deleteClient(client); }
+        catch (error) { status.textContent = error.message; }
+        finally { remove.disabled = false; }
+      });
+      article.append(remove, status);
+    }
     return article;
   }
 
@@ -727,14 +742,17 @@
   $("client-search")?.addEventListener("input", (event) => { state.clientSearch = event.target.value; if (state.overview) renderClientGrid(state.overview.clients); });
   $("client-sort")?.addEventListener("change", (event) => { state.clientSort = event.target.value; state.clientDescending = event.target.value !== "name"; text("client-order", state.clientDescending ? "降序" : "升序"); if (state.overview) renderClientGrid(state.overview.clients); });
   $("client-order")?.addEventListener("click", () => { state.clientDescending = !state.clientDescending; text("client-order", state.clientDescending ? "降序" : "升序"); if (state.overview) renderClientGrid(state.overview.clients); });
-  $("delete-client-button")?.addEventListener("click", async () => {
-    const client = state.detail?.client; if (!client) return;
+  async function deleteClient(client) {
+    if (!client || client.identity_source !== "dynamic") return;
     if (!confirm(`确定删除客户端“${client.name}”吗？在线会话将立即终止。`)) return;
     if (!confirm("请再次确认：客户端将进入墓碑状态，且无法立即复用该 ID。")) return;
-    try {
-      await managementRequest(`/api/v1/clients/${encodeURIComponent(client.name)}/delete`, { expected_revision: client.revision });
-      location.hash = "overview";
-    } catch (error) { text("client-management-status", error.message); }
+    await managementRequest(`/api/v1/clients/${encodeURIComponent(client.name)}/delete`, { expected_revision: client.revision });
+    location.hash = "overview";
+    requestPoll();
+  }
+  $("delete-client-button")?.addEventListener("click", async () => {
+    try { await deleteClient(state.detail?.client); }
+    catch (error) { text("client-management-status", error.message); }
   });
   $("managed-kind")?.addEventListener("change", buildManagedFields);
   $("managed-form")?.addEventListener("submit", async (event) => {

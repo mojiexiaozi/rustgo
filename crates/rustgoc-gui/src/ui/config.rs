@@ -136,7 +136,7 @@ fn optional_address(ui: &mut Ui, label: &str, value: &mut Option<String>) {
 }
 pub(super) fn default_p2p() -> P2pConfig {
     P2pConfig {
-        enabled: true,
+        enabled: false,
         prefer_direct: true,
         direct_timeout_secs: 10,
         reconnect_timeout_secs: 30,
