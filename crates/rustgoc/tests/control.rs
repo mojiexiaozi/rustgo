@@ -1744,3 +1744,393 @@ async fn managed_p2p_rebuilds_exports_and_forwards_reports_bind_failure_and_rele
     })
     .await?
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn enabling_management_drains_unmanaged_forward_before_empty_snapshot() -> Result<(), AnyError>
+{
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let pki = TestPki::generate()?;
+        let mut provider = client_fixture(&pki, "127.0.0.1:1".into())?;
+        let mut consumer = client_fixture(&pki, "127.0.0.1:1".into())?;
+        provider.config.client.name = "provider".into();
+        consumer.config.client.name = "consumer".into();
+        for config in [&mut provider.config, &mut consumer.config] {
+            config.tunnels.clear();
+            config.p2p = Some(rustgo_config::P2pConfig {
+                enabled: true,
+                prefer_direct: false,
+                direct_timeout_secs: 1,
+                reconnect_timeout_secs: 5,
+                allow_relay_fallback: true,
+                udp_port_range: rustgo_config::PortRange {
+                    start: 40000,
+                    end: 40010,
+                },
+                tcp_port_range: rustgo_config::PortRange {
+                    start: 40100,
+                    end: 40110,
+                },
+                observation_primary_addr: None,
+                observation_alternate_addr: None,
+            });
+        }
+        let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let echo_address = echo.local_addr()?.to_string();
+        let listen = {
+            let socket = std::net::TcpListener::bind("127.0.0.1:0")?;
+            socket.local_addr()?.to_string()
+        };
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        provider.config.exports = vec![rustgo_config::ExportConfig {
+            name: "echo".into(),
+            protocol: ConfigProtocol::Tcp,
+            local_addr: echo_address,
+            allowed_peers: vec!["consumer".into()],
+        }];
+        consumer.config.forwards = vec![
+            rustgo_config::ForwardConfig {
+                name: "good".into(),
+                peer: "provider".into(),
+                export: "echo".into(),
+                listen_addr: listen.clone(),
+            },
+            rustgo_config::ForwardConfig {
+                name: "busy".into(),
+                peer: "provider".into(),
+                export: "echo".into(),
+                listen_addr: occupied.local_addr()?.to_string(),
+            },
+        ];
+        let database = pki._directory.path().join("managed-p2p.db");
+        let mut config = real_server_config(&pki, &provider.verification_key, 5);
+        config.clients = vec![
+            AuthorizedClient {
+                name: "provider".into(),
+                public_key: provider.verification_key.public_key().to_string(),
+                enabled: true,
+            },
+            AuthorizedClient {
+                name: "consumer".into(),
+                public_key: consumer.verification_key.public_key().to_string(),
+                enabled: true,
+            },
+        ];
+
+        consumer.config.forwards.truncate(1);
+        let consumer_identity = format!(
+            "static:{}",
+            consumer.verification_key.public_key().fingerprint()
+        );
+        let mut empty = rustgo_config::ManagedConfiguration::from_client(&consumer.config);
+        empty.forwards.clear();
+        let store = rustgos::managed::ManagedStore::open(&database)?;
+        store.sync(&consumer_identity, "consumer", &empty)?;
+        let server = ServerApp::bind(config.clone()).await?;
+        config.server.bind_addr = server.local_addr()?.to_string();
+        provider.config.client.server_addr = config.server.bind_addr.clone();
+        consumer.config.client.server_addr = config.server.bind_addr.clone();
+        let mut server_stop = CancellationToken::new();
+        let mut server_task = tokio::spawn(server.run_until(server_stop.clone()));
+        let provider_stop = CancellationToken::new();
+        let provider_app = ClientApp::from_config(provider.config)?;
+        let mut provider_status = provider_app.subscribe();
+        let provider_task = tokio::spawn(provider_app.run_until(provider_stop.clone()));
+        wait_for_status(&mut provider_status, |s| s.active().is_some()).await;
+        let consumer_stop = CancellationToken::new();
+        let consumer_app = ClientApp::from_config(consumer.config)?;
+        let mut consumer_status = consumer_app.subscribe();
+        let consumer_task = tokio::spawn(consumer_app.run_until(consumer_stop.clone()));
+        let mut client = loop {
+            if let Ok(stream) = TcpStream::connect(&listen).await {
+                break stream;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        client.write_all(b"ping").await?;
+        let (mut target, _) = echo.accept().await?;
+        let mut bytes = [0; 4];
+        target.read_exact(&mut bytes).await?;
+        target.write_all(&bytes).await?;
+        client.read_exact(&mut bytes).await?;
+        assert_eq!(&bytes, b"ping");
+        assert_eq!(consumer_status.borrow().managed_revision(), None);
+        drop(client);
+        drop(target);
+        config.managed_tunnels = Some(rustgo_config::ManagedTunnelsConfig {
+            database_path: database,
+        });
+        server_stop.cancel();
+        server_task.await??;
+        let server = ServerApp::bind(config).await?;
+        server_stop = CancellationToken::new();
+        server_task = tokio::spawn(server.run_until(server_stop.clone()));
+        wait_for_status(&mut consumer_status, |s| {
+            s.active().is_some() && s.managed_revision() == Some(1)
+        })
+        .await;
+        let _released = tokio::net::TcpListener::bind(&listen).await?;
+        consumer_stop.cancel();
+        provider_stop.cancel();
+        server_stop.cancel();
+        consumer_task.await??;
+        provider_task.await??;
+        server_task.await??;
+        Ok::<_, AnyError>(())
+    })
+    .await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn provider_only_protocol_change_rebinds_consumer_without_reconnect() -> Result<(), AnyError>
+{
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let pki = TestPki::generate()?;
+        let mut provider = client_fixture(&pki, "127.0.0.1:1".into())?;
+        let mut consumer = client_fixture(&pki, "127.0.0.1:1".into())?;
+        provider.config.client.name = "provider".into();
+        consumer.config.client.name = "consumer".into();
+        for config in [&mut provider.config, &mut consumer.config] {
+            config.tunnels.clear();
+            config.p2p = Some(rustgo_config::P2pConfig {
+                enabled: true,
+                prefer_direct: false,
+                direct_timeout_secs: 1,
+                reconnect_timeout_secs: 5,
+                allow_relay_fallback: true,
+                udp_port_range: rustgo_config::PortRange {
+                    start: 40000,
+                    end: 40010,
+                },
+                tcp_port_range: rustgo_config::PortRange {
+                    start: 40100,
+                    end: 40110,
+                },
+                observation_primary_addr: None,
+                observation_alternate_addr: None,
+            });
+        }
+        let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let echo_address = echo.local_addr()?.to_string();
+        let listen = {
+            let socket = std::net::TcpListener::bind("127.0.0.1:0")?;
+            socket.local_addr()?.to_string()
+        };
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        provider.config.exports = vec![rustgo_config::ExportConfig {
+            name: "echo".into(),
+            protocol: ConfigProtocol::Tcp,
+            local_addr: echo_address,
+            allowed_peers: vec!["consumer".into()],
+        }];
+        consumer.config.forwards = vec![
+            rustgo_config::ForwardConfig {
+                name: "good".into(),
+                peer: "provider".into(),
+                export: "echo".into(),
+                listen_addr: listen.clone(),
+            },
+            rustgo_config::ForwardConfig {
+                name: "busy".into(),
+                peer: "provider".into(),
+                export: "echo".into(),
+                listen_addr: occupied.local_addr()?.to_string(),
+            },
+        ];
+        let database = pki._directory.path().join("managed-p2p.db");
+        let mut config = real_server_config(&pki, &provider.verification_key, 5);
+        config.clients = vec![
+            AuthorizedClient {
+                name: "provider".into(),
+                public_key: provider.verification_key.public_key().to_string(),
+                enabled: true,
+            },
+            AuthorizedClient {
+                name: "consumer".into(),
+                public_key: consumer.verification_key.public_key().to_string(),
+                enabled: true,
+            },
+        ];
+
+        consumer.config.forwards.truncate(1);
+        config.managed_tunnels = Some(rustgo_config::ManagedTunnelsConfig {
+            database_path: database.clone(),
+        });
+        let server = ServerApp::bind(config).await?;
+        provider.config.client.server_addr = server.local_addr()?.to_string();
+        consumer.config.client.server_addr = server.local_addr()?.to_string();
+        let server_stop = CancellationToken::new();
+        let server_task = tokio::spawn(server.run_until(server_stop.clone()));
+        let provider_config = provider.config.clone();
+        let mut provider_stop = CancellationToken::new();
+        let mut provider_task =
+            tokio::spawn(ClientApp::from_config(provider.config)?.run_until(provider_stop.clone()));
+        let consumer_stop = CancellationToken::new();
+        let consumer_app = ClientApp::from_config(consumer.config)?;
+        let consumer_status = consumer_app.subscribe();
+        let consumer_task = tokio::spawn(consumer_app.run_until(consumer_stop.clone()));
+        let store = rustgos::managed::ManagedStore::open(&database)?;
+        loop {
+            if store.get("consumer")?.is_some_and(|s| {
+                s.results
+                    .as_array()
+                    .is_some_and(|r| r.iter().any(|r| r["state"] == "ready"))
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let mut client = TcpStream::connect(&listen).await?;
+        client.write_all(b"ping").await?;
+        let (mut target, _) = echo.accept().await?;
+        let mut bytes = [0; 4];
+        target.read_exact(&mut bytes).await?;
+        target.write_all(&bytes).await?;
+        client.read_exact(&mut bytes).await?;
+        assert_eq!(&bytes, b"ping");
+        drop(client);
+        drop(target);
+        let generation = consumer_status.borrow().active().unwrap().generation();
+        let udp_echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+        let mut desired = store.get("provider")?.unwrap().configuration;
+        desired.exports[0].protocol = ConfigProtocol::Udp;
+        desired.exports[0].local_addr = udp_echo.local_addr()?.to_string();
+        store.replace("provider", 1, &desired)?;
+        provider_stop.cancel();
+        provider_task.await??;
+        provider_stop = CancellationToken::new();
+        provider_task = tokio::spawn(
+            ClientApp::from_config(provider_config.clone())?.run_until(provider_stop.clone()),
+        );
+        loop {
+            match tokio::net::UdpSocket::bind(&listen).await {
+                Ok(probe) => {
+                    drop(probe);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => break,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+        loop {
+            udp.send_to(b"pong", &listen).await?;
+            let mut bytes = [0; 32];
+            if let Ok(Ok((length, peer))) =
+                tokio::time::timeout(Duration::from_millis(200), udp_echo.recv_from(&mut bytes))
+                    .await
+            {
+                udp_echo.send_to(&bytes[..length], peer).await?;
+                break;
+            }
+        }
+        let mut bytes = [0; 32];
+        let (length, _) = udp.recv_from(&mut bytes).await?;
+        assert_eq!(&bytes[..length], b"pong");
+        assert_eq!(
+            consumer_status.borrow().active().unwrap().generation(),
+            generation
+        );
+        assert_eq!(consumer_status.borrow().managed_revision(), Some(1));
+        desired.exports.clear();
+        store.replace("provider", 2, &desired)?;
+        provider_stop.cancel();
+        provider_task.await??;
+        provider_stop = CancellationToken::new();
+        provider_task =
+            tokio::spawn(ClientApp::from_config(provider_config)?.run_until(provider_stop.clone()));
+        loop {
+            if store
+                .get("consumer")?
+                .unwrap()
+                .results
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|r| r["state"] == "pending")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let _released = tokio::net::UdpSocket::bind(&listen).await?;
+        consumer_stop.cancel();
+        provider_stop.cancel();
+        server_stop.cancel();
+        consumer_task.await??;
+        provider_task.await??;
+        server_task.await??;
+        Ok::<_, AnyError>(())
+    })
+    .await?
+}
+
+#[tokio::test]
+async fn rejected_managed_local_policy_reports_failure_before_registration() -> Result<(), AnyError>
+{
+    let pki = TestPki::generate()?;
+    let tls = TlsServer::bind("127.0.0.1:0", &pki.certificate_file, &pki.private_key_file).await?;
+    let fixture = client_fixture(&pki, tls.local_addr()?.to_string())?;
+    let server = tokio::spawn(async move {
+        let (socket, _) = tls.accept_tcp().await?;
+        let mut server = FramedServer::new(tls.handshake(socket).await?);
+        assert!(matches!(
+            server.receive().await?.message,
+            Message::ClientHello(_)
+        ));
+        let version = ProtocolVersion::V0_4;
+        let challenge = Message::ServerChallenge(ServerChallenge {
+            challenge: bytes(&[5; 32]),
+            session_id: bytes(&[6; 32]),
+        });
+        server
+            .stream
+            .write_all(&server.codec.encode(version, 0, &challenge)?)
+            .await?;
+        assert!(matches!(
+            server.receive().await?.message,
+            Message::ClientAuthenticate(_)
+        ));
+        server
+            .stream
+            .write_all(&server.codec.encode(
+                version,
+                0,
+                &Message::AuthResult(AuthResult {
+                    accepted: true,
+                    error: None,
+                }),
+            )?)
+            .await?;
+        assert!(matches!(
+            server.receive().await?.message,
+            Message::ManagedConfigRequest(_)
+        ));
+        let snapshot = Message::ManagedConfigSnapshot(rustgo_protocol::ManagedConfigSnapshot {
+            revision: 7,
+            configuration: Some(bytes(
+                br#"{"tunnels":[],"exports":[{"name":"blocked","protocol":"tcp","local_addr":"127.0.0.1:22","allowed_peers":[]}],"forwards":[],"p2p_enabled":true}"#,
+            )),
+        });
+        server
+            .stream
+            .write_all(&server.codec.encode(version, 0, &snapshot)?)
+            .await?;
+        let Message::ManagedConfigReport(report) = server.receive().await?.message else {
+            panic!("expected failed report before registration");
+        };
+        assert_eq!(report.revision, 7);
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(report.results.as_slice())?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["kind"], "export");
+        assert_eq!(rows[0]["name"], "blocked");
+        assert_eq!(rows[0]["state"], "failed");
+        assert!(!rows[0]["error"].as_str().unwrap().is_empty());
+        Ok::<_, AnyError>(())
+    });
+    assert!(matches!(
+        ControlClient::from_config(fixture.config)?.connect().await,
+        Err(ClientError::InvalidConfiguration)
+    ));
+    server.await??;
+    Ok(())
+}

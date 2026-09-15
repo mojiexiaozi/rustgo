@@ -176,9 +176,19 @@ impl ControlClient {
                     let desired: rustgo_config::ManagedConfiguration =
                         serde_json::from_slice(configuration.as_slice())
                             .map_err(|_| ClientError::InvalidConfiguration)?;
-                    desired
-                        .apply_to(&mut effective)
-                        .map_err(|_| ClientError::InvalidConfiguration)?;
+                    if let Err(error) = desired.apply_to(&mut effective) {
+                        framed
+                            .send(
+                                negotiated,
+                                rejected_configuration_report(
+                                    revision,
+                                    &desired,
+                                    &error.to_string(),
+                                )?,
+                            )
+                            .await?;
+                        return Err(ClientError::InvalidConfiguration);
+                    }
                     managed_revision = Some(revision);
                 }
                 Message::ManagedConfigSnapshot(rustgo_protocol::ManagedConfigSnapshot {
@@ -216,6 +226,48 @@ impl ControlClient {
         session.managed_revision = managed_revision;
         Ok(session)
     }
+}
+
+fn rejected_configuration_report(
+    revision: u64,
+    desired: &rustgo_config::ManagedConfiguration,
+    error: &str,
+) -> Result<Message, ClientError> {
+    let mut results = desired
+        .tunnels
+        .iter()
+        .map(|item| ("tunnel", &item.name))
+        .chain(desired.exports.iter().map(|item| ("export", &item.name)))
+        .chain(desired.forwards.iter().map(|item| ("forward", &item.name)))
+        .map(
+            |(kind, name)| serde_json::json!({"kind":kind,"name":name,"state":"failed","error":""}),
+        )
+        .collect::<Vec<_>>();
+    let baseline = serde_json::to_vec(&results)
+        .map_err(|_| ClientError::InvalidConfiguration)?
+        .len();
+    let error_budget = 65536usize.saturating_sub(baseline) / results.len().max(1);
+    let mut detail = error.to_owned();
+    while detail.len() > 2048
+        || serde_json::to_string(&detail)
+            .map_err(|_| ClientError::InvalidConfiguration)?
+            .len()
+            .saturating_sub(2)
+            > error_budget
+    {
+        detail.pop();
+    }
+    for result in &mut results {
+        result["error"] = serde_json::Value::String(detail.clone());
+    }
+    let results = serde_json::to_vec(&results).map_err(|_| ClientError::InvalidConfiguration)?;
+    Ok(Message::ManagedConfigReport(
+        rustgo_protocol::ManagedConfigReport {
+            revision,
+            results: BoundedBytes::try_from(results)
+                .map_err(|_| ClientError::InvalidConfiguration)?,
+        },
+    ))
 }
 
 fn load_credentials(

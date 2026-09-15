@@ -100,11 +100,16 @@ pub enum ForwardError {
 
 pub struct ForwardRuntime {
     local_addrs: HashMap<String, SocketAddr>,
+    protocols: HashMap<String, TunnelProtocol>,
     shutdown: CancellationToken,
     tasks: Vec<JoinHandle<()>>,
 }
 
 impl ForwardRuntime {
+    pub(crate) fn protocol(&self, name: &str) -> Option<TunnelProtocol> {
+        self.protocols.get(name).copied()
+    }
+
     pub async fn start(
         forwards: Vec<ForwardConfig>,
         connector: Arc<dyn ForwardConnector>,
@@ -148,6 +153,10 @@ impl ForwardRuntime {
             };
             prepared.push((forward, listen_addr, protocol));
         }
+        let protocols = prepared
+            .iter()
+            .map(|(forward, _, protocol)| (forward.name.clone(), *protocol))
+            .collect();
         let mut local_addrs = HashMap::with_capacity(prepared.len());
         let mut tasks = Vec::with_capacity(prepared.len());
         for (forward, listen_addr, protocol) in prepared {
@@ -196,6 +205,7 @@ impl ForwardRuntime {
         }
         Ok(Self {
             local_addrs,
+            protocols,
             shutdown,
             tasks,
         })

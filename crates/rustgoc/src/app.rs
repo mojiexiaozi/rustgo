@@ -274,7 +274,7 @@ impl ClientApp {
                 traffic,
             )
         });
-        let peer_runtime = self.peer_handler.clone().unwrap_or_else(|| {
+        let mut peer_runtime = Some(self.peer_handler.clone().unwrap_or_else(|| {
             Arc::new(ProductionPeerRuntime::new(
                 Arc::new(self.control.config().clone()),
                 self.control.keypair(),
@@ -282,22 +282,25 @@ impl ClientApp {
                 self.logical_traffic.clone(),
                 self.path_status_store.clone(),
             ))
-        });
+        }));
         let result = self
-            .run_reconnect_loop(shutdown, peer_runtime.clone(), telemetry.as_mut())
+            .run_reconnect_loop(shutdown, &mut peer_runtime, telemetry.as_mut())
             .await;
         let telemetry_result = match telemetry {
             Some(telemetry) => telemetry.shutdown().await,
             None => Ok(()),
         };
-        let shutdown_result = peer_runtime.shutdown().await;
+        let shutdown_result = match peer_runtime {
+            Some(runtime) => runtime.shutdown().await,
+            None => Ok(()),
+        };
         telemetry_result.and(shutdown_result).and(result)
     }
 
     async fn run_reconnect_loop(
         &mut self,
         shutdown: CancellationToken,
-        peer_runtime: Arc<dyn PeerGenerationHandler>,
+        peer_runtime: &mut Option<Arc<dyn PeerGenerationHandler>>,
         mut telemetry: Option<&mut TelemetryRuntime>,
     ) -> Result<(), ClientError> {
         loop {
@@ -316,6 +319,9 @@ impl ClientApp {
                     let managed_revision = session.managed_revision();
                     let generation_peer: Arc<dyn PeerGenerationHandler> =
                         if managed_revision.is_some() && self.peer_handler.is_none() {
+                            if let Some(previous) = peer_runtime.take() {
+                                previous.shutdown().await?;
+                            }
                             self.exports = ExportRegistry::new(effective.exports.clone())
                                 .map_err(|_| ClientError::InvalidConfiguration)?;
                             Arc::new(ProductionPeerRuntime::new(
@@ -326,7 +332,19 @@ impl ClientApp {
                                 self.path_status_store.clone(),
                             ))
                         } else {
-                            peer_runtime.clone()
+                            peer_runtime
+                                .get_or_insert_with(|| {
+                                    let exports = ExportRegistry::new(effective.exports.clone())
+                                        .expect("effective exports were validated");
+                                    Arc::new(ProductionPeerRuntime::new(
+                                        Arc::new(effective.clone()),
+                                        self.control.keypair(),
+                                        exports,
+                                        self.logical_traffic.clone(),
+                                        self.path_status_store.clone(),
+                                    ))
+                                })
+                                .clone()
                         };
                     let generation = SessionGeneration::next(self.last_generation)?;
                     let protocol_version = session.protocol_version();

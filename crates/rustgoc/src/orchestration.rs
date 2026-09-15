@@ -219,10 +219,43 @@ impl PeerGenerationHandler for ProductionPeerRuntime {
                         .map_err(|_| ClientError::PeerGenerationFailed)?;
                 }
             }
-            while !pending.is_empty() {
+            let mut refresh_at = tokio::time::Instant::now() + Duration::from_secs(5);
+            while context.is_managed() && !runtime.config.forwards.is_empty() {
                 tokio::select! { biased; () = shutdown.cancelled() => break, () = tokio::time::sleep(Duration::from_secs(1)) => {} }
                 let mut retry = Vec::new();
                 let mut changed = false;
+                if tokio::time::Instant::now() >= refresh_at {
+                    refresh_at = tokio::time::Instant::now() + Duration::from_secs(5);
+                    for (index, item) in runtime.config.forwards.iter().enumerate() {
+                        if results[index]["state"] != "ready" {
+                            continue;
+                        }
+                        let protocol = tokio::select! {
+                            biased;
+                            () = shutdown.cancelled() => break,
+                            result = tokio::time::timeout(Duration::from_secs(10), ForwardConnector::protocol(&runtime, &item.peer, &item.export)) => result.ok().and_then(Result::ok),
+                        };
+                        let previous = {
+                            let mut owner = runtime.owner.lock().await;
+                            let owner = owner.as_mut().ok_or(ClientError::PeerGenerationFailed)?;
+                            if let Some(position) = owner.forward.iter().position(|listener| {
+                                listener
+                                    .protocol(&item.name)
+                                    .is_some_and(|bound| Some(bound) != protocol)
+                            }) {
+                                Some(owner.forward.remove(position))
+                            } else {
+                                None
+                            }
+                        };
+                        if let Some(previous) = previous {
+                            previous.shutdown().await;
+                            results[index] = serde_json::json!({"kind":"forward","name":item.name,"state":"pending","error":"peer export changed or is unavailable"});
+                            pending.push((index, item.clone()));
+                            changed = true;
+                        }
+                    }
+                }
                 for (index, item) in pending.drain(..) {
                     match ForwardRuntime::start(
                         vec![item.clone()],
