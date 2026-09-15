@@ -147,12 +147,6 @@ impl ForwardingPanel {
             {
                 self.reload_managed = true;
             }
-            if ui
-                .add_enabled(!self.saving, egui::Button::new("保存本地 P2P 设置并生效"))
-                .clicked()
-            {
-                *save = true;
-            }
         }
         let mut remote = c.clone();
         if let Some(draft) = self.managed.draft() {
