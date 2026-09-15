@@ -168,8 +168,14 @@ fn checked_in_dashboard_uses_only_relative_allowlisted_resources() {
     assert!(script.contains("{ approve }"));
     assert!(script.contains("/delete"));
     assert_eq!(
+        script
+            .matches("/api/v1/clients/${encodeURIComponent(name)}/tunnels")
+            .count(),
+        2
+    );
+    assert_eq!(
         script.matches("/api/v1/").count(),
-        8,
+        10,
         "the dashboard may only issue documented read and client-management API routes"
     );
     assert!(!assets.contains("max-age=31536000"));
