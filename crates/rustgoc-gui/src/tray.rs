@@ -38,6 +38,7 @@ pub mod platform {
             let tray = TrayIconBuilder::new()
                 .with_menu(Box::new(menu))
                 .with_icon(rustgo_icon()?)
+                .with_menu_on_left_click(false)
                 .with_tooltip("Rustgo 客户端")
                 .build()?;
 
@@ -58,6 +59,10 @@ pub mod platform {
                     tray_icon::TrayIconEvent::DoubleClick {
                         button: tray_icon::MouseButton::Left,
                         ..
+                    } | tray_icon::TrayIconEvent::Click {
+                        button: tray_icon::MouseButton::Left,
+                        button_state: tray_icon::MouseButtonState::Up,
+                        ..
                     }
                 ) {
                     let _ = tx_clone.try_send(TrayEvent::Show);
@@ -77,24 +82,11 @@ pub mod platform {
     }
 
     fn rustgo_icon() -> anyhow::Result<tray_icon::Icon> {
-        // White R on blue, rendered at native tray resolution.
-        let glyph = [
-            0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001,
-        ];
-        let mut rgba = Vec::with_capacity(32 * 32 * 4);
-        for y in 0..32 {
-            for x in 0..32 {
-                let white = (8..23).contains(&x)
-                    && (5..26).contains(&y)
-                    && glyph[(y - 5) / 3] & (1 << (4 - (x - 8) / 3)) != 0;
-                rgba.extend_from_slice(if white {
-                    &[255, 255, 255, 255]
-                } else {
-                    &[30, 100, 210, 255]
-                });
-            }
-        }
-        Ok(tray_icon::Icon::from_rgba(rgba, 32, 32)?)
+        Ok(tray_icon::Icon::from_rgba(
+            crate::app_icon::rgba(32),
+            32,
+            32,
+        )?)
     }
 }
 

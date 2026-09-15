@@ -94,7 +94,7 @@ async fn enroll_inner(
                 &config.client.server_name,
             ),
         }
-        .map_err(|_| EnrollmentError::Network)?;
+        .map_err(|error| EnrollmentError::LocalCertificate(error.to_string()))?;
         (tls, config.client.server_addr.clone())
     };
     let stream = tokio::time::timeout(ENROLLMENT_TIMEOUT, tls.connect(&address))

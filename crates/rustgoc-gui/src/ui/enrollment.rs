@@ -28,12 +28,12 @@ impl EnrollmentPanel {
                             ui.set_width(width);
                             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
                             ui.heading(if replacing {
-                                "等待密钥更换审批"
+                                "恢复连接申请"
                             } else {
-                                "等待接入审批"
+                                "接入申请"
                             });
                             ui.add_space(16.0);
-                            ui.label("客户端将自动向服务器提交申请，请在管理端批准。");
+                            ui.label("客户端自动提交申请；服务器收到后，可在管理端审批。");
                             ui.label("批准后自动连接，无需输入密钥或验证码。");
                             if let Some(fingerprint) = &self.fingerprint {
                                 ui.add_space(12.0);
@@ -48,7 +48,7 @@ impl EnrollmentPanel {
                             } else {
                                 ui.horizontal(|ui| {
                                     ui.spinner();
-                                    ui.label("正在提交申请或等待管理员审批…");
+                                    ui.label("正在连接服务器、提交申请或查询审批状态…");
                                 });
                             }
                             ui.add_space(20.0);

@@ -43,6 +43,29 @@ fn corrupt_default_identity_requests_approval_instead_of_stopping() {
     );
 }
 
+#[tokio::test]
+async fn missing_enrollment_certificate_is_a_local_error_not_pending_approval() {
+    let directory = tempfile::tempdir().unwrap();
+    let config_path = directory.path().join("client.toml");
+    let mut config = client_config(
+        directory.path().join("device.key"),
+        Some(IdentityMode::Dynamic),
+    );
+    config.client.trust_mode = None;
+    config.client.certificate_authority_file = directory.path().join("missing-ca.pem");
+    let error =
+        rustgoc::request_registration(&mut config, &config_path, EnrollmentPurpose::ReEnroll)
+            .await
+            .unwrap_err();
+    assert!(error.to_string().contains("本地证书配置不可用"), "{error}");
+    assert!(
+        !config_path
+            .with_extension("enrollment-pending.toml")
+            .exists()
+    );
+    assert!(!config.client.private_key_file.exists());
+}
+
 #[test]
 fn pending_recovers_after_key_move_before_metadata_cleanup() {
     let dir = tempfile::tempdir().unwrap();

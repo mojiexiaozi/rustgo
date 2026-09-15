@@ -69,6 +69,8 @@ pub enum EnrollmentError {
     DestinationExists,
     #[error("enrollment network protocol failed")]
     Network,
+    #[error("本地证书配置不可用，申请尚未提交：{0}")]
+    LocalCertificate(String),
     #[error("enrollment was rejected: {0:?}")]
     Rejected(rustgo_protocol::EnrollmentErrorCode),
     #[error("cannot update client configuration ({0:?})")]

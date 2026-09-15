@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod app_icon;
 #[cfg(windows)]
 mod autostart;
 mod configuration;
@@ -76,6 +77,11 @@ fn main() -> anyhow::Result<()> {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 800.0])
+            .with_icon(eframe::egui::IconData {
+                rgba: app_icon::rgba(64),
+                width: 64,
+                height: 64,
+            })
             .with_title("Rustgo 图形界面"),
         ..Default::default()
     };
