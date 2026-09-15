@@ -23,6 +23,7 @@ impl ForwardEntryKind {
     }
 }
 pub struct ForwardingPanel {
+    pub managed: crate::state::managed::ManagedViewModel,
     kind: ForwardEntryKind,
     name: String,
     local: String,
@@ -44,6 +45,7 @@ impl Default for ForwardingPanel {
 impl ForwardingPanel {
     pub fn new() -> Self {
         Self {
+            managed: Default::default(),
             kind: ForwardEntryKind::TcpTunnel,
             name: String::new(),
             local: "127.0.0.1:22".into(),
@@ -110,6 +112,63 @@ impl ForwardingPanel {
         });
         ui.separator();
         ui.heading("配置项");
+        if let Some(snapshot) = self.managed.snapshot() {
+            ui.strong(format!(
+                "由服务器管理 · 修订号 {}",
+                self.managed.revision().unwrap_or(0)
+            ));
+            ui.label("隧道、导出和转发请在服务器 Web 管理端修改。断线时保留最后收到的配置。");
+            for tunnel in &snapshot.tunnels {
+                ui.label(format!(
+                    "{} 隧道 · {} · {} → 服务器端口 {}",
+                    protocol_label(tunnel.protocol),
+                    tunnel.name,
+                    tunnel.local_addr,
+                    tunnel.remote_port
+                ));
+                if let Some(row) = tunnels.iter().find(|row| row.name == tunnel.name) {
+                    if let Some(error) = &row.error {
+                        ui.colored_label(egui::Color32::RED, error);
+                    } else if row.accepted {
+                        ui.weak("服务器已接受");
+                    }
+                } else {
+                    ui.weak("暂无在线运行状态");
+                }
+            }
+            for export in &snapshot.exports {
+                ui.label(format!(
+                    "{} 导出 · {} · {} · 允许客户端：{}",
+                    protocol_label(export.protocol),
+                    export.name,
+                    export.local_addr,
+                    if export.allowed_peers.is_empty() {
+                        "所有已授权客户端".into()
+                    } else {
+                        export.allowed_peers.join(", ")
+                    }
+                ));
+            }
+            for forward in &snapshot.forwards {
+                ui.label(format!(
+                    "P2P 转发 · {} · {} → {} / {}",
+                    forward.name, forward.listen_addr, forward.peer, forward.export
+                ));
+            }
+            if snapshot.tunnels.is_empty()
+                && snapshot.exports.is_empty()
+                && snapshot.forwards.is_empty()
+            {
+                ui.weak("服务器配置为空");
+            }
+            if let Some(message) = &self.message {
+                ui.label(message);
+            }
+            if ui.button("保存 P2P 设置并生效").clicked() {
+                *save = true;
+            }
+            return;
+        }
         let mut remove = None;
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
@@ -337,6 +396,9 @@ impl ForwardingPanel {
     }
 
     fn validated_candidate(&self, current: &ClientConfig) -> Result<ClientConfig, String> {
+        if self.managed.snapshot().is_some() {
+            return Err("由服务器管理，请在服务器 Web 管理端修改".into());
+        }
         let name = self.name.trim();
         if name.is_empty() {
             return Err("名称不能为空".into());
@@ -495,6 +557,64 @@ fn now_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{ForwardEntryKind, ForwardingPanel, parse_peers};
+    #[test]
+    fn managed_collections_reject_local_add_and_never_replace_saved_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("client.toml");
+        let mut config_panel = crate::ui::config::ConfigPanel::new(path.clone());
+        let config = config_panel.config_mut().unwrap();
+        config.p2p = Some(super::default_p2p());
+        config.tunnels.push(rustgo_config::TunnelConfig {
+            name: "local-tunnel".into(),
+            protocol: rustgo_config::TunnelProtocol::Tcp,
+            local_addr: "127.0.0.1:22".into(),
+            remote_port: 2222,
+        });
+        config.exports.push(rustgo_config::ExportConfig {
+            name: "local-export".into(),
+            protocol: rustgo_config::TunnelProtocol::Tcp,
+            local_addr: "127.0.0.1:22".into(),
+            allowed_peers: vec![],
+        });
+        config.forwards.push(rustgo_config::ForwardConfig {
+            name: "local-forward".into(),
+            peer: "other".into(),
+            export: "ssh".into(),
+            listen_addr: "127.0.0.1:10022".into(),
+        });
+        let local = config_panel.config().unwrap().clone();
+        let mut panel = ForwardingPanel::new();
+        panel.name = "new-tunnel".into();
+        panel.managed.select_server("server:8443");
+        panel.managed.observe(
+            Some(3),
+            Some(&rustgo_config::ManagedConfiguration {
+                tunnels: vec![],
+                exports: vec![],
+                forwards: vec![],
+                p2p_enabled: false,
+            }),
+        );
+        assert!(panel.validated_candidate(&local).is_err());
+        let context = eframe::egui::Context::default();
+        let p2p = crate::state::p2p::P2PViewModel::new(rustgoc::PathStatusStore::new());
+        let mut save = false;
+        let mut output = context.run_ui(Default::default(), |ui| {
+            panel.show(ui, config_panel.config_mut(), &[], &p2p, &mut save);
+        });
+        output.textures_delta.clear();
+        config_panel
+            .config_mut()
+            .unwrap()
+            .client
+            .heartbeat_interval_secs = 45;
+        config_panel.save().unwrap();
+        let saved = rustgo_config::load_client(&path).unwrap();
+        assert_eq!(saved.tunnels, local.tunnels);
+        assert_eq!(saved.exports, local.exports);
+        assert_eq!(saved.forwards, local.forwards);
+        assert_eq!(saved.client.heartbeat_interval_secs, 45);
+    }
     #[test]
     fn selector_has_exactly_four_types() {
         let k = [

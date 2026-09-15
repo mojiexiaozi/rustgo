@@ -286,9 +286,16 @@ impl eframe::App for GuiApp {
         }
         self.last_logged_connection_state = state.clone();
 
+        {
+            let status = self.connection_vm.status();
+            self.forwarding_panel
+                .managed
+                .observe(status.managed_revision(), status.effective_configuration());
+        }
+
         // Update tunnels from active generation
         if matches!(state, state::connection::ConnectionState::Connected { .. })
-            && let Some(active) = self._status_tx.borrow().active()
+            && let Some(active) = self.connection_vm.status().active()
         {
             let new_tunnels: Vec<TunnelRow> = active
                 .registered_tunnels()
@@ -296,6 +303,8 @@ impl eframe::App for GuiApp {
                 .map(TunnelRow::from_registered)
                 .collect();
             self.tunnels = new_tunnels;
+        } else {
+            self.tunnels.clear();
         }
 
         // Update P2P paths
@@ -373,6 +382,7 @@ impl eframe::App for GuiApp {
                         })
                         .unzip();
                     let config = self.config_panel.config();
+                    let managed = self.forwarding_panel.managed.snapshot();
                     let p2p_rows = self.p2p_vm.rows(now_millis());
                     self.connection_panel.show(
                         ui,
@@ -383,9 +393,15 @@ impl eframe::App for GuiApp {
                             sent_bytes,
                             received_bytes,
                             tunnels: &self.tunnels,
-                            configured_tunnels: config.map(|c| c.tunnels.len()).unwrap_or(0),
-                            exports: config.map(|c| c.exports.len()).unwrap_or(0),
-                            forwards: config.map(|c| c.forwards.len()).unwrap_or(0),
+                            configured_tunnels: managed
+                                .map(|c| c.tunnels.len())
+                                .unwrap_or_else(|| config.map(|c| c.tunnels.len()).unwrap_or(0)),
+                            exports: managed
+                                .map(|c| c.exports.len())
+                                .unwrap_or_else(|| config.map(|c| c.exports.len()).unwrap_or(0)),
+                            forwards: managed
+                                .map(|c| c.forwards.len())
+                                .unwrap_or_else(|| config.map(|c| c.forwards.len()).unwrap_or(0)),
                             p2p_rows: &p2p_rows,
                         },
                     );
@@ -505,6 +521,11 @@ impl GuiApp {
                 directory.join(&config.client.certificate_authority_file);
         }
         let server_address = config.client.server_addr.clone();
+        self.forwarding_panel.managed.select_server(&server_address);
+        // Drop the prior subscription before any enrollment or initialization failure.
+        let (_, status_rx) = watch::channel(rustgoc::ClientStatus::default());
+        self.connection_vm = ConnectionViewModel::new(status_rx);
+        self.tunnels.clear();
         self.connection_panel
             .set_server_address(server_address.clone());
 

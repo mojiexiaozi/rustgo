@@ -18,6 +18,9 @@ pub struct ConnectionViewModel {
 }
 
 impl ConnectionViewModel {
+    pub fn status(&self) -> watch::Ref<'_, ClientStatus> {
+        self.status_rx.borrow()
+    }
     pub fn authentication_rejected(&self) -> bool {
         self.status_rx.borrow().authentication_rejected()
     }
