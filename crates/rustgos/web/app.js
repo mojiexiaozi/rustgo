@@ -17,6 +17,7 @@
     pollInFlight: false,
     pollQueued: false,
     pollGeneration: 0,
+    managed: { name: null, value: null, busy: false, generation: 0, fields: {} },
 
     serverHistory: { key: "", expiresAt: 0, retryAfter: 0, failed: false, generation: 0 },
     clientHistory: { key: "", expiresAt: 0, retryAfter: 0, failed: false, generation: 0 },
@@ -194,6 +195,8 @@
     capacity_reached: "动态客户端或密钥容量已满",
     enrollment_unavailable: "动态客户端管理暂时不可用",
     invalid_client_id: "客户端 ID 格式无效",
+    managed_unavailable: "服务器未启用隧道管理或配置存储不可用",
+    invalid_tunnel_configuration: "配置无效，请检查名称、地址、端口、重复项及客户端权限",
   };
 
   async function managementRequest(path, body) {
@@ -207,6 +210,116 @@
     const value = await response.json();
     if (!response.ok) throw new Error(errorLabels[value?.error?.code] || `操作失败（${response.status}）`);
     return value;
+  }
+
+  function managedEditable() {
+    const m = state.managed;
+    return m.value?.snapshot && m.value.supported !== false && !m.busy && activeRoute().name === m.name;
+  }
+
+  function buildManagedFields() {
+    const container = $("managed-fields");
+    if (!container) return;
+    const kind = $("managed-kind").value;
+    const fields = [["name", "名称", "text"]];
+    if (kind === "forward") fields.push(["peer", "目标客户端", "text"], ["export", "目标导出名称", "text"], ["listen_addr", "监听地址（例如 127.0.0.1:9000）", "text"]);
+    else fields.push(["protocol", "协议", "select"], ["local_addr", "本地服务地址（例如 127.0.0.1:80）", "text"], kind === "tunnel" ? ["remote_port", "服务器端口（1–65535）", "number"] : ["allowed_peers", "允许的客户端（逗号分隔；留空允许所有已授权客户端）", "text"]);
+    state.managed.fields = {};
+    container.replaceChildren();
+    for (const [name, label, type] of fields) {
+      const wrapper = document.createElement("label"); wrapper.textContent = label;
+      const input = document.createElement(type === "select" ? "select" : "input"); input.name = name;
+      if (type === "select") {
+        for (const value of ["tcp", "udp"]) { const option = document.createElement("option"); option.value = value; option.textContent = value.toUpperCase(); input.append(option); }
+        input.value = "tcp";
+      } else { input.type = type; input.required = name !== "allowed_peers"; input.autocomplete = "off"; }
+      if (type === "number") { input.min = "1"; input.max = "65535"; input.step = "1"; }
+      state.managed.fields[name] = input;
+      wrapper.append(input); container.append(wrapper);
+    }
+    updateManagedControls();
+  }
+
+  function updateManagedControls() {
+    const allowed = Boolean(managedEditable());
+    const p2p = state.managed.value?.snapshot?.configuration.p2p_enabled;
+    if ($("managed-submit")) $("managed-submit").disabled = !allowed || ($("managed-kind").value !== "tunnel" && !p2p);
+    if ($("managed-kind")) $("managed-kind").disabled = !allowed;
+    for (const input of Object.values(state.managed.fields)) input.disabled = !allowed;
+    for (const row of $("managed-rows")?.children || []) {
+      const button = row.children[row.children.length - 1]?.children[0]; if (button) button.disabled = !allowed;
+    }
+    text("managed-p2p-note", p2p ? "" : "客户端未启用 P2P，无法添加导出或转发；请先在客户端启用 P2P。");
+  }
+
+  function renderManaged(name, value) {
+    const m = state.managed;
+    if (m.name !== name) {
+      m.name = name; m.value = null;
+      text("managed-operation-status", "");
+      if ($("managed-kind")) $("managed-kind").value = "tunnel";
+      buildManagedFields();
+    }
+    m.value = value;
+    const snapshot = value.snapshot;
+    text("managed-status", value.supported === false ? "客户端版本不支持远程配置，请升级客户端。" : !snapshot ? "尚无配置快照，等待客户端首次连接并同步。" : `${value.online ? "在线" : "离线 · 修改将在下次连接时应用"} · 期望版本 ${snapshot.revision} · ${value.online && snapshot.applied_revision === snapshot.revision ? "已收到应用结果" : "等待应用"}`);
+    const rows = $("managed-rows");
+    if (rows) {
+      rows.replaceChildren();
+      for (const [kind, collection, label] of [["tunnel", "tunnels", "隧道"], ["export", "exports", "导出"], ["forward", "forwards", "转发"]]) {
+        for (const item of snapshot?.configuration[collection] || []) {
+          const result = snapshot.results?.find(r => r.kind === kind && r.name === item.name);
+          const current = value.online && snapshot.applied_revision === snapshot.revision;
+          const status = !current || !result ? "等待应用" : result.state === "ready" ? "已就绪" : result.state === "failed" ? `失败：${result.error || "未知错误"}` : "等待应用";
+          const description = kind === "tunnel" ? `服务器端口 ${item.remote_port}` : kind === "export" ? `允许：${item.allowed_peers.length ? item.allowed_peers.join("、") : "所有已授权客户端"}` : `目标 ${item.peer} / ${item.export}`;
+          const row = document.createElement("tr");
+          for (const value of [label, item.name, kind === "forward" ? "P2P" : protocolLabel(item.protocol), item.local_addr || item.listen_addr, description, status]) { const cell = document.createElement("td"); cell.textContent = value; row.append(cell); }
+          const cell = document.createElement("td"); const button = document.createElement("button");
+          button.type = "button"; button.className = "button button-danger"; button.textContent = `删除 ${item.name}`;
+          button.addEventListener("click", () => mutateManaged({ action: "delete", kind, name: item.name }));
+          cell.append(button); row.append(cell); rows.append(row);
+        }
+      }
+    }
+    updateManagedControls();
+  }
+
+  async function refreshManaged(name) {
+    if (!$("managed-form") || state.managed.busy) return;
+    const generation = ++state.managed.generation;
+    if (state.managed.name !== name) renderManaged(name, { snapshot: null });
+    try {
+      const value = await requestJson(`/api/v1/clients/${encodeURIComponent(name)}/tunnels`, "managed-tunnels");
+      if (generation !== state.managed.generation || activeRoute().name !== name) return;
+      renderManaged(name, value);
+    } catch (error) {
+      if (error.name === "AbortError" || generation !== state.managed.generation || activeRoute().name !== name) return;
+      state.managed.value = null; $("managed-rows")?.replaceChildren();
+      text("managed-status", `配置管理不可用（服务可能未启用），请稍后重试：${error.message}`);
+      updateManagedControls();
+    }
+  }
+
+  async function mutateManaged(mutation) {
+    if (!managedEditable()) return;
+    const m = state.managed, name = m.name, revision = m.value.snapshot.revision;
+    m.busy = true;
+    const generation = ++m.generation;
+    controllers.get("managed-tunnels")?.abort(); updateManagedControls();
+    text("managed-operation-status", "正在保存…");
+    try {
+      await managementRequest(`/api/v1/clients/${encodeURIComponent(name)}/tunnels`, { expected_revision: revision, ...mutation });
+      if (activeRoute().name === name && generation === m.generation) {
+        text("managed-operation-status", "已保存，等待客户端重新连接并应用。该客户端的其他连接也可能短暂中断。");
+        if (mutation.action === "add") buildManagedFields();
+      }
+    } catch (error) {
+      if (activeRoute().name === name && generation === m.generation) text("managed-operation-status", error.message);
+    } finally {
+      m.busy = false;
+      // Require a fresh revision before accepting another mutation.
+      m.value = null; updateManagedControls(); requestPoll();
+    }
   }
 
   function sessionPathLabel(path) {
@@ -524,6 +637,7 @@
       if (activeRoute().view !== "client" || activeRoute().name !== route.name) return true;
       state.detail = detail;
       renderClientDetail(detail);
+      await refreshManaged(route.name);
       return refreshClientHistory(route.name);
     } else if (route.view === "sessions") {
       const sessions = await requestJson(sessionFilterPath(), "sessions");
@@ -590,6 +704,10 @@
   }
 
   function abortSupersededViewRequests() {
+    controllers.get("managed-tunnels")?.abort();
+    state.managed.generation += 1;
+    state.managed.name = null; state.managed.value = null;
+    $("managed-rows")?.replaceChildren(); updateManagedControls();
     controllers.get("detail")?.abort();
     controllers.get("sessions")?.abort();
   }
@@ -616,6 +734,16 @@
       await managementRequest(`/api/v1/clients/${encodeURIComponent(client.name)}/delete`, { expected_revision: client.revision });
       location.hash = "overview";
     } catch (error) { text("client-management-status", error.message); }
+  });
+  $("managed-kind")?.addEventListener("change", buildManagedFields);
+  $("managed-form")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (!managedEditable() || $("managed-submit").disabled) return;
+    const kind = $("managed-kind").value;
+    const item = Object.fromEntries(Object.entries(state.managed.fields).map(([key, input]) => [key, input.value.trim()]));
+    if (kind === "tunnel") item.remote_port = Number(item.remote_port);
+    if (kind === "export") item.allowed_peers = item.allowed_peers.split(/[,，]/).map(value => value.trim()).filter(Boolean);
+    await mutateManaged({ action: "add", kind, item });
   });
   $("history-range")?.addEventListener("change", () => { resetHistory(); requestPoll(); });
   $("session-filters")?.addEventListener("submit", (event) => { event.preventDefault(); abortSupersededViewRequests(); if (activeRoute().view === "sessions") requestPoll(); });

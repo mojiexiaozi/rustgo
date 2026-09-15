@@ -90,7 +90,20 @@
           </div>
           <p id="client-management-status" class="muted" role="status" aria-live="polite"></p>
         </section>
-        <section class="detail-grid">
+          <section class="detail-card managed-panel" aria-labelledby="managed-title">
+            <h2 id="managed-title">服务端配置管理</h2>
+            <p class="muted">添加或删除会保存到服务器，并让客户端重新连接。该客户端的其他现有连接也可能短暂中断。离线修改将在下次连接时应用。</p>
+            <p id="managed-status" role="status" aria-live="polite">正在读取配置…</p>
+            <div class="table-wrap"><table><thead><tr><th>类型</th><th>名称</th><th>协议</th><th>地址</th><th>目标 / 权限</th><th>应用状态</th><th>操作</th></tr></thead><tbody id="managed-rows"></tbody></table></div>
+            <form id="managed-form" class="managed-form">
+              <label>添加类型 <select id="managed-kind"><option value="tunnel">隧道</option><option value="export">导出</option><option value="forward">转发</option></select></label>
+              <div id="managed-fields" class="managed-fields"></div>
+              <p id="managed-p2p-note" class="muted"></p>
+              <button id="managed-submit" class="button" type="submit" disabled>保存并应用</button>
+            </form>
+            <p id="managed-operation-status" role="status" aria-live="polite"></p>
+          </section>
+          <section class="detail-grid">
           <article class="detail-card"><h2>清单</h2><dl id="client-inventory"></dl></article>
           <article class="detail-card"><h2>路径与会话</h2><dl id="client-paths"></dl></article>
           <article class="detail-card"><h2>最近会话</h2><div id="client-sessions"></div></article>
