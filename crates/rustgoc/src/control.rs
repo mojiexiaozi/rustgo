@@ -479,6 +479,49 @@ impl RegisteredTunnel {
     pub const fn error(&self) -> Option<ProtocolErrorCode> {
         self.error
     }
+
+    /// Human-readable registration failure, shared by the GUI and managed reports.
+    pub fn error_message(&self) -> Option<String> {
+        let code = self.error?;
+        let reason = match code {
+            ProtocolErrorCode::TUNNEL_PORT_IN_USE => {
+                format!("服务器端口 {} 已被占用，请更换远程端口", self.remote_port)
+            }
+            ProtocolErrorCode::TUNNEL_PERMISSION_DENIED => format!(
+                "服务器无权监听端口 {}，请更换端口或检查服务权限",
+                self.remote_port
+            ),
+            ProtocolErrorCode::TUNNEL_REJECTED => {
+                "服务端拒绝注册隧道，请检查隧道配置、数量限制及服务端日志".to_owned()
+            }
+            ProtocolErrorCode::UDP_BIND_ADDRESS_REQUIRED => {
+                "服务器未配置 UDP 监听地址，请设置 server.udp_bind_ip".to_owned()
+            }
+            ProtocolErrorCode::AUTHENTICATION_FAILED => {
+                "客户端身份验证失败，请检查设备授权".to_owned()
+            }
+            ProtocolErrorCode::UNSUPPORTED_VERSION => {
+                "客户端与服务器协议版本不兼容，请升级程序".to_owned()
+            }
+            ProtocolErrorCode::UNKNOWN_MESSAGE => {
+                "收到无法识别的协议消息，请检查程序版本".to_owned()
+            }
+            ProtocolErrorCode::INVALID_FRAME => {
+                "通信数据格式错误，请检查程序版本及服务端日志".to_owned()
+            }
+            ProtocolErrorCode::PAYLOAD_TOO_LARGE => {
+                "通信数据超过大小限制，请减少配置内容".to_owned()
+            }
+            ProtocolErrorCode::INVALID_STATE => "连接状态异常，请重新连接".to_owned(),
+            ProtocolErrorCode::UNKNOWN_SESSION => "连接会话已失效，请重新连接".to_owned(),
+            ProtocolErrorCode::INCOMPATIBLE_HEARTBEAT => {
+                "心跳配置不兼容，请检查客户端与服务器心跳设置".to_owned()
+            }
+            ProtocolErrorCode::INTERNAL => "服务器内部错误，请查看服务端日志".to_owned(),
+            _ => "服务端返回未知错误，请查看服务端日志".to_owned(),
+        };
+        Some(format!("{reason}（错误码 {}）", code.as_u16()))
+    }
 }
 
 pub struct ControlSession {
@@ -489,6 +532,29 @@ pub struct ControlSession {
     registered_tunnels: Arc<[RegisteredTunnel]>,
     effective_config: Option<Arc<ClientConfig>>,
     managed_revision: Option<u64>,
+}
+
+#[cfg(test)]
+mod registration_error_tests {
+    use super::*;
+
+    #[test]
+    fn occupied_port_has_chinese_reason_and_action() {
+        let mut tunnel = RegisteredTunnel::accepted_for_test(1, ConfigTunnelProtocol::Tcp);
+        tunnel.remote_port = 10022;
+        tunnel.error = Some(ProtocolErrorCode::TUNNEL_PORT_IN_USE);
+        assert_eq!(
+            tunnel.error_message().unwrap(),
+            "服务器端口 10022 已被占用，请更换远程端口（错误码 11）"
+        );
+        tunnel.error = Some(ProtocolErrorCode::TUNNEL_REJECTED);
+        let reason = tunnel.error_message().unwrap();
+        assert!(reason.contains("服务端拒绝注册隧道"));
+        assert!(!reason.contains("已被占用"));
+        assert!(!reason.contains("ProtocolErrorCode"));
+        tunnel.error = None;
+        assert_eq!(tunnel.error_message(), None);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -522,7 +588,7 @@ impl ControlSession {
 
     pub(crate) fn managed_report(&self) -> Option<(u64, Vec<serde_json::Value>)> {
         let revision = self.managed_revision?;
-        let mut results = self.registered_tunnels.iter().map(|tunnel| serde_json::json!({"kind":"tunnel","name":tunnel.name(),"state":if tunnel.accepted() {"ready"} else {"failed"},"error":tunnel.error().map(|error| format!("{error:?}"))})).collect::<Vec<_>>();
+        let mut results = self.registered_tunnels.iter().map(|tunnel| serde_json::json!({"kind":"tunnel","name":tunnel.name(),"state":if tunnel.accepted() {"ready"} else {"failed"},"error":tunnel.error_message()})).collect::<Vec<_>>();
         if let Some(config) = self.effective_config() {
             results.extend(config.exports.iter().map(|export| serde_json::json!({"kind":"export","name":export.name,"state":"ready","error":null})));
         }

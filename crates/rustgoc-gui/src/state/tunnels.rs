@@ -23,7 +23,7 @@ impl TunnelRow {
             local_addr: tunnel.local_addr().to_string(),
             remote_port: tunnel.remote_port(),
             accepted: tunnel.accepted(),
-            error: tunnel.error().map(|e| format!("{:?}", e)),
+            error: tunnel.error_message(),
         }
     }
 

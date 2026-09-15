@@ -878,7 +878,15 @@ impl ControlSessionGuard {
                         error = %safe_display(&error),
                         "event=tunnel_rejected 服务端拒绝了隧道注册"
                     );
-                    let code = if matches!(error, RegistryError::UdpBindAddressRequired) {
+                    let code = if self.protocol_version().supports_managed_configuration()
+                        && matches!(&error, RegistryError::Io(io) if io.kind() == std::io::ErrorKind::AddrInUse)
+                    {
+                        ProtocolErrorCode::TUNNEL_PORT_IN_USE
+                    } else if self.protocol_version().supports_managed_configuration()
+                        && matches!(&error, RegistryError::Io(io) if io.kind() == std::io::ErrorKind::PermissionDenied)
+                    {
+                        ProtocolErrorCode::TUNNEL_PERMISSION_DENIED
+                    } else if matches!(error, RegistryError::UdpBindAddressRequired) {
                         ProtocolErrorCode::UDP_BIND_ADDRESS_REQUIRED
                     } else {
                         ProtocolErrorCode::TUNNEL_REJECTED

@@ -836,6 +836,18 @@ async fn heartbeat_timeout_drops_the_control_owner_and_its_listener() -> Result<
 #[tokio::test]
 async fn tunnel_conflict_is_rejected_without_discarding_unrelated_tunnels()
 -> Result<(), Box<dyn Error>> {
+    check_tunnel_conflict(VERSION, ProtocolErrorCode::TUNNEL_REJECTED).await
+}
+
+#[tokio::test]
+async fn modern_client_receives_explicit_port_in_use() -> Result<(), Box<dyn Error>> {
+    check_tunnel_conflict(ProtocolVersion::V0_4, ProtocolErrorCode::TUNNEL_PORT_IN_USE).await
+}
+
+async fn check_tunnel_conflict(
+    version: ProtocolVersion,
+    expected: ProtocolErrorCode,
+) -> Result<(), Box<dyn Error>> {
     let pki = TestPki::generate()?;
     let key = DeviceKeypair::from_secret_bytes([18; 32]);
     let occupied = std::net::TcpListener::bind("127.0.0.1:0")?;
@@ -848,21 +860,54 @@ async fn tunnel_conflict_is_rejected_without_discarding_unrelated_tunnels()
     let server_task = tokio::spawn(app.run_until(shutdown.clone()));
 
     let mut client = FramedClient::connect(&pki, address).await?;
-    assert!(authenticate(&mut client, "home-pc", &key).await?.accepted);
-    let results = register_tunnels(
-        &mut client,
-        vec![
-            tcp_tunnel(1, "conflict", occupied_port),
-            tcp_tunnel(2, "healthy", available_port),
-        ],
-    )
-    .await?;
+    let challenge = begin_authentication(&mut client, version, "home-pc", &key).await?;
+    assert!(
+        finish_authentication(
+            &mut client,
+            version,
+            authentication_message(&challenge, &key, &key, version, "home-pc")
+        )
+        .await?
+        .accepted
+    );
+    if version.supports_managed_configuration() {
+        client
+            .send(
+                version,
+                Message::ManagedConfigRequest(rustgo_protocol::ManagedConfigRequest {
+                    configuration: bytes(
+                        br#"{"tunnels":[],"exports":[],"forwards":[],"p2p_enabled":false}"#,
+                    ),
+                }),
+            )
+            .await?;
+        assert!(matches!(
+            client.receive().await?.message,
+            Message::ManagedConfigSnapshot(_)
+        ));
+    }
+    client
+        .send(
+            version,
+            Message::RegisterTunnels(RegisterTunnels {
+                tunnels: BoundedVec::try_from(vec![
+                    tcp_tunnel(1, "conflict", occupied_port),
+                    tcp_tunnel(2, "healthy", available_port),
+                ])
+                .unwrap(),
+            }),
+        )
+        .await?;
+    let Frame {
+        message: Message::TunnelResults(results),
+        ..
+    } = client.receive().await?
+    else {
+        return Err("server did not send tunnel results".into());
+    };
     assert_eq!(results.results.as_slice().len(), 2);
     assert!(!results.results.as_slice()[0].accepted);
-    assert_eq!(
-        results.results.as_slice()[0].error,
-        Some(ProtocolErrorCode::TUNNEL_REJECTED)
-    );
+    assert_eq!(results.results.as_slice()[0].error, Some(expected));
     assert!(results.results.as_slice()[1].accepted);
     assert_eq!(results.results.as_slice()[1].error, None);
     assert!(std::net::TcpListener::bind(("127.0.0.1", available_port)).is_err());
