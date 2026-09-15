@@ -87,50 +87,72 @@ impl ForwardingPanel {
             return;
         };
         ui.add_enabled_ui(!self.saving, |ui| {
-        ui.collapsing("P2P 全局设置", |ui| {
-            let p = c.p2p.get_or_insert_with(default_p2p);
-            ui.checkbox(&mut p.enabled, "启用 P2P");
-            ui.checkbox(&mut p.prefer_direct, "优先直连");
-            ui.checkbox(&mut p.allow_relay_fallback, "允许中继回退");
-            ui.horizontal(|ui| {
-                ui.label("直连超时");
-                ui.add(egui::DragValue::new(&mut p.direct_timeout_secs).range(1..=300));
-                ui.label("秒");
+            ui.collapsing("P2P 全局设置", |ui| {
+                let p = c.p2p.get_or_insert_with(default_p2p);
+                ui.checkbox(&mut p.enabled, "启用 P2P");
+                ui.checkbox(&mut p.prefer_direct, "优先直连");
+                ui.checkbox(&mut p.allow_relay_fallback, "允许中继回退");
+                ui.horizontal(|ui| {
+                    ui.label("直连超时");
+                    ui.add(egui::DragValue::new(&mut p.direct_timeout_secs).range(1..=300));
+                    ui.label("秒");
+                });
+                ui.horizontal(|ui| {
+                    ui.label("重连超时");
+                    ui.add(egui::DragValue::new(&mut p.reconnect_timeout_secs).range(1..=3600));
+                    ui.label("秒");
+                });
+                ui.horizontal(|ui| {
+                    ui.label("UDP 端口范围");
+                    ui.add(egui::DragValue::new(&mut p.udp_port_range.start).range(1..=65535));
+                    ui.label("至");
+                    ui.add(egui::DragValue::new(&mut p.udp_port_range.end).range(1..=65535));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("TCP 端口范围");
+                    ui.add(egui::DragValue::new(&mut p.tcp_port_range.start).range(1..=65535));
+                    ui.label("至");
+                    ui.add(egui::DragValue::new(&mut p.tcp_port_range.end).range(1..=65535));
+                });
+                optional_address(ui, "主观测地址", &mut p.observation_primary_addr);
+                optional_address(ui, "备用观测地址", &mut p.observation_alternate_addr);
             });
-            ui.horizontal(|ui| {
-                ui.label("重连超时");
-                ui.add(egui::DragValue::new(&mut p.reconnect_timeout_secs).range(1..=3600));
-                ui.label("秒");
-            });
-            ui.horizontal(|ui| {
-                ui.label("UDP 端口范围");
-                ui.add(egui::DragValue::new(&mut p.udp_port_range.start).range(1..=65535));
-                ui.label("至");
-                ui.add(egui::DragValue::new(&mut p.udp_port_range.end).range(1..=65535));
-            });
-            ui.horizontal(|ui| {
-                ui.label("TCP 端口范围");
-                ui.add(egui::DragValue::new(&mut p.tcp_port_range.start).range(1..=65535));
-                ui.label("至");
-                ui.add(egui::DragValue::new(&mut p.tcp_port_range.end).range(1..=65535));
-            });
-            optional_address(ui, "主观测地址", &mut p.observation_primary_addr);
-            optional_address(ui, "备用观测地址", &mut p.observation_alternate_addr);
-        });
         });
         ui.separator();
         ui.heading("配置项");
         let is_managed = self.managed.draft().is_some();
         if is_managed {
-            ui.strong(format!("由服务器管理 · 编辑修订号 {}", self.managed.draft_revision().unwrap_or(0)));
-            if self.managed.dirty() { ui.label("有未保存的服务器配置修改"); }
-            if self.managed.revision() != self.managed.draft_revision() {
-                ui.colored_label(egui::Color32::YELLOW, format!("服务器已有新修订号 {}，请重新加载后合并修改", self.managed.revision().unwrap_or(0)));
+            ui.strong(format!(
+                "由服务器管理 · 编辑修订号 {}",
+                self.managed.draft_revision().unwrap_or(0)
+            ));
+            if self.managed.dirty() {
+                ui.label("有未保存的服务器配置修改");
             }
-            if ui.add_enabled(!self.saving, egui::Button::new("重新加载服务器配置（丢弃草稿）")).clicked() {
+            if self.managed.revision() != self.managed.draft_revision() {
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    format!(
+                        "服务器已有新修订号 {}，请重新加载后合并修改",
+                        self.managed.revision().unwrap_or(0)
+                    ),
+                );
+            }
+            if ui
+                .add_enabled(
+                    !self.saving,
+                    egui::Button::new("重新加载服务器配置（丢弃草稿）"),
+                )
+                .clicked()
+            {
                 self.reload_managed = true;
             }
-            if ui.add_enabled(!self.saving, egui::Button::new("保存本地 P2P 设置并生效")).clicked() { *save = true; }
+            if ui
+                .add_enabled(!self.saving, egui::Button::new("保存本地 P2P 设置并生效"))
+                .clicked()
+            {
+                *save = true;
+            }
         }
         let mut remote = c.clone();
         if let Some(draft) = self.managed.draft() {
@@ -140,253 +162,284 @@ impl ForwardingPanel {
         }
         let c = if is_managed { &mut remote } else { c };
         ui.add_enabled_ui(!self.saving, |ui| {
-        let mut remove = None;
-        ui.with_layout(
-            egui::Layout::left_to_right(egui::Align::Min).with_main_wrap(true),
-            |ui| {
-                ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
-                for (i, x) in c.tunnels.iter_mut().enumerate() {
-                    compact_card(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.strong(if x.protocol == TunnelProtocol::Tcp {
-                                "TCP 隧道"
-                            } else {
-                                "UDP 隧道"
+            let mut remove = None;
+            ui.with_layout(
+                egui::Layout::left_to_right(egui::Align::Min).with_main_wrap(true),
+                |ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
+                    for (i, x) in c.tunnels.iter_mut().enumerate() {
+                        compact_card(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.strong(if x.protocol == TunnelProtocol::Tcp {
+                                    "TCP 隧道"
+                                } else {
+                                    "UDP 隧道"
+                                });
+                                ui.add_sized(
+                                    [150.0, 24.0],
+                                    egui::TextEdit::singleline(&mut x.name),
+                                );
+                                if ui.small_button("删除").clicked() {
+                                    remove = Some(i);
+                                }
                             });
-                            ui.add_sized([150.0, 24.0], egui::TextEdit::singleline(&mut x.name));
-                            if ui.small_button("删除").clicked() {
-                                remove = Some(i);
+                            ui.horizontal(|ui| {
+                                ui.label("本地地址");
+                                ui.add_sized(
+                                    [165.0, 24.0],
+                                    egui::TextEdit::singleline(&mut x.local_addr),
+                                );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("远程端口");
+                                ui.add(egui::DragValue::new(&mut x.remote_port).range(1..=65535));
+                            });
+                            let runtime = tunnels.iter().find(|row| row.name == x.name);
+                            let (color, label, detail) = match runtime {
+                                Some(row) if row.error.is_some() || !row.accepted => (
+                                    egui::Color32::from_rgb(220, 65, 65),
+                                    "转发失败",
+                                    row.error.as_deref().unwrap_or("服务端拒绝该隧道"),
+                                ),
+                                Some(_) => (
+                                    egui::Color32::from_rgb(45, 170, 95),
+                                    "正常转发",
+                                    "隧道已获服务端接受；此状态不代表实时连通性检测结果",
+                                ),
+                                None => {
+                                    (ui.visuals().weak_text_color(), "未就绪", "暂无隧道运行状态")
+                                }
+                            };
+                            egui::Frame::new()
+                                .fill(color.gamma_multiply(0.12))
+                                .stroke(egui::Stroke::new(1.0, color))
+                                .corner_radius(4.0)
+                                .inner_margin(egui::Margin::symmetric(8, 4))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        let (rect, _) = ui.allocate_exact_size(
+                                            egui::vec2(8.0, 8.0),
+                                            egui::Sense::hover(),
+                                        );
+                                        ui.painter().circle_filled(rect.center(), 4.0, color);
+                                        ui.label(egui::RichText::new(label).color(color).strong());
+                                    });
+                                })
+                                .response
+                                .on_hover_text(detail);
+                            if runtime.is_some_and(|row| row.error.is_some() || !row.accepted) {
+                                ui.colored_label(color, detail);
                             }
                         });
-                        ui.horizontal(|ui| {
-                            ui.label("本地地址");
-                            ui.add_sized(
-                                [165.0, 24.0],
-                                egui::TextEdit::singleline(&mut x.local_addr),
-                            );
+                    }
+                },
+            );
+            if let Some(i) = remove {
+                c.tunnels.remove(i);
+            }
+            let mut remove = None;
+            ui.with_layout(
+                egui::Layout::left_to_right(egui::Align::Min).with_main_wrap(true),
+                |ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
+                    for (i, x) in c.exports.iter_mut().enumerate() {
+                        compact_card(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.strong("P2P 导出");
+                                ui.add_sized(
+                                    [150.0, 24.0],
+                                    egui::TextEdit::singleline(&mut x.name),
+                                );
+                                if ui.small_button("删除").clicked() {
+                                    remove = Some(i);
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                egui::ComboBox::from_id_salt(("existing-export-protocol", i))
+                                    .selected_text(protocol_label(x.protocol))
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(
+                                            &mut x.protocol,
+                                            TunnelProtocol::Tcp,
+                                            "TCP",
+                                        );
+                                        ui.selectable_value(
+                                            &mut x.protocol,
+                                            TunnelProtocol::Udp,
+                                            "UDP",
+                                        );
+                                    });
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("本地地址");
+                                ui.add_sized(
+                                    [165.0, 24.0],
+                                    egui::TextEdit::singleline(&mut x.local_addr),
+                                );
+                            });
+                            let mut peers = x.allowed_peers.join(", ");
+                            ui.horizontal(|ui| {
+                                ui.label("允许客户端");
+                                if ui
+                                    .add_sized(
+                                        [205.0, 24.0],
+                                        egui::TextEdit::singleline(&mut peers),
+                                    )
+                                    .changed()
+                                {
+                                    x.allowed_peers = parse_peers(&peers);
+                                }
+                            });
                         });
-                        ui.horizontal(|ui| {
-                            ui.label("远程端口");
-                            ui.add(egui::DragValue::new(&mut x.remote_port).range(1..=65535));
+                    }
+                },
+            );
+            if let Some(i) = remove {
+                c.exports.remove(i);
+            }
+            let mut remove = None;
+            ui.with_layout(
+                egui::Layout::left_to_right(egui::Align::Min).with_main_wrap(true),
+                |ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
+                    for (i, x) in c.forwards.iter_mut().enumerate() {
+                        compact_card(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.strong("P2P 转发");
+                                ui.add_sized(
+                                    [150.0, 24.0],
+                                    egui::TextEdit::singleline(&mut x.name),
+                                );
+                                if ui.small_button("删除").clicked() {
+                                    remove = Some(i);
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("监听地址");
+                                ui.add_sized(
+                                    [165.0, 24.0],
+                                    egui::TextEdit::singleline(&mut x.listen_addr),
+                                );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("目标客户端");
+                                ui.add_sized(
+                                    [100.0, 24.0],
+                                    egui::TextEdit::singleline(&mut x.peer),
+                                );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("导出名称");
+                                ui.add_sized(
+                                    [100.0, 24.0],
+                                    egui::TextEdit::singleline(&mut x.export),
+                                );
+                            });
                         });
-                        let runtime = tunnels.iter().find(|row| row.name == x.name);
-                        let (color, label, detail) = match runtime {
-                            Some(row) if row.error.is_some() || !row.accepted => (
-                                egui::Color32::from_rgb(220, 65, 65),
-                                "转发失败",
-                                row.error.as_deref().unwrap_or("服务端拒绝该隧道"),
-                            ),
-                            Some(_) => (
-                                egui::Color32::from_rgb(45, 170, 95),
-                                "正常转发",
-                                "隧道已获服务端接受；此状态不代表实时连通性检测结果",
-                            ),
-                            None => (ui.visuals().weak_text_color(), "未就绪", "暂无隧道运行状态"),
-                        };
-                        egui::Frame::new()
-                            .fill(color.gamma_multiply(0.12))
-                            .stroke(egui::Stroke::new(1.0, color))
-                            .corner_radius(4.0)
-                            .inner_margin(egui::Margin::symmetric(8, 4))
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    let (rect, _) = ui.allocate_exact_size(
-                                        egui::vec2(8.0, 8.0),
-                                        egui::Sense::hover(),
-                                    );
-                                    ui.painter().circle_filled(rect.center(), 4.0, color);
-                                    ui.label(egui::RichText::new(label).color(color).strong());
-                                });
-                            })
-                            .response
-                            .on_hover_text(detail);
-                        if runtime.is_some_and(|row| row.error.is_some() || !row.accepted) {
-                            ui.colored_label(color, detail);
-                        }
-                    });
-                }
-            },
-        );
-        if let Some(i) = remove {
-            c.tunnels.remove(i);
-        }
-        let mut remove = None;
-        ui.with_layout(
-            egui::Layout::left_to_right(egui::Align::Min).with_main_wrap(true),
-            |ui| {
-                ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
-                for (i, x) in c.exports.iter_mut().enumerate() {
-                    compact_card(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.strong("P2P 导出");
-                            ui.add_sized([150.0, 24.0], egui::TextEdit::singleline(&mut x.name));
-                            if ui.small_button("删除").clicked() {
-                                remove = Some(i);
-                            }
-                        });
-                        ui.horizontal(|ui| {
-                            egui::ComboBox::from_id_salt(("existing-export-protocol", i))
-                                .selected_text(protocol_label(x.protocol))
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(
-                                        &mut x.protocol,
-                                        TunnelProtocol::Tcp,
-                                        "TCP",
-                                    );
-                                    ui.selectable_value(
-                                        &mut x.protocol,
-                                        TunnelProtocol::Udp,
-                                        "UDP",
-                                    );
-                                });
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("本地地址");
-                            ui.add_sized(
-                                [165.0, 24.0],
-                                egui::TextEdit::singleline(&mut x.local_addr),
-                            );
-                        });
-                        let mut peers = x.allowed_peers.join(", ");
-                        ui.horizontal(|ui| {
-                            ui.label("允许客户端");
-                            if ui
-                                .add_sized([205.0, 24.0], egui::TextEdit::singleline(&mut peers))
-                                .changed()
-                            {
-                                x.allowed_peers = parse_peers(&peers);
-                            }
-                        });
-                    });
-                }
-            },
-        );
-        if let Some(i) = remove {
-            c.exports.remove(i);
-        }
-        let mut remove = None;
-        ui.with_layout(
-            egui::Layout::left_to_right(egui::Align::Min).with_main_wrap(true),
-            |ui| {
-                ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
-                for (i, x) in c.forwards.iter_mut().enumerate() {
-                    compact_card(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.strong("P2P 转发");
-                            ui.add_sized([150.0, 24.0], egui::TextEdit::singleline(&mut x.name));
-                            if ui.small_button("删除").clicked() {
-                                remove = Some(i);
-                            }
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("监听地址");
-                            ui.add_sized(
-                                [165.0, 24.0],
-                                egui::TextEdit::singleline(&mut x.listen_addr),
-                            );
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("目标客户端");
-                            ui.add_sized([100.0, 24.0], egui::TextEdit::singleline(&mut x.peer));
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("导出名称");
-                            ui.add_sized([100.0, 24.0], egui::TextEdit::singleline(&mut x.export));
-                        });
-                    });
-                }
-            },
-        );
-        if let Some(i) = remove {
-            c.forwards.remove(i);
-        }
-        ui.separator();
-        ui.heading("添加配置");
-        egui::ComboBox::from_id_salt("forward-kind")
-            .selected_text(self.kind.label())
-            .show_ui(ui, |ui| {
-                for k in [
-                    ForwardEntryKind::TcpTunnel,
-                    ForwardEntryKind::UdpTunnel,
-                    ForwardEntryKind::P2pExport,
-                    ForwardEntryKind::P2pForward,
-                ] {
-                    ui.selectable_value(&mut self.kind, k, k.label());
-                }
+                    }
+                },
+            );
+            if let Some(i) = remove {
+                c.forwards.remove(i);
+            }
+            ui.separator();
+            ui.heading("添加配置");
+            egui::ComboBox::from_id_salt("forward-kind")
+                .selected_text(self.kind.label())
+                .show_ui(ui, |ui| {
+                    for k in [
+                        ForwardEntryKind::TcpTunnel,
+                        ForwardEntryKind::UdpTunnel,
+                        ForwardEntryKind::P2pExport,
+                        ForwardEntryKind::P2pForward,
+                    ] {
+                        ui.selectable_value(&mut self.kind, k, k.label());
+                    }
+                });
+            ui.horizontal(|ui| {
+                ui.label("名称");
+                ui.add_sized([180.0, 24.0], egui::TextEdit::singleline(&mut self.name));
             });
-        ui.horizontal(|ui| {
-            ui.label("名称");
-            ui.add_sized([180.0, 24.0], egui::TextEdit::singleline(&mut self.name));
-        });
-        match self.kind {
-            ForwardEntryKind::TcpTunnel | ForwardEntryKind::UdpTunnel => {
-                ui.horizontal(|ui| {
-                    ui.label("本地地址");
-                    ui.add_sized([210.0, 24.0], egui::TextEdit::singleline(&mut self.local));
-                });
-                ui.horizontal(|ui| {
-                    ui.label("远程端口");
-                    ui.add(egui::DragValue::new(&mut self.port).range(1..=65535));
-                });
-            }
-            ForwardEntryKind::P2pExport => {
-                egui::ComboBox::from_id_salt("export-protocol")
-                    .selected_text(if self.protocol == TunnelProtocol::Tcp {
-                        "TCP"
-                    } else {
-                        "UDP"
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.protocol, TunnelProtocol::Tcp, "TCP");
-                        ui.selectable_value(&mut self.protocol, TunnelProtocol::Udp, "UDP");
+            match self.kind {
+                ForwardEntryKind::TcpTunnel | ForwardEntryKind::UdpTunnel => {
+                    ui.horizontal(|ui| {
+                        ui.label("本地地址");
+                        ui.add_sized([210.0, 24.0], egui::TextEdit::singleline(&mut self.local));
                     });
-                ui.horizontal(|ui| {
-                    ui.label("本地地址");
-                    ui.text_edit_singleline(&mut self.local);
-                });
-                ui.horizontal(|ui| {
-                    ui.label("允许客户端（逗号分隔）");
-                    ui.text_edit_singleline(&mut self.peers);
-                });
-            }
-            ForwardEntryKind::P2pForward => {
-                ui.horizontal(|ui| {
-                    ui.label("目标客户端");
-                    ui.text_edit_singleline(&mut self.peer);
-                });
-                ui.horizontal(|ui| {
-                    ui.label("导出名称");
-                    ui.text_edit_singleline(&mut self.export);
-                });
-                ui.horizontal(|ui| {
-                    ui.label("监听地址");
-                    ui.text_edit_singleline(&mut self.listen);
-                });
-            }
-        }
-        if ui.button("添加").clicked() {
-            match self.validated_candidate(c) {
-                Ok(candidate) => {
-                    *c = candidate;
-                    self.name.clear();
-                    self.message = Some("已添加，点击保存并生效后应用".into());
+                    ui.horizontal(|ui| {
+                        ui.label("远程端口");
+                        ui.add(egui::DragValue::new(&mut self.port).range(1..=65535));
+                    });
                 }
-                Err(reason) => {
-                    self.message = Some(format!("添加失败：{reason}"));
+                ForwardEntryKind::P2pExport => {
+                    egui::ComboBox::from_id_salt("export-protocol")
+                        .selected_text(if self.protocol == TunnelProtocol::Tcp {
+                            "TCP"
+                        } else {
+                            "UDP"
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.protocol, TunnelProtocol::Tcp, "TCP");
+                            ui.selectable_value(&mut self.protocol, TunnelProtocol::Udp, "UDP");
+                        });
+                    ui.horizontal(|ui| {
+                        ui.label("本地地址");
+                        ui.text_edit_singleline(&mut self.local);
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("允许客户端（逗号分隔）");
+                        ui.text_edit_singleline(&mut self.peers);
+                    });
+                }
+                ForwardEntryKind::P2pForward => {
+                    ui.horizontal(|ui| {
+                        ui.label("目标客户端");
+                        ui.text_edit_singleline(&mut self.peer);
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("导出名称");
+                        ui.text_edit_singleline(&mut self.export);
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("监听地址");
+                        ui.text_edit_singleline(&mut self.listen);
+                    });
                 }
             }
-        }
-        if let Some(m) = &self.message {
-            if m.starts_with("添加失败") || m.starts_with("保存失败") {
-                ui.colored_label(egui::Color32::RED, m);
-            } else {
-                ui.label(m);
+            if ui.button("添加").clicked() {
+                match self.validated_candidate(c) {
+                    Ok(candidate) => {
+                        *c = candidate;
+                        self.name.clear();
+                        self.message = Some("已添加，点击保存并生效后应用".into());
+                    }
+                    Err(reason) => {
+                        self.message = Some(format!("添加失败：{reason}"));
+                    }
+                }
             }
-        }
-        ui.add_space(8.0);
-        if ui.button(if is_managed { "保存到服务器并生效" } else { "保存并生效" }).clicked() {
-            if is_managed { self.save_managed = true; } else { *save = true; }
-        }
+            if let Some(m) = &self.message {
+                if m.starts_with("添加失败") || m.starts_with("保存失败") {
+                    ui.colored_label(egui::Color32::RED, m);
+                } else {
+                    ui.label(m);
+                }
+            }
+            ui.add_space(8.0);
+            if ui
+                .button(if is_managed {
+                    "保存到服务器并生效"
+                } else {
+                    "保存并生效"
+                })
+                .clicked()
+            {
+                if is_managed {
+                    self.save_managed = true;
+                } else {
+                    *save = true;
+                }
+            }
         });
         if is_managed {
             let mut draft = rustgo_config::ManagedConfiguration::from_client(c);
@@ -598,7 +651,9 @@ mod tests {
         remote.exports.clear();
         remote.forwards.clear();
         let added = panel.validated_candidate(&remote).unwrap();
-        panel.managed.edit(rustgo_config::ManagedConfiguration::from_client(&added));
+        panel
+            .managed
+            .edit(rustgo_config::ManagedConfiguration::from_client(&added));
         assert_eq!(panel.managed.draft().unwrap().tunnels[0].name, "new-tunnel");
         assert!(panel.managed.dirty());
         let context = eframe::egui::Context::default();

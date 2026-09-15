@@ -274,9 +274,13 @@ impl eframe::App for GuiApp {
                 match result {
                     Ok(revision) => {
                         self.forwarding_panel.managed.saved(revision);
-                        self.forwarding_panel.set_message(format!("服务器配置已保存（修订号 {revision}），正在重新连接"));
+                        self.forwarding_panel.set_message(format!(
+                            "服务器配置已保存（修订号 {revision}），正在重新连接"
+                        ));
                     }
-                    Err(error) => self.forwarding_panel.set_message(format!("保存失败：{error}；草稿已保留，可重新加载服务器配置后重试")),
+                    Err(error) => self.forwarding_panel.set_message(format!(
+                        "保存失败：{error}；草稿已保留，可重新加载服务器配置后重试"
+                    )),
                 }
                 self.handle_connect();
             }
@@ -312,7 +316,9 @@ impl eframe::App for GuiApp {
         self.last_logged_connection_state = state.clone();
 
         if let Some(address) = self.config_panel.server_address() {
-            if self.managed_save_rx.is_none() { self.forwarding_panel.managed.select_server(address); }
+            if self.managed_save_rx.is_none() {
+                self.forwarding_panel.managed.select_server(address);
+            }
         }
         if self.config_panel.server_address() == Some(self.connected_server.as_str()) {
             let status = self.connection_vm.status();
@@ -448,14 +454,17 @@ impl eframe::App for GuiApp {
                 );
                 if std::mem::take(&mut self.forwarding_panel.reload_managed) {
                     self.forwarding_panel.managed.reload();
-                    self.forwarding_panel.set_message("正在重新连接并加载服务器配置");
+                    self.forwarding_panel
+                        .set_message("正在重新连接并加载服务器配置");
                     self.handle_disconnect();
                     self.handle_connect();
                 }
                 if std::mem::take(&mut self.forwarding_panel.save_managed) {
                     self.save_managed_configuration();
                 }
-                if save { self.apply_configuration(); }
+                if save {
+                    self.apply_configuration();
+                }
             }
             Tab::Logs => {
                 let (log_lines, _dropped) = self.log_ring.snapshot();
@@ -521,7 +530,9 @@ impl eframe::App for GuiApp {
 
 impl GuiApp {
     fn apply_configuration(&mut self) {
-        if self.managed_save_rx.is_some() { return; }
+        if self.managed_save_rx.is_some() {
+            return;
+        }
         match self.config_panel.save() {
             Ok(()) => {
                 if let Some(address) = self.config_panel.server_address() {
@@ -541,30 +552,41 @@ impl GuiApp {
     }
 
     fn save_managed_configuration(&mut self) {
-        if self.managed_save_rx.is_some() { return; }
+        if self.managed_save_rx.is_some() {
+            return;
+        }
         let (Some(revision), Some(desired), Some(mut config)) = (
             self.forwarding_panel.managed.draft_revision(),
             self.forwarding_panel.managed.draft().cloned(),
             self.config_panel.config().cloned(),
-        ) else { return; };
-        if config.client.server_addr != self.connected_server || config.client.name != self.connected_name {
-            self.forwarding_panel.set_message("保存失败：连接身份已修改，请先保存本地设置并重新连接以加载对应配置");
+        ) else {
+            return;
+        };
+        if config.client.server_addr != self.connected_server
+            || config.client.name != self.connected_name
+        {
+            self.forwarding_panel
+                .set_message("保存失败：连接身份已修改，请先保存本地设置并重新连接以加载对应配置");
             return;
         }
         if let Err(error) = desired.validate() {
-            self.forwarding_panel.set_message(format!("保存失败：{error}"));
+            self.forwarding_panel
+                .set_message(format!("保存失败：{error}"));
             return;
         }
         if let Err(error) = self.config_panel.save() {
-            self.forwarding_panel.set_message(format!("保存失败：本地设置无法保存：{error:#}"));
+            self.forwarding_panel
+                .set_message(format!("保存失败：本地设置无法保存：{error:#}"));
             return;
         }
         if let Some(directory) = self.config_path.parent() {
             config.client.private_key_file = directory.join(&config.client.private_key_file);
-            config.client.certificate_authority_file = directory.join(&config.client.certificate_authority_file);
+            config.client.certificate_authority_file =
+                directory.join(&config.client.certificate_authority_file);
         }
         let Some(runtime) = &self.runtime else {
-            self.forwarding_panel.set_message("保存失败：客户端运行时不可用");
+            self.forwarding_panel
+                .set_message("保存失败：客户端运行时不可用");
             return;
         };
         self.managed_save_rx = Some(runtime.update_managed(config, revision, desired));
@@ -573,7 +595,9 @@ impl GuiApp {
     }
 
     fn handle_connect(&mut self) {
-        if self.managed_save_rx.is_some() { return; }
+        if self.managed_save_rx.is_some() {
+            return;
+        }
         let mut config = match configuration::load_or_create(&self.config_path) {
             Ok(cfg) => cfg,
             Err(e) => {
@@ -729,18 +753,32 @@ mod approval_regression_tests {
         app.connected_server = config.client.server_addr.clone();
         app.connected_name = config.client.name.clone();
         config.p2p = Some(rustgo_config::P2pConfig {
-            enabled: true, prefer_direct: true, direct_timeout_secs: 10,
-            reconnect_timeout_secs: 30, allow_relay_fallback: true,
-            udp_port_range: rustgo_config::PortRange { start: 20000, end: 21000 },
-            tcp_port_range: rustgo_config::PortRange { start: 22000, end: 23000 },
-            observation_primary_addr: None, observation_alternate_addr: None,
+            enabled: true,
+            prefer_direct: true,
+            direct_timeout_secs: 10,
+            reconnect_timeout_secs: 30,
+            allow_relay_fallback: true,
+            udp_port_range: rustgo_config::PortRange {
+                start: 20000,
+                end: 21000,
+            },
+            tcp_port_range: rustgo_config::PortRange {
+                start: 22000,
+                end: 23000,
+            },
+            observation_primary_addr: None,
+            observation_alternate_addr: None,
         });
         let mut remote = rustgo_config::ManagedConfiguration::from_client(config);
         remote.tunnels.push(rustgo_config::TunnelConfig {
-            name: "remote".into(), protocol: rustgo_config::TunnelProtocol::Tcp,
-            local_addr: "127.0.0.1:22".into(), remote_port: 2222,
+            name: "remote".into(),
+            protocol: rustgo_config::TunnelProtocol::Tcp,
+            local_addr: "127.0.0.1:22".into(),
+            remote_port: 2222,
         });
-        app.forwarding_panel.managed.observe(true, Some(4), Some(&remote));
+        app.forwarding_panel
+            .managed
+            .observe(true, Some(4), Some(&remote));
         app.save_managed_configuration();
         let saved = rustgo_config::load_client(&path).unwrap();
         assert!(saved.p2p.unwrap().enabled);

@@ -127,7 +127,9 @@ impl ClientRuntime {
                     previous.cancel();
                 }
                 guard.client_tasks.retain(|(_, done)| !done.is_cancelled());
-                guard.client_tasks.push((shutdown.clone(), completed.clone()));
+                guard
+                    .client_tasks
+                    .push((shutdown.clone(), completed.clone()));
                 guard.generation += 1;
                 guard.traffic_handle = traffic_handle;
                 guard.generation
@@ -169,16 +171,25 @@ impl ClientRuntime {
         self.disconnect();
         let completions = {
             let guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
-            guard.client_tasks.iter().map(|(_, done)| done.clone()).collect::<Vec<_>>()
+            guard
+                .client_tasks
+                .iter()
+                .map(|(_, done)| done.clone())
+                .collect::<Vec<_>>()
         };
         if let Some(runtime) = &self.runtime {
             runtime.spawn(async move {
-                for completed in completions { completed.cancelled().await; }
+                for completed in completions {
+                    completed.cancelled().await;
+                }
                 let result = rustgoc::update_managed_configuration(config, revision, desired)
-                    .await.map_err(|error| error.to_string());
+                    .await
+                    .map_err(|error| error.to_string());
                 let _ = sender.send(result);
             });
-        } else { let _ = sender.send(Err("客户端运行时不可用".into())); }
+        } else {
+            let _ = sender.send(Err("客户端运行时不可用".into()));
+        }
         receiver
     }
 
@@ -189,7 +200,9 @@ impl ClientRuntime {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             guard.traffic_handle = None;
-            for (shutdown, _) in &guard.client_tasks { shutdown.cancel(); }
+            for (shutdown, _) in &guard.client_tasks {
+                shutdown.cancel();
+            }
             if let Some(pending) = guard.enrollment_shutdown.take() {
                 pending.cancel();
             }

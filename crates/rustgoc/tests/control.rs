@@ -167,6 +167,110 @@ struct Fixture {
     verification_key: DeviceKeypair,
 }
 
+#[tokio::test]
+async fn client_managed_edit_rejects_old_server_without_sending_update() -> Result<(), AnyError> {
+    let pki = TestPki::generate()?;
+    let tls = TlsServer::bind("127.0.0.1:0", &pki.certificate_file, &pki.private_key_file).await?;
+    let fixture = client_fixture(&pki, tls.local_addr()?.to_string())?;
+    let server = tokio::spawn(async move {
+        let (socket, _) = tls.accept_tcp().await?;
+        let mut server = FramedServer::new(tls.handshake(socket).await?);
+        assert!(matches!(
+            server.receive().await?.message,
+            Message::ClientHello(_)
+        ));
+        server
+            .send(Message::ServerChallenge(ServerChallenge {
+                challenge: bytes(&[1; 32]),
+                session_id: bytes(&[2; 32]),
+            }))
+            .await?;
+        assert!(matches!(
+            server.receive().await?.message,
+            Message::ClientAuthenticate(_)
+        ));
+        server
+            .send(Message::AuthResult(AuthResult {
+                accepted: true,
+                error: None,
+            }))
+            .await?;
+        assert!(
+            server.receive().await.is_err(),
+            "old server must not receive a write request"
+        );
+        Ok::<_, AnyError>(())
+    });
+    let desired = rustgo_config::ManagedConfiguration::from_client(&fixture.config);
+    let error = rustgoc::update_managed_configuration(fixture.config, 1, desired)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("请先升级服务器"));
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn client_managed_edit_is_persisted_and_stale_revision_cannot_overwrite()
+-> Result<(), AnyError> {
+    let pki = TestPki::generate()?;
+    let mut fixture = client_fixture(&pki, "127.0.0.1:1".into())?;
+    fixture.config.tunnels.clear();
+    let database = pki._directory.path().join("client-edit.db");
+    let mut config = real_server_config(&pki, &fixture.verification_key, 5);
+    config.managed_tunnels = Some(rustgo_config::ManagedTunnelsConfig {
+        database_path: database.clone(),
+    });
+    let server = ServerApp::bind(config).await?;
+    fixture.config.client.server_addr = server.local_addr()?.to_string();
+    let shutdown = CancellationToken::new();
+    let task = tokio::spawn(server.run_until(shutdown.clone()));
+    let client = ControlClient::from_config(fixture.config.clone())?;
+    let session = client.connect().await?;
+    assert_eq!(session.managed_revision(), Some(1));
+    drop(session);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let store = rustgos::managed::ManagedStore::open(&database)?;
+    let mut desired = store.get("home-pc")?.unwrap().configuration;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    drop(listener);
+    desired.tunnels.push(TunnelConfig {
+        name: "from-client".into(),
+        protocol: ConfigProtocol::Tcp,
+        local_addr: "127.0.0.1:22".into(),
+        remote_port: port.into(),
+    });
+    assert_eq!(
+        rustgoc::update_managed_configuration(fixture.config.clone(), 1, desired.clone()).await?,
+        2
+    );
+    assert_eq!(store.get("home-pc")?.unwrap().configuration, desired);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut stale = desired.clone();
+    stale.tunnels.clear();
+    let error = rustgoc::update_managed_configuration(fixture.config.clone(), 1, stale.clone())
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("服务器配置已被修改"));
+    assert_eq!(store.get("home-pc")?.unwrap().configuration, desired);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let session = client.connect().await?;
+    assert_eq!(session.managed_revision(), Some(2));
+    assert_eq!(session.registered_tunnels()[0].name(), "from-client");
+    assert!(session.registered_tunnels()[0].accepted());
+    drop(session);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        rustgoc::update_managed_configuration(fixture.config.clone(), 2, stale.clone()).await?,
+        3
+    );
+    assert_eq!(store.get("home-pc")?.unwrap().configuration, stale);
+    shutdown.cancel();
+    task.await??;
+    Ok(())
+}
+
 fn client_fixture(pki: &TestPki, server_addr: String) -> Result<Fixture, AnyError> {
     let keys = tempfile::tempdir()?;
     generate_key_file(keys.path())?;

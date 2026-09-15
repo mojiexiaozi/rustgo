@@ -79,12 +79,15 @@ impl ControlClient {
     }
 
     pub async fn connect(&self) -> Result<ControlSession, ClientError> {
-        tokio::time::timeout(CONTROL_HANDSHAKE_TIMEOUT, self.connect_inner())
+        tokio::time::timeout(CONTROL_HANDSHAKE_TIMEOUT, self.connect_inner(None))
             .await
             .map_err(|_| ClientError::HandshakeTimeout)?
     }
 
-    async fn connect_inner(&self) -> Result<ControlSession, ClientError> {
+    async fn connect_inner(
+        &self,
+        update: Option<(u64, &rustgo_config::ManagedConfiguration)>,
+    ) -> Result<ControlSession, ClientError> {
         let stream = self
             .tls_client
             .connect(&self.config.client.server_addr)
@@ -148,6 +151,49 @@ impl ControlClient {
         state = state.transition(&Message::AuthResult(result.clone()))?;
         if !result.accepted {
             return Err(ClientError::AuthenticationRejected);
+        }
+
+        if let Some((expected_revision, desired)) = update {
+            if !negotiated.supports_managed_editing() {
+                return Err(ClientError::ManagedUpdate(
+                    "服务器版本不支持客户端修改，请先升级服务器".into(),
+                ));
+            }
+            let configuration =
+                serde_json::to_vec(desired).map_err(|_| ClientError::InvalidConfiguration)?;
+            framed
+                .send(
+                    negotiated,
+                    Message::ManagedConfigUpdate(rustgo_protocol::ManagedConfigUpdate {
+                        expected_revision,
+                        configuration: configuration
+                            .try_into()
+                            .map_err(|_| ClientError::InvalidConfiguration)?,
+                    }),
+                )
+                .await?;
+            let response = framed.receive().await?;
+            require_version(response.version, negotiated)?;
+            let Message::ManagedConfigUpdateResult(result) = response.message else {
+                return Err(ClientError::InvalidState);
+            };
+            if let Some(error) = result.error {
+                return Err(ClientError::ManagedUpdate(error.as_str().to_owned()));
+            }
+            if expected_revision.checked_add(1) != Some(result.revision) {
+                return Err(ClientError::ManagedUpdate(
+                    "服务器确认的配置版本不一致，请重新载入后核对".into(),
+                ));
+            }
+            let mut session = ControlSession::new(
+                framed,
+                negotiated,
+                challenge.session_id.into_vec(),
+                self.heartbeat_interval,
+                Vec::new().into(),
+            );
+            session.managed_revision = Some(result.revision);
+            return Ok(session);
         }
 
         let mut effective = self.config.as_ref().clone();
@@ -226,6 +272,56 @@ impl ControlClient {
         session.managed_revision = managed_revision;
         Ok(session)
     }
+}
+
+/// Save this device's server configuration using its existing TLS/device credentials.
+/// The caller must stop its active client first; no automatic overwrite or retry occurs.
+pub async fn update_managed_configuration(
+    config: ClientConfig,
+    expected_revision: u64,
+    desired: rustgo_config::ManagedConfiguration,
+) -> Result<u64, ClientError> {
+    update_managed_inner(config, expected_revision, desired)
+        .await
+        .map_err(|error| {
+            let reason = match &error {
+                ClientError::ManagedUpdate(_) => return error,
+                ClientError::AuthenticationRejected => {
+                    "服务器拒绝设备认证，请检查授权或等待旧连接退出"
+                }
+                ClientError::Crypto(_) | ClientError::InvalidIdentity => {
+                    "设备凭据不可用，请检查本地密钥文件"
+                }
+                ClientError::Tls(_) => "无法建立安全连接，请检查服务器地址、证书和网络",
+                ClientError::Io(_) | ClientError::Closed => {
+                    "与服务器的连接中断，保存结果未确认，请重新载入配置核对"
+                }
+                ClientError::InvalidConfiguration => "客户端配置无效，请检查本地设置",
+                _ => "保存未获有效确认，请检查程序版本并重新载入服务器配置核对",
+            };
+            ClientError::ManagedUpdate(format!("{reason}（详情：{error}）"))
+        })
+}
+
+async fn update_managed_inner(
+    config: ClientConfig,
+    expected_revision: u64,
+    mut desired: rustgo_config::ManagedConfiguration,
+) -> Result<u64, ClientError> {
+    desired.p2p_enabled = config.p2p.as_ref().is_some_and(|p| p.enabled);
+    desired
+        .apply_to(&mut config.clone())
+        .map_err(|error| ClientError::ManagedUpdate(format!("配置无效：{error}")))?;
+    let client = ControlClient::from_config(config)?;
+    let session = tokio::time::timeout(
+        CONTROL_HANDSHAKE_TIMEOUT,
+        client.connect_inner(Some((expected_revision, &desired))),
+    )
+    .await
+    .map_err(|_| {
+        ClientError::ManagedUpdate("保存超时，结果尚未确认，请重新载入服务器配置核对".into())
+    })??;
+    session.managed_revision.ok_or(ClientError::InvalidState)
 }
 
 fn rejected_configuration_report(
@@ -831,6 +927,8 @@ impl FramedControl {
 
 #[derive(Debug, Error)]
 pub enum ClientError {
+    #[error("{0}")]
+    ManagedUpdate(String),
     #[error("invalid client configuration")]
     InvalidConfiguration,
     #[error("invalid client identity")]

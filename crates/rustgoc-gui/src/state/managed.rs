@@ -46,13 +46,21 @@ impl ManagedViewModel {
         }
         self.revision = Some(revision);
         self.snapshot = Some(snapshot.clone());
-        if !self.dirty { self.reload(); }
+        if !self.dirty {
+            self.reload();
+        }
         true
     }
 
-    pub fn draft(&self) -> Option<&ManagedConfiguration> { self.draft.as_ref() }
-    pub fn draft_revision(&self) -> Option<u64> { self.draft_revision }
-    pub fn dirty(&self) -> bool { self.dirty }
+    pub fn draft(&self) -> Option<&ManagedConfiguration> {
+        self.draft.as_ref()
+    }
+    pub fn draft_revision(&self) -> Option<u64> {
+        self.draft_revision
+    }
+    pub fn dirty(&self) -> bool {
+        self.dirty
+    }
     pub fn edit(&mut self, draft: ManagedConfiguration) {
         if self.draft.as_ref() != Some(&draft) {
             self.draft = Some(draft);
@@ -85,7 +93,12 @@ mod tests {
     #[test]
     fn dirty_draft_keeps_base_revision_until_explicit_reload() {
         let mut model = ManagedViewModel::default();
-        let initial = ManagedConfiguration { p2p_enabled: false, tunnels: vec![], exports: vec![], forwards: vec![] };
+        let initial = ManagedConfiguration {
+            p2p_enabled: false,
+            tunnels: vec![],
+            exports: vec![],
+            forwards: vec![],
+        };
         model.observe(true, Some(7), Some(&initial));
         let mut edited = initial.clone();
         edited.p2p_enabled = true;
@@ -103,7 +116,12 @@ mod tests {
     #[test]
     fn acknowledged_save_advances_draft_revision() {
         let mut model = ManagedViewModel::default();
-        let initial = ManagedConfiguration { p2p_enabled: false, tunnels: vec![], exports: vec![], forwards: vec![] };
+        let initial = ManagedConfiguration {
+            p2p_enabled: false,
+            tunnels: vec![],
+            exports: vec![],
+            forwards: vec![],
+        };
         model.observe(true, Some(7), Some(&initial));
         let mut edited = initial;
         edited.p2p_enabled = true;

@@ -524,6 +524,69 @@ where
             rustgo_protocol::ControlMessageDirection::ClientToServer,
             &frame.message,
         )?;
+        if let Message::ManagedConfigUpdate(request) = &frame.message {
+            let result = if let Some(management) = runtime.managed.clone() {
+                let authenticated = guard.identity().clone();
+                let request = request.clone();
+                tokio::task::spawn_blocking(move || {
+                    let configuration: rustgo_config::ManagedConfiguration =
+                        serde_json::from_slice(request.configuration.as_slice()).map_err(|_| {
+                            crate::managed::ManagedError::Invalid("配置数据格式无效".into())
+                        })?;
+                    management.update_authenticated(
+                        &authenticated,
+                        request.expected_revision,
+                        &configuration,
+                    )
+                })
+                .await
+                .map_err(|_| ControlError::InvalidState)?
+            } else {
+                Err(crate::managed::ManagedError::Invalid(
+                    "服务器未启用隧道配置同步".into(),
+                ))
+            };
+            let (revision, error) = match result {
+                Ok(snapshot) => {
+                    tracing::info!(client = %safe_display(guard.identity().name()), revision = snapshot.revision, "event=client_configuration_saved 客户端配置已同步到服务器");
+                    (snapshot.revision, None)
+                }
+                Err(error) => {
+                    let detail = match error {
+                        crate::managed::ManagedError::Conflict => {
+                            "服务器配置已被修改，请重新载入后再保存；本地草稿已保留".to_owned()
+                        }
+                        crate::managed::ManagedError::Invalid(detail) => {
+                            format!("配置无法保存：{detail}")
+                        }
+                        crate::managed::ManagedError::NotFound => {
+                            "当前设备尚未同步配置或授权已变化，请重新连接后重试".to_owned()
+                        }
+                        crate::managed::ManagedError::Storage(_) => {
+                            "服务器配置存储暂不可用，请稍后重试".to_owned()
+                        }
+                    };
+                    let bounded =
+                        BoundedString::<1024>::try_from(detail.as_str()).unwrap_or_else(|_| {
+                            BoundedString::try_from("配置无法保存，请检查配置或服务端日志")
+                                .expect("bounded literal")
+                        });
+                    (request.expected_revision, Some(bounded))
+                }
+            };
+            let response =
+                Message::ManagedConfigUpdateResult(rustgo_protocol::ManagedConfigUpdateResult {
+                    revision,
+                    error,
+                });
+            *state = state.transition_control(
+                negotiated,
+                ControlMessageDirection::ServerToClient,
+                &response,
+            )?;
+            framed.send(negotiated, response).await?;
+            return Ok(());
+        }
         let Message::ManagedConfigRequest(request) = frame.message else {
             return Err(ControlError::InvalidState);
         };

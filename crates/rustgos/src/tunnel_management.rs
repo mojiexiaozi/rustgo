@@ -20,6 +20,29 @@ pub struct TunnelManagement {
 }
 
 impl TunnelManagement {
+    pub(crate) fn update_authenticated(
+        &self,
+        authenticated: &crate::AuthenticatedClient,
+        expected_revision: u64,
+        configuration: &ManagedConfiguration,
+    ) -> Result<ManagedSnapshot, ManagedError> {
+        self.validate(authenticated.name(), configuration)?;
+        if !configuration.p2p_enabled
+            && (!configuration.exports.is_empty() || !configuration.forwards.is_empty())
+        {
+            return Err(ManagedError::Invalid(
+                "请先在客户端启用 P2P，或删除 P2P 项目".into(),
+            ));
+        }
+        let identity = self.authenticated_identity(authenticated)?;
+        self.store.replace_for_identity(
+            &identity,
+            authenticated.name(),
+            expected_revision,
+            configuration,
+        )
+    }
+
     pub(crate) fn sync_authenticated(
         &self,
         authenticated: &crate::AuthenticatedClient,

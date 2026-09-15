@@ -20,6 +20,7 @@ mod udp;
 pub use app::{ActiveGeneration, ClientApp, ClientStatus, ReconnectBackoff};
 pub use control::{
     CLIENT_VERSION, ClientError, ControlClient, ControlEvent, ControlSession, RegisteredTunnel,
+    update_managed_configuration,
 };
 pub use enrollment::{
     EnrollmentCompletion, EnrollmentError, EnrollmentKey, EnrollmentPurpose, EnrollmentState,
