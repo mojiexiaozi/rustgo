@@ -58,6 +58,7 @@ pub(crate) struct ControlRuntime {
     version: ProtocolVersion,
     observation_token_issuer: Option<ObservationTokenIssuer>,
     rendezvous: RendezvousCoordinator,
+    managed: Option<crate::TunnelManagement>,
 }
 
 impl ControlRuntime {
@@ -74,7 +75,13 @@ impl ControlRuntime {
             version,
             observation_token_issuer,
             rendezvous,
+            managed: None,
         }
+    }
+
+    pub(crate) fn with_managed_tunnels(mut self, managed: Option<crate::TunnelManagement>) -> Self {
+        self.managed = managed;
+        self
     }
 }
 
@@ -504,6 +511,60 @@ async fn run_control_session<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let mut managed_snapshot = None;
+    if negotiated.supports_managed_configuration() {
+        let frame = tokio::time::timeout(runtime.heartbeat_timeout, framed.receive())
+            .await
+            .map_err(|_| ControlError::HeartbeatTimeout)??;
+        if frame.version != negotiated {
+            return Err(ControlError::InvalidState);
+        }
+        *state = state.transition_control(
+            negotiated,
+            rustgo_protocol::ControlMessageDirection::ClientToServer,
+            &frame.message,
+        )?;
+        let Message::ManagedConfigRequest(request) = frame.message else {
+            return Err(ControlError::InvalidState);
+        };
+        let configuration: rustgo_config::ManagedConfiguration =
+            serde_json::from_slice(request.configuration.as_slice())
+                .map_err(|_| ControlError::InvalidState)?;
+        configuration
+            .validate()
+            .map_err(|_| ControlError::InvalidState)?;
+        let snapshot = if let Some(management) = runtime.managed.clone() {
+            let authenticated = guard.identity().clone();
+            Some(
+                tokio::task::spawn_blocking(move || {
+                    management.sync_authenticated(&authenticated, &configuration)
+                })
+                .await
+                .map_err(|_| ControlError::InvalidState)??,
+            )
+        } else {
+            None
+        };
+        let response = rustgo_protocol::ManagedConfigSnapshot {
+            revision: snapshot.as_ref().map_or(0, |snapshot| snapshot.revision),
+            configuration: snapshot
+                .as_ref()
+                .map(|snapshot| {
+                    serde_json::to_vec(&snapshot.configuration)
+                        .map_err(|_| ControlError::InvalidState)
+                        .and_then(|bytes| bytes.try_into().map_err(|_| ControlError::InvalidState))
+                })
+                .transpose()?,
+        };
+        let message = Message::ManagedConfigSnapshot(response);
+        *state = state.transition_control(
+            negotiated,
+            rustgo_protocol::ControlMessageDirection::ServerToClient,
+            &message,
+        )?;
+        framed.send(negotiated, message).await?;
+        managed_snapshot = snapshot;
+    }
     let registration_frame = tokio::time::timeout(runtime.heartbeat_timeout, framed.receive())
         .await
         .map_err(|_| ControlError::HeartbeatTimeout)??;
@@ -513,6 +574,32 @@ where
     let Message::RegisterTunnels(registration) = registration_frame.message else {
         return Err(ControlError::InvalidState);
     };
+    if let Some(snapshot) = &managed_snapshot {
+        let matches = registration.tunnels.as_slice().len() == snapshot.configuration.tunnels.len()
+            && registration
+                .tunnels
+                .as_slice()
+                .iter()
+                .zip(&snapshot.configuration.tunnels)
+                .enumerate()
+                .all(|(index, (actual, expected))| {
+                    actual.tunnel_id == (index + 1) as u32
+                        && actual.name.as_str() == expected.name
+                        && u32::from(actual.remote_port) == expected.remote_port
+                        && actual.protocol
+                            == match expected.protocol {
+                                rustgo_config::TunnelProtocol::Tcp => {
+                                    rustgo_protocol::TunnelProtocol::TCP
+                                }
+                                rustgo_config::TunnelProtocol::Udp => {
+                                    rustgo_protocol::TunnelProtocol::UDP
+                                }
+                            }
+                });
+        if !matches {
+            return Err(ControlError::InvalidState);
+        }
+    }
     *state = state.transition(&Message::RegisterTunnels(registration.clone()))?;
     let results = guard.register_tunnels(registration).await;
     guard.publish_tunnel_inventory();
@@ -528,7 +615,16 @@ where
         local_protocol_minor = runtime.version.minor,
         "event=registration_ready 服务端隧道注册已就绪"
     );
-    run_active_control(framed, guard, state, negotiated, outbound_rx, runtime).await
+    run_active_control(
+        framed,
+        guard,
+        state,
+        negotiated,
+        outbound_rx,
+        runtime,
+        managed_snapshot.map(|snapshot| (snapshot.identity, snapshot.revision)),
+    )
+    .await
 }
 
 async fn run_active_control<S>(
@@ -538,6 +634,7 @@ async fn run_active_control<S>(
     negotiated: ProtocolVersion,
     outbound: &mut mpsc::Receiver<Message>,
     runtime: &ControlRuntime,
+    managed_binding: Option<(String, u64)>,
 ) -> Result<(), ControlError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -582,6 +679,16 @@ where
                     continue;
                 }
                 match frame.message {
+                    Message::ManagedConfigReport(report) => {
+                        *state = state.transition_control(negotiated, rustgo_protocol::ControlMessageDirection::ClientToServer, &Message::ManagedConfigReport(report.clone()))?;
+                        let (identity, revision) = managed_binding.as_ref().ok_or(ControlError::InvalidState)?;
+                        if report.revision != *revision { return Err(ControlError::InvalidState); }
+                        let results = serde_json::from_slice(report.results.as_slice()).map_err(|_| ControlError::InvalidState)?;
+                        let management = runtime.managed.clone().ok_or(ControlError::InvalidState)?;
+                        let identity = identity.clone();
+                        let result = tokio::task::spawn_blocking(move || management.store.report(&identity, report.revision, results)).await.map_err(|_| ControlError::InvalidState)?;
+                        match result { Ok(()) | Err(crate::managed::ManagedError::Conflict) => {}, Err(error) => return Err(error.into()) }
+                    }
                     Message::Heartbeat(heartbeat) => {
                         let acknowledgement = Message::Heartbeat(heartbeat);
                         *state = state.transition(&acknowledgement)?;
@@ -943,6 +1050,8 @@ where
 
 #[derive(Debug, Error)]
 pub(crate) enum ControlError {
+    #[error("managed configuration failed: {0}")]
+    Managed(#[from] crate::managed::ManagedError),
     #[error("TLS transport failed: {0}")]
     Tls(#[from] rustgo_transport::TlsError),
     #[error("control frame failed: {0}")]
@@ -1169,7 +1278,7 @@ mod tests {
         );
         let (outbound, outbound_rx) = mpsc::channel(1);
         let guard = registry
-            .claim_with_outbound(identity, outbound, SERVER_VERSION)
+            .claim_with_outbound(identity, outbound, rustgo_protocol::ProtocolVersion::V0_3)
             .unwrap();
         let registration = Message::RegisterTunnels(RegisterTunnels {
             tunnels: BoundedVec::try_from(vec![TunnelRegistration {
@@ -1181,7 +1290,7 @@ mod tests {
             .unwrap(),
         });
         let encoded = FrameCodec::new(70 * 1024)
-            .encode(SERVER_VERSION, 0, &registration)
+            .encode(rustgo_protocol::ProtocolVersion::V0_3, 0, &registration)
             .unwrap();
         let framed = FramedControl::new(RegistrationThenWriteFailure {
             input: std::io::Cursor::new(encoded.to_vec()),
@@ -1203,12 +1312,12 @@ mod tests {
             framed,
             guard,
             state,
-            SERVER_VERSION,
+            rustgo_protocol::ProtocolVersion::V0_3,
             outbound_rx,
             ControlRuntime::new(
                 Duration::from_secs(2),
                 Duration::from_secs(2),
-                SERVER_VERSION,
+                rustgo_protocol::ProtocolVersion::V0_3,
                 None,
                 rendezvous,
             ),

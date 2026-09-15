@@ -131,6 +131,7 @@ fn server_config(pki: &TestPki, clients: Vec<AuthorizedClient>) -> Result<Server
         clients,
         web: None,
         enrollment: None,
+        managed_tunnels: None,
     })
 }
 

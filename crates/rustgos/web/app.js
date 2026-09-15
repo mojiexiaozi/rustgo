@@ -270,7 +270,8 @@
         for (const item of snapshot?.configuration[collection] || []) {
           const result = snapshot.results?.find(r => r.kind === kind && r.name === item.name);
           const current = value.online && snapshot.applied_revision === snapshot.revision;
-          const status = !current || !result ? "等待应用" : result.state === "ready" ? "已就绪" : result.state === "failed" ? `失败：${result.error || "未知错误"}` : "等待应用";
+          const failure = result?.state === "failed" && snapshot.applied_revision === snapshot.revision;
+          const status = failure ? `${value.online ? "失败" : "上次失败"}：${result.error || "未知错误"}` : !current || !result ? "等待应用" : result.state === "ready" ? "已就绪" : `等待应用${result.error ? `：${result.error}` : ""}`;
           const description = kind === "tunnel" ? `服务器端口 ${item.remote_port}` : kind === "export" ? `允许：${item.allowed_peers.length ? item.allowed_peers.join("、") : "所有已授权客户端"}` : `目标 ${item.peer} / ${item.export}`;
           const row = document.createElement("tr");
           for (const value of [label, item.name, kind === "forward" ? "P2P" : protocolLabel(item.protocol), item.local_addr || item.listen_addr, description, status]) { const cell = document.createElement("td"); cell.textContent = value; row.append(cell); }

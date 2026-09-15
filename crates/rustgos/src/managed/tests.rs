@@ -210,6 +210,20 @@ fn reconnect_clears_previous_generation_readiness_without_changing_desired_revis
     assert_eq!(next.results, json!([]));
 }
 
+#[test]
+fn enabling_local_p2p_updates_capability_without_reimporting_collections() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = ManagedStore::open(&dir.path().join("managed.db")).unwrap();
+    let mut local = config(false);
+    local.p2p_enabled = false;
+    store.sync("key", "node", &local).unwrap();
+    local.p2p_enabled = true;
+    local.tunnels = config(true).tunnels;
+    let updated = store.sync("key", "node", &local).unwrap();
+    assert!(updated.configuration.p2p_enabled);
+    assert!(updated.configuration.tunnels.is_empty());
+}
+
 #[cfg(unix)]
 #[test]
 fn database_is_private_on_creation_and_reopen() {

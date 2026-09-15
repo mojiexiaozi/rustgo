@@ -1247,5 +1247,6 @@ fn server_config(web_address: SocketAddr, cookie_secure: bool) -> ServerConfig {
             database_max_mib: 256,
         }),
         enrollment: None,
+        managed_tunnels: None,
     }
 }

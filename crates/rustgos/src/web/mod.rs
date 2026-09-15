@@ -4,6 +4,7 @@ mod api;
 mod assets;
 mod auth;
 mod dto;
+mod managed;
 mod security;
 
 pub use api::MAX_API_RESPONSE_BYTES;
@@ -218,6 +219,7 @@ impl WebServer {
             observability: data_sources.observability,
             history: data_sources.history,
             enrollment: data_sources.enrollment,
+            managed: data_sources.managed,
             operations: OperationLedger::new(1_024),
         });
         let router = build_router(state);
@@ -309,6 +311,7 @@ pub struct DashboardDataSources {
     observability: ObservabilityStore,
     history: Option<HistoryService>,
     enrollment: Option<EnrollmentManagement>,
+    managed: Option<crate::TunnelManagement>,
 }
 
 #[derive(Clone)]
@@ -352,11 +355,17 @@ impl DashboardDataSources {
             observability,
             history,
             enrollment: None,
+            managed: None,
         }
     }
 
     pub fn with_enrollment(mut self, enrollment: EnrollmentManagement) -> Self {
         self.enrollment = Some(enrollment);
+        self
+    }
+
+    pub fn with_managed_tunnels(mut self, managed: crate::TunnelManagement) -> Self {
+        self.managed = Some(managed);
         self
     }
 
@@ -394,6 +403,7 @@ struct WebState {
     observability: ObservabilityStore,
     history: Option<HistoryService>,
     enrollment: Option<EnrollmentManagement>,
+    managed: Option<crate::TunnelManagement>,
     operations: OperationLedger,
 }
 
@@ -880,6 +890,207 @@ mod management_tests {
     use rustgo_protocol::{EnrollmentKeyMaterial, EnrollmentPurpose};
 
     #[tokio::test]
+    async fn managed_tunnels_static_client_all_kinds_persist_and_reject_stale_revision() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            crate::managed::ManagedStore::open(&directory.path().join("managed.db")).unwrap(),
+        );
+        let key = DeviceKeypair::from_secret_bytes([42; 32]);
+        let registry = crate::ClientRegistry::new(
+            4,
+            16,
+            "127.0.0.1".parse().unwrap(),
+            32,
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let management = crate::TunnelManagement::new(
+            store.clone(),
+            registry,
+            &[rustgo_config::AuthorizedClient {
+                name: "node".into(),
+                public_key: key.public_key().to_string(),
+                enabled: true,
+            }],
+            None,
+            16,
+        )
+        .unwrap();
+        let identity = management.identity("node").unwrap();
+        assert!(
+            management
+                .authenticated_identity(&crate::AuthenticatedClient::verified(
+                    "node".into(),
+                    "sha256:other-key".into(),
+                    vec![1; 32]
+                ))
+                .is_err()
+        );
+        store
+            .sync(
+                &identity,
+                "node",
+                &rustgo_config::ManagedConfiguration {
+                    tunnels: vec![],
+                    exports: vec![],
+                    forwards: vec![],
+                    p2p_enabled: true,
+                },
+            )
+            .unwrap();
+        let (observability, _, _) = ObservabilityStore::new();
+        let authentication =
+            AuthenticationState::new("admin", "password", &WebRuntimeLimits::default()).unwrap();
+        let cookie = format!(
+            "{SESSION_COOKIE_NAME}={}",
+            authentication.issue_session().unwrap()
+        );
+        let csrf = authentication.csrf_for_cookie(Some(&cookie)).unwrap();
+        let state = Arc::new(WebState {
+            authentication,
+            expected_origin: WebOrigin::parse("http://127.0.0.1:8080").unwrap(),
+            cookie_secure: false,
+            body_read_timeout: Duration::from_secs(1),
+            observability,
+            history: None,
+            enrollment: None,
+            managed: Some(management),
+            operations: OperationLedger::new(16),
+        });
+        let router = build_router(state);
+        let operations = [
+            serde_json::json!({"expected_revision":1,"action":"add","kind":"tunnel","item":{"name":"tcp","protocol":"tcp","local_addr":"127.0.0.1:80","remote_port":18080}}),
+            serde_json::json!({"expected_revision":2,"action":"add","kind":"tunnel","item":{"name":"udp","protocol":"udp","local_addr":"127.0.0.1:53","remote_port":18053}}),
+            serde_json::json!({"expected_revision":3,"action":"add","kind":"export","item":{"name":"ssh","protocol":"tcp","local_addr":"127.0.0.1:22","allowed_peers":["peer"]}}),
+            serde_json::json!({"expected_revision":4,"action":"add","kind":"forward","item":{"name":"peer-ssh","peer":"peer","export":"ssh","listen_addr":"127.0.0.1:10022"}}),
+        ];
+        let request = HttpRequest::builder().method("POST").uri("/api/v1/clients/node/tunnels").header("host", "127.0.0.1:8080").header("origin", "http://127.0.0.1:8080").header("content-type", "application/json").header("cookie", &cookie).header("x-rustgo-csrf-token", &csrf).body(Body::from(serde_json::json!({"operation_id":"self-forward","expected_revision":1,"action":"add","kind":"forward","item":{"name":"self","peer":"node","export":"ssh","listen_addr":"127.0.0.1:10022"}}).to_string())).unwrap();
+        assert_eq!(
+            router.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(store.get("node").unwrap().unwrap().revision, 1);
+        for operation in &operations {
+            let request = HttpRequest::builder()
+                .method("POST")
+                .uri("/api/v1/clients/node/tunnels")
+                .header("host", "127.0.0.1:8080")
+                .header("origin", "http://127.0.0.1:8080")
+                .header("content-type", "application/json")
+                .header("cookie", &cookie)
+                .header("x-rustgo-csrf-token", &csrf)
+                .body(Body::from(operation.to_string()))
+                .unwrap();
+            let response = router.clone().oneshot(request).await.unwrap();
+            let status = response.status();
+            let bytes = body::to_bytes(response.into_body(), 65536).await.unwrap();
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{}",
+                String::from_utf8_lossy(&bytes)
+            );
+        }
+        let snapshot = store.get("node").unwrap().unwrap();
+        assert_eq!(
+            (
+                snapshot.configuration.tunnels.len(),
+                snapshot.configuration.exports.len(),
+                snapshot.configuration.forwards.len()
+            ),
+            (2, 1, 1)
+        );
+        for (revision, kind, name) in [
+            (1, "tunnel", "tcp"),
+            (5, "tunnel", "tcp"),
+            (6, "tunnel", "udp"),
+            (7, "export", "ssh"),
+            (8, "forward", "peer-ssh"),
+        ] {
+            let request = HttpRequest::builder().method("POST").uri("/api/v1/clients/node/tunnels").header("host", "127.0.0.1:8080").header("origin", "http://127.0.0.1:8080").header("content-type", "application/json").header("cookie", &cookie).header("x-rustgo-csrf-token", &csrf).body(Body::from(serde_json::json!({"expected_revision":revision,"action":"delete","kind":kind,"name":name}).to_string())).unwrap();
+            assert_eq!(
+                router.clone().oneshot(request).await.unwrap().status(),
+                if revision == 1 {
+                    StatusCode::CONFLICT
+                } else {
+                    StatusCode::OK
+                }
+            );
+        }
+        let persisted = crate::managed::ManagedStore::open(&directory.path().join("managed.db"))
+            .unwrap()
+            .get("node")
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.revision, 9);
+        assert!(
+            persisted.configuration.tunnels.is_empty()
+                && persisted.configuration.exports.is_empty()
+                && persisted.configuration.forwards.is_empty()
+        );
+        let request = HttpRequest::builder()
+            .uri("/api/v1/clients/node/tunnels")
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = body::to_bytes(response.into_body(), 65536).await.unwrap();
+        let result: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(result["online"], false);
+        assert_eq!(result["snapshot"]["revision"], 9);
+        assert!(result["snapshot"].get("identity").is_none());
+    }
+
+    #[tokio::test]
+    async fn managed_tunnels_route_requires_auth_and_reports_disabled_storage() {
+        let (observability, _, _) = ObservabilityStore::new();
+        let authentication =
+            AuthenticationState::new("admin", "password", &WebRuntimeLimits::default()).unwrap();
+        let token = authentication.issue_session().unwrap();
+        let cookie = format!("{SESSION_COOKIE_NAME}={token}");
+        let state = Arc::new(WebState {
+            authentication,
+            expected_origin: WebOrigin::parse("http://127.0.0.1:8080").unwrap(),
+            cookie_secure: false,
+            body_read_timeout: Duration::from_secs(1),
+            observability,
+            history: None,
+            enrollment: None,
+            managed: None,
+            operations: OperationLedger::new(16),
+        });
+        let router = build_router(state);
+        let request = HttpRequest::builder()
+            .uri("/api/v1/clients/node/tunnels")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            router.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let request = HttpRequest::builder()
+            .uri("/api/v1/clients/node/tunnels")
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            router.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let request = HttpRequest::builder()
+            .method("POST")
+            .uri("/api/v1/clients/node/tunnels")
+            .header("cookie", &cookie)
+            .body(Body::from("{}"))
+            .unwrap();
+        assert_eq!(
+            router.oneshot(request).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
     async fn registration_review_requires_login_and_csrf_and_binds_only_on_approval() {
         let directory = tempfile::tempdir().unwrap();
         let store = Arc::new(
@@ -921,6 +1132,7 @@ mod management_tests {
                 [7; 32],
                 Duration::from_secs(300),
             )),
+            managed: None,
             operations: OperationLedger::new(16),
         });
         let router = build_router(state);
@@ -1017,6 +1229,7 @@ mod management_tests {
                 [7; 32],
                 Duration::from_secs(300),
             )),
+            managed: None,
             operations: OperationLedger::new(16),
         });
         let request = HttpRequest::builder()

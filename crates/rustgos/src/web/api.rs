@@ -69,7 +69,7 @@ pub(super) fn routes() -> Router<Arc<WebState>> {
             get(clients)
                 .post(create_client)
                 .fallback(method_not_allowed)
-                .layer(DefaultBodyLimit::max(4_096)),
+                .layer(DefaultBodyLimit::max(65_536)),
         )
         .route(
             "/api/v1/registration-requests",
@@ -86,7 +86,7 @@ pub(super) fn routes() -> Router<Arc<WebState>> {
             get(client)
                 .post(client_management)
                 .fallback(method_not_allowed)
-                .layer(DefaultBodyLimit::max(4_096)),
+                .layer(DefaultBodyLimit::max(65_536)),
         )
         .route(
             "/api/v1/sessions",
@@ -319,6 +319,13 @@ async fn client(
     headers: HeaderMap,
     OriginalUri(uri): OriginalUri,
 ) -> Response {
+    if let Some(path) = uri.path().strip_suffix("/tunnels") {
+        let name = match client_name_from_path(path) {
+            Ok(name) => name,
+            Err(()) => return invalid_client_name(),
+        };
+        return super::managed::get(state, headers, name).await;
+    }
     if let Err(response) = authenticate(&state, &headers) {
         return *response;
     }
@@ -580,7 +587,7 @@ pub(super) fn not_found() -> Response {
     error_response(StatusCode::NOT_FOUND, "not_found", "resource was not found")
 }
 
-fn authenticate(state: &WebState, headers: &HeaderMap) -> Result<(), Box<Response>> {
+pub(super) fn authenticate(state: &WebState, headers: &HeaderMap) -> Result<(), Box<Response>> {
     if state
         .authentication
         .authenticate_cookie(single_cookie_header(headers))
@@ -646,6 +653,7 @@ async fn client_management(
         return not_found();
     };
     match action {
+        "tunnels" => super::managed::write(state, headers, client_id.to_owned(), body).await,
         "enrollment-token" | "reenrollment-token" => {
             let Ok(request) = serde_json::from_slice::<TokenRequest>(&body) else {
                 return invalid_management_request();
@@ -1298,7 +1306,7 @@ fn error_response(status: StatusCode, code: &'static str, message: &'static str)
     )
 }
 
-fn json_response<T: Serialize>(status: StatusCode, value: &T) -> Response {
+pub(super) fn json_response<T: Serialize>(status: StatusCode, value: &T) -> Response {
     let bytes = match serde_json::to_vec(value) {
         Ok(bytes) if bytes.len() <= MAX_API_RESPONSE_BYTES => bytes,
         Ok(_) => {

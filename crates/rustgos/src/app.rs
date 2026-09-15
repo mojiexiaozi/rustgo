@@ -195,6 +195,7 @@ pub struct ServerApp {
     observability_sink: Option<ObservabilitySink>,
     dashboard: Option<DashboardRuntime>,
     _enrollment: Option<EnrollmentManagement>,
+    managed: Option<crate::TunnelManagement>,
 }
 
 struct DashboardRuntime {
@@ -234,6 +235,9 @@ impl ServerApp {
             })?;
         }
         let _ = load_enrollment_management(config)?;
+        if let Some(managed) = &config.managed_tunnels {
+            let _ = crate::managed::ManagedStore::open(&managed.database_path)?;
+        }
         Ok(())
     }
 
@@ -318,6 +322,21 @@ impl ServerApp {
             },
         )?;
         enrollment = enrollment.map(|management| management.with_registry(registry.clone()));
+        let managed = config
+            .managed_tunnels
+            .as_ref()
+            .map(|settings| {
+                crate::TunnelManagement::new(
+                    Arc::new(crate::managed::ManagedStore::open(&settings.database_path)?),
+                    registry.clone(),
+                    &config.clients,
+                    enrollment
+                        .as_ref()
+                        .map(|management| management.store.clone()),
+                    max_tunnels,
+                )
+            })
+            .transpose()?;
         let observation = match (
             config.server.p2p_observation_bind.as_deref(),
             config.server.p2p_observation_alternate_bind.as_deref(),
@@ -379,6 +398,9 @@ impl ServerApp {
                 if let Some(management) = enrollment.clone() {
                     web_data_sources = web_data_sources.with_enrollment(management);
                 }
+                if let Some(management) = managed.clone() {
+                    web_data_sources = web_data_sources.with_managed_tunnels(management);
+                }
                 let web_limits = WebRuntimeLimits {
                     test_exit_after_accepts: runtime_limits.web_test_exit_after_accepts,
                     ..WebRuntimeLimits::default()
@@ -431,6 +453,7 @@ impl ServerApp {
             observability_sink,
             dashboard,
             _enrollment: enrollment,
+            managed,
         })
     }
 
@@ -608,7 +631,7 @@ impl ServerApp {
                             self.protocol_version,
                             observation_token_issuer,
                             rendezvous,
-                        ),
+                        ).with_managed_tunnels(self.managed.clone()),
                     );
                     let child_shutdown = session_shutdown.child_token();
                     sessions.spawn(async move {
@@ -1169,6 +1192,8 @@ impl std::fmt::Debug for ServerApp {
 
 #[derive(Debug, Error)]
 pub enum ServerError {
+    #[error("managed tunnel storage failed: {0}")]
+    Managed(#[from] crate::managed::ManagedError),
     #[error("TLS server failed: {0}")]
     Tls(#[from] TlsError),
     #[error("server I/O failed: {0}")]

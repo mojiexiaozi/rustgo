@@ -197,6 +197,15 @@ fn invalid_external_origin() -> ValidationError {
 }
 
 pub(crate) fn validate_server(config: &ServerConfig) -> Result<(), ValidationError> {
+    if config
+        .managed_tunnels
+        .as_ref()
+        .is_some_and(|settings| settings.database_path.as_os_str().is_empty())
+    {
+        return Err(ValidationError::new(
+            "managed_tunnels.database_path must not be empty",
+        ));
+    }
     validate_bind_address(&config.server.bind_addr)?;
     match (
         config.server.p2p_observation_bind.as_deref(),

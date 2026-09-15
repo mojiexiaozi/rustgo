@@ -39,6 +39,19 @@ test('offline or stale report cannot appear ready; polling preserves input nodes
   assert.ok(!content(app.nodes.get('managed-rows')).includes('已就绪'));
   assert.equal(app.nodes.get('managed-fields').children, fields);
 });
+
+test('offline application failures remain visible as previous failures', () => {
+  const app = setup(); const value = detail(); value.online = false;
+  app.renderManaged('node', value);
+  assert.match(content(app.nodes.get('managed-rows')), /上次失败：bind error/);
+});
+
+test('pending target status includes its reason', () => {
+  const app = setup(); const value = detail();
+  value.snapshot.results.push({kind:'forward',name:'use',state:'pending',error:'目标客户端离线'});
+  app.renderManaged('node',value);
+  assert.match(content(app.nodes.get('managed-rows')), /目标客户端离线/);
+});
 test('unsupported client and unsynced client disable mutations', async () => {
   const app = setup(); const value = detail(); value.supported = false; app.renderManaged('node', value);
   assert.match(app.nodes.get('managed-status').textContent, /升级/);

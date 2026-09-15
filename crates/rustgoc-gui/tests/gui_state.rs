@@ -155,6 +155,7 @@ fn server_config(pki: &TestPki, key: &DeviceKeypair) -> ServerConfig {
         }],
         web: None,
         enrollment: None,
+        managed_tunnels: None,
     }
 }
 

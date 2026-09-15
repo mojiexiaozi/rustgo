@@ -6,10 +6,12 @@ mod app;
 mod auth;
 mod control;
 pub mod enrollment;
+pub mod managed;
 mod observation;
 mod registry;
 mod rendezvous;
 mod tcp;
+mod tunnel_management;
 mod udp;
 pub mod web;
 
@@ -23,4 +25,5 @@ pub use rendezvous::{
     RendezvousCoordinator, RendezvousCoordinatorError, RendezvousErrorCode,
     RendezvousSessionMetadata,
 };
+pub use tunnel_management::TunnelManagement;
 pub use web::{DashboardDataSources, EnrollmentManagement, WebError, WebRuntimeLimits, WebServer};

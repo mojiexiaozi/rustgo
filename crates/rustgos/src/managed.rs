@@ -118,6 +118,18 @@ impl ManagedStore {
             transaction.execute("INSERT INTO managed_snapshots (identity,name,revision,configuration,results) VALUES (?1,?2,1,?3,'[]')", params![identity,name,json]).map_err(storage)?;
         }
         bind_name(&transaction, identity, name)?;
+        let current =
+            read_snapshot(&transaction, "identity", identity)?.ok_or(ManagedError::NotFound)?;
+        if current.configuration.p2p_enabled != configuration.p2p_enabled
+            && (configuration.p2p_enabled
+                || (current.configuration.exports.is_empty()
+                    && current.configuration.forwards.is_empty()))
+        {
+            let mut refreshed = current.configuration;
+            refreshed.p2p_enabled = configuration.p2p_enabled;
+            let refreshed = configuration_json(&refreshed)?;
+            transaction.execute("UPDATE managed_snapshots SET configuration=?2,revision=revision+1 WHERE identity=?1", params![identity,refreshed]).map_err(storage)?;
+        }
         transaction
             .execute(
                 "UPDATE managed_snapshots SET applied_revision=NULL,results='[]' WHERE identity=?1",

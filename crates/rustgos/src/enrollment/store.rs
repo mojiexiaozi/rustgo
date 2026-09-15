@@ -51,6 +51,10 @@ impl DynamicClient {
     pub fn is_bound(&self) -> bool {
         self.public_key.is_some()
     }
+
+    pub(crate) fn public_key(&self) -> Option<&str> {
+        self.public_key.as_deref()
+    }
     pub fn is_deleted(&self) -> bool {
         self.tombstoned
     }

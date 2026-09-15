@@ -73,6 +73,7 @@ fn server_config(pki: &TestPki) -> ServerConfig {
         clients: Vec::new(),
         web: None,
         enrollment: None,
+        managed_tunnels: None,
     }
 }
 

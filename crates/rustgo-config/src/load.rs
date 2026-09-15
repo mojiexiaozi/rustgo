@@ -61,6 +61,9 @@ where
     if let Some(enrollment) = &mut config.enrollment {
         resolve_path(path, &mut enrollment.database_path);
     }
+    if let Some(managed) = &mut config.managed_tunnels {
+        resolve_path(path, &mut managed.database_path);
+    }
     config.validate().map_err(|error| ConfigError::Validation {
         path: path.to_path_buf(),
         error,
