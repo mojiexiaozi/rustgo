@@ -56,6 +56,12 @@ impl ControlClient {
         })
     }
 
+    pub(crate) fn with_effective_config(&self, config: ClientConfig) -> Self {
+        let mut client = self.clone();
+        client.config = Arc::new(config);
+        client
+    }
+
     pub fn config(&self) -> &ClientConfig {
         &self.config
     }
@@ -144,7 +150,46 @@ impl ControlClient {
             return Err(ClientError::AuthenticationRejected);
         }
 
-        let registration = registration_message(&self.config)?;
+        let mut effective = self.config.as_ref().clone();
+        let mut managed_revision = None;
+        if negotiated.supports_managed_configuration() {
+            let configuration = serde_json::to_vec(
+                &rustgo_config::ManagedConfiguration::from_client(&effective),
+            )
+            .map_err(|_| ClientError::InvalidConfiguration)?;
+            framed
+                .send(
+                    negotiated,
+                    Message::ManagedConfigRequest(rustgo_protocol::ManagedConfigRequest {
+                        configuration: BoundedBytes::try_from(configuration)
+                            .map_err(|_| ClientError::InvalidConfiguration)?,
+                    }),
+                )
+                .await?;
+            let snapshot = framed.receive().await?;
+            require_version(snapshot.version, negotiated)?;
+            match snapshot.message {
+                Message::ManagedConfigSnapshot(rustgo_protocol::ManagedConfigSnapshot {
+                    revision,
+                    configuration: Some(configuration),
+                }) => {
+                    let desired: rustgo_config::ManagedConfiguration =
+                        serde_json::from_slice(configuration.as_slice())
+                            .map_err(|_| ClientError::InvalidConfiguration)?;
+                    desired
+                        .apply_to(&mut effective)
+                        .map_err(|_| ClientError::InvalidConfiguration)?;
+                    managed_revision = Some(revision);
+                }
+                Message::ManagedConfigSnapshot(rustgo_protocol::ManagedConfigSnapshot {
+                    configuration: None,
+                    ..
+                }) => {}
+                Message::Error(error) => return Err(ClientError::Protocol(error.code)),
+                _ => return Err(ClientError::InvalidState),
+            }
+        }
+        let registration = registration_message(&effective)?;
         state = state.transition(&registration)?;
         if !state.is_active() {
             return Err(ClientError::InvalidState);
@@ -158,15 +203,18 @@ impl ControlClient {
             Message::Error(error) => return Err(ClientError::Protocol(error.code)),
             _ => return Err(ClientError::InvalidState),
         };
-        let registered_tunnels = correlate_results(&self.config, results.results.into_vec())?;
+        let registered_tunnels = correlate_results(&effective, results.results.into_vec())?;
 
-        Ok(ControlSession::new(
+        let mut session = ControlSession::new(
             framed,
             negotiated,
             challenge.session_id.into_vec(),
             self.heartbeat_interval,
             registered_tunnels,
-        ))
+        );
+        session.effective_config = Some(Arc::new(effective));
+        session.managed_revision = managed_revision;
+        Ok(session)
     }
 }
 
@@ -387,6 +435,8 @@ pub struct ControlSession {
     pub(crate) session_id: Vec<u8>,
     pub(crate) heartbeat_interval: Duration,
     registered_tunnels: Arc<[RegisteredTunnel]>,
+    effective_config: Option<Arc<ClientConfig>>,
+    managed_revision: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -413,7 +463,26 @@ impl ControlSession {
             session_id,
             heartbeat_interval,
             registered_tunnels,
+            effective_config: None,
+            managed_revision: None,
         }
+    }
+
+    pub(crate) fn managed_report(&self) -> Option<(u64, Vec<serde_json::Value>)> {
+        let revision = self.managed_revision?;
+        let mut results = self.registered_tunnels.iter().map(|tunnel| serde_json::json!({"kind":"tunnel","name":tunnel.name(),"state":if tunnel.accepted() {"ready"} else {"failed"},"error":tunnel.error().map(|error| format!("{error:?}"))})).collect::<Vec<_>>();
+        if let Some(config) = self.effective_config() {
+            results.extend(config.exports.iter().map(|export| serde_json::json!({"kind":"export","name":export.name,"state":"ready","error":null})));
+        }
+        Some((revision, results))
+    }
+
+    pub fn effective_config(&self) -> Option<&ClientConfig> {
+        self.effective_config.as_deref()
+    }
+
+    pub fn managed_revision(&self) -> Option<u64> {
+        self.managed_revision
     }
 
     pub fn registered_tunnels(&self) -> &[RegisteredTunnel] {

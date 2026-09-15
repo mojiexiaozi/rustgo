@@ -48,9 +48,37 @@ pub struct ChildSessionContext {
     session_id: Arc<[u8]>,
     control_outbound: mpsc::Sender<Message>,
     protocol_version: ProtocolVersion,
+    managed_report: Option<(u64, Vec<serde_json::Value>)>,
 }
 
 impl ChildSessionContext {
+    pub(crate) fn is_managed(&self) -> bool {
+        self.managed_report.is_some()
+    }
+
+    pub(crate) async fn report_managed(
+        &self,
+        forward_results: Vec<serde_json::Value>,
+        shutdown: &CancellationToken,
+    ) -> Result<(), ClientError> {
+        if let Some((revision, initial)) = &self.managed_report {
+            let mut results = initial.clone();
+            results.extend(forward_results);
+            let results =
+                serde_json::to_vec(&results).map_err(|_| ClientError::InvalidConfiguration)?;
+            self.send_peer_control(
+                Message::ManagedConfigReport(rustgo_protocol::ManagedConfigReport {
+                    revision: *revision,
+                    results: rustgo_protocol::BoundedBytes::try_from(results)
+                        .map_err(|_| ClientError::InvalidConfiguration)?,
+                }),
+                shutdown,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     pub const fn generation(&self) -> SessionGeneration {
         self.generation
     }
@@ -215,6 +243,7 @@ impl ControlSession {
             session_id: Arc::from(self.session_id.clone()),
             control_outbound,
             protocol_version: self.version,
+            managed_report: self.managed_report(),
         };
         let mut child_signals = ChildSignals {
             control: &mut child_control,
@@ -352,6 +381,7 @@ impl ControlSession {
                     };
                     if !matches!(message, Message::TcpStreamReady(_))
                         && !is_peer_outbound(&message)
+                        && !(self.version.supports_managed_configuration() && matches!(message, Message::ManagedConfigReport(_)))
                     {
                         return Err(ClientError::InvalidState);
                     }

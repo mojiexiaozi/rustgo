@@ -52,9 +52,18 @@ where
 pub struct ClientStatus {
     active: Option<ActiveGeneration>,
     authentication_rejected: bool,
+    managed_revision: Option<u64>,
+    effective_configuration: Option<Arc<rustgo_config::ManagedConfiguration>>,
 }
 
 impl ClientStatus {
+    pub fn managed_revision(&self) -> Option<u64> {
+        self.managed_revision
+    }
+    pub fn effective_configuration(&self) -> Option<&rustgo_config::ManagedConfiguration> {
+        self.effective_configuration.as_deref()
+    }
+
     pub fn authentication_rejected(&self) -> bool {
         self.authentication_rejected
     }
@@ -84,6 +93,7 @@ pub struct ClientApp {
     control: ControlClient,
     backoff: Box<dyn ReconnectBackoff>,
     supervisor: Arc<dyn ChildSessionSupervisor>,
+    production_supervisor: bool,
     status: watch::Sender<ClientStatus>,
     exports: ExportRegistry,
     peer_handler: Option<Arc<dyn PeerGenerationHandler>>,
@@ -116,14 +126,16 @@ impl ClientApp {
             &control,
             logical_traffic.clone(),
         ));
-        Ok(Self::with_runtime_and_exports(
+        let mut app = Self::with_runtime_and_exports(
             control,
             backoff,
             supervisor,
             exports,
             telemetry,
             logical_traffic,
-        ))
+        );
+        app.production_supervisor = true;
+        Ok(app)
     }
 
     pub fn with_runtime<B>(
@@ -168,6 +180,7 @@ impl ClientApp {
             control,
             backoff: Box::new(backoff),
             supervisor,
+            production_supervisor: false,
             status,
             exports,
             peer_handler: None,
@@ -296,6 +309,25 @@ impl ClientApp {
 
             match connected {
                 Ok(session) => {
+                    let effective = session
+                        .effective_config()
+                        .unwrap_or(self.control.config())
+                        .clone();
+                    let managed_revision = session.managed_revision();
+                    let generation_peer: Arc<dyn PeerGenerationHandler> =
+                        if managed_revision.is_some() && self.peer_handler.is_none() {
+                            self.exports = ExportRegistry::new(effective.exports.clone())
+                                .map_err(|_| ClientError::InvalidConfiguration)?;
+                            Arc::new(ProductionPeerRuntime::new(
+                                Arc::new(effective.clone()),
+                                self.control.keypair(),
+                                self.exports.clone(),
+                                self.logical_traffic.clone(),
+                                self.path_status_store.clone(),
+                            ))
+                        } else {
+                            peer_runtime.clone()
+                        };
                     let generation = SessionGeneration::next(self.last_generation)?;
                     let protocol_version = session.protocol_version();
                     let generation_telemetry = if session.supports_telemetry() {
@@ -308,6 +340,10 @@ impl ClientApp {
                     self.backoff.mark_connected();
                     self.status.send_replace(ClientStatus {
                         authentication_rejected: false,
+                        managed_revision,
+                        effective_configuration: Some(Arc::new(
+                            rustgo_config::ManagedConfiguration::from_client(&effective),
+                        )),
                         active: Some(ActiveGeneration {
                             generation,
                             registered_tunnels: session.registered_tunnels_shared(),
@@ -323,7 +359,16 @@ impl ClientApp {
                         "客户端隧道注册已就绪"
                     );
                     let status = self.status.clone();
-                    let supervisor = self.supervisor.clone();
+                    let supervisor: Arc<dyn ChildSessionSupervisor> = if self.production_supervisor
+                    {
+                        let control = self.control.with_effective_config(effective);
+                        Arc::new(RelaySessionSupervisor::new(
+                            &control,
+                            self.logical_traffic.clone(),
+                        ))
+                    } else {
+                        self.supervisor.clone()
+                    };
                     let backoff = &mut self.backoff;
                     let result = session
                         .run_generation_with_peer(crate::session::GenerationConfig {
@@ -331,15 +376,18 @@ impl ClientApp {
                             telemetry: generation_telemetry,
                             shutdown: shutdown.clone(),
                             supervisor,
-                            peer_handler: Some(peer_runtime.clone()),
+                            peer_handler: Some(generation_peer.clone()),
                             on_control_ended: move || {
                                 backoff.mark_disconnected();
                             },
                             on_inactive: move || {
-                                status.send_replace(ClientStatus::default());
+                                status.send_modify(|status| status.active = None);
                             },
                         })
                         .await;
+                    if managed_revision.is_some() && self.peer_handler.is_none() {
+                        generation_peer.shutdown().await?;
+                    }
                     if shutdown.is_cancelled() {
                         return Ok(());
                     }
@@ -368,15 +416,15 @@ impl ClientApp {
                 }
                 Err(error) => {
                     if matches!(error, ClientError::AuthenticationRejected) {
-                        self.status.send_replace(ClientStatus {
-                            active: None,
-                            authentication_rejected: true,
+                        self.status.send_modify(|status| {
+                            status.active = None;
+                            status.authentication_rejected = true;
                         });
                         if self.stop_on_auth_rejection {
                             return Err(error);
                         }
                     }
-                    self.status.send_replace(ClientStatus::default());
+                    self.status.send_modify(|status| status.active = None);
                     tracing::warn!(
                         client = %safe_display(&self.control.config().client.name),
                         error = %safe_display(&error),

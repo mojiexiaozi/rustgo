@@ -78,7 +78,7 @@ pub(crate) struct ProductionPeerRuntime {
 
 struct PeerRuntimeOwner {
     actor: tokio::task::JoinHandle<io::Result<()>>,
-    forward: ForwardRuntime,
+    forward: Vec<ForwardRuntime>,
 }
 
 impl ProductionPeerRuntime {
@@ -147,6 +147,8 @@ impl PeerGenerationHandler for ProductionPeerRuntime {
         let runtime = self.clone();
         Box::pin(async move {
             let generation = context.generation().get();
+            let mut pending = Vec::new();
+            let mut results = Vec::new();
             {
                 let mut owner = runtime.owner.lock().await;
                 if owner.is_none() {
@@ -165,22 +167,49 @@ impl PeerGenerationHandler for ProductionPeerRuntime {
                         )
                         .run(),
                     );
-                    let forward = match ForwardRuntime::start(
-                        runtime.config.forwards.clone(),
-                        Arc::new(runtime.clone()),
-                        runtime.lifetime.child_token(),
-                    )
-                    .await
-                    {
-                        Ok(forward) => forward,
-                        Err(error) => {
-                            tracing::error!(error = %error, "启动对端转发失败");
-                            runtime.lifetime.cancel();
-                            let _ = actor_result(actor.await);
-                            return Err(ClientError::PeerGenerationFailed);
-                        }
-                    };
+                    let mut forward = Vec::new();
+                    for item in &runtime.config.forwards {
+                        match ForwardRuntime::start(
+                            vec![item.clone()],
+                            Arc::new(runtime.clone()),
+                            if context.is_managed() {
+                                shutdown.child_token()
+                            } else {
+                                runtime.lifetime.child_token()
+                            },
+                        )
+                        .await
+                        {
+                            Ok(listener) => {
+                                forward.push(listener);
+                                results.push(serde_json::json!({"kind":"forward","name":item.name,"state":"ready","error":null}));
+                            }
+                            Err(error) => {
+                                tracing::error!(error = %error, "启动对端转发失败");
+                                if !context.is_managed() {
+                                    runtime.lifetime.cancel();
+                                    for listener in forward {
+                                        listener.shutdown().await;
+                                    }
+                                    let _ = actor_result(actor.await);
+                                    return Err(ClientError::PeerGenerationFailed);
+                                }
+                                let state = if matches!(
+                                    error,
+                                    crate::ForwardError::Protocol
+                                        | crate::ForwardError::ProtocolTimeout
+                                ) {
+                                    pending.push((results.len(), item.clone()));
+                                    "pending"
+                                } else {
+                                    "failed"
+                                };
+                                results.push(serde_json::json!({"kind":"forward","name":item.name,"state":state,"error":error.to_string()}));
+                            }
+                        };
+                    }
                     *owner = Some(PeerRuntimeOwner { actor, forward });
+                    context.report_managed(results.clone(), &shutdown).await?;
                     tracing::info!(event = %"peer_forwards_ready", "对端转发监听器已就绪");
                 } else {
                     runtime
@@ -188,6 +217,47 @@ impl PeerGenerationHandler for ProductionPeerRuntime {
                         .send(ActorInput::ControlAttached(context.clone()))
                         .await
                         .map_err(|_| ClientError::PeerGenerationFailed)?;
+                }
+            }
+            while !pending.is_empty() {
+                tokio::select! { biased; () = shutdown.cancelled() => break, () = tokio::time::sleep(Duration::from_secs(1)) => {} }
+                let mut retry = Vec::new();
+                let mut changed = false;
+                for (index, item) in pending.drain(..) {
+                    match ForwardRuntime::start(
+                        vec![item.clone()],
+                        Arc::new(runtime.clone()),
+                        shutdown.child_token(),
+                    )
+                    .await
+                    {
+                        Ok(listener) => {
+                            runtime
+                                .owner
+                                .lock()
+                                .await
+                                .as_mut()
+                                .ok_or(ClientError::PeerGenerationFailed)?
+                                .forward
+                                .push(listener);
+                            results[index] = serde_json::json!({"kind":"forward","name":item.name,"state":"ready","error":null});
+                            changed = true;
+                        }
+                        Err(
+                            crate::ForwardError::Protocol | crate::ForwardError::ProtocolTimeout,
+                        ) => retry.push((index, item)),
+                        Err(error) => {
+                            results[index] = serde_json::json!({"kind":"forward","name":item.name,"state":"failed","error":error.to_string()});
+                            changed = true;
+                        }
+                    }
+                    if shutdown.is_cancelled() {
+                        break;
+                    }
+                }
+                pending = retry;
+                if changed && !shutdown.is_cancelled() {
+                    context.report_managed(results.clone(), &shutdown).await?;
                 }
             }
             shutdown.cancelled().await;
@@ -228,7 +298,9 @@ impl PeerGenerationHandler for ProductionPeerRuntime {
             let Some(owner) = owner else {
                 return Ok(());
             };
-            owner.forward.shutdown().await;
+            for forward in owner.forward {
+                forward.shutdown().await;
+            }
             actor_result(owner.actor.await)
         })
     }

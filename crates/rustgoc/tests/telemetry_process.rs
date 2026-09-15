@@ -452,6 +452,7 @@ async fn production_p2p_fallback_counts_only_application_payload() -> Result<(),
         ],
         web: None,
         enrollment: None,
+        managed_tunnels: None,
     };
     let (store, sink, worker) = ObservabilityStore::new();
     let server = ServerApp::bind(server_config)

@@ -159,6 +159,7 @@ fn server_config(pki: &TestPki, key: &DeviceKeypair, heartbeat_timeout_secs: u64
         }],
         web: None,
         enrollment: None,
+        managed_tunnels: None,
     }
 }
 
