@@ -56,7 +56,6 @@ impl ConfigPanel {
     }
     pub fn show(&mut self, ui: &mut Ui, apply: &mut bool) {
         ui.heading("配置");
-        ui.label(format!("固定位置：{}", self.config_path.display()));
         ui.separator();
         if let Some(e) = &self.error {
             ui.colored_label(eframe::egui::Color32::RED, e);

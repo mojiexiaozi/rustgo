@@ -129,7 +129,6 @@ struct GuiApp {
     connected_name: String,
     auto_connect_pending: bool,
     last_logged_connection_state: state::connection::ConnectionState,
-    rotate_key: bool,
 }
 
 impl GuiApp {
@@ -174,7 +173,6 @@ impl GuiApp {
             active_tab: Tab::Connection,
             connection_panel: ConnectionPanel::new("8.133.176.172:8443".to_string()),
             enrollment_panel: EnrollmentPanel::new(),
-            rotate_key: false,
             forwarding_panel: ForwardingPanel::new(),
             logs_panel: LogsPanel::new(),
             config_panel: ConfigPanel::new(config_path.clone()),
@@ -494,8 +492,6 @@ impl eframe::App for GuiApp {
                             }
                         }
                     }
-                    ui.weak("勾选立即生效：当前用户登录 Windows 时启动。取消勾选后不再自启动。");
-                    ui.weak("关闭窗口后继续在系统托盘运行，右键托盘图标可退出，双击可恢复窗口。");
                     if let Some(error) = &self.autostart_error {
                         ui.colored_label(eframe::egui::Color32::RED, error);
                     }
@@ -509,20 +505,6 @@ impl eframe::App for GuiApp {
                 if on_save_and_reconnect {
                     self.apply_configuration();
                 }
-                ui.separator();
-                if ui
-                    .add_enabled(
-                        self.enrollment_rx.is_none() && self.managed_save_rx.is_none(),
-                        eframe::egui::Button::new("生成候选密钥并申请更换"),
-                    )
-                    .clicked()
-                {
-                    self.rotate_key = true;
-                    self.enrollment_state = EnrollmentState::ReRegistrationRequired;
-                    self.active_tab = Tab::Connection;
-                    self.handle_enrollment_submit();
-                }
-                ui.weak("管理员批准后更换设备密钥，等待期间保留当前密钥。");
             }
         });
     }
@@ -706,8 +688,7 @@ impl GuiApp {
         if let Some(runtime) = &self.runtime {
             self.enrollment_panel.clear_error();
             self.enrollment_rx =
-                Some(runtime.enroll(config, self.config_path.clone(), purpose, self.rotate_key));
-            self.rotate_key = false;
+                Some(runtime.enroll(config, self.config_path.clone(), purpose, false));
             self.enrollment_state = match purpose {
                 rustgoc::EnrollmentPurpose::Enroll => EnrollmentState::EnrollmentPending,
                 rustgoc::EnrollmentPurpose::ReEnroll => EnrollmentState::ReEnrollmentPending,
@@ -823,7 +804,6 @@ mod approval_regression_tests {
             connected_name: String::new(),
             auto_connect_pending: false,
             last_logged_connection_state: state::connection::ConnectionState::Disconnected,
-            rotate_key: false,
         }
     }
 
