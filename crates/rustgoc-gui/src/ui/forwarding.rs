@@ -24,6 +24,9 @@ impl ForwardEntryKind {
 }
 pub struct ForwardingPanel {
     pub managed: crate::state::managed::ManagedViewModel,
+    pub saving: bool,
+    pub save_managed: bool,
+    pub reload_managed: bool,
     kind: ForwardEntryKind,
     name: String,
     local: String,
@@ -46,6 +49,9 @@ impl ForwardingPanel {
     pub fn new() -> Self {
         Self {
             managed: Default::default(),
+            saving: false,
+            save_managed: false,
+            reload_managed: false,
             kind: ForwardEntryKind::TcpTunnel,
             name: String::new(),
             local: "127.0.0.1:22".into(),
@@ -80,6 +86,7 @@ impl ForwardingPanel {
             ui.label("配置不可用");
             return;
         };
+        ui.add_enabled_ui(!self.saving, |ui| {
         ui.collapsing("P2P 全局设置", |ui| {
             let p = c.p2p.get_or_insert_with(default_p2p);
             ui.checkbox(&mut p.enabled, "启用 P2P");
@@ -110,65 +117,29 @@ impl ForwardingPanel {
             optional_address(ui, "主观测地址", &mut p.observation_primary_addr);
             optional_address(ui, "备用观测地址", &mut p.observation_alternate_addr);
         });
+        });
         ui.separator();
         ui.heading("配置项");
-        if let Some(snapshot) = self.managed.snapshot() {
-            ui.strong(format!(
-                "由服务器管理 · 修订号 {}",
-                self.managed.revision().unwrap_or(0)
-            ));
-            ui.label("隧道、导出和转发请在服务器 Web 管理端修改。断线时保留最后收到的配置。");
-            for tunnel in &snapshot.tunnels {
-                ui.label(format!(
-                    "{} 隧道 · {} · {} → 服务器端口 {}",
-                    protocol_label(tunnel.protocol),
-                    tunnel.name,
-                    tunnel.local_addr,
-                    tunnel.remote_port
-                ));
-                if let Some(row) = tunnels.iter().find(|row| row.name == tunnel.name) {
-                    if let Some(error) = &row.error {
-                        ui.colored_label(egui::Color32::RED, error);
-                    } else if row.accepted {
-                        ui.weak("服务器已接受");
-                    }
-                } else {
-                    ui.weak("暂无在线运行状态");
-                }
+        let is_managed = self.managed.draft().is_some();
+        if is_managed {
+            ui.strong(format!("由服务器管理 · 编辑修订号 {}", self.managed.draft_revision().unwrap_or(0)));
+            if self.managed.dirty() { ui.label("有未保存的服务器配置修改"); }
+            if self.managed.revision() != self.managed.draft_revision() {
+                ui.colored_label(egui::Color32::YELLOW, format!("服务器已有新修订号 {}，请重新加载后合并修改", self.managed.revision().unwrap_or(0)));
             }
-            for export in &snapshot.exports {
-                ui.label(format!(
-                    "{} 导出 · {} · {} · 允许客户端：{}",
-                    protocol_label(export.protocol),
-                    export.name,
-                    export.local_addr,
-                    if export.allowed_peers.is_empty() {
-                        "所有已授权客户端".into()
-                    } else {
-                        export.allowed_peers.join(", ")
-                    }
-                ));
+            if ui.add_enabled(!self.saving, egui::Button::new("重新加载服务器配置（丢弃草稿）")).clicked() {
+                self.reload_managed = true;
             }
-            for forward in &snapshot.forwards {
-                ui.label(format!(
-                    "P2P 转发 · {} · {} → {} / {}",
-                    forward.name, forward.listen_addr, forward.peer, forward.export
-                ));
-            }
-            if snapshot.tunnels.is_empty()
-                && snapshot.exports.is_empty()
-                && snapshot.forwards.is_empty()
-            {
-                ui.weak("服务器配置为空");
-            }
-            if let Some(message) = &self.message {
-                ui.label(message);
-            }
-            if ui.button("保存 P2P 设置并生效").clicked() {
-                *save = true;
-            }
-            return;
+            if ui.add_enabled(!self.saving, egui::Button::new("保存本地 P2P 设置并生效")).clicked() { *save = true; }
         }
+        let mut remote = c.clone();
+        if let Some(draft) = self.managed.draft() {
+            remote.tunnels = draft.tunnels.clone();
+            remote.exports = draft.exports.clone();
+            remote.forwards = draft.forwards.clone();
+        }
+        let c = if is_managed { &mut remote } else { c };
+        ui.add_enabled_ui(!self.saving, |ui| {
         let mut remove = None;
         ui.with_layout(
             egui::Layout::left_to_right(egui::Align::Min).with_main_wrap(true),
@@ -413,15 +384,18 @@ impl ForwardingPanel {
             }
         }
         ui.add_space(8.0);
-        if ui.button("保存并生效").clicked() {
-            *save = true;
+        if ui.button(if is_managed { "保存到服务器并生效" } else { "保存并生效" }).clicked() {
+            if is_managed { self.save_managed = true; } else { *save = true; }
+        }
+        });
+        if is_managed {
+            let mut draft = rustgo_config::ManagedConfiguration::from_client(c);
+            draft.p2p_enabled = self.managed.draft().unwrap().p2p_enabled;
+            self.managed.edit(draft);
         }
     }
 
     fn validated_candidate(&self, current: &ClientConfig) -> Result<ClientConfig, String> {
-        if self.managed.snapshot().is_some() {
-            return Err("由服务器管理，请在服务器 Web 管理端修改".into());
-        }
         let name = self.name.trim();
         if name.is_empty() {
             return Err("名称不能为空".into());
@@ -581,7 +555,7 @@ fn now_millis() -> u64 {
 mod tests {
     use super::{ForwardEntryKind, ForwardingPanel, parse_peers};
     #[test]
-    fn managed_collections_reject_local_add_and_never_replace_saved_source() {
+    fn managed_cards_allow_add_and_never_replace_saved_source() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("client.toml");
         let mut config_panel = crate::ui::config::ConfigPanel::new(path.clone());
@@ -619,7 +593,14 @@ mod tests {
                 p2p_enabled: false,
             }),
         );
-        assert!(panel.validated_candidate(&local).is_err());
+        let mut remote = local.clone();
+        remote.tunnels.clear();
+        remote.exports.clear();
+        remote.forwards.clear();
+        let added = panel.validated_candidate(&remote).unwrap();
+        panel.managed.edit(rustgo_config::ManagedConfiguration::from_client(&added));
+        assert_eq!(panel.managed.draft().unwrap().tunnels[0].name, "new-tunnel");
+        assert!(panel.managed.dirty());
         let context = eframe::egui::Context::default();
         let p2p = crate::state::p2p::P2PViewModel::new(rustgoc::PathStatusStore::new());
         let mut save = false;
@@ -627,6 +608,8 @@ mod tests {
             panel.show(ui, config_panel.config_mut(), &[], &p2p, &mut save);
         });
         output.textures_delta.clear();
+        assert_eq!(panel.managed.draft().unwrap().tunnels[0].name, "new-tunnel");
+        assert!(panel.managed.dirty());
         config_panel
             .config_mut()
             .unwrap()

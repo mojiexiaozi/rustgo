@@ -19,6 +19,7 @@ struct RuntimeState {
     enrollment_shutdown: Option<CancellationToken>,
     shutdown: Option<CancellationToken>,
     generation: u64,
+    client_tasks: Vec<(CancellationToken, CancellationToken)>,
     traffic_handle: Option<TrafficHandle>,
 }
 
@@ -95,6 +96,7 @@ impl ClientRuntime {
             enrollment_shutdown: None,
             shutdown: None,
             generation: 0,
+            client_tasks: Vec::new(),
             traffic_handle: None,
         }));
         let telemetry_shutdown = CancellationToken::new();
@@ -115,6 +117,7 @@ impl ClientRuntime {
     pub fn connect(&self, app: ClientApp, traffic_handle: Option<TrafficHandle>) {
         if let Some(runtime) = &self.runtime {
             let shutdown = CancellationToken::new();
+            let completed = CancellationToken::new();
             let generation = {
                 let mut guard = self
                     .state
@@ -123,6 +126,8 @@ impl ClientRuntime {
                 if let Some(previous) = guard.shutdown.replace(shutdown.clone()) {
                     previous.cancel();
                 }
+                guard.client_tasks.retain(|(_, done)| !done.is_cancelled());
+                guard.client_tasks.push((shutdown.clone(), completed.clone()));
                 guard.generation += 1;
                 guard.traffic_handle = traffic_handle;
                 guard.generation
@@ -132,6 +137,7 @@ impl ClientRuntime {
             // Spawn client task
             let client_shutdown = shutdown.clone();
             runtime.spawn(async move {
+                let _completion_guard = completed.clone().drop_guard();
                 let result = app
                     .with_approval_recovery()
                     .run_until(client_shutdown)
@@ -145,11 +151,35 @@ impl ClientRuntime {
                     guard.traffic_handle = None;
                 }
 
+                completed.cancel();
                 if let Err(e) = result {
                     tracing::error!("客户端错误：{}", e);
                 }
             });
         }
+    }
+
+    pub fn update_managed(
+        &self,
+        config: rustgo_config::ClientConfig,
+        revision: u64,
+        desired: rustgo_config::ManagedConfiguration,
+    ) -> std::sync::mpsc::Receiver<Result<u64, String>> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        self.disconnect();
+        let completions = {
+            let guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            guard.client_tasks.iter().map(|(_, done)| done.clone()).collect::<Vec<_>>()
+        };
+        if let Some(runtime) = &self.runtime {
+            runtime.spawn(async move {
+                for completed in completions { completed.cancelled().await; }
+                let result = rustgoc::update_managed_configuration(config, revision, desired)
+                    .await.map_err(|error| error.to_string());
+                let _ = sender.send(result);
+            });
+        } else { let _ = sender.send(Err("客户端运行时不可用".into())); }
+        receiver
     }
 
     pub fn disconnect(&self) {
@@ -159,6 +189,7 @@ impl ClientRuntime {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             guard.traffic_handle = None;
+            for (shutdown, _) in &guard.client_tasks { shutdown.cancel(); }
             if let Some(pending) = guard.enrollment_shutdown.take() {
                 pending.cancel();
             }

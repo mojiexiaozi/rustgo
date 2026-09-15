@@ -6,6 +6,9 @@ pub struct ManagedViewModel {
     server: String,
     revision: Option<u64>,
     snapshot: Option<ManagedConfiguration>,
+    draft: Option<ManagedConfiguration>,
+    draft_revision: Option<u64>,
+    dirty: bool,
 }
 
 impl ManagedViewModel {
@@ -14,6 +17,9 @@ impl ManagedViewModel {
             self.server = server.to_owned();
             self.revision = None;
             self.snapshot = None;
+            self.draft = None;
+            self.draft_revision = None;
+            self.dirty = false;
         }
     }
 
@@ -26,6 +32,9 @@ impl ManagedViewModel {
         if active && revision.is_none() && snapshot.is_some() {
             // A successful legacy/unmanaged session confirms ownership changed.
             self.revision = None;
+            self.draft = None;
+            self.draft_revision = None;
+            self.dirty = false;
             return self.snapshot.take().is_some();
         }
         let (Some(revision), Some(snapshot)) = (revision, snapshot) else {
@@ -37,7 +46,28 @@ impl ManagedViewModel {
         }
         self.revision = Some(revision);
         self.snapshot = Some(snapshot.clone());
+        if !self.dirty { self.reload(); }
         true
+    }
+
+    pub fn draft(&self) -> Option<&ManagedConfiguration> { self.draft.as_ref() }
+    pub fn draft_revision(&self) -> Option<u64> { self.draft_revision }
+    pub fn dirty(&self) -> bool { self.dirty }
+    pub fn edit(&mut self, draft: ManagedConfiguration) {
+        if self.draft.as_ref() != Some(&draft) {
+            self.draft = Some(draft);
+            self.dirty = true;
+        }
+    }
+    pub fn reload(&mut self) {
+        self.draft = self.snapshot.clone();
+        self.draft_revision = self.revision;
+        self.dirty = false;
+    }
+    pub fn saved(&mut self, revision: u64) {
+        self.snapshot = self.draft.clone();
+        self.revision = Some(revision);
+        self.reload();
     }
 
     pub fn revision(&self) -> Option<u64> {
@@ -51,6 +81,41 @@ impl ManagedViewModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dirty_draft_keeps_base_revision_until_explicit_reload() {
+        let mut model = ManagedViewModel::default();
+        let initial = ManagedConfiguration { p2p_enabled: false, tunnels: vec![], exports: vec![], forwards: vec![] };
+        model.observe(true, Some(7), Some(&initial));
+        let mut edited = initial.clone();
+        edited.p2p_enabled = true;
+        model.edit(edited.clone());
+        model.observe(true, Some(8), Some(&initial));
+        assert_eq!(model.draft(), Some(&edited));
+        assert_eq!(model.draft_revision(), Some(7));
+        assert!(model.dirty());
+        model.reload();
+        assert_eq!(model.draft(), Some(&initial));
+        assert_eq!(model.draft_revision(), Some(8));
+        assert!(!model.dirty());
+    }
+
+    #[test]
+    fn acknowledged_save_advances_draft_revision() {
+        let mut model = ManagedViewModel::default();
+        let initial = ManagedConfiguration { p2p_enabled: false, tunnels: vec![], exports: vec![], forwards: vec![] };
+        model.observe(true, Some(7), Some(&initial));
+        let mut edited = initial;
+        edited.p2p_enabled = true;
+        model.edit(edited.clone());
+        // Failed requests do not call saved(), retaining both content and CAS base.
+        assert_eq!(model.draft_revision(), Some(7));
+        assert_eq!(model.draft(), Some(&edited));
+        model.saved(8);
+        assert_eq!(model.draft_revision(), Some(8));
+        assert_eq!(model.snapshot(), Some(&edited));
+        assert!(!model.dirty());
+    }
 
     #[test]
     fn confirmed_unmanaged_session_unlocks_same_server_but_disconnect_does_not() {
@@ -100,5 +165,8 @@ mod tests {
         assert_eq!(model.snapshot(), Some(&changed));
         model.select_server("two:8443");
         assert!(model.snapshot().is_none());
+        assert!(model.draft().is_none());
+        assert_eq!(model.draft_revision(), None);
+        assert!(!model.dirty());
     }
 }
