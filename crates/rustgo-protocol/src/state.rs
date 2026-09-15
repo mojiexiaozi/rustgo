@@ -96,7 +96,7 @@ impl ClientHandshakeState {
 
     /// Validates a control message with its negotiated protocol version and
     /// direction. The legacy [`Self::transition`] API intentionally rejects
-    /// telemetry because it has neither of those security-relevant inputs.
+    /// telemetry and managed configuration because it lacks these security-relevant inputs.
     pub fn transition_control(
         &self,
         negotiated_version: ProtocolVersion,
@@ -104,6 +104,30 @@ impl ClientHandshakeState {
         message: &Message,
     ) -> Result<Self, StateError> {
         match message {
+            Message::ManagedConfigRequest(_)
+            | Message::ManagedConfigSnapshot(_)
+            | Message::ManagedConfigReport(_) => {
+                let allowed = match message {
+                    Message::ManagedConfigRequest(_) => {
+                        matches!(self, Self::AwaitingTunnelRegistration { .. })
+                            && direction == ControlMessageDirection::ClientToServer
+                    }
+                    Message::ManagedConfigSnapshot(_) => {
+                        matches!(self, Self::AwaitingTunnelRegistration { .. })
+                            && direction == ControlMessageDirection::ServerToClient
+                    }
+                    Message::ManagedConfigReport(_) => {
+                        matches!(self, Self::Active { .. })
+                            && direction == ControlMessageDirection::ClientToServer
+                    }
+                    _ => false,
+                };
+                if negotiated_version.supports_managed_configuration() && allowed {
+                    Ok(self.clone())
+                } else {
+                    Err(StateError::invalid_state())
+                }
+            }
             Message::TelemetryReport(_)
                 if matches!(self, Self::Active { .. })
                     && direction == ControlMessageDirection::ClientToServer

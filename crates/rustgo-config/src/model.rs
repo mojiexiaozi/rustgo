@@ -1,6 +1,6 @@
 use std::{fmt, net::IpAddr, path::PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::ValidationError;
 
@@ -15,6 +15,14 @@ pub struct ServerConfig {
     pub web: Option<WebConfig>,
     #[serde(default)]
     pub enrollment: Option<EnrollmentConfig>,
+    #[serde(default)]
+    pub managed_tunnels: Option<ManagedTunnelsConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedTunnelsConfig {
+    pub database_path: PathBuf,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -119,7 +127,7 @@ pub enum IdentityMode {
     Dynamic,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TunnelConfig {
     pub name: String,
@@ -128,7 +136,7 @@ pub struct TunnelConfig {
     pub remote_port: u32,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum TunnelProtocol {
     Tcp,

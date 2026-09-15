@@ -1,4 +1,4 @@
-use serde::{Deserialize, Deserializer, de::Error as _};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
 use crate::TunnelProtocol;
 
@@ -61,7 +61,7 @@ impl<'de> Deserialize<'de> for PortRange {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ExportConfig {
     pub name: String,
@@ -77,7 +77,7 @@ impl ExportConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ForwardConfig {
     pub name: String,

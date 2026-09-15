@@ -21,7 +21,7 @@ pub struct ValidationError {
 }
 
 impl ValidationError {
-    fn new(message: impl Into<String>) -> Self {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
         }
@@ -290,36 +290,6 @@ pub(crate) fn validate_client(config: &ClientConfig) -> Result<(), ValidationErr
             u32::MAX
         )));
     }
-    if config.tunnels.len() > MAX_TUNNELS {
-        return Err(ValidationError::new(format!(
-            "tunnels must contain at most {MAX_TUNNELS} entries"
-        )));
-    }
-
-    let mut names = HashSet::new();
-    let mut remote_ports = HashSet::new();
-    for tunnel in &config.tunnels {
-        validate_wire_string("tunnels.name", &tunnel.name, MAX_TUNNEL_NAME_BYTES)?;
-        validate_host_address("tunnels.local_addr", &tunnel.local_addr)?;
-        if !(1..=u16::MAX as u32).contains(&tunnel.remote_port) {
-            return Err(ValidationError::new(format!(
-                "tunnel `{}` has an invalid remote port",
-                tunnel.name
-            )));
-        }
-        if !names.insert(&tunnel.name) {
-            return Err(ValidationError::new(format!(
-                "duplicate tunnel name `{}`",
-                tunnel.name
-            )));
-        }
-        if !remote_ports.insert((tunnel.protocol, tunnel.remote_port)) {
-            return Err(ValidationError::new(format!(
-                "duplicate {:?} remote port {}",
-                tunnel.protocol, tunnel.remote_port
-            )));
-        }
-    }
     if let Some(p2p) = &config.p2p {
         require_nonzero("p2p.direct_timeout_secs", p2p.direct_timeout_secs)?;
         require_nonzero("p2p.reconnect_timeout_secs", p2p.reconnect_timeout_secs)?;
@@ -350,60 +320,13 @@ pub(crate) fn validate_client(config: &ClientConfig) -> Result<(), ValidationErr
         validate_telemetry(telemetry)?;
     }
 
-    if config.exports.len() > MAX_EXPORTS {
-        return Err(ValidationError::new(format!(
-            "exports must contain at most {MAX_EXPORTS} entries"
-        )));
-    }
-    if config.forwards.len() > MAX_FORWARDS {
-        return Err(ValidationError::new(format!(
-            "forwards must contain at most {MAX_FORWARDS} entries"
-        )));
-    }
-
-    let mut export_names = HashSet::new();
-    for export in &config.exports {
-        validate_wire_string("exports.name", &export.name, MAX_TUNNEL_NAME_BYTES)?;
-        validate_host_address("exports.local_addr", &export.local_addr)?;
-        if !export_names.insert(&export.name) {
-            return Err(ValidationError::new(format!(
-                "duplicate export name `{}`",
-                export.name
-            )));
-        }
-        if export.allowed_peers.len() > MAX_ALLOWED_PEERS_PER_EXPORT {
-            return Err(ValidationError::new(format!(
-                "export `{}` allowed_peers must contain at most {MAX_ALLOWED_PEERS_PER_EXPORT} entries",
-                export.name
-            )));
-        }
-        for peer in &export.allowed_peers {
-            validate_client_name(peer)?;
-        }
-    }
-
-    let mut forward_names = HashSet::new();
-    for forward in &config.forwards {
-        validate_wire_string("forwards.name", &forward.name, MAX_TUNNEL_NAME_BYTES)?;
-        validate_client_name(&forward.peer)?;
-        validate_wire_string("forwards.export", &forward.export, MAX_TUNNEL_NAME_BYTES)?;
-        validate_host_address("forwards.listen_addr", &forward.listen_addr)?;
-        if forward.peer == config.client.name {
-            return Err(ValidationError::new(format!(
-                "forward `{}` must not target the local client",
-                forward.name
-            )));
-        }
-        if !forward_names.insert(&forward.name) {
-            return Err(ValidationError::new(format!(
-                "duplicate forward name `{}`",
-                forward.name
-            )));
-        }
-    }
-    Ok(())
+    validate_managed_collections(
+        &config.tunnels,
+        &config.exports,
+        &config.forwards,
+        Some(&config.client.name),
+    )
 }
-
 pub(crate) fn server_validation_warnings(config: &ServerConfig) -> Vec<ConfigWarning> {
     let mut warnings = Vec::new();
     if cfg!(windows) && config.web.as_ref().is_some_and(|web| web.enabled) {
@@ -665,6 +588,96 @@ fn validate_public_key(value: &str) -> Result<(), ValidationError> {
         return Err(ValidationError::new(
             "client public key must contain exactly 32 bytes",
         ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_managed_collections(
+    tunnels: &[crate::TunnelConfig],
+    exports: &[crate::ExportConfig],
+    forwards: &[crate::ForwardConfig],
+    local_name: Option<&str>,
+) -> Result<(), ValidationError> {
+    if tunnels.len() > MAX_TUNNELS {
+        return Err(ValidationError::new(format!(
+            "tunnels must contain at most {MAX_TUNNELS} entries"
+        )));
+    }
+
+    let mut names = HashSet::new();
+    let mut remote_ports = HashSet::new();
+    for tunnel in tunnels {
+        validate_wire_string("tunnels.name", &tunnel.name, MAX_TUNNEL_NAME_BYTES)?;
+        validate_host_address("tunnels.local_addr", &tunnel.local_addr)?;
+        if !(1..=u16::MAX as u32).contains(&tunnel.remote_port) {
+            return Err(ValidationError::new(format!(
+                "tunnel `{}` has an invalid remote port",
+                tunnel.name
+            )));
+        }
+        if !names.insert(&tunnel.name) {
+            return Err(ValidationError::new(format!(
+                "duplicate tunnel name `{}`",
+                tunnel.name
+            )));
+        }
+        if !remote_ports.insert((tunnel.protocol, tunnel.remote_port)) {
+            return Err(ValidationError::new(format!(
+                "duplicate {:?} remote port {}",
+                tunnel.protocol, tunnel.remote_port
+            )));
+        }
+    }
+    if exports.len() > MAX_EXPORTS {
+        return Err(ValidationError::new(format!(
+            "exports must contain at most {MAX_EXPORTS} entries"
+        )));
+    }
+    if forwards.len() > MAX_FORWARDS {
+        return Err(ValidationError::new(format!(
+            "forwards must contain at most {MAX_FORWARDS} entries"
+        )));
+    }
+
+    let mut export_names = HashSet::new();
+    for export in exports {
+        validate_wire_string("exports.name", &export.name, MAX_TUNNEL_NAME_BYTES)?;
+        validate_host_address("exports.local_addr", &export.local_addr)?;
+        if !export_names.insert(&export.name) {
+            return Err(ValidationError::new(format!(
+                "duplicate export name `{}`",
+                export.name
+            )));
+        }
+        if export.allowed_peers.len() > MAX_ALLOWED_PEERS_PER_EXPORT {
+            return Err(ValidationError::new(format!(
+                "export `{}` allowed_peers must contain at most {MAX_ALLOWED_PEERS_PER_EXPORT} entries",
+                export.name
+            )));
+        }
+        for peer in &export.allowed_peers {
+            validate_client_name(peer)?;
+        }
+    }
+
+    let mut forward_names = HashSet::new();
+    for forward in forwards {
+        validate_wire_string("forwards.name", &forward.name, MAX_TUNNEL_NAME_BYTES)?;
+        validate_client_name(&forward.peer)?;
+        validate_wire_string("forwards.export", &forward.export, MAX_TUNNEL_NAME_BYTES)?;
+        validate_host_address("forwards.listen_addr", &forward.listen_addr)?;
+        if local_name == Some(forward.peer.as_str()) {
+            return Err(ValidationError::new(format!(
+                "forward `{}` must not target the local client",
+                forward.name
+            )));
+        }
+        if !forward_names.insert(&forward.name) {
+            return Err(ValidationError::new(format!(
+                "duplicate forward name `{}`",
+                forward.name
+            )));
+        }
     }
     Ok(())
 }

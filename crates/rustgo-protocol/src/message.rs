@@ -4,6 +4,7 @@ use serde::de::{self, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
+pub const MAX_MANAGED_CONFIGURATION_BYTES: usize = 65536;
 pub const MAX_CLIENT_NAME_BYTES: usize = 128;
 pub const MAX_FINGERPRINT_BYTES: usize = 64;
 pub const MAX_CHALLENGE_BYTES: usize = 64;
@@ -307,6 +308,9 @@ impl MessageId {
     pub const TELEMETRY_REPORT: Self = Self(30);
     pub const ENROLLMENT_REQUEST: Self = Self(31);
     pub const ENROLLMENT_RESULT: Self = Self(32);
+    pub const MANAGED_CONFIG_REQUEST: Self = Self(33);
+    pub const MANAGED_CONFIG_SNAPSHOT: Self = Self(34);
+    pub const MANAGED_CONFIG_REPORT: Self = Self(35);
 
     pub const fn as_u16(self) -> u16 {
         self.0
@@ -340,6 +344,9 @@ impl MessageId {
             30 => MAX_TELEMETRY_REPORT_BYTES,
             31 => 1024,
             32 => 256,
+            33 => MAX_MANAGED_CONFIGURATION_BYTES + 3,
+            34 => MAX_MANAGED_CONFIGURATION_BYTES + 14,
+            35 => MAX_MANAGED_CONFIGURATION_BYTES + 13,
             _ => 0,
         }
     }
@@ -350,7 +357,7 @@ impl TryFrom<u16> for MessageId {
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
         match value {
-            1..=32 => Ok(Self(value)),
+            1..=35 => Ok(Self(value)),
             _ => Err(value),
         }
     }
@@ -793,6 +800,9 @@ pub enum Message {
     PeerIdentityLookup(PeerIdentityLookup),
     PunchGrant(PunchGrant),
     TelemetryReport(TelemetryReport),
+    ManagedConfigRequest(ManagedConfigRequest),
+    ManagedConfigSnapshot(ManagedConfigSnapshot),
+    ManagedConfigReport(ManagedConfigReport),
     EnrollmentRequest(EnrollmentRequest),
     EnrollmentResult(EnrollmentResultMessage),
 }
@@ -830,8 +840,30 @@ impl Message {
             Self::PeerIdentityLookup(_) => MessageId::PEER_IDENTITY_LOOKUP,
             Self::PunchGrant(_) => MessageId::PUNCH_GRANT,
             Self::TelemetryReport(_) => MessageId::TELEMETRY_REPORT,
+            Self::ManagedConfigRequest(_) => MessageId::MANAGED_CONFIG_REQUEST,
+            Self::ManagedConfigSnapshot(_) => MessageId::MANAGED_CONFIG_SNAPSHOT,
+            Self::ManagedConfigReport(_) => MessageId::MANAGED_CONFIG_REPORT,
             Self::EnrollmentRequest(_) => MessageId::ENROLLMENT_REQUEST,
             Self::EnrollmentResult(_) => MessageId::ENROLLMENT_RESULT,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedConfigRequest {
+    pub configuration: BoundedBytes<MAX_MANAGED_CONFIGURATION_BYTES>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedConfigSnapshot {
+    pub revision: u64,
+    /// None means server management is disabled; an empty JSON snapshot is authoritative.
+    pub configuration: Option<BoundedBytes<MAX_MANAGED_CONFIGURATION_BYTES>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedConfigReport {
+    pub revision: u64,
+    /// JSON array of {kind,name,state,error} item results.
+    pub results: BoundedBytes<MAX_MANAGED_CONFIGURATION_BYTES>,
 }

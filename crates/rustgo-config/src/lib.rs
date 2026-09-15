@@ -3,7 +3,9 @@
 //! Shared configuration support for Rustgo.
 
 mod load;
+mod managed;
 mod model;
+pub use managed::ManagedConfiguration;
 mod p2p;
 mod validate;
 
@@ -13,8 +15,8 @@ pub use load::{
 };
 pub use model::{
     AuthorizedClient, ClientConfig, ClientSection, EnrollmentConfig, IdentityMode, Limits,
-    ServerConfig, ServerSection, TelemetryConfig, TrustMode, TunnelConfig, TunnelProtocol,
-    WebConfig,
+    ManagedTunnelsConfig, ServerConfig, ServerSection, TelemetryConfig, TrustMode, TunnelConfig,
+    TunnelProtocol, WebConfig,
 };
 pub use p2p::{
     ConfigWarning, ExportConfig, ForwardConfig, MAX_ALLOWED_PEERS_PER_EXPORT, MAX_EXPORTS,
