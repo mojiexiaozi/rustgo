@@ -288,9 +288,11 @@ impl eframe::App for GuiApp {
 
         {
             let status = self.connection_vm.status();
-            self.forwarding_panel
-                .managed
-                .observe(status.managed_revision(), status.effective_configuration());
+            self.forwarding_panel.managed.observe(
+                status.active().is_some(),
+                status.managed_revision(),
+                status.effective_configuration(),
+            );
         }
 
         // Update tunnels from active generation

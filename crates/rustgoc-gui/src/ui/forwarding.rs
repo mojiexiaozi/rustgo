@@ -587,6 +587,7 @@ mod tests {
         panel.name = "new-tunnel".into();
         panel.managed.select_server("server:8443");
         panel.managed.observe(
+            true,
             Some(3),
             Some(&rustgo_config::ManagedConfiguration {
                 tunnels: vec![],
