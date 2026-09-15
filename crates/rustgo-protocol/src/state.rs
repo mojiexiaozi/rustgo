@@ -117,8 +117,10 @@ impl ClientHandshakeState {
                             && direction == ControlMessageDirection::ServerToClient
                     }
                     Message::ManagedConfigReport(_) => {
-                        matches!(self, Self::Active { .. })
-                            && direction == ControlMessageDirection::ClientToServer
+                        matches!(
+                            self,
+                            Self::Active { .. } | Self::AwaitingTunnelRegistration { .. }
+                        ) && direction == ControlMessageDirection::ClientToServer
                     }
                     _ => false,
                 };

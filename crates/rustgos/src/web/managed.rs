@@ -114,6 +114,9 @@ fn mutate(
         return Err(ManagedError::Conflict);
     }
     let mut configuration = snapshot.configuration;
+    if request.action == "add" && request.kind != "tunnel" && !configuration.p2p_enabled {
+        return Err(ManagedError::Invalid("请先在客户端启用 P2P 并重连".into()));
+    }
     let invalid = || ManagedError::Invalid("invalid tunnel operation".into());
     match (request.action.as_str(), request.kind.as_str()) {
         ("add", "tunnel") => configuration.tunnels.push(

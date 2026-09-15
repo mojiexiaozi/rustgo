@@ -254,12 +254,8 @@ mod tests {
                 &provider,
             )
             .unwrap();
-        let disabled = ManagedConfiguration {
-            tunnels: vec![],
-            exports: vec![],
-            forwards: vec![],
-            p2p_enabled: false,
-        };
+        let mut disabled = provider.clone();
+        disabled.p2p_enabled = false;
         let authenticated = crate::AuthenticatedClient::verified(
             "provider".into(),
             rustgo_crypto::DeviceKeypair::from_secret_bytes([1; 32])
@@ -295,7 +291,9 @@ mod tests {
         store.sync(&identity, "consumer", &consumer).unwrap();
         store.report(&identity,1,serde_json::json!([{"kind":"forward","name":"use-ssh","state":"ready","error":null}])).unwrap();
         provider.exports.clear();
-        store.replace("provider", 1, &provider).unwrap();
+        store
+            .replace("provider", failed.revision, &provider)
+            .unwrap();
         let projected = management.snapshot("consumer").unwrap().unwrap();
         assert_eq!(projected.configuration.forwards.len(), 1);
         assert_eq!(projected.results[0]["state"], "failed");
@@ -306,4 +304,3 @@ mod tests {
         );
     }
 }
-

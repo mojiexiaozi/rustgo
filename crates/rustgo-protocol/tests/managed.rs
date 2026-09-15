@@ -84,7 +84,9 @@ fn managed_messages_require_version_phase_and_direction() {
                             .transition_control(version, direction, message)
                             .is_ok(),
                         version == ProtocolVersion::V0_4
-                            && index == phase
+                            && (index == phase
+                                || (matches!(message, Message::ManagedConfigReport(_))
+                                    && index == 1))
                             && direction == allowed_direction
                     );
                     assert!(state.transition(message).is_err());

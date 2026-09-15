@@ -22,11 +22,6 @@ impl ManagedConfiguration {
     }
 
     pub fn validate(&self) -> Result<(), ValidationError> {
-        if (!self.exports.is_empty() || !self.forwards.is_empty()) && !self.p2p_enabled {
-            return Err(ValidationError::new(
-                "managed exports and forwards require enabled P2P",
-            ));
-        }
         crate::validate::validate_managed_collections(
             &self.tunnels,
             &self.exports,

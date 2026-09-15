@@ -80,9 +80,6 @@ fn invalid_snapshots_are_rejected_without_mutating_client() {
     let mut s = baseline.clone();
     s.forwards[0].export.clear();
     invalid.push(s);
-    let mut s = baseline.clone();
-    s.p2p_enabled = false;
-    invalid.push(s);
     for snapshot in invalid {
         assert!(snapshot.validate().is_err());
         let mut target = client();
@@ -104,4 +101,14 @@ fn invalid_snapshots_are_rejected_without_mutating_client() {
     let mut self_forward = baseline;
     self_forward.forwards[0].peer = "local".into();
     assert!(self_forward.apply_to(&mut client()).is_err());
+}
+
+#[test]
+fn disabled_capability_does_not_discard_existing_structurally_valid_collections() {
+    let mut snapshot = ManagedConfiguration::from_client(&client());
+    snapshot.p2p_enabled = false;
+    assert!(snapshot.validate().is_ok());
+    let mut target = client();
+    target.p2p.as_mut().unwrap().enabled = false;
+    assert!(snapshot.apply_to(&mut target).is_err());
 }

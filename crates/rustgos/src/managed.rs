@@ -120,11 +120,7 @@ impl ManagedStore {
         bind_name(&transaction, identity, name)?;
         let current =
             read_snapshot(&transaction, "identity", identity)?.ok_or(ManagedError::NotFound)?;
-        if current.configuration.p2p_enabled != configuration.p2p_enabled
-            && (configuration.p2p_enabled
-                || (current.configuration.exports.is_empty()
-                    && current.configuration.forwards.is_empty()))
-        {
+        if current.configuration.p2p_enabled != configuration.p2p_enabled {
             let mut refreshed = current.configuration;
             refreshed.p2p_enabled = configuration.p2p_enabled;
             let refreshed = configuration_json(&refreshed)?;

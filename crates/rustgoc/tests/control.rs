@@ -1659,18 +1659,18 @@ async fn managed_p2p_rebuilds_exports_and_forwards_reports_bind_failure_and_rele
             tokio::spawn(ClientApp::from_config(consumer.config)?.run_until(consumer_stop.clone()));
         let store = rustgos::managed::ManagedStore::open(&database)?;
         loop {
-            if let Some(snapshot) = store.get("consumer")? {
-                if snapshot.applied_revision == Some(1) {
-                    assert!(
-                        snapshot
-                            .results
-                            .as_array()
-                            .unwrap()
-                            .iter()
-                            .all(|r| r["state"] == "pending")
-                    );
-                    break;
-                }
+            if let Some(snapshot) = store.get("consumer")?
+                && snapshot.applied_revision == Some(1)
+            {
+                assert!(
+                    snapshot
+                        .results
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .all(|r| r["state"] == "pending")
+                );
+                break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }

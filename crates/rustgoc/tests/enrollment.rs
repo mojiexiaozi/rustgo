@@ -371,6 +371,7 @@ async fn client_runtime_enrolls_over_pinned_tls_and_promotes_configuration() {
         .into_encoded();
     drop(store);
     let server = ServerApp::bind(ServerConfig {
+        managed_tunnels: None,
         server: ServerSection {
             bind_addr: address.clone(),
             udp_bind_ip: None,

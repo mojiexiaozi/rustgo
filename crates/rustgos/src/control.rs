@@ -571,6 +571,34 @@ where
     if registration_frame.version != negotiated {
         return Err(ControlError::InvalidState);
     }
+    if let Message::ManagedConfigReport(report) = &registration_frame.message {
+        *state = state.transition_control(
+            negotiated,
+            rustgo_protocol::ControlMessageDirection::ClientToServer,
+            &registration_frame.message,
+        )?;
+        let snapshot = managed_snapshot
+            .as_ref()
+            .ok_or(ControlError::InvalidState)?;
+        if report.revision != snapshot.revision {
+            return Err(ControlError::InvalidState);
+        }
+        let results: serde_json::Value = serde_json::from_slice(report.results.as_slice())
+            .map_err(|_| ControlError::InvalidState)?;
+        if !results
+            .as_array()
+            .is_some_and(|items| items.iter().all(|item| item["state"] == "failed"))
+        {
+            return Err(ControlError::InvalidState);
+        }
+        let management = runtime.managed.clone().ok_or(ControlError::InvalidState)?;
+        let identity = snapshot.identity.clone();
+        let revision = report.revision;
+        tokio::task::spawn_blocking(move || management.store.report(&identity, revision, results))
+            .await
+            .map_err(|_| ControlError::InvalidState)??;
+        return Err(ControlError::InvalidState);
+    }
     let Message::RegisterTunnels(registration) = registration_frame.message else {
         return Err(ControlError::InvalidState);
     };
