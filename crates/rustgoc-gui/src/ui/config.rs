@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 use eframe::egui::{self, Ui};
-use rustgo_config::{ClientConfig, P2pConfig, PortRange};
+use rustgo_config::{ClientConfig, P2pConfig};
 use std::path::PathBuf;
 
 pub struct ConfigPanel {
@@ -161,23 +161,7 @@ fn optional_address(ui: &mut Ui, label: &str, value: &mut Option<String>) {
     });
 }
 pub(super) fn default_p2p() -> P2pConfig {
-    P2pConfig {
-        enabled: false,
-        prefer_direct: true,
-        direct_timeout_secs: 10,
-        reconnect_timeout_secs: 30,
-        allow_relay_fallback: true,
-        udp_port_range: PortRange {
-            start: 20000,
-            end: 21023,
-        },
-        tcp_port_range: PortRange {
-            start: 22000,
-            end: 23023,
-        },
-        observation_primary_addr: None,
-        observation_alternate_addr: None,
-    }
+    crate::configuration::default_p2p()
 }
 
 #[cfg(test)]

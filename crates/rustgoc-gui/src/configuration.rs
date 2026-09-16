@@ -26,7 +26,31 @@ pub fn load_or_create(path: &Path) -> Result<ClientConfig> {
         .with_context(|| format!("读取配置失败: {}", path.display()))?;
     enforce_fixed_credentials(&mut config);
     ensure_profile(&mut config);
+    if config.p2p.is_none() {
+        config.p2p = Some(default_p2p());
+        save_validated(path, &config)?;
+    }
     Ok(config)
+}
+
+pub fn default_p2p() -> rustgo_config::P2pConfig {
+    rustgo_config::P2pConfig {
+        enabled: true,
+        prefer_direct: true,
+        direct_timeout_secs: 10,
+        reconnect_timeout_secs: 30,
+        allow_relay_fallback: true,
+        udp_port_range: rustgo_config::PortRange {
+            start: 20000,
+            end: 21023,
+        },
+        tcp_port_range: rustgo_config::PortRange {
+            start: 22000,
+            end: 23023,
+        },
+        observation_primary_addr: None,
+        observation_alternate_addr: None,
+    }
 }
 
 pub fn ensure_profile(config: &mut ClientConfig) {
@@ -96,7 +120,7 @@ fn default_config() -> ClientConfig {
             private_key_file: "device.key".into(),
             heartbeat_interval_secs: 30,
         },
-        p2p: None,
+        p2p: Some(default_p2p()),
         telemetry: Some(rustgo_config::TelemetryConfig::default()),
         tunnels: Vec::new(),
         exports: Vec::new(),
@@ -329,6 +353,14 @@ mod tests {
         assert!(!directory.path().join("server-cert.pem").exists());
         assert_eq!(config.client.display_name(), system_display_name());
         assert!(config.client.profile.as_ref().unwrap().uid.is_none());
+        assert!(config.p2p.as_ref().unwrap().enabled);
+        assert!(
+            rustgo_config::load_client(&path)
+                .unwrap()
+                .p2p
+                .unwrap()
+                .enabled
+        );
     }
 
     #[test]
@@ -368,11 +400,10 @@ mod tests {
     }
 
     #[test]
-    fn existing_config_is_not_rewritten() {
+    fn missing_p2p_is_enabled_and_persisted_for_existing_gui_configuration() {
         let directory = tempfile::TempDir::new().unwrap();
         let path = directory.path().join("client.toml");
         fs::write(&path, valid_config("saved.example:8443")).unwrap();
-        let before = fs::read(&path).unwrap();
         let loaded = load_or_create(&path).expect("existing config");
         assert_eq!(loaded.client.server_addr, "saved.example:8443");
         assert_eq!(loaded.client.server_name, "saved.example");
@@ -381,7 +412,27 @@ mod tests {
             loaded.client.certificate_authority_file,
             Path::new("server-cert.pem")
         );
-        assert_eq!(fs::read(path).unwrap(), before);
+        assert!(loaded.p2p.as_ref().unwrap().enabled);
+        assert!(
+            rustgo_config::load_client(&path)
+                .unwrap()
+                .p2p
+                .unwrap()
+                .enabled
+        );
+        assert!(rustgo_config::ManagedConfiguration::from_client(&loaded).p2p_enabled);
+    }
+
+    #[test]
+    fn explicit_p2p_disable_is_preserved() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("client.toml");
+        let mut config = super::default_config();
+        config.p2p.as_mut().unwrap().enabled = false;
+        save_validated(&path, &config).unwrap();
+        let before = fs::read(&path).unwrap();
+        assert!(!load_or_create(&path).unwrap().p2p.unwrap().enabled);
+        assert_eq!(fs::read(&path).unwrap(), before);
     }
 
     #[test]
