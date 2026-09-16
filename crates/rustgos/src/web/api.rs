@@ -159,24 +159,46 @@ async fn overview(State(state): State<Arc<WebState>>, headers: HeaderMap) -> Res
     if let Err(response) = authenticate(&state, &headers) {
         return *response;
     }
+    let dynamic_clients = match load_dynamic_clients(&state).await {
+        Ok(clients) => clients,
+        Err(response) => return *response,
+    };
     let snapshot = state.observability.snapshot();
     let enrollment = enrollment_health(&state).await;
     let now = now_unix_millis();
-    let total_clients = snapshot.clients.len();
-    let clients = snapshot
+    let mut clients: Vec<Client> = snapshot
         .clients
         .iter()
-        .take(MAX_CLIENT_ITEMS)
-        .map(|client| {
-            client_dto(
+        .filter_map(|client| {
+            let dynamic = dynamic_clients
+                .iter()
+                .find(|d| d.display_id().eq_ignore_ascii_case(client.name.as_str()));
+            if dynamic.is_some_and(|d| d.is_deleted()) {
+                return None;
+            }
+            Some(client_dto(
                 client,
                 &snapshot.sessions,
                 now,
                 MAX_LIST_INVENTORY_ITEMS,
-                None,
-            )
+                dynamic,
+            ))
         })
         .collect();
+    clients.extend(
+        dynamic_clients
+            .iter()
+            .filter(|d| {
+                !d.is_deleted()
+                    && !snapshot
+                        .clients
+                        .iter()
+                        .any(|c| d.display_id().eq_ignore_ascii_case(c.name.as_str()))
+            })
+            .map(offline_dynamic_client_dto),
+    );
+    let total_clients = clients.len();
+    clients.truncate(MAX_CLIENT_ITEMS);
     let response = OverviewResponse {
         generated_unix_millis: snapshot.generated_unix_millis,
         snapshot_stale: snapshot.generated_unix_millis == 0
@@ -266,30 +288,34 @@ async fn clients(
     let mut items: Vec<Client> = snapshot
         .clients
         .iter()
-        .map(|client| {
+        .filter_map(|client| {
             let dynamic = dynamic_clients.iter().find(|dynamic| {
                 dynamic
                     .display_id()
                     .eq_ignore_ascii_case(client.name.as_str())
             });
-            client_dto(
+            if dynamic.is_some_and(|d| d.is_deleted()) {
+                return None;
+            }
+            Some(client_dto(
                 client,
                 &snapshot.sessions,
                 now,
                 MAX_LIST_INVENTORY_ITEMS,
                 dynamic,
-            )
+            ))
         })
         .collect();
     items.extend(
         dynamic_clients
             .iter()
             .filter(|dynamic| {
-                !snapshot.clients.iter().any(|client| {
-                    dynamic
-                        .display_id()
-                        .eq_ignore_ascii_case(client.name.as_str())
-                })
+                !dynamic.is_deleted()
+                    && !snapshot.clients.iter().any(|client| {
+                        dynamic
+                            .display_id()
+                            .eq_ignore_ascii_case(client.name.as_str())
+                    })
             })
             .map(offline_dynamic_client_dto),
     );
@@ -338,6 +364,13 @@ async fn client(
         Ok(client) => client,
         Err(response) => return *response,
     };
+    if dynamic.as_ref().is_some_and(|client| client.is_deleted()) {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "client_not_found",
+            "client was deleted",
+        );
+    }
     let observed = snapshot
         .clients
         .iter()
@@ -828,7 +861,7 @@ async fn load_dynamic_clients(
     let Some(management) = state.enrollment.clone() else {
         return Ok(Vec::new());
     };
-    match tokio::task::spawn_blocking(move || management.store.list_clients()).await {
+    match tokio::task::spawn_blocking(move || management.store.list_client_identities()).await {
         Ok(Ok(clients)) => Ok(clients),
         _ => Err(Box::new(enrollment_unavailable())),
     }
@@ -842,8 +875,14 @@ async fn load_dynamic_client(
         return Ok(None);
     };
     let display_id = display_id.to_owned();
-    match tokio::task::spawn_blocking(move || management.store.client_by_display_id(&display_id))
-        .await
+    match tokio::task::spawn_blocking(move || {
+        management.store.list_client_identities().map(|clients| {
+            clients
+                .into_iter()
+                .find(|client| client.display_id().eq_ignore_ascii_case(&display_id))
+        })
+    })
+    .await
     {
         Ok(Ok(client)) => Ok(client),
         Ok(Err(crate::enrollment::EnrollmentStoreError::InvalidDisplayId)) => Ok(None),

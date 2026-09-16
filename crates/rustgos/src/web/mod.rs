@@ -1272,6 +1272,23 @@ mod management_tests {
         assert_eq!(list["clients"]["items"][0]["identity_source"], "dynamic");
         assert_eq!(list["clients"]["items"][0]["online"], false);
         assert!(list["clients"]["items"][0].get("internal_id").is_none());
+        let overview = HttpRequest::builder()
+            .uri("/api/v1/overview")
+            .header("cookie", cookie.clone())
+            .body(Body::empty())
+            .unwrap();
+        let overview = router.clone().oneshot(overview).await.unwrap();
+        let overview: serde_json::Value =
+            serde_json::from_slice(&body::to_bytes(overview.into_body(), 65536).await.unwrap())
+                .unwrap();
+        let card = overview["clients"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "Node.One")
+            .unwrap();
+        assert_eq!(card["identity_source"], "dynamic");
+        assert_eq!(card["revision"], 1);
 
         let detail = HttpRequest::builder()
             .uri("/api/v1/clients/Node.One")

@@ -745,7 +745,7 @@
   async function deleteClient(client) {
     if (!client || client.identity_source !== "dynamic") return;
     if (!confirm(`确定删除客户端“${client.name}”吗？在线会话将立即终止。`)) return;
-    if (!confirm("请再次确认：客户端将进入墓碑状态，且无法立即复用该 ID。")) return;
+    if (!confirm("请再次确认：客户端将从列表移除；重新接入必须再次审批。")) return;
     await managementRequest(`/api/v1/clients/${encodeURIComponent(client.name)}/delete`, { expected_revision: client.revision });
     location.hash = "overview";
     requestPoll();

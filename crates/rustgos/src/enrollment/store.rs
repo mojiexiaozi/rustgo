@@ -342,6 +342,15 @@ impl DynamicClientStore {
     }
 
     pub fn list_clients(&self) -> Result<Vec<DynamicClient>, EnrollmentStoreError> {
+        Ok(self
+            .list_client_identities()?
+            .into_iter()
+            .filter(|client| !client.is_deleted())
+            .collect())
+    }
+
+    /// Includes tombstones so presentation layers can suppress stale telemetry.
+    pub fn list_client_identities(&self) -> Result<Vec<DynamicClient>, EnrollmentStoreError> {
         let connection = self
             .connection
             .lock()
@@ -349,7 +358,7 @@ impl DynamicClientStore {
         let mut statement = connection
             .prepare(
                 "SELECT internal_id, display_id, enabled, revision, public_key, tombstoned
-             FROM dynamic_clients WHERE tombstoned = 0 ORDER BY normalized_id",
+             FROM dynamic_clients ORDER BY normalized_id",
             )
             .map_err(database_error)?;
         statement

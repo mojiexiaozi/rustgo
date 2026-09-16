@@ -4,6 +4,47 @@ use rustgos::enrollment::{DynamicClientStore, EnrollmentStoreError, EnrollmentSt
 use std::time::{Duration, SystemTime};
 
 #[test]
+fn deleted_client_can_request_restoration_but_remains_deleted_until_approved() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = DynamicClientStore::open(
+        dir.path().join("db"),
+        EnrollmentStoreLimits {
+            max_active_clients: 4,
+            max_tokens: 4,
+        },
+    )
+    .unwrap();
+    let key = DeviceKeypair::from_secret_bytes([41; 32]).public_key();
+    let now = SystemTime::now();
+    let _ = store.request_approval("restore", EnrollmentPurpose::Enroll, &key, "initial", now);
+    store.review_approval("initial", true).unwrap();
+    let old = store.client_by_display_id("restore").unwrap().unwrap();
+    store
+        .delete_client(old.internal_id(), old.revision())
+        .unwrap();
+    assert_eq!(
+        store.request_approval(
+            "restore",
+            EnrollmentPurpose::ReEnroll,
+            &key,
+            "restore-request",
+            now
+        ),
+        Err(EnrollmentStoreError::ReplacementApprovalPending)
+    );
+    assert!(store.list_clients().unwrap().is_empty());
+    assert_eq!(store.pending_approvals().unwrap().len(), 1);
+    store.review_approval("restore-request", true).unwrap();
+    assert!(
+        store
+            .client_by_display_id("restore")
+            .unwrap()
+            .unwrap()
+            .enabled()
+    );
+}
+
+#[test]
 fn approval_creates_client_and_replacement_is_atomic() {
     let dir = tempfile::tempdir().unwrap();
     let store = DynamicClientStore::open(

@@ -126,10 +126,7 @@ impl DynamicClientStore {
             |r| Ok((r.get::<_,String>(0)?,r.get::<_,u64>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,bool>(3)?,r.get::<_,bool>(4)?))).optional().map_err(database_error)?;
         let (target_id, revision) = if let Some((id, revision, _old_key, enabled, deleted)) = target
         {
-            if deleted {
-                return Err(EnrollmentStoreError::ClientNotFound);
-            }
-            if !enabled {
+            if !enabled && !deleted {
                 return Err(EnrollmentStoreError::ClientDisabled);
             }
             (Some(id), Some(revision))
@@ -221,7 +218,26 @@ impl DynamicClientStore {
             let next = expected
                 .checked_add(1)
                 .ok_or(EnrollmentStoreError::RevisionConflict)?;
-            let changed=tx.execute("UPDATE dynamic_clients SET public_key=?1, revision=?2, updated_at=?3 WHERE internal_id=?4 AND revision=?5 AND enabled=1 AND tombstoned=0 AND normalized_id=?6",
+            let restoring: bool = tx
+                .query_row(
+                    "SELECT tombstoned FROM dynamic_clients WHERE internal_id=?1",
+                    [&id],
+                    |r| r.get(0),
+                )
+                .map_err(database_error)?;
+            if restoring {
+                let active: usize = tx
+                    .query_row(
+                        "SELECT COUNT(*) FROM dynamic_clients WHERE enabled=1 AND tombstoned=0",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .map_err(database_error)?;
+                if active >= self.limits.max_active_clients {
+                    return Err(EnrollmentStoreError::ClientCapacity);
+                }
+            }
+            let changed=tx.execute("UPDATE dynamic_clients SET public_key=?1, revision=?2, updated_at=?3, enabled=1, tombstoned=0, deleted_at=NULL WHERE internal_id=?4 AND revision=?5 AND (enabled=1 OR tombstoned=1) AND normalized_id=?6",
                 params![key,next,unix_now()?,id,expected,name.to_ascii_lowercase()]).map_err(|e| if e.sqlite_error_code()==Some(rusqlite::ErrorCode::ConstraintViolation) {EnrollmentStoreError::PublicKeyConflict} else {database_error(e)})?;
             if changed != 1 {
                 return Err(EnrollmentStoreError::RevisionConflict);
