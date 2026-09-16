@@ -394,27 +394,9 @@ impl eframe::App for GuiApp {
                         | EnrollmentState::EnrollmentPending
                         | EnrollmentState::ReEnrollmentPending
                 ) {
-                    let mut on_submit = false;
-                    if let Ok(pending) = rustgoc::PendingEnrollment::load(&self.config_path)
-                        && let Ok(public) = pending
-                            .public_key()
-                            .parse::<rustgo_crypto::DevicePublicKey>()
-                    {
-                        self.enrollment_panel
-                            .set_fingerprint(public.fingerprint().to_string());
-                    }
-                    self.enrollment_panel.show(
-                        ui,
-                        matches!(
-                            self.enrollment_state,
-                            EnrollmentState::ReRegistrationRequired
-                                | EnrollmentState::ReEnrollmentPending
-                        ),
-                        &mut on_submit,
-                    );
-
-                    if on_submit {
-                        self.handle_enrollment_submit();
+                    ui.label("接入申请和连接错误请在配置页面查看。");
+                    if ui.button("打开配置").clicked() {
+                        self.active_tab = Tab::Config;
                     }
                 } else {
                     let (sent_bytes, received_bytes) = self
@@ -514,6 +496,37 @@ impl eframe::App for GuiApp {
 
                 if on_save_and_reconnect {
                     self.apply_configuration();
+                }
+                if matches!(
+                    self.enrollment_state,
+                    EnrollmentState::RegistrationRequired
+                        | EnrollmentState::ReRegistrationRequired
+                        | EnrollmentState::EnrollmentPending
+                        | EnrollmentState::ReEnrollmentPending
+                ) {
+                    ui.separator();
+                    let mut on_submit = false;
+                    if let Ok(pending) = rustgoc::PendingEnrollment::load(&self.config_path)
+                        && let Ok(public) = pending
+                            .public_key()
+                            .parse::<rustgo_crypto::DevicePublicKey>()
+                    {
+                        self.enrollment_panel
+                            .set_fingerprint(public.fingerprint().to_string());
+                    }
+                    self.enrollment_panel.show(
+                        ui,
+                        matches!(
+                            self.enrollment_state,
+                            EnrollmentState::ReRegistrationRequired
+                                | EnrollmentState::ReEnrollmentPending
+                        ),
+                        &mut on_submit,
+                    );
+
+                    if on_submit {
+                        self.handle_enrollment_submit();
+                    }
                 }
             }
         });
@@ -679,6 +692,7 @@ impl GuiApp {
     }
 
     fn handle_enrollment_submit(&mut self) {
+        self.active_tab = Tab::Config;
         if self.enrollment_rx.is_some() {
             return;
         }
@@ -733,6 +747,15 @@ impl GuiApp {
 mod approval_regression_tests {
     use super::*;
     use eframe::App;
+
+    #[test]
+    fn application_attempt_switches_to_configuration_even_when_config_is_invalid() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = headless_app(directory.path().join("missing.toml"));
+        app.active_tab = Tab::Connection;
+        app.handle_enrollment_submit();
+        assert!(matches!(app.active_tab, Tab::Config));
+    }
 
     #[test]
     fn managed_save_persists_local_policy_without_remote_collections() {

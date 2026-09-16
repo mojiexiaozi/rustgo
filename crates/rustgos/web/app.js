@@ -750,10 +750,6 @@
     location.hash = "overview";
     requestPoll();
   }
-  $("delete-client-button")?.addEventListener("click", async () => {
-    try { await deleteClient(state.detail?.client); }
-    catch (error) { text("client-management-status", error.message); }
-  });
   $("managed-kind")?.addEventListener("change", buildManagedFields);
   $("managed-form")?.addEventListener("submit", async (event) => {
     event.preventDefault();

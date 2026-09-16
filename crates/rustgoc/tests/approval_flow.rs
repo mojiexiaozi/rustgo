@@ -77,10 +77,10 @@ async fn approval_reuses_keys_rotates_only_when_requested_and_cli_waits_without_
     let mut metadata: toml::Value = toml::from_str(&original_metadata).unwrap();
     metadata["certificate_fingerprint"] = toml::Value::String("00".repeat(32));
     fs::write(&metadata_path, toml::to_string(&metadata).unwrap()).unwrap();
-    assert_eq!(
+    assert!(matches!(
         rustgoc::request_registration(&mut config, &config_path, EnrollmentPurpose::Enroll).await,
-        Err(EnrollmentError::Network)
-    );
+        Err(EnrollmentError::NetworkDetail(_))
+    ));
     fs::write(&metadata_path, original_metadata).unwrap();
     assert_eq!(fs::read(&private).unwrap(), original);
     store.review_approval(pending.request_id(), true).unwrap();

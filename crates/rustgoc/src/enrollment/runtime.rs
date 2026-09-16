@@ -120,8 +120,10 @@ async fn enroll_inner(
     };
     let stream = tokio::time::timeout(ENROLLMENT_TIMEOUT, tls.connect(&address))
         .await
-        .map_err(|_| EnrollmentError::Network)?
-        .map_err(|_| EnrollmentError::Network)?;
+        .map_err(|_| EnrollmentError::NetworkDetail("连接服务器超时，申请尚未提交".into()))?
+        .map_err(|error| {
+            EnrollmentError::NetworkDetail(format!("连接服务器失败，申请尚未提交：{error}"))
+        })?;
     let key = if let Some(key) = legacy {
         key
     } else {

@@ -67,8 +67,10 @@ pub enum EnrollmentError {
     },
     #[error("enrollment destination already exists")]
     DestinationExists,
-    #[error("enrollment network protocol failed")]
+    #[error("申请通信失败，未收到服务器确认，请检查服务器地址及网络后重试")]
     Network,
+    #[error("申请失败：{0}")]
+    NetworkDetail(String),
     #[error("本地证书配置不可用，申请尚未提交：{0}")]
     LocalCertificate(String),
     #[error("{}", rejection_message(.0))]
