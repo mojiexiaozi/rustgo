@@ -65,7 +65,7 @@ test("approval sends authenticated review request without creating a client manu
   const { nodes, posts } = await dashboard(webcrypto);
   const row = nodes.get("approval-list").children[0];
   assert.ok(row);
-  await row.children[3].children[0].click();
+  await row.children[4].children[0].click();
   assert.equal(posts[0].path, "/api/v1/registration-requests/request-1");
   assert.equal(posts[0].body.approve, true);
   assert.equal(posts[0].headers["X-Rustgo-CSRF-Token"], "test-csrf");

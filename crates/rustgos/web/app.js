@@ -763,6 +763,12 @@
     location.hash = "overview";
     requestPoll();
   }
+  $("delete-client-button")?.addEventListener("click", async () => {
+    const client = state.detail?.client;
+    if (!client) return;
+    try { await deleteClient(client); }
+    catch (error) { text("client-management-status", error.message); }
+  });
   $("managed-kind")?.addEventListener("change", buildManagedFields);
   $("managed-form")?.addEventListener("submit", async (event) => {
     event.preventDefault();
