@@ -55,24 +55,25 @@ All GUI-owned collections are bounded: 1,000 log lines, 300 telemetry chart poin
 
 ## Releases
 
-Pushing a version tag such as `v0.3` builds `rustgoc` and `rustgos` for Windows
+Pushing a version tag such as `v1.0.0` builds `rustgoc` and `rustgos` for Windows
 x86_64, Linux x86_64, and Linux ARM64. The GitHub Release contains:
 
 ```text
-rustgoc-win-x86-v0.3.zip
-rustgos-win-x86-v0.3.zip
-rustgoc-linux-x86-v0.3.zip
-rustgos-linux-x86-v0.3.zip
-rustgoc-linux-arm64-v0.3.zip
-rustgos-linux-arm64-v0.3.zip
+rustgoc-win-x86-v1.0.0.zip
+rustgos-win-x86-v1.0.0.zip
+rustgoc-linux-x86-v1.0.0.zip
+rustgos-linux-x86-v1.0.0.zip
+rustgoc-linux-arm64-v1.0.0.zip
+rustgos-linux-arm64-v1.0.0.zip
 SHA256SUMS
 ```
 
 Each ZIP contains one conventionally named executable and its matching
 `client.toml` or `server.toml`. Linux ZIPs also contain
-`docker-compose.yaml`. The configuration is an example: replace endpoints and
-provide your own certificates and keys before startup. Releases never contain
-generated credentials.
+`docker-compose.yaml`. The configuration is an example: replace endpoints
+before startup. On its first normal startup, `rustgos` generates its TLS
+certificate and private key when both configured files are absent. Releases
+never contain generated credentials.
 
 Verify checksums after downloading all seven assets. On Linux:
 
@@ -102,7 +103,7 @@ Generate a key pair on the client host:
 rustgoc keygen -o ./keys
 ```
 
-Keep `keys/device.key` on the client. Copy only `keys/device.pub` to the server operator and place its `ed25519:...` value in the matching server authorization entry. Create a TLS server certificate whose SAN contains the real DNS name used by clients, and configure every client with that same `server_name` plus an explicit CA certificate file.
+Keep `keys/device.key` on the client. Copy only `keys/device.pub` to the server operator and place its `ed25519:...` value in the matching server authorization entry. Configure `server.tls_server_name` with the real DNS name used by clients. On first startup, the server generates a TLS identity covering that name when both configured identity files are absent. Copy the generated certificate to clients through a protected channel, verify its logged fingerprint, and configure the same `server_name` plus that explicit CA certificate file.
 
 Copy [examples/server.toml](examples/server.toml) and [examples/client.toml](examples/client.toml), provide their documented environment variables, then validate without binding or contacting the peer:
 

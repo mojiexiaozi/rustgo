@@ -54,6 +54,8 @@ impl Default for EnrollmentConfig {
 pub struct ServerSection {
     pub bind_addr: String,
     #[serde(default)]
+    pub tls_server_name: Option<String>,
+    #[serde(default)]
     pub udp_bind_ip: Option<IpAddr>,
     #[serde(default)]
     pub p2p_observation_bind: Option<String>,

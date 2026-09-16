@@ -237,17 +237,16 @@ impl ControlClient {
                     let mut value: serde_json::Value =
                         serde_json::from_slice(configuration.as_slice())
                             .map_err(|_| ClientError::InvalidConfiguration)?;
-                    if negotiated.supports_client_profile() {
-                        if let Some(profile) = value
+                    if negotiated.supports_client_profile()
+                        && let Some(profile) = value
                             .as_object_mut()
                             .and_then(|v| v.remove("client_profile"))
-                        {
-                            let mut profile: rustgo_config::ClientProfile =
-                                serde_json::from_value(profile)
-                                    .map_err(|_| ClientError::InvalidConfiguration)?;
-                            profile.local_ip = Some(local_ip.clone());
-                            effective.client.profile = Some(profile);
-                        }
+                    {
+                        let mut profile: rustgo_config::ClientProfile =
+                            serde_json::from_value(profile)
+                                .map_err(|_| ClientError::InvalidConfiguration)?;
+                        profile.local_ip = Some(local_ip.clone());
+                        effective.client.profile = Some(profile);
                     }
                     if !value.as_object().is_some_and(|object| object.is_empty()) {
                         let desired: rustgo_config::ManagedConfiguration =

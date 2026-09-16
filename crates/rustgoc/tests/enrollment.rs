@@ -403,6 +403,7 @@ async fn client_runtime_enrolls_over_pinned_tls_and_promotes_configuration() {
         managed_tunnels: None,
         server: ServerSection {
             bind_addr: address.clone(),
+            tls_server_name: None,
             udp_bind_ip: None,
             p2p_observation_bind: None,
             p2p_observation_alternate_bind: None,

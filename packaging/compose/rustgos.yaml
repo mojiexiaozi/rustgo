@@ -9,6 +9,11 @@ services:
     security_opt: [no-new-privileges:true]
     working_dir: /data
     command: [/app/rustgos, -c, /config/server.toml]
+    environment:
+      RUSTGO_SERVER_CERTIFICATE_FILE: /data/server.crt
+      RUSTGO_SERVER_PRIVATE_KEY_FILE: /data/server.key
+      RUSTGO_SERVER_UDP_BIND_IP: ${RUSTGO_SERVER_UDP_BIND_IP}
+      RUSTGO_DEVICE_PUBLIC_KEY: ${RUSTGO_DEVICE_PUBLIC_KEY}
     volumes:
       - ./rustgos:/app/rustgos:ro
       - ./server.toml:/config/server.toml:ro

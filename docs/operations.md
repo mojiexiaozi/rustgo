@@ -115,6 +115,17 @@ An absent environment variable is an error. Unknown TOML fields are rejected.
 Relative file paths are resolved against the directory containing the selected
 configuration, not against the executable or a platform config directory.
 
+On normal server startup, if both configured TLS identity files are absent,
+`rustgos` creates a self-signed certificate and private key at those paths. The
+paths must be writable. Existing files are reused unchanged; if only one file
+exists, startup fails without overwriting it. The generated certificate covers
+`server.tls_server_name`, the enabled enrollment public host, a concrete server
+bind IP, localhost, and the loopback addresses. Set `tls_server_name` to the DNS
+name or IP clients use as `client.server_name`. Record the SHA-256 fingerprint
+printed at first startup and distribute the certificate to clients through a
+trusted channel. `rustgos check` remains read-only and therefore requires the
+identity files to exist already.
+
 ## Configure and check
 
 Use [../examples/server.toml](../examples/server.toml) and
@@ -342,7 +353,7 @@ rollback.
    `scripts/release_acceptance.py` with binaries from all three build targets.
 3. Push the commit without a version tag and require the complete ordinary CI
    workflow to pass.
-4. Create an annotated tag, for example `git tag -a v0.3 -m "Rustgo v0.3"`,
+4. Create an annotated tag, for example `git tag -a v1.0.0 -m "Rustgo v1.0.0"`,
    then push that tag.
 5. Require the Release workflow to build all three targets. It creates a draft,
    downloads all seven assets again, verifies `SHA256SUMS`, and only then makes

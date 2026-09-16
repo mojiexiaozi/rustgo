@@ -1,9 +1,7 @@
 #![forbid(unsafe_code)]
 use crate::state::{p2p::P2PViewModel, tunnels::TunnelRow};
 use eframe::egui::{self, Ui};
-use rustgo_config::{
-    ClientConfig, ExportConfig, ForwardConfig, TunnelConfig, TunnelProtocol,
-};
+use rustgo_config::{ClientConfig, ExportConfig, ForwardConfig, TunnelConfig, TunnelProtocol};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForwardEntryKind {
@@ -393,8 +391,7 @@ impl ForwardingPanel {
                         *save = true;
                     }
                 }
-                if is_managed
-                    && ui.button("重新加载服务器配置（丢弃草稿）").clicked()
+                if is_managed && ui.button("重新加载服务器配置（丢弃草稿）").clicked()
                 {
                     self.reload_managed = true;
                 }

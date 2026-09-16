@@ -1,11 +1,14 @@
 [server]
 bind_addr = "0.0.0.0:7443"
+tls_server_name = "tunnel.example.com"
 # Optional P2P NAT observation service. Configure both fields together.
 p2p_observation_bind = "0.0.0.0:7443"
 p2p_observation_alternate_bind = "0.0.0.0:7444"
 # Required for UDP tunnels when bind_addr uses 0.0.0.0 or ::. Set this to a
 # specific address assigned to the server interface that receives public UDP.
 udp_bind_ip = "${RUSTGO_SERVER_UDP_BIND_IP}"
+# On normal startup, rustgos creates both files when both are absent. It never
+# overwrites an existing or half-existing TLS identity.
 certificate_file = "${RUSTGO_SERVER_CERTIFICATE_FILE}"
 private_key_file = "${RUSTGO_SERVER_PRIVATE_KEY_FILE}"
 heartbeat_timeout_secs = 60

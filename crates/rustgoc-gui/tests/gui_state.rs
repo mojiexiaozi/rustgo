@@ -101,6 +101,7 @@ fn client_config(pki: &TestPki, keys: &ClientKeys, server_addr: String) -> Clien
         client: ClientSection {
             name: "gui-test-client".to_owned(),
             identity_mode: None,
+            profile: None,
             server_addr,
             server_name: SERVER_NAME.to_owned(),
             certificate_authority_file: pki.ca_file.clone(),
@@ -134,6 +135,7 @@ fn server_config(pki: &TestPki, key: &DeviceKeypair) -> ServerConfig {
     ServerConfig {
         server: ServerSection {
             bind_addr: "127.0.0.1:0".to_owned(),
+            tls_server_name: None,
             udp_bind_ip: None,
             p2p_observation_bind: None,
             p2p_observation_alternate_bind: None,

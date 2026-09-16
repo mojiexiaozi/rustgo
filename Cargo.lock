@@ -3719,7 +3719,7 @@ dependencies = [
 
 [[package]]
 name = "rustgo-config"
-version = "0.3.0"
+version = "1.0.0"
 dependencies = [
  "base64",
  "rustgo-protocol",
@@ -3732,7 +3732,7 @@ dependencies = [
 
 [[package]]
 name = "rustgo-crypto"
-version = "0.3.0"
+version = "1.0.0"
 dependencies = [
  "atomicwrites",
  "base64",
@@ -3753,7 +3753,7 @@ dependencies = [
 
 [[package]]
 name = "rustgo-e2e"
-version = "0.3.0"
+version = "1.0.0"
 dependencies = [
  "base64",
  "bytes",
@@ -3770,7 +3770,7 @@ dependencies = [
 
 [[package]]
 name = "rustgo-nat"
-version = "0.3.0"
+version = "1.0.0"
 dependencies = [
  "proptest",
  "rustgo-config",
@@ -3784,7 +3784,7 @@ dependencies = [
 
 [[package]]
 name = "rustgo-observability"
-version = "0.3.0"
+version = "1.0.0"
 dependencies = [
  "atomicwrites",
  "rand 0.9.5",
@@ -3801,7 +3801,7 @@ dependencies = [
 
 [[package]]
 name = "rustgo-path"
-version = "0.3.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "thiserror 2.0.20",
@@ -3811,7 +3811,7 @@ dependencies = [
 
 [[package]]
 name = "rustgo-protocol"
-version = "0.3.0"
+version = "1.0.0"
 dependencies = [
  "base64",
  "bytes",
@@ -3824,7 +3824,7 @@ dependencies = [
 
 [[package]]
 name = "rustgo-rendezvous"
-version = "0.3.0"
+version = "1.0.0"
 dependencies = [
  "postcard",
  "rustgo-protocol",
@@ -3834,7 +3834,7 @@ dependencies = [
 
 [[package]]
 name = "rustgo-transport"
-version = "0.3.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3862,7 +3862,7 @@ dependencies = [
 
 [[package]]
 name = "rustgoc"
-version = "0.3.0"
+version = "1.0.0"
 dependencies = [
  "assert_cmd",
  "async-trait",
@@ -3898,7 +3898,7 @@ dependencies = [
 
 [[package]]
 name = "rustgoc-gui"
-version = "0.3.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "atomicwrites",
@@ -3928,7 +3928,7 @@ dependencies = [
 
 [[package]]
 name = "rustgos"
-version = "0.3.0"
+version = "1.0.0"
 dependencies = [
  "assert_cmd",
  "axum",

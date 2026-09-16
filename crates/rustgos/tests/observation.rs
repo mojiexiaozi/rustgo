@@ -56,6 +56,7 @@ fn server_config(pki: &TestPki) -> ServerConfig {
     ServerConfig {
         server: ServerSection {
             bind_addr: "127.0.0.1:0".to_owned(),
+            tls_server_name: None,
             udp_bind_ip: None,
             p2p_observation_bind: None,
             p2p_observation_alternate_bind: None,

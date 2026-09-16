@@ -11,6 +11,7 @@ mod observation;
 mod registry;
 mod rendezvous;
 mod tcp;
+mod tls_identity;
 mod tunnel_management;
 mod udp;
 pub mod web;
@@ -25,5 +26,6 @@ pub use rendezvous::{
     RendezvousCoordinator, RendezvousCoordinatorError, RendezvousErrorCode,
     RendezvousSessionMetadata,
 };
+pub use tls_identity::{IdentityProvisioning, ServerIdentityError, ensure_server_identity};
 pub use tunnel_management::TunnelManagement;
 pub use web::{DashboardDataSources, EnrollmentManagement, WebError, WebRuntimeLimits, WebServer};

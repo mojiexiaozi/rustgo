@@ -1,4 +1,7 @@
-use std::{collections::HashSet, net::SocketAddr};
+use std::{
+    collections::HashSet,
+    net::{IpAddr, SocketAddr},
+};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use rustgo_protocol::{MAX_CLIENT_NAME_BYTES, MAX_TUNNEL_NAME_BYTES, MAX_TUNNELS};
@@ -207,6 +210,14 @@ pub(crate) fn validate_server(config: &ServerConfig) -> Result<(), ValidationErr
         ));
     }
     validate_bind_address(&config.server.bind_addr)?;
+    if let Some(name) = &config.server.tls_server_name
+        && name.parse::<IpAddr>().is_err()
+        && validate_canonical_dns_name(name).is_err()
+    {
+        return Err(ValidationError::new(
+            "server.tls_server_name must be a canonical DNS name or IP address",
+        ));
+    }
     match (
         config.server.p2p_observation_bind.as_deref(),
         config.server.p2p_observation_alternate_bind.as_deref(),

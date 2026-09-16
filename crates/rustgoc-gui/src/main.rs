@@ -7,6 +7,7 @@ mod autostart;
 mod configuration;
 mod runtime;
 mod selfcheck;
+mod single_instance;
 mod state;
 mod tray;
 mod tray_events;
@@ -74,6 +75,16 @@ fn main() -> anyhow::Result<()> {
         return selfcheck::run(&config_path);
     }
 
+    let Some(instance) = single_instance::SingleInstance::acquire(
+        &single_instance::SingleInstance::user_directory()?,
+    )?
+    else {
+        return Ok(());
+    };
+    // Keep ownership until eframe and the app's background runtime finish dropping.
+    let instance = std::sync::Arc::new(instance);
+    let app_instance = instance.clone();
+
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 800.0])
@@ -91,7 +102,9 @@ fn main() -> anyhow::Result<()> {
         options,
         Box::new(move |cc| {
             setup_fonts(&cc.egui_ctx);
-            Ok(Box::new(GuiApp::new(config_path, cc.egui_ctx.clone())))
+            let mut app = GuiApp::new(config_path, cc.egui_ctx.clone());
+            app.single_instance = Some(app_instance);
+            Ok(Box::new(app))
         }),
     )
     .map_err(|e| anyhow::anyhow!("eframe error: {}", e))
@@ -105,6 +118,7 @@ enum Tab {
 }
 
 struct GuiApp {
+    single_instance: Option<std::sync::Arc<single_instance::SingleInstance>>,
     active_tab: Tab,
     connection_panel: ConnectionPanel,
     enrollment_panel: EnrollmentPanel,
@@ -176,6 +190,7 @@ impl GuiApp {
         let path_status_store = rustgoc::PathStatusStore::new();
 
         Self {
+            single_instance: None,
             active_tab: Tab::Connection,
             connection_panel: ConnectionPanel::new("8.133.176.172:8443".to_string()),
             enrollment_panel: EnrollmentPanel::new(),
@@ -219,6 +234,16 @@ fn now_millis() -> u64 {
 
 impl eframe::App for GuiApp {
     fn logic(&mut self, ctx: &eframe::egui::Context, _frame: &mut eframe::Frame) {
+        if let Some(instance) = &self.single_instance {
+            match instance.take_activation() {
+                Ok(true) => {
+                    self.window_lifecycle
+                        .update(ctx, self._tray.is_some(), Some(TrayEvent::Show))
+                }
+                Ok(false) => {}
+                Err(error) => tracing::warn!("读取窗口唤醒请求失败：{error}"),
+            }
+        }
         while let Ok(event) = self.tray_rx.try_recv() {
             match event {
                 TrayEvent::Connect if !self.window_lifecycle.quitting => self.handle_connect(),
@@ -323,10 +348,10 @@ impl eframe::App for GuiApp {
         }
         self.last_logged_connection_state = state.clone();
 
-        if let Some(address) = self.config_panel.server_address() {
-            if self.managed_save_rx.is_none() {
-                self.forwarding_panel.managed.select_server(address);
-            }
+        if let Some(address) = self.config_panel.server_address()
+            && self.managed_save_rx.is_none()
+        {
+            self.forwarding_panel.managed.select_server(address);
         }
         if self.config_panel.server_address() == Some(self.connected_server.as_str()) {
             let status = self.connection_vm.status();
@@ -771,6 +796,50 @@ mod approval_regression_tests {
     }
 
     #[test]
+    fn duplicate_launch_restores_hidden_window_without_painting() {
+        use eframe::egui::{Context, RawInput, ViewportCommand, ViewportId};
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = headless_app(directory.path().join("client.toml"));
+        app.runtime = None;
+        app.single_instance = Some(std::sync::Arc::new(
+            single_instance::SingleInstance::acquire(directory.path())
+                .unwrap()
+                .unwrap(),
+        ));
+        let contender_directory = directory.path().to_owned();
+        let contender = std::thread::spawn(move || {
+            single_instance::SingleInstance::acquire(&contender_directory).unwrap()
+        });
+        let activation = directory.path().join("activate");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !activation.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(activation.exists());
+        let ctx = Context::default();
+        let mut input = RawInput::default();
+        input
+            .viewports
+            .get_mut(&ViewportId::ROOT)
+            .unwrap()
+            .minimized = Some(true);
+        let mut frame = eframe::Frame::_new_kittest();
+        let output = ctx.run_logic(&input, |ctx| app.logic(ctx, &mut frame));
+        let commands = &output.viewport_commands[&ViewportId::ROOT];
+        assert!(commands.contains(&ViewportCommand::Visible(true)));
+        assert!(commands.contains(&ViewportCommand::Minimized(false)));
+        assert!(commands.contains(&ViewportCommand::Focus));
+        assert!(contender.join().unwrap().is_none());
+        assert!(
+            !app.single_instance
+                .as_ref()
+                .unwrap()
+                .take_activation()
+                .unwrap()
+        );
+    }
+
+    #[test]
     fn managed_save_persists_local_policy_without_remote_collections() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("client.toml");
@@ -820,6 +889,7 @@ mod approval_regression_tests {
         let telemetry_history = state::telemetry::TelemetryHistory::new();
         let path_status_store = rustgoc::PathStatusStore::new();
         GuiApp {
+            single_instance: None,
             active_tab: Tab::Connection,
             connection_panel: ConnectionPanel::new(String::new()),
             enrollment_panel: EnrollmentPanel::new(),

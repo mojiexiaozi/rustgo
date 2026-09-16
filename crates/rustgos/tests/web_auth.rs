@@ -1220,6 +1220,7 @@ fn server_config(web_address: SocketAddr, cookie_secure: bool) -> ServerConfig {
     ServerConfig {
         server: ServerSection {
             bind_addr: "127.0.0.1:7443".to_owned(),
+            tls_server_name: None,
             udp_bind_ip: None,
             p2p_observation_bind: None,
             p2p_observation_alternate_bind: None,
