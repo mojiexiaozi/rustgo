@@ -273,6 +273,25 @@ pub(crate) fn validate_server(config: &ServerConfig) -> Result<(), ValidationErr
 
 pub(crate) fn validate_client(config: &ClientConfig) -> Result<(), ValidationError> {
     validate_client_name(&config.client.name)?;
+    if let Some(profile) = &config.client.profile {
+        rustgo_protocol::RegistrationIntent::for_profile(
+            &profile.display_name,
+            profile.uid.as_deref(),
+            rustgo_protocol::EnrollmentPurpose::Enroll,
+        )
+        .map_err(|_| {
+            ValidationError::new(
+                "客户端名称不能为空、不得包含控制字符且不能超过 128 字节；UID 格式须有效",
+            )
+        })?;
+        if profile
+            .local_ip
+            .as_deref()
+            .is_some_and(|ip| ip.parse::<std::net::IpAddr>().is_err())
+        {
+            return Err(ValidationError::new("本地 IP 格式无效"));
+        }
+    }
     validate_host_address("client.server_addr", &config.client.server_addr)?;
     require_non_empty("client.server_name", &config.client.server_name)?;
     match (

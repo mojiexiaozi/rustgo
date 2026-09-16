@@ -15,6 +15,8 @@ pub struct ConnectionPanel {
 pub struct OverviewData<'a> {
     pub state: &'a ConnectionState,
     pub client_name: &'a str,
+    pub uid: Option<&'a str>,
+    pub local_ip: Option<&'a str>,
     pub history: &'a TelemetryHistory,
     pub sent_bytes: Option<u64>,
     pub received_bytes: Option<u64>,
@@ -44,6 +46,11 @@ impl ConnectionPanel {
             ConnectionState::Backoff { seconds } => format!("重试中（{seconds} 秒）"),
         };
         ui.heading(RichText::new(data.client_name).size(30.0));
+        ui.label(format!("UID：{}", data.uid.unwrap_or("尚未分配")));
+        ui.label(format!(
+            "本地 IP：{}",
+            data.local_ip.unwrap_or("连接后获取")
+        ));
         ui.label(format!(
             "{state} · 心跳 {} · 0 个活跃会话",
             age.map(|v| format!("{v} 秒前"))

@@ -16,6 +16,10 @@ const FORMAT_VERSION: u8 = 1;
 #[serde(deny_unknown_fields)]
 struct PendingMetadata {
     format_version: u8,
+    #[serde(default)]
+    approval_intent: Option<String>,
+    #[serde(default = "legacy_approval_metadata_version")]
+    approval_metadata_version: u8,
     kind: String,
     candidate_private_key: PathBuf,
     final_private_key: PathBuf,
@@ -94,6 +98,8 @@ impl PendingEnrollment {
         };
         let metadata = PendingMetadata {
             format_version: FORMAT_VERSION,
+            approval_intent: None,
+            approval_metadata_version: 2,
             kind: match key.purpose() {
                 EnrollmentPurpose::Enroll => "enroll",
                 EnrollmentPurpose::ReEnroll => "reenroll",
@@ -135,6 +141,19 @@ impl PendingEnrollment {
             metadata_path,
             metadata,
         })
+    }
+
+    pub(crate) fn requires_legacy_approval_intent(&self) -> bool {
+        self.metadata.approval_metadata_version == 1 && self.metadata.approval_intent.is_none()
+    }
+
+    pub(crate) fn bind_approval_intent(&mut self, intent: &str) -> Result<String, EnrollmentError> {
+        if let Some(existing) = &self.metadata.approval_intent {
+            return Ok(existing.clone());
+        }
+        self.metadata.approval_intent = Some(intent.to_owned());
+        write_metadata(&self.metadata_path, &self.metadata)?;
+        Ok(intent.to_owned())
     }
 
     pub fn public_key(&self) -> &str {
@@ -210,12 +229,17 @@ impl PendingEnrollment {
     }
 }
 
+fn legacy_approval_metadata_version() -> u8 {
+    1
+}
+
 fn metadata_path(config_path: &Path) -> PathBuf {
     config_path.with_extension("enrollment-pending.toml")
 }
 
 fn validate_metadata(metadata: &PendingMetadata) -> Result<(), EnrollmentError> {
     if metadata.format_version != FORMAT_VERSION
+        || !matches!(metadata.approval_metadata_version, 1 | 2)
         || !matches!(metadata.kind.as_str(), "enroll" | "reenroll")
         || metadata.request_id.len() != 32
         || metadata.server_addr.is_empty()

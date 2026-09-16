@@ -321,9 +321,14 @@ async fn clients(
     );
     let search_folded = search.as_ref().map(|value| value.to_lowercase());
     items.retain(|client| {
-        search_folded
-            .as_ref()
-            .is_none_or(|search| client.name.to_lowercase().contains(search))
+        search_folded.as_ref().is_none_or(|search| {
+            [&client.name, &client.display_name]
+                .into_iter()
+                .map(String::as_str)
+                .chain(client.uid.as_deref())
+                .chain(client.local_ip.as_deref())
+                .any(|value| value.to_lowercase().contains(search))
+        })
     });
     items.sort_by(|left, right| compare_client_dtos(left, right, sort, descending));
     let total = items.len();
@@ -1601,6 +1606,11 @@ fn client_dto(
         .collect();
     Client {
         name: client.name.as_str().to_owned(),
+        display_name: dynamic
+            .map_or(client.name.as_str(), |client| client.display_name())
+            .to_owned(),
+        uid: dynamic.map(|client| client.internal_id().to_owned()),
+        local_ip: dynamic.and_then(|client| client.local_ip().map(str::to_owned)),
         identity_source: if dynamic.is_some() {
             "dynamic"
         } else {
@@ -1641,6 +1651,9 @@ fn client_dto(
 fn offline_dynamic_client_dto(client: &crate::enrollment::DynamicClient) -> Client {
     Client {
         name: client.display_id().to_owned(),
+        display_name: client.display_name().to_owned(),
+        uid: Some(client.internal_id().to_owned()),
+        local_ip: client.local_ip().map(str::to_owned),
         identity_source: "dynamic",
         enabled: Some(client.enabled()),
         bound: Some(client.is_bound()),
@@ -1916,7 +1929,7 @@ fn compare_client_dtos(
     }
     let ordering = match sort {
         ClientSort::Online => left.online.cmp(&right.online),
-        ClientSort::Name => left.name.cmp(&right.name),
+        ClientSort::Name => left.display_name.cmp(&right.display_name),
         ClientSort::Traffic => (left.traffic.received_bytes + left.traffic.sent_bytes)
             .cmp(&(right.traffic.received_bytes + right.traffic.sent_bytes)),
         ClientSort::Cpu => unreachable!("CPU ordering is handled above"),

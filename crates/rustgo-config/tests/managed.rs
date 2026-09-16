@@ -112,3 +112,58 @@ fn disabled_capability_does_not_discard_existing_structurally_valid_collections(
     target.p2p.as_mut().unwrap().enabled = false;
     assert!(snapshot.apply_to(&mut target).is_err());
 }
+
+#[test]
+fn profile_roundtrip_and_legacy_display_name_fallback() {
+    let mut config = client();
+    assert!(config.client.profile.is_none());
+    assert_eq!(config.client.display_name(), "local");
+    let profile = ClientProfile {
+        display_name: "小明 🦀".into(),
+        uid: Some("uid-42".into()),
+        local_ip: Some("192.168.1.2".into()),
+    };
+    let encoded = toml::to_string(&profile).unwrap();
+    assert_eq!(toml::from_str::<ClientProfile>(&encoded).unwrap(), profile);
+    config.client.profile = Some(profile);
+    assert_eq!(config.client.display_name(), "小明 🦀");
+    let snapshot = ManagedConfiguration::from_client(&config);
+    assert!(
+        !serde_json::to_value(&snapshot)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .contains_key("client_profile")
+    );
+    snapshot.apply_to(&mut config).unwrap();
+    assert_eq!(config.client.name, "local");
+    assert_eq!(
+        config.client.profile.as_ref().unwrap().uid.as_deref(),
+        Some("uid-42")
+    );
+}
+
+#[test]
+fn malformed_profile_is_rejected_during_validation() {
+    let mut config = client();
+    for profile in [
+        ClientProfile {
+            display_name: " ".into(),
+            uid: None,
+            local_ip: None,
+        },
+        ClientProfile {
+            display_name: "label".into(),
+            uid: Some("bad uid".into()),
+            local_ip: None,
+        },
+        ClientProfile {
+            display_name: "label".into(),
+            uid: None,
+            local_ip: Some("not an ip".into()),
+        },
+    ] {
+        config.client.profile = Some(profile);
+        assert!(config.validate().is_err());
+    }
+}

@@ -54,9 +54,13 @@ pub struct ClientStatus {
     authentication_rejected: bool,
     managed_revision: Option<u64>,
     effective_configuration: Option<Arc<rustgo_config::ManagedConfiguration>>,
+    client_profile: Option<rustgo_config::ClientProfile>,
 }
 
 impl ClientStatus {
+    pub fn client_profile(&self) -> Option<&rustgo_config::ClientProfile> {
+        self.client_profile.as_ref()
+    }
     pub fn managed_revision(&self) -> Option<u64> {
         self.managed_revision
     }
@@ -359,6 +363,7 @@ impl ClientApp {
                     self.status.send_replace(ClientStatus {
                         authentication_rejected: false,
                         managed_revision,
+                        client_profile: effective.client.profile.clone(),
                         effective_configuration: Some(Arc::new(
                             rustgo_config::ManagedConfiguration::from_client(&effective),
                         )),

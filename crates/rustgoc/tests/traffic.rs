@@ -111,6 +111,7 @@ fn client_fixture(
 ) -> Result<ClientConfig, AnyError> {
     Ok(ClientConfig {
         client: ClientSection {
+            profile: None,
             name: "traffic-client".to_owned(),
             identity_mode: None,
             server_addr,

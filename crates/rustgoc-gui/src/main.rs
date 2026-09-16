@@ -330,6 +330,11 @@ impl eframe::App for GuiApp {
         }
         if self.config_panel.server_address() == Some(self.connected_server.as_str()) {
             let status = self.connection_vm.status();
+            if status.active().is_some()
+                && let Some(profile) = status.client_profile()
+            {
+                self.config_panel.observe_profile(profile);
+            }
             self.forwarding_panel.managed.observe(
                 status.active().is_some(),
                 status.managed_revision(),
@@ -414,7 +419,15 @@ impl eframe::App for GuiApp {
                         ui,
                         ui::connection::OverviewData {
                             state: self.connection_vm.current(),
-                            client_name: config.map(|c| c.client.name.as_str()).unwrap_or("客户端"),
+                            client_name: config
+                                .map(|c| c.client.display_name())
+                                .unwrap_or("客户端"),
+                            uid: config
+                                .and_then(|c| c.client.profile.as_ref())
+                                .and_then(|p| p.uid.as_deref()),
+                            local_ip: config
+                                .and_then(|c| c.client.profile.as_ref())
+                                .and_then(|p| p.local_ip.as_deref()),
                             history: &self.telemetry_history,
                             sent_bytes,
                             received_bytes,

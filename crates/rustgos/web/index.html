@@ -57,7 +57,7 @@
             <div><h2 id="clients-title">客户端</h2><p id="clients-summary" class="muted">暂无客户端快照。</p></div>
             <div class="client-controls">
               <label for="client-search">搜索客户端</label>
-              <input id="client-search" type="search" autocomplete="off" placeholder="输入名称…">
+              <input id="client-search" type="search" autocomplete="off" placeholder="输入显示名、UID 或本地 IP…">
               <label for="client-sort">排序</label>
               <select id="client-sort">
                 <option value="online">在线状态</option>
@@ -82,6 +82,7 @@
       <section id="client-view" data-view="client" hidden aria-labelledby="client-title">
         <a class="back-link" href="#overview">← 所有客户端</a>
         <div class="view-heading"><div><p class="eyebrow">客户端详情</p><h1 id="client-title">客户端</h1><p id="client-detail-summary" class="muted"></p></div></div>
+        <dl id="client-identity"></dl>
         <section id="client-detail-metrics" class="metric-grid" aria-label="客户端指标"></section>
           <section class="detail-card managed-panel" aria-labelledby="managed-title">
             <h2 id="managed-title">服务端配置管理</h2>

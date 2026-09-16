@@ -28,7 +28,15 @@ pub async fn request_registration(
     config_path: &Path,
     purpose: EnrollmentPurpose,
 ) -> Result<EnrollmentCompletion, EnrollmentError> {
-    let intent = rustgo_protocol::RegistrationIntent::new(&config.client.name, purpose)?;
+    let intent = rustgo_protocol::RegistrationIntent::for_profile(
+        config.client.display_name(),
+        config
+            .client
+            .profile
+            .as_ref()
+            .and_then(|p| p.uid.as_deref()),
+        purpose,
+    )?;
     enroll(config, config_path, &intent.encode()).await
 }
 
@@ -37,8 +45,35 @@ pub async fn request_key_rotation(
     config: &mut ClientConfig,
     config_path: &Path,
 ) -> Result<EnrollmentCompletion, EnrollmentError> {
-    let intent =
-        rustgo_protocol::RegistrationIntent::new(&config.client.name, EnrollmentPurpose::ReEnroll)?;
+    if config
+        .client
+        .profile
+        .as_ref()
+        .and_then(|p| p.uid.as_ref())
+        .is_none()
+        && !PendingEnrollment::exists(config_path)
+    {
+        let session = ControlClient::from_config(config.clone())
+            .map_err(|_| EnrollmentError::InvalidPendingState)?
+            .connect()
+            .await
+            .map_err(|_| EnrollmentError::Network)?;
+        if let Some(profile) = session
+            .effective_config()
+            .and_then(|c| c.client.profile.clone())
+        {
+            config.client.profile = Some(profile);
+        }
+    }
+    let intent = rustgo_protocol::RegistrationIntent::for_profile(
+        config.client.display_name(),
+        config
+            .client
+            .profile
+            .as_ref()
+            .and_then(|p| p.uid.as_deref()),
+        EnrollmentPurpose::ReEnroll,
+    )?;
     enroll_inner(config, config_path, &intent.encode(), false).await
 }
 
@@ -142,7 +177,8 @@ async fn enroll_inner(
             Sha256::digest(cert.as_ref()).into(),
         )?
     };
-    let pending = if PendingEnrollment::exists(config_path) {
+    let pending_existed = PendingEnrollment::exists(config_path);
+    let mut pending = if pending_existed {
         PendingEnrollment::load(config_path)?
     } else if approval.is_some() && reuse {
         PendingEnrollment::create_reusing(config_path, &config.client.private_key_file, &key)?
@@ -155,6 +191,19 @@ async fn enroll_inner(
     {
         return Err(EnrollmentError::InvalidPendingState);
     }
+    let approval = if let Some(intent) = approval {
+        // Metadata written before profile support belongs to a v1 request. Its
+        // signed bytes must remain identical when the same request ID is retried.
+        let intent = if pending_existed && pending.requires_legacy_approval_intent() {
+            rustgo_protocol::RegistrationIntent::new(&config.client.name, intent.purpose)?
+        } else {
+            intent
+        };
+        let encoded = pending.bind_approval_intent(&intent.encode())?;
+        Some(rustgo_protocol::RegistrationIntent::decode(&encoded)?)
+    } else {
+        None
+    };
     let wire_credential = if let Some(intent) = &approval {
         let keypair =
             rustgo_crypto::DeviceKeypair::load_private_file(pending.candidate_private_key())
@@ -327,6 +376,20 @@ fn update_config_values(
         .ok_or(EnrollmentError::ConfigurationIo(
             std::io::ErrorKind::InvalidData,
         ))?;
+    let profile = config
+        .client
+        .profile
+        .clone()
+        .unwrap_or_else(|| rustgo_config::ClientProfile {
+            display_name: config.client.name.clone(),
+            uid: None,
+            local_ip: None,
+        });
+    client.insert(
+        "profile".to_owned(),
+        toml::Value::try_from(&profile)
+            .map_err(|_| EnrollmentError::ConfigurationIo(std::io::ErrorKind::InvalidData))?,
+    );
     if let Some(client_id) = client_id {
         client.insert("name".to_owned(), toml::Value::String(client_id.to_owned()));
     }
@@ -361,6 +424,7 @@ fn update_config_values(
     if let Some(client_id) = client_id {
         config.client.name = client_id.to_owned();
     }
+    config.client.profile = Some(profile);
     config.client.identity_mode = Some(IdentityMode::Dynamic);
     config.client.server_addr = server_addr.to_owned();
     config.client.trust_mode = Some(TrustMode::Pinned);

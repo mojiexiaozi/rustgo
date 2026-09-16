@@ -136,14 +136,14 @@
     const folded = state.clientSearch.trim().toLocaleLowerCase();
     const entries = clients.items
       .map((client, index) => ({ client, index }))
-      .filter(({ client }) => !folded || client.name.toLocaleLowerCase().includes(folded));
+      .filter(({ client }) => !folded || [client.name, client.display_name, client.uid, client.local_ip].some(value => value?.toLocaleLowerCase().includes(folded)));
     const direction = state.clientDescending ? -1 : 1;
     const compare = (left, right) => {
       const a = left.client;
       const b = right.client;
       let result = 0;
       if (state.clientSort === "online") result = Number(a.online) - Number(b.online);
-      else if (state.clientSort === "name") result = a.name.localeCompare(b.name);
+      else if (state.clientSort === "name") result = (a.display_name || a.name).localeCompare(b.display_name || b.name);
       else if (state.clientSort === "traffic") {
         const aTraffic = BigInt(a.traffic_sort_bytes);
         const bTraffic = BigInt(b.traffic_sort_bytes);
@@ -351,7 +351,7 @@
     const title = document.createElement("h3");
     const link = document.createElement("a");
     link.href = `#client/${encodeURIComponent(client.name)}`;
-    link.textContent = client.name;
+    link.textContent = client.display_name || client.name;
     title.append(link);
     top.append(title, badge(client.online ? "在线" : "离线", client.online ? "badge-online" : "badge-offline"));
     const badges = document.createElement("div"); badges.className = "badges";
@@ -359,6 +359,8 @@
     if (!client.telemetry.available) badges.append(badge("指标不可用", "badge-warning"));
     if (client.reconnects > 0) badges.append(badge(`重连 ${client.reconnects} 次`, "badge-warning"));
     const details = document.createElement("dl");
+    appendDefinition(details, "UID", client.uid || "未分配（旧版静态身份）");
+    appendDefinition(details, "本地 IP", client.local_ip || "未上报");
     appendDefinition(details, "版本", client.version || "不可用");
     appendDefinition(details, "心跳", formatAge(client.heartbeat.age_millis));
     appendDefinition(details, "CPU", formatPercent(client.telemetry.cpu_basis_points));
@@ -528,7 +530,13 @@
     const management = $("client-management");
     if (management) management.hidden = client.identity_source !== "dynamic";
 
-    text("client-title", client.name);
+    text("client-title", client.display_name || client.name);
+    const identity = $("client-identity");
+    if (identity) {
+      identity.replaceChildren();
+      appendDefinition(identity, "UID", client.uid || "未分配（旧版静态身份）");
+      appendDefinition(identity, "本地 IP", client.local_ip || "未上报");
+    }
     text("client-detail-summary", `${client.online ? "在线" : "离线"} · 心跳 ${formatAge(client.heartbeat.age_millis)} · ${client.sessions.active} 个活跃会话`);
     const metrics = $("client-detail-metrics");
     if (metrics) {
@@ -613,7 +621,9 @@
       const row = document.createElement("article");
       row.className = "approval-item";
       const heading = document.createElement("h3");
-      heading.textContent = `${item.client_id} · ${item.replacing ? "重新接入 / 换钥申请" : "首次接入"}`;
+      heading.textContent = `${item.display_name || item.client_id} · ${item.replacing ? "重新接入 / 换钥申请" : "首次接入"}`;
+      const identity = document.createElement("p");
+      identity.textContent = `UID：${item.uid || "批准后分配"} · 本地 IP：连接后上报`;
       const fingerprint = document.createElement("p");
       fingerprint.className = "approval-fingerprint";
       fingerprint.textContent = `公钥指纹：${item.fingerprint}`;
@@ -628,7 +638,7 @@
         button.className = approve ? "button" : "button button-quiet";
         button.textContent = label;
         button.addEventListener("click", async () => {
-          if (approve && !confirm(`确认批准“${item.client_id}”？请核对客户端公钥指纹：\n${item.fingerprint}${item.replacing ? "\n批准后将更新绑定并中断旧连接。" : ""}`)) return;
+          if (approve && !confirm(`确认批准“${item.display_name || item.client_id}”（UID：${item.uid || "批准后分配"}）？请核对客户端公钥指纹：\n${item.fingerprint}${item.replacing ? "\n批准后将更新绑定并中断旧连接。" : ""}`)) return;
           for (const control of buttons.children) control.disabled = true;
           try {
             await managementRequest(`/api/v1/registration-requests/${encodeURIComponent(item.request_id)}`, { approve });
@@ -641,7 +651,7 @@
         });
         buttons.append(button);
       }
-      row.append(heading, fingerprint, when, buttons);
+      row.append(heading, identity, fingerprint, when, buttons);
       list.append(row);
     }
   }
@@ -747,7 +757,7 @@
   $("client-order")?.addEventListener("click", () => { state.clientDescending = !state.clientDescending; text("client-order", state.clientDescending ? "降序" : "升序"); if (state.overview) renderClientGrid(state.overview.clients); });
   async function deleteClient(client) {
     if (!client || client.identity_source !== "dynamic") return;
-    if (!confirm(`确定删除客户端“${client.name}”吗？在线会话将立即终止。`)) return;
+    if (!confirm(`确定删除客户端“${client.display_name || client.name}”（UID：${client.uid || client.name}）吗？在线会话将立即终止。`)) return;
     if (!confirm("请再次确认：客户端将从列表移除；重新接入必须再次审批。")) return;
     await managementRequest(`/api/v1/clients/${encodeURIComponent(client.name)}/delete`, { expected_revision: client.revision });
     location.hash = "overview";

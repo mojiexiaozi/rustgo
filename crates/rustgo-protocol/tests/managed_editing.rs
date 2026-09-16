@@ -104,7 +104,7 @@ fn managed_editing_requires_version_authenticated_phase_and_direction() {
             S,
         ),
     ];
-    assert_eq!(ProtocolVersion::SUPPORTED, ProtocolVersion::V0_5);
+    assert_eq!(ProtocolVersion::SUPPORTED, ProtocolVersion::V0_6);
     assert_eq!(
         ProtocolVersion::V0_5.negotiate(ProtocolVersion::V0_4),
         Ok(ProtocolVersion::V0_4)

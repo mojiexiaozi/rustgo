@@ -50,6 +50,24 @@ impl ConfigPanel {
         self.error = None;
         Ok(())
     }
+    pub fn observe_profile(&mut self, profile: &rustgo_config::ClientProfile) {
+        let Some(config) = self.config.as_mut() else {
+            return;
+        };
+        crate::configuration::ensure_profile(config);
+        let local = config.client.profile.as_mut().expect("profile initialized");
+        if local.uid == profile.uid && local.local_ip == profile.local_ip {
+            return;
+        }
+        if let Err(error) =
+            crate::configuration::persist_profile_identity(&self.config_path, profile)
+        {
+            self.error = Some(format!("保存客户端身份失败：{error:#}"));
+            return;
+        }
+        local.uid.clone_from(&profile.uid);
+        local.local_ip.clone_from(&profile.local_ip);
+    }
     pub fn set_save_error(&mut self, error: &anyhow::Error) {
         self.success = None;
         self.error = Some(format!("保存失败：{error:#}"));
@@ -67,11 +85,19 @@ impl ConfigPanel {
             ui.label("无法读取配置，请检查软件目录写入权限。");
             return;
         };
+        crate::configuration::ensure_profile(c);
         eframe::egui::Grid::new("client-settings")
             .num_columns(2)
             .show(ui, |ui| {
                 ui.label("客户端名称");
-                ui.text_edit_singleline(&mut c.client.name);
+                let profile = c.client.profile.as_mut().expect("profile initialized");
+                ui.text_edit_singleline(&mut profile.display_name);
+                ui.end_row();
+                ui.label("UID");
+                ui.label(profile.uid.as_deref().unwrap_or("审批后由服务器分配"));
+                ui.end_row();
+                ui.label("本地 IP");
+                ui.label(profile.local_ip.as_deref().unwrap_or("连接后获取"));
                 ui.end_row();
                 ui.label("服务器地址");
                 ui.text_edit_singleline(&mut c.client.server_addr);

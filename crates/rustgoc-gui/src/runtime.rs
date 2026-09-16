@@ -60,7 +60,7 @@ impl ClientRuntime {
                     };
                     if let Err(error) = &result {
                         let message = match error {
-                            rustgoc::EnrollmentError::Rejected(rustgoc::EnrollmentErrorCode::ReplacementApprovalPending) => "服务器已存在同名客户端，已提交密钥更换申请。管理员批准后将替换原客户端密钥。",
+                            rustgoc::EnrollmentError::Rejected(rustgoc::EnrollmentErrorCode::ReplacementApprovalPending) => "已提交此 UID 的恢复连接申请，等待管理员审批。",
                             rustgoc::EnrollmentError::Rejected(rustgoc::EnrollmentErrorCode::PendingApproval) => "申请已提交，等待管理员审批。",
                             _ => "正在处理服务器返回结果…",
                         };

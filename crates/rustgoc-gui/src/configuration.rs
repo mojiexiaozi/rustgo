@@ -25,7 +25,40 @@ pub fn load_or_create(path: &Path) -> Result<ClientConfig> {
     let mut config = rustgo_config::load_client(path)
         .with_context(|| format!("读取配置失败: {}", path.display()))?;
     enforce_fixed_credentials(&mut config);
+    ensure_profile(&mut config);
     Ok(config)
+}
+
+pub fn ensure_profile(config: &mut ClientConfig) {
+    if config.client.profile.is_none() {
+        config.client.profile = Some(rustgo_config::ClientProfile {
+            display_name: config.client.name.clone(),
+            uid: None,
+            local_ip: None,
+        });
+    }
+}
+
+fn system_display_name() -> String {
+    ["USERNAME", "USER"]
+        .into_iter()
+        .filter_map(|key| std::env::var(key).ok())
+        .find(|value| {
+            !value.trim().is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
+        })
+        .unwrap_or_else(|| "客户端".to_owned())
+}
+
+/// Merge only server-confirmed identity metadata; never save an unsaved UI draft.
+pub fn persist_profile_identity(path: &Path, profile: &rustgo_config::ClientProfile) -> Result<()> {
+    let mut config = load_or_create(path)?;
+    let local = config.client.profile.as_mut().expect("profile initialized");
+    if local.uid == profile.uid && local.local_ip == profile.local_ip {
+        return Ok(());
+    }
+    local.uid.clone_from(&profile.uid);
+    local.local_ip.clone_from(&profile.local_ip);
+    save_validated(path, &config)
 }
 
 pub fn save_validated(path: &Path, config: &ClientConfig) -> Result<()> {
@@ -49,6 +82,11 @@ fn default_config() -> ClientConfig {
     ClientConfig {
         client: rustgo_config::ClientSection {
             name: "gui-client".into(),
+            profile: Some(rustgo_config::ClientProfile {
+                display_name: system_display_name(),
+                uid: None,
+                local_ip: None,
+            }),
             identity_mode: None,
             server_addr: "8.133.176.172:8443".into(),
             server_name: "8.133.176.172".into(),
@@ -88,6 +126,17 @@ fn to_toml(config: &ClientConfig) -> Value {
     let mut root = Table::new();
     let mut client = Table::new();
     insert_string(&mut client, "name", &config.client.name);
+    if let Some(profile) = &config.client.profile {
+        let mut table = Table::new();
+        insert_string(&mut table, "display_name", &profile.display_name);
+        if let Some(uid) = &profile.uid {
+            insert_string(&mut table, "uid", uid);
+        }
+        if let Some(ip) = &profile.local_ip {
+            insert_string(&mut table, "local_ip", ip);
+        }
+        client.insert("profile".into(), Value::Table(table));
+    }
     if let Some(mode) = config.client.identity_mode {
         insert_string(
             &mut client,
@@ -255,6 +304,7 @@ fn protocol_name(protocol: TunnelProtocol) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use super::{persist_profile_identity, system_display_name};
     use std::fs;
 
     use super::{config_path_for_executable, load_or_create, save_validated};
@@ -277,6 +327,44 @@ mod tests {
         assert!(config.exports.is_empty());
         assert!(config.forwards.is_empty());
         assert!(!directory.path().join("server-cert.pem").exists());
+        assert_eq!(config.client.display_name(), system_display_name());
+        assert!(config.client.profile.as_ref().unwrap().uid.is_none());
+    }
+
+    #[test]
+    fn profile_metadata_preserves_legacy_identity_and_saved_display_name() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("client.toml");
+        fs::write(&path, valid_config("saved.example:8443")).unwrap();
+        let mut config = load_or_create(&path).unwrap();
+        config.client.profile.as_mut().unwrap().display_name = "小王的电脑".into();
+        save_validated(&path, &config).unwrap();
+        persist_profile_identity(
+            &path,
+            &rustgo_config::ClientProfile {
+                display_name: "旧名称".into(),
+                uid: Some("server-uid-1".into()),
+                local_ip: Some("192.168.1.9".into()),
+            },
+        )
+        .unwrap();
+        let reloaded = load_or_create(&path).unwrap();
+        assert_eq!(reloaded.client.name, "gui-client");
+        assert_eq!(reloaded.client.display_name(), "小王的电脑");
+        assert_eq!(
+            reloaded.client.profile.as_ref().unwrap().uid.as_deref(),
+            Some("server-uid-1")
+        );
+        assert_eq!(
+            reloaded
+                .client
+                .profile
+                .as_ref()
+                .unwrap()
+                .local_ip
+                .as_deref(),
+            Some("192.168.1.9")
+        );
     }
 
     #[test]

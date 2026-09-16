@@ -102,6 +102,8 @@ pub struct ClientConfig {
 pub struct ClientSection {
     pub name: String,
     #[serde(default)]
+    pub profile: Option<ClientProfile>,
+    #[serde(default)]
     pub identity_mode: Option<IdentityMode>,
     pub server_addr: String,
     pub server_name: String,
@@ -112,6 +114,24 @@ pub struct ClientSection {
     pub server_certificate_fingerprint: Option<String>,
     pub private_key_file: PathBuf,
     pub heartbeat_interval_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClientProfile {
+    pub display_name: String,
+    #[serde(default)]
+    pub uid: Option<String>,
+    #[serde(default)]
+    pub local_ip: Option<String>,
+}
+
+impl ClientSection {
+    pub fn display_name(&self) -> &str {
+        self.profile
+            .as_ref()
+            .map_or(&self.name, |profile| &profile.display_name)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]

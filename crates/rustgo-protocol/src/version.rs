@@ -15,7 +15,8 @@ impl ProtocolVersion {
     pub const V0_3: Self = Self::new(1, 2);
     pub const V0_4: Self = Self::new(1, 3);
     pub const V0_5: Self = Self::new(1, 4);
-    pub const SUPPORTED: Self = Self::V0_5;
+    pub const V0_6: Self = Self::new(1, 5);
+    pub const SUPPORTED: Self = Self::V0_6;
 
     pub const fn new(major: u16, minor: u16) -> Self {
         Self { major, minor }
@@ -31,6 +32,10 @@ impl ProtocolVersion {
 
     pub const fn supports_managed_configuration(self) -> bool {
         self.major == Self::V0_4.major && self.minor >= Self::V0_4.minor
+    }
+
+    pub const fn supports_client_profile(self) -> bool {
+        self.major == Self::V0_6.major && self.minor >= Self::V0_6.minor
     }
 
     pub const fn supports_managed_editing(self) -> bool {

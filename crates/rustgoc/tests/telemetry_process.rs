@@ -154,6 +154,7 @@ fn client_fixture(
     Ok(Fixture {
         config: ClientConfig {
             client: ClientSection {
+                profile: None,
                 name: "telemetry-client".to_owned(),
                 identity_mode: None,
                 server_addr,
@@ -377,6 +378,7 @@ fn relay_only_client(
 ) -> ClientConfig {
     ClientConfig {
         client: ClientSection {
+            profile: None,
             name: name.to_owned(),
             identity_mode: None,
             server_addr,

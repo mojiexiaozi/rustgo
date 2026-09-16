@@ -19,6 +19,48 @@ pub struct TunnelManagement {
     max_tunnels: usize,
 }
 
+/// Metadata belongs to the authenticated device, independently of managed tunnels.
+pub(crate) fn sync_client_profile(
+    dynamic: Option<&DynamicClientStore>,
+    authenticated: &crate::AuthenticatedClient,
+    profile: &rustgo_config::ClientProfile,
+) -> Result<rustgo_config::ClientProfile, ManagedError> {
+    let client = dynamic
+        .map(|store| store.client_by_display_id(authenticated.name()))
+        .transpose()
+        .map_err(|error| ManagedError::Storage(error.to_string()))?
+        .flatten();
+    let uid = if let Some(client) = client {
+        let key: DevicePublicKey = client
+            .public_key()
+            .ok_or(ManagedError::NotFound)?
+            .parse()
+            .map_err(|_| ManagedError::NotFound)?;
+        if !client.enabled()
+            || client.is_deleted()
+            || key.fingerprint().to_string() != authenticated.fingerprint()
+        {
+            return Err(ManagedError::NotFound);
+        }
+        dynamic
+            .ok_or(ManagedError::NotFound)?
+            .update_profile(
+                client.internal_id(),
+                &profile.display_name,
+                profile.local_ip.as_deref(),
+            )
+            .map_err(|error| ManagedError::Storage(error.to_string()))?;
+        Some(client.internal_id().to_owned())
+    } else {
+        None
+    };
+    Ok(rustgo_config::ClientProfile {
+        display_name: profile.display_name.clone(),
+        uid,
+        local_ip: profile.local_ip.clone(),
+    })
+}
+
 impl TunnelManagement {
     pub(crate) fn update_authenticated(
         &self,
@@ -234,6 +276,79 @@ impl TunnelManagement {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_sync_uses_authenticated_uid_and_keeps_configuration_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let dynamic = Arc::new(
+            DynamicClientStore::open(
+                directory.path().join("identities.db"),
+                crate::enrollment::EnrollmentStoreLimits {
+                    max_active_clients: 4,
+                    max_tokens: 4,
+                },
+            )
+            .unwrap(),
+        );
+        let key = rustgo_crypto::DeviceKeypair::from_secret_bytes([74; 32]).public_key();
+        let _ = dynamic.request_approval(
+            "legacy-device",
+            rustgo_protocol::EnrollmentPurpose::Enroll,
+            &key,
+            "initial",
+            std::time::SystemTime::now(),
+        );
+        dynamic.review_approval("initial", true).unwrap();
+        let client = dynamic
+            .client_by_display_id("legacy-device")
+            .unwrap()
+            .unwrap();
+        let store = Arc::new(ManagedStore::open(&directory.path().join("managed.db")).unwrap());
+        let registry = ClientRegistry::new(
+            4,
+            16,
+            "127.0.0.1".parse().unwrap(),
+            32,
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap();
+        let management =
+            TunnelManagement::new(store, registry, &[], Some(dynamic.clone()), 16).unwrap();
+        let authenticated = crate::AuthenticatedClient::verified(
+            "legacy-device".into(),
+            key.fingerprint().to_string(),
+            vec![1; 32],
+        );
+        let identity_before = management.authenticated_identity(&authenticated).unwrap();
+        let profile = sync_client_profile(
+            Some(&dynamic),
+            &authenticated,
+            &rustgo_config::ClientProfile {
+                display_name: "重复名称".into(),
+                uid: Some("another-device-uid".into()),
+                local_ip: Some("192.168.1.20".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(profile.uid.as_deref(), Some(client.internal_id()));
+        assert_eq!(
+            management.authenticated_identity(&authenticated).unwrap(),
+            identity_before
+        );
+        let saved = dynamic
+            .client_by_display_id("legacy-device")
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.display_name(), "重复名称");
+        assert_eq!(saved.local_ip(), Some("192.168.1.20"));
+        assert_eq!(saved.revision(), client.revision());
+        let impostor = crate::AuthenticatedClient::verified(
+            "legacy-device".into(),
+            "wrong-fingerprint".into(),
+            vec![2; 32],
+        );
+        assert!(sync_client_profile(Some(&dynamic), &impostor, &profile).is_err());
+    }
 
     #[test]
     fn deleting_provider_export_marks_consumer_target_unavailable_without_deleting_forward() {

@@ -92,6 +92,7 @@ impl ControlClient {
             .tls_client
             .connect(&self.config.client.server_addr)
             .await?;
+        let local_ip = stream.get_ref().0.local_addr()?.ip().to_string();
         let mut framed = FramedControl::new(stream);
         let mut state = ClientHandshakeState::new();
 
@@ -199,10 +200,24 @@ impl ControlClient {
         let mut effective = self.config.as_ref().clone();
         let mut managed_revision = None;
         if negotiated.supports_managed_configuration() {
-            let configuration = serde_json::to_vec(
-                &rustgo_config::ManagedConfiguration::from_client(&effective),
-            )
-            .map_err(|_| ClientError::InvalidConfiguration)?;
+            let mut value =
+                serde_json::to_value(rustgo_config::ManagedConfiguration::from_client(&effective))
+                    .map_err(|_| ClientError::InvalidConfiguration)?;
+            if negotiated.supports_client_profile() {
+                let profile = rustgo_config::ClientProfile {
+                    display_name: effective.client.display_name().to_owned(),
+                    uid: effective
+                        .client
+                        .profile
+                        .as_ref()
+                        .and_then(|p| p.uid.clone()),
+                    local_ip: Some(local_ip.clone()),
+                };
+                value["client_profile"] =
+                    serde_json::to_value(profile).map_err(|_| ClientError::InvalidConfiguration)?;
+            }
+            let configuration =
+                serde_json::to_vec(&value).map_err(|_| ClientError::InvalidConfiguration)?;
             framed
                 .send(
                     negotiated,
@@ -219,23 +234,40 @@ impl ControlClient {
                     revision,
                     configuration: Some(configuration),
                 }) => {
-                    let desired: rustgo_config::ManagedConfiguration =
+                    let mut value: serde_json::Value =
                         serde_json::from_slice(configuration.as_slice())
                             .map_err(|_| ClientError::InvalidConfiguration)?;
-                    if let Err(error) = desired.apply_to(&mut effective) {
-                        framed
-                            .send(
-                                negotiated,
-                                rejected_configuration_report(
-                                    revision,
-                                    &desired,
-                                    &error.to_string(),
-                                )?,
-                            )
-                            .await?;
-                        return Err(ClientError::InvalidConfiguration);
+                    if negotiated.supports_client_profile() {
+                        if let Some(profile) = value
+                            .as_object_mut()
+                            .and_then(|v| v.remove("client_profile"))
+                        {
+                            let mut profile: rustgo_config::ClientProfile =
+                                serde_json::from_value(profile)
+                                    .map_err(|_| ClientError::InvalidConfiguration)?;
+                            profile.local_ip = Some(local_ip.clone());
+                            effective.client.profile = Some(profile);
+                        }
                     }
-                    managed_revision = Some(revision);
+                    if !value.as_object().is_some_and(|object| object.is_empty()) {
+                        let desired: rustgo_config::ManagedConfiguration =
+                            serde_json::from_value(value)
+                                .map_err(|_| ClientError::InvalidConfiguration)?;
+                        if let Err(error) = desired.apply_to(&mut effective) {
+                            framed
+                                .send(
+                                    negotiated,
+                                    rejected_configuration_report(
+                                        revision,
+                                        &desired,
+                                        &error.to_string(),
+                                    )?,
+                                )
+                                .await?;
+                            return Err(ClientError::InvalidConfiguration);
+                        }
+                        managed_revision = Some(revision);
+                    }
                 }
                 Message::ManagedConfigSnapshot(rustgo_protocol::ManagedConfigSnapshot {
                     configuration: None,

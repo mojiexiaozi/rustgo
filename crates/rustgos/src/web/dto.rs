@@ -167,6 +167,9 @@ pub(super) struct Traffic {
 #[derive(Serialize)]
 pub(super) struct Client {
     pub name: String,
+    pub display_name: String,
+    pub uid: Option<String>,
+    pub local_ip: Option<String>,
     pub identity_source: &'static str,
     pub enabled: Option<bool>,
     pub bound: Option<bool>,

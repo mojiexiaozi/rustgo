@@ -1259,6 +1259,13 @@ mod management_tests {
         assert_eq!(key.server_addr(), "server.example:7443");
         assert_eq!(enrollment_store.list_clients().unwrap().len(), 1);
 
+        let uid = enrollment_store.list_clients().unwrap()[0]
+            .internal_id()
+            .to_owned();
+        enrollment_store
+            .update_profile(&uid, "同名 <node>", Some("192.168.1.10"))
+            .unwrap();
+
         let list = HttpRequest::builder()
             .uri("/api/v1/clients?sort=name")
             .header("cookie", cookie.clone())
@@ -1269,6 +1276,9 @@ mod management_tests {
         let list: serde_json::Value =
             serde_json::from_slice(&body::to_bytes(list.into_body(), 4096).await.unwrap()).unwrap();
         assert_eq!(list["clients"]["items"][0]["name"], "Node.One");
+        assert_eq!(list["clients"]["items"][0]["display_name"], "同名 <node>");
+        assert_eq!(list["clients"]["items"][0]["uid"], uid);
+        assert_eq!(list["clients"]["items"][0]["local_ip"], "192.168.1.10");
         assert_eq!(list["clients"]["items"][0]["identity_source"], "dynamic");
         assert_eq!(list["clients"]["items"][0]["online"], false);
         assert!(list["clients"]["items"][0].get("internal_id").is_none());
@@ -1288,6 +1298,9 @@ mod management_tests {
             .find(|c| c["name"] == "Node.One")
             .unwrap();
         assert_eq!(card["identity_source"], "dynamic");
+        assert_eq!(card["display_name"], "同名 <node>");
+        assert_eq!(card["uid"], uid);
+        assert_eq!(card["local_ip"], "192.168.1.10");
         assert_eq!(card["revision"], 1);
 
         let detail = HttpRequest::builder()
@@ -1301,7 +1314,30 @@ mod management_tests {
             serde_json::from_slice(&body::to_bytes(detail.into_body(), 4096).await.unwrap())
                 .unwrap();
         assert_eq!(detail["client"]["revision"], 1);
+        assert_eq!(detail["client"]["name"], "Node.One");
+        assert_eq!(detail["client"]["display_name"], "同名 <node>");
+        assert_eq!(detail["client"]["uid"], uid);
+        assert_eq!(detail["client"]["local_ip"], "192.168.1.10");
         assert_eq!(detail["sessions"]["total"], 0);
+
+        for search in [
+            "%E5%90%8C%E5%90%8D",
+            uid.as_str(),
+            "192.168.1.10",
+            "Node.One",
+        ] {
+            let request = HttpRequest::builder()
+                .uri(format!("/api/v1/clients?search={search}"))
+                .header("cookie", cookie.clone())
+                .body(Body::empty())
+                .unwrap();
+            let response = router.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let result: serde_json::Value =
+                serde_json::from_slice(&body::to_bytes(response.into_body(), 4096).await.unwrap())
+                    .unwrap();
+            assert_eq!(result["clients"]["total"], 1, "search {search}");
+        }
 
         let replay = HttpRequest::builder()
             .method("POST")

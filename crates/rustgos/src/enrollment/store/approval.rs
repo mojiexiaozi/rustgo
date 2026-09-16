@@ -4,6 +4,8 @@ use super::*;
 pub struct RegistrationRequest {
     pub request_id: String,
     pub client_id: String,
+    pub display_name: String,
+    pub uid: Option<String>,
     pub public_key: String,
     pub fingerprint: String,
     pub replacing: bool,
@@ -32,7 +34,40 @@ impl DynamicClientStore {
         request_id: &str,
         now: SystemTime,
     ) -> Result<EnrollmentResult, EnrollmentStoreError> {
-        let name = validate_display_id(name)?;
+        self.request_approval_inner(name, None, false, purpose, key, request_id, now)
+    }
+
+    pub fn request_profile_approval(
+        &self,
+        display_name: &str,
+        uid: Option<&str>,
+        purpose: EnrollmentPurpose,
+        key: &DevicePublicKey,
+        request_id: &str,
+        now: SystemTime,
+    ) -> Result<EnrollmentResult, EnrollmentStoreError> {
+        self.request_approval_inner(display_name, uid, true, purpose, key, request_id, now)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn request_approval_inner(
+        &self,
+        name: &str,
+        uid: Option<&str>,
+        profile: bool,
+        purpose: EnrollmentPurpose,
+        key: &DevicePublicKey,
+        request_id: &str,
+        now: SystemTime,
+    ) -> Result<EnrollmentResult, EnrollmentStoreError> {
+        let name = if profile {
+            validate_display_name(name)?
+        } else {
+            validate_display_id(name)?
+        };
+        if let Some(uid) = uid {
+            validate_display_id(uid)?;
+        }
         if request_id.is_empty()
             || request_id.len() > 128
             || !request_id
@@ -46,7 +81,7 @@ impl DynamicClientStore {
             .map_err(|_| EnrollmentStoreError::InvalidToken)?
             .as_secs();
         let public_key = key.to_string();
-        self.ensure_not_static(name, &public_key)?;
+        self.ensure_not_static(if profile { "" } else { name }, &public_key)?;
         let purpose = if purpose == EnrollmentPurpose::ReEnroll {
             2i64
         } else {
@@ -60,19 +95,33 @@ impl DynamicClientStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error)?;
         let existing = tx.query_row(
-            "SELECT display_id, public_key, purpose, status, expires_at, result_revision FROM registration_requests WHERE request_id=?1",
-            [request_id], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?,r.get::<_,i64>(3)?,r.get::<_,u64>(4)?,r.get::<_,Option<u64>>(5)?))
+            "SELECT display_id, public_key, purpose, status, expires_at, result_revision, profile_name, requested_uid FROM registration_requests WHERE request_id=?1",
+            [request_id], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?,r.get::<_,i64>(3)?,r.get::<_,u64>(4)?,r.get::<_,Option<u64>>(5)?,r.get::<_,Option<String>>(6)?,r.get::<_,Option<String>>(7)?))
         ).optional().map_err(database_error)?;
-        if let Some((stored_name, stored_key, stored_purpose, status, expires, revision)) = existing
+        if let Some((
+            stored_name,
+            stored_key,
+            stored_purpose,
+            status,
+            expires,
+            revision,
+            profile_name,
+            requested_uid,
+        )) = existing
         {
-            if stored_name != name || stored_key != public_key || stored_purpose != purpose {
+            if profile != profile_name.is_some()
+                || profile_name.as_deref().unwrap_or(&stored_name) != name
+                || requested_uid.as_deref() != uid
+                || stored_key != public_key
+                || stored_purpose != purpose
+            {
                 return Err(EnrollmentStoreError::InvalidRequestId);
             }
             if status == 2 {
                 return Err(EnrollmentStoreError::ApprovalRejected);
             }
             if status == 1 {
-                let current = tx.query_row("SELECT revision, public_key, enabled, tombstoned FROM dynamic_clients WHERE normalized_id=?1", [name.to_ascii_lowercase()],
+                let current = tx.query_row("SELECT revision, public_key, enabled, tombstoned FROM dynamic_clients WHERE normalized_id=?1 AND (?2=0 OR internal_id=(SELECT COALESCE(target_id,display_id) FROM registration_requests WHERE request_id=?3))", params![stored_name.to_ascii_lowercase(),profile,request_id],
                     |r| Ok((r.get::<_,u64>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,bool>(2)?,r.get::<_,bool>(3)?))).optional().map_err(database_error)?;
                 if current.is_some_and(|(rev, k, enabled, deleted)| {
                     Some(rev) == revision
@@ -122,7 +171,36 @@ impl DynamicClientStore {
         if pending >= self.limits.max_tokens.min(256) || total >= 4096 {
             return Err(EnrollmentStoreError::TokenCapacity);
         }
-        let target = tx.query_row("SELECT internal_id, revision, public_key, enabled, tombstoned FROM dynamic_clients WHERE normalized_id=?1", [name.to_ascii_lowercase()],
+        let lookup = if profile {
+            if let Some(uid) = uid {
+                let client = query_client(&tx, uid)?.ok_or(EnrollmentStoreError::ClientNotFound)?;
+                // A key already owned by another UID cannot be reassigned by naming a target.
+                let owner: Option<String> = tx
+                    .query_row(
+                        "SELECT internal_id FROM dynamic_clients WHERE public_key=?1",
+                        [&public_key],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .map_err(database_error)?;
+                if owner.as_deref().is_some_and(|owner| owner != uid) {
+                    return Err(EnrollmentStoreError::PublicKeyConflict);
+                }
+                Some(client.display_id)
+            } else {
+                tx.query_row(
+                    "SELECT display_id FROM dynamic_clients WHERE public_key=?1",
+                    [&public_key],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(database_error)?
+            }
+        } else {
+            Some(name.to_owned())
+        };
+        let routing_id = lookup.unwrap_or_else(random_id);
+        let target = tx.query_row("SELECT internal_id, revision, public_key, enabled, tombstoned FROM dynamic_clients WHERE normalized_id=?1", [routing_id.to_ascii_lowercase()],
             |r| Ok((r.get::<_,String>(0)?,r.get::<_,u64>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,bool>(3)?,r.get::<_,bool>(4)?))).optional().map_err(database_error)?;
         let (target_id, revision) = if let Some((id, revision, _old_key, enabled, deleted)) = target
         {
@@ -133,8 +211,8 @@ impl DynamicClientStore {
         } else {
             (None, None)
         };
-        tx.execute("INSERT INTO registration_requests (request_id, display_id, public_key, purpose, target_id, expected_revision, created_at, expires_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-            params![request_id,name,public_key,purpose,target_id,revision,now,now.saturating_add(86400)]).map_err(database_error)?;
+        tx.execute("INSERT INTO registration_requests (request_id, display_id, public_key, purpose, target_id, expected_revision, created_at, expires_at, profile_name, requested_uid) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            params![request_id,routing_id,public_key,purpose,target_id,revision,now,now.saturating_add(86400),if profile {Some(name)} else {None},uid]).map_err(database_error)?;
         audit(&tx, "registration_requested", request_id)?;
         tx.commit().map_err(database_error)?;
         Err(if target_id.is_some() {
@@ -149,7 +227,7 @@ impl DynamicClientStore {
             .connection
             .lock()
             .map_err(|_| EnrollmentStoreError::Database("connection lock poisoned".into()))?;
-        let mut statement = connection.prepare("SELECT request_id,display_id,public_key,purpose,created_at FROM registration_requests WHERE status=0 AND expires_at>?1 ORDER BY created_at,request_id LIMIT 256").map_err(database_error)?;
+        let mut statement = connection.prepare("SELECT request_id,display_id,public_key,target_id IS NOT NULL,created_at,COALESCE(profile_name,display_id),CASE WHEN profile_name IS NOT NULL THEN COALESCE(target_id, display_id) ELSE target_id END FROM registration_requests WHERE status=0 AND expires_at>?1 ORDER BY created_at,request_id LIMIT 256").map_err(database_error)?;
         let rows = statement
             .query_map([unix_now()?], |r| {
                 let public_key: String = r.get(2)?;
@@ -160,9 +238,11 @@ impl DynamicClientStore {
                 Ok(RegistrationRequest {
                     request_id: r.get(0)?,
                     client_id: r.get(1)?,
+                    display_name: r.get(5)?,
+                    uid: r.get(6)?,
                     public_key,
                     fingerprint,
-                    replacing: r.get::<_, i64>(3)? == 2,
+                    replacing: r.get::<_, bool>(3)?,
                     created_at: r.get(4)?,
                 })
             })
@@ -182,14 +262,14 @@ impl DynamicClientStore {
         let tx = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error)?;
-        let row = tx.query_row("SELECT display_id, public_key, target_id, expected_revision, status, expires_at, result_revision FROM registration_requests WHERE request_id=?1", [request_id],
-            |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<u64>>(3)?,r.get::<_,i64>(4)?,r.get::<_,u64>(5)?,r.get::<_,Option<u64>>(6)?))).optional().map_err(database_error)?.ok_or(EnrollmentStoreError::ClientNotFound)?;
-        let (name, key, target, expected, status, expires, result_revision) = row;
-        self.ensure_not_static(&name, &key)?;
+        let row = tx.query_row("SELECT display_id, public_key, target_id, expected_revision, status, expires_at, result_revision, profile_name FROM registration_requests WHERE request_id=?1", [request_id],
+            |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<u64>>(3)?,r.get::<_,i64>(4)?,r.get::<_,u64>(5)?,r.get::<_,Option<u64>>(6)?,r.get::<_,Option<String>>(7)?))).optional().map_err(database_error)?.ok_or(EnrollmentStoreError::ClientNotFound)?;
+        let (name, key, target, expected, status, expires, result_revision, profile_name) = row;
+        self.ensure_not_static(if profile_name.is_some() { "" } else { &name }, &key)?;
         if status != 0 {
             return match (status, approve) {
                 (1, true) => {
-                    let unchanged:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM dynamic_clients WHERE normalized_id=?1 AND public_key=?2 AND revision=?3 AND enabled=1 AND tombstoned=0)",params![name.to_ascii_lowercase(),key,result_revision],|r|r.get(0)).map_err(database_error)?;
+                    let unchanged:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM dynamic_clients WHERE normalized_id=?1 AND public_key=?2 AND revision=?3 AND enabled=1 AND tombstoned=0 AND (?4=0 OR internal_id=?5))",params![name.to_ascii_lowercase(),key,result_revision,profile_name.is_some(),target.as_deref().unwrap_or(&name)],|r|r.get(0)).map_err(database_error)?;
                     if unchanged {
                         Ok(None)
                     } else {
@@ -237,8 +317,8 @@ impl DynamicClientStore {
                     return Err(EnrollmentStoreError::ClientCapacity);
                 }
             }
-            let changed=tx.execute("UPDATE dynamic_clients SET public_key=?1, revision=?2, updated_at=?3, enabled=1, tombstoned=0, deleted_at=NULL WHERE internal_id=?4 AND revision=?5 AND (enabled=1 OR tombstoned=1) AND normalized_id=?6",
-                params![key,next,unix_now()?,id,expected,name.to_ascii_lowercase()]).map_err(|e| if e.sqlite_error_code()==Some(rusqlite::ErrorCode::ConstraintViolation) {EnrollmentStoreError::PublicKeyConflict} else {database_error(e)})?;
+            let changed=tx.execute("UPDATE dynamic_clients SET public_key=?1, revision=?2, updated_at=?3, enabled=1, tombstoned=0, deleted_at=NULL, display_name=COALESCE(?7,display_name) WHERE internal_id=?4 AND revision=?5 AND (enabled=1 OR tombstoned=1) AND normalized_id=?6",
+                params![key,next,unix_now()?,id,expected,name.to_ascii_lowercase(),profile_name]).map_err(|e| if e.sqlite_error_code()==Some(rusqlite::ErrorCode::ConstraintViolation) {EnrollmentStoreError::PublicKeyConflict} else {database_error(e)})?;
             if changed != 1 {
                 return Err(EnrollmentStoreError::RevisionConflict);
             }
@@ -259,8 +339,8 @@ impl DynamicClientStore {
             if count >= self.limits.max_active_clients {
                 return Err(EnrollmentStoreError::ClientCapacity);
             }
-            tx.execute("INSERT INTO dynamic_clients (internal_id,display_id,normalized_id,public_key,enabled,revision,created_at,updated_at) VALUES (?1,?2,?3,?4,1,1,?5,?5)",
-                params![random_id(),name,name.to_ascii_lowercase(),key,unix_now()?]).map_err(|e| if e.sqlite_error_code()==Some(rusqlite::ErrorCode::ConstraintViolation) {EnrollmentStoreError::RevisionConflict} else {database_error(e)})?;
+            tx.execute("INSERT INTO dynamic_clients (internal_id,display_id,normalized_id,public_key,enabled,revision,created_at,updated_at,display_name) VALUES (?1,?2,?3,?4,1,1,?5,?5,?6)",
+                params![if profile_name.is_some() {name.clone()} else {random_id()},name,name.to_ascii_lowercase(),key,unix_now()?,profile_name.as_deref().unwrap_or(&name)]).map_err(|e| if e.sqlite_error_code()==Some(rusqlite::ErrorCode::ConstraintViolation) {EnrollmentStoreError::RevisionConflict} else {database_error(e)})?;
             1
         };
         tx.execute(

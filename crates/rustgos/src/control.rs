@@ -59,6 +59,7 @@ pub(crate) struct ControlRuntime {
     observation_token_issuer: Option<ObservationTokenIssuer>,
     rendezvous: RendezvousCoordinator,
     managed: Option<crate::TunnelManagement>,
+    profile_store: Option<Arc<crate::enrollment::DynamicClientStore>>,
 }
 
 impl ControlRuntime {
@@ -76,6 +77,7 @@ impl ControlRuntime {
             observation_token_issuer,
             rendezvous,
             managed: None,
+            profile_store: None,
         }
     }
 
@@ -92,8 +94,11 @@ impl ControlContext {
         registry: ClientRegistry,
         limiter: FailedAuthLimiter,
         enrollment: Option<EnrollmentManagement>,
-        runtime: ControlRuntime,
+        mut runtime: ControlRuntime,
     ) -> Self {
+        runtime.profile_store = enrollment
+            .as_ref()
+            .map(|management| management.store.clone());
         Self {
             tls_server,
             authenticator,
@@ -379,6 +384,16 @@ where
         deadline,
         tokio::task::spawn_blocking(move || {
             if let Some(intent) = approval {
+                if intent.profile {
+                    return management.store.request_profile_approval(
+                        &intent.client_name,
+                        intent.uid.as_deref(),
+                        intent.purpose,
+                        &public_key,
+                        &request_id,
+                        std::time::SystemTime::now(),
+                    );
+                }
                 return management.store.request_approval(
                     &intent.client_name,
                     intent.purpose,
@@ -596,17 +611,35 @@ where
         let Message::ManagedConfigRequest(request) = frame.message else {
             return Err(ControlError::InvalidState);
         };
-        let configuration: rustgo_config::ManagedConfiguration =
+        let mut configuration_json: serde_json::Value =
             serde_json::from_slice(request.configuration.as_slice())
                 .map_err(|_| ControlError::InvalidState)?;
+        let profile: Option<rustgo_config::ClientProfile> = if negotiated.supports_client_profile()
+        {
+            configuration_json
+                .as_object_mut()
+                .and_then(|object| object.remove("client_profile"))
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|_| ControlError::InvalidState)?
+        } else {
+            None
+        };
+        let configuration: rustgo_config::ManagedConfiguration =
+            serde_json::from_value(configuration_json).map_err(|_| ControlError::InvalidState)?;
         configuration
             .validate()
             .map_err(|_| ControlError::InvalidState)?;
-        let snapshot = if let Some(management) = runtime.managed.clone() {
+        let profile = if let Some(profile) = profile {
+            let store = runtime.profile_store.clone();
             let authenticated = guard.identity().clone();
             Some(
                 tokio::task::spawn_blocking(move || {
-                    management.sync_authenticated(&authenticated, &configuration)
+                    crate::tunnel_management::sync_client_profile(
+                        store.as_deref(),
+                        &authenticated,
+                        &profile,
+                    )
                 })
                 .await
                 .map_err(|_| ControlError::InvalidState)??,
@@ -614,12 +647,31 @@ where
         } else {
             None
         };
+        let snapshot = if let Some(management) = runtime.managed.clone() {
+            let authenticated = guard.identity().clone();
+            tokio::task::spawn_blocking(move || {
+                let snapshot = management.sync_authenticated(&authenticated, &configuration)?;
+                Ok::<_, crate::managed::ManagedError>(Some(snapshot))
+            })
+            .await
+            .map_err(|_| ControlError::InvalidState)??
+        } else {
+            None
+        };
         let response = rustgo_protocol::ManagedConfigSnapshot {
             revision: snapshot.as_ref().map_or(0, |snapshot| snapshot.revision),
-            configuration: snapshot
-                .as_ref()
-                .map(|snapshot| {
-                    serde_json::to_vec(&snapshot.configuration)
+            configuration: (snapshot.is_some() || profile.is_some())
+                .then(|| {
+                    let mut configuration = match snapshot.as_ref() {
+                        Some(snapshot) => serde_json::to_value(&snapshot.configuration)
+                            .map_err(|_| ControlError::InvalidState)?,
+                        None => serde_json::json!({}),
+                    };
+                    if let Some(profile) = &profile {
+                        configuration["client_profile"] = serde_json::to_value(profile)
+                            .map_err(|_| ControlError::InvalidState)?;
+                    }
+                    serde_json::to_vec(&configuration)
                         .map_err(|_| ControlError::InvalidState)
                         .and_then(|bytes| bytes.try_into().map_err(|_| ControlError::InvalidState))
                 })

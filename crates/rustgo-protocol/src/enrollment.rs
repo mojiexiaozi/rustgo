@@ -12,6 +12,8 @@ const CHECKSUM_HEX_BYTES: usize = 8;
 #[derive(Debug)]
 pub struct RegistrationIntent {
     pub client_name: String,
+    pub uid: Option<String>,
+    pub profile: bool,
     pub purpose: EnrollmentPurpose,
     pub signature: Option<[u8; 64]>,
 }
@@ -28,6 +30,30 @@ impl RegistrationIntent {
         }
         Ok(Self {
             client_name: client_name.to_owned(),
+            uid: None,
+            profile: false,
+            purpose,
+            signature: None,
+        })
+    }
+    pub fn for_profile(
+        display_name: &str,
+        uid: Option<&str>,
+        purpose: EnrollmentPurpose,
+    ) -> Result<Self, EnrollmentKeyError> {
+        if display_name.trim().is_empty()
+            || display_name.len() > 128
+            || display_name.chars().any(char::is_control)
+        {
+            return Err(EnrollmentKeyError::InvalidFormat);
+        }
+        if let Some(uid) = uid {
+            Self::new(uid, purpose)?;
+        }
+        Ok(Self {
+            client_name: display_name.to_owned(),
+            uid: uid.map(str::to_owned),
+            profile: true,
             purpose,
             signature: None,
         })
@@ -38,9 +64,20 @@ impl RegistrationIntent {
         } else {
             "reenroll"
         };
-        format!("rustgo-approval-v1.{kind}.{}", self.client_name)
+        if self.profile {
+            format!(
+                "rustgo-approval-v2.{kind}.{}.{}",
+                URL_SAFE_NO_PAD.encode(self.client_name.as_bytes()),
+                self.uid.as_deref().unwrap_or("")
+            )
+        } else {
+            format!("rustgo-approval-v1.{kind}.{}", self.client_name)
+        }
     }
     pub fn decode(encoded: &str) -> Result<Self, EnrollmentKeyError> {
+        if encoded.len() > MAX_ENCODED_BYTES {
+            return Err(EnrollmentKeyError::InvalidFormat);
+        }
         let (encoded, signature) = if let Some((intent, proof)) = encoded.split_once(':') {
             if proof.len() != 128 || !proof.bytes().all(|b| b.is_ascii_hexdigit()) {
                 return Err(EnrollmentKeyError::InvalidFormat);
@@ -54,8 +91,13 @@ impl RegistrationIntent {
         } else {
             (encoded, None)
         };
+        let profile = encoded.starts_with("rustgo-approval-v2.");
         let (purpose, name) = encoded
-            .strip_prefix("rustgo-approval-v1.")
+            .strip_prefix(if profile {
+                "rustgo-approval-v2."
+            } else {
+                "rustgo-approval-v1."
+            })
             .and_then(|s| s.split_once('.'))
             .ok_or(EnrollmentKeyError::InvalidFormat)?;
         let purpose = match purpose {
@@ -63,7 +105,19 @@ impl RegistrationIntent {
             "reenroll" => EnrollmentPurpose::ReEnroll,
             _ => return Err(EnrollmentKeyError::InvalidPurpose),
         };
-        let mut result = Self::new(name, purpose)?;
+        let mut result = if profile {
+            let (name, uid) = name
+                .split_once('.')
+                .ok_or(EnrollmentKeyError::InvalidFormat)?;
+            let bytes = URL_SAFE_NO_PAD
+                .decode(name)
+                .map_err(|_| EnrollmentKeyError::InvalidFormat)?;
+            let name =
+                std::str::from_utf8(&bytes).map_err(|_| EnrollmentKeyError::InvalidFormat)?;
+            Self::for_profile(name, if uid.is_empty() { None } else { Some(uid) }, purpose)?
+        } else {
+            Self::new(name, purpose)?
+        };
         result.signature = signature;
         Ok(result)
     }

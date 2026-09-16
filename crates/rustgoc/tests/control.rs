@@ -280,6 +280,7 @@ fn client_fixture(pki: &TestPki, server_addr: String) -> Result<Fixture, AnyErro
         _keys: keys,
         config: ClientConfig {
             client: ClientSection {
+                profile: None,
                 name: "home-pc".to_owned(),
                 identity_mode: None,
                 server_addr,
@@ -1266,6 +1267,7 @@ async fn real_server_heartbeat_echo_keeps_one_generation_active() -> Result<(), 
 
     let config = ClientConfig {
         client: ClientSection {
+            profile: None,
             name: "home-pc".to_owned(),
             identity_mode: None,
             server_addr,
@@ -1326,6 +1328,7 @@ async fn client_control_api_requests_grants_and_decodes_rendezvous_events() -> R
 
     let config = ClientConfig {
         client: ClientSection {
+            profile: None,
             name: "home-pc".to_owned(),
             identity_mode: None,
             server_addr,

@@ -200,6 +200,7 @@ fn client_config(
 ) -> ClientConfig {
     ClientConfig {
         client: ClientSection {
+            profile: None,
             name: "device-one".to_owned(),
             identity_mode,
             server_addr: "server.example:7443".to_owned(),

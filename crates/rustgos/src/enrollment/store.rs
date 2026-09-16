@@ -29,6 +29,8 @@ pub struct EnrollmentStoreLimits {
 pub struct DynamicClient {
     internal_id: String,
     display_id: String,
+    display_name: String,
+    local_ip: Option<String>,
     enabled: bool,
     revision: u64,
     public_key: Option<String>,
@@ -41,6 +43,12 @@ impl DynamicClient {
     }
     pub fn display_id(&self) -> &str {
         &self.display_id
+    }
+    pub fn display_name(&self) -> &str {
+        &self.display_name
+    }
+    pub fn local_ip(&self) -> Option<&str> {
+        self.local_ip.as_deref()
     }
     pub fn enabled(&self) -> bool {
         self.enabled
@@ -194,6 +202,8 @@ impl DynamicClientStore {
         Ok(DynamicClient {
             internal_id,
             display_id: display_id.to_owned(),
+            display_name: display_id.to_owned(),
+            local_ip: None,
             enabled: true,
             revision: 1,
             public_key: None,
@@ -282,6 +292,8 @@ impl DynamicClientStore {
             DynamicClient {
                 internal_id,
                 display_id: display_id.to_owned(),
+                display_name: display_id.to_owned(),
+                local_ip: None,
                 enabled: true,
                 revision: 1,
                 public_key: None,
@@ -297,7 +309,7 @@ impl DynamicClientStore {
             .lock()
             .map_err(|_| EnrollmentStoreError::Database("connection lock poisoned".into()))?;
         connection.query_row(
-            "SELECT internal_id, display_id, enabled, revision, public_key, tombstoned FROM dynamic_clients WHERE internal_id = ?1",
+            "SELECT internal_id, display_id, enabled, revision, public_key, tombstoned, COALESCE(display_name, display_id), local_ip FROM dynamic_clients WHERE internal_id = ?1",
             [internal_id], client_from_row,
         ).optional().map_err(database_error)
     }
@@ -313,7 +325,7 @@ impl DynamicClientStore {
             .map_err(|_| EnrollmentStoreError::Database("connection lock poisoned".into()))?;
         connection
             .query_row(
-                "SELECT internal_id, display_id, enabled, revision, public_key, tombstoned
+                "SELECT internal_id, display_id, enabled, revision, public_key, tombstoned, COALESCE(display_name, display_id), local_ip
              FROM dynamic_clients WHERE normalized_id = ?1 AND tombstoned = 0",
                 [display_id.to_ascii_lowercase()],
                 client_from_row,
@@ -332,7 +344,7 @@ impl DynamicClientStore {
             .map_err(|_| EnrollmentStoreError::Database("connection lock poisoned".into()))?;
         connection
             .query_row(
-                "SELECT internal_id, display_id, enabled, revision, public_key, tombstoned
+                "SELECT internal_id, display_id, enabled, revision, public_key, tombstoned, COALESCE(display_name, display_id), local_ip
                  FROM dynamic_clients WHERE public_key = ?1 LIMIT 1",
                 [public_key.to_string()],
                 client_from_row,
@@ -357,7 +369,7 @@ impl DynamicClientStore {
             .map_err(|_| EnrollmentStoreError::Database("connection lock poisoned".into()))?;
         let mut statement = connection
             .prepare(
-                "SELECT internal_id, display_id, enabled, revision, public_key, tombstoned
+                "SELECT internal_id, display_id, enabled, revision, public_key, tombstoned, COALESCE(display_name, display_id), local_ip
              FROM dynamic_clients ORDER BY normalized_id",
             )
             .map_err(database_error)?;
@@ -790,6 +802,32 @@ impl DynamicClientStore {
         Ok(())
     }
 
+    /// Updates authenticated presentation metadata without changing identity revision.
+    pub fn update_profile(
+        &self,
+        internal_id: &str,
+        display_name: &str,
+        local_ip: Option<&str>,
+    ) -> Result<(), EnrollmentStoreError> {
+        let display_name = validate_display_name(display_name)?;
+        let local_ip = local_ip
+            .map(|ip| {
+                ip.parse::<std::net::IpAddr>()
+                    .map(|ip| ip.to_string())
+                    .map_err(|_| EnrollmentStoreError::InvalidLocalIp)
+            })
+            .transpose()?;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| EnrollmentStoreError::Database("connection lock poisoned".into()))?;
+        let changed = connection.execute("UPDATE dynamic_clients SET display_name=?1, local_ip=?2, updated_at=?3 WHERE internal_id=?4 AND enabled=1 AND tombstoned=0", params![display_name, local_ip, unix_now()?, internal_id]).map_err(database_error)?;
+        if changed == 0 {
+            return Err(EnrollmentStoreError::ClientNotFound);
+        }
+        Ok(())
+    }
+
     pub fn health_check(&self) -> Result<(), EnrollmentStoreError> {
         let connection = self
             .connection
@@ -937,6 +975,10 @@ pub enum EnrollmentStoreError {
     ReplacementApprovalPending,
     #[error("registration request rejected by administrator")]
     ApprovalRejected,
+    #[error("invalid client display name")]
+    InvalidDisplayName,
+    #[error("invalid client local IP address")]
+    InvalidLocalIp,
     #[error("invalid dynamic client display ID")]
     InvalidDisplayId,
     #[error("dynamic client display ID already exists")]
@@ -990,6 +1032,13 @@ fn validate_display_id(value: &str) -> Result<&str, EnrollmentStoreError> {
     Ok(value)
 }
 
+fn validate_display_name(value: &str) -> Result<&str, EnrollmentStoreError> {
+    if value.trim().is_empty() || value.len() > 128 || value.chars().any(char::is_control) {
+        return Err(EnrollmentStoreError::InvalidDisplayName);
+    }
+    Ok(value)
+}
+
 fn random_id() -> String {
     let mut bytes = [0_u8; 16];
     rand::rng().fill_bytes(&mut bytes);
@@ -1028,7 +1077,7 @@ fn query_client(
     internal_id: &str,
 ) -> Result<Option<DynamicClient>, EnrollmentStoreError> {
     connection.query_row(
-        "SELECT internal_id, display_id, enabled, revision, public_key, tombstoned FROM dynamic_clients WHERE internal_id = ?1",
+        "SELECT internal_id, display_id, enabled, revision, public_key, tombstoned, COALESCE(display_name, display_id), local_ip FROM dynamic_clients WHERE internal_id = ?1",
         [internal_id],
         client_from_row,
     ).optional().map_err(database_error)
@@ -1042,6 +1091,8 @@ fn client_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DynamicClient> {
         revision: row.get(3)?,
         public_key: row.get(4)?,
         tombstoned: row.get(5)?,
+        display_name: row.get(6)?,
+        local_ip: row.get(7)?,
     })
 }
 
@@ -1066,7 +1117,7 @@ fn migrate_schema(connection: &mut Connection) -> Result<(), EnrollmentStoreErro
     let version: u32 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(database_error)?;
-    if version > 4 {
+    if version > 5 {
         return Err(EnrollmentStoreError::UnsupportedSchema(version));
     }
     let transaction = connection
@@ -1105,8 +1156,19 @@ fn migrate_schema(connection: &mut Connection) -> Result<(), EnrollmentStoreErro
         );",
         )
         .map_err(database_error)?;
+    if version < 5 {
+        transaction
+            .execute_batch(
+                "ALTER TABLE dynamic_clients ADD COLUMN display_name TEXT;
+            ALTER TABLE dynamic_clients ADD COLUMN local_ip TEXT;
+            UPDATE dynamic_clients SET display_name=display_id;
+            ALTER TABLE registration_requests ADD COLUMN profile_name TEXT;
+            ALTER TABLE registration_requests ADD COLUMN requested_uid TEXT;",
+            )
+            .map_err(database_error)?;
+    }
     transaction
-        .pragma_update(None, "user_version", 4)
+        .pragma_update(None, "user_version", 5)
         .map_err(database_error)?;
     transaction.commit().map_err(database_error)
 }
