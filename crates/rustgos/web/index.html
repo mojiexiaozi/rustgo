@@ -89,7 +89,7 @@
             <p id="managed-status" role="status" aria-live="polite">正在读取配置…</p>
             <div class="table-wrap"><table><thead><tr><th>类型</th><th>名称</th><th>协议</th><th>地址</th><th>目标 / 权限</th><th>应用状态</th><th>操作</th></tr></thead><tbody id="managed-rows"></tbody></table></div>
             <form id="managed-form" class="managed-form">
-              <label>添加类型 <select id="managed-kind"><option value="tunnel">隧道</option><option value="export">导出</option><option value="forward">转发</option></select></label>
+              <label>添加类型 <select id="managed-kind"><option value="tcp">TCP 隧道</option><option value="udp">UDP 隧道</option><option value="export">P2P 导出</option><option value="forward">P2P 转发</option></select></label>
               <div id="managed-fields" class="managed-fields"></div>
               <p id="managed-p2p-note" class="muted"></p>
               <button id="managed-submit" class="button" type="submit" disabled>保存并应用</button>

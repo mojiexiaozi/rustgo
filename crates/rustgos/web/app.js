@@ -223,7 +223,10 @@
     const kind = $("managed-kind").value;
     const fields = [["name", "名称", "text"]];
     if (kind === "forward") fields.push(["peer", "目标客户端", "text"], ["export", "目标导出名称", "text"], ["listen_addr", "监听地址（例如 127.0.0.1:9000）", "text"]);
-    else fields.push(["protocol", "协议", "select"], ["local_addr", "本地服务地址（例如 127.0.0.1:80）", "text"], kind === "tunnel" ? ["remote_port", "服务器端口（1–65535）", "number"] : ["allowed_peers", "允许的客户端（逗号分隔；留空允许所有已授权客户端）", "text"]);
+    else {
+      if (kind === "export") fields.push(["protocol", "协议", "select"]);
+      fields.push(["local_addr", "本地服务地址（例如 127.0.0.1:80）", "text"], kind !== "export" ? ["remote_port", "服务器端口（1–65535）", "number"] : ["allowed_peers", "允许的客户端（逗号分隔；留空允许所有已授权客户端）", "text"]);
+    }
     state.managed.fields = {};
     container.replaceChildren();
     for (const [name, label, type] of fields) {
@@ -243,7 +246,7 @@
   function updateManagedControls() {
     const allowed = Boolean(managedEditable());
     const p2p = state.managed.value?.snapshot?.configuration.p2p_enabled;
-    if ($("managed-submit")) $("managed-submit").disabled = !allowed || ($("managed-kind").value !== "tunnel" && !p2p);
+    if ($("managed-submit")) $("managed-submit").disabled = !allowed || (["export", "forward"].includes($("managed-kind").value) && !p2p);
     if ($("managed-kind")) $("managed-kind").disabled = !allowed;
     for (const input of Object.values(state.managed.fields)) input.disabled = !allowed;
     for (const row of $("managed-rows")?.children || []) {
@@ -257,7 +260,7 @@
     if (m.name !== name) {
       m.name = name; m.value = null;
       text("managed-operation-status", "");
-      if ($("managed-kind")) $("managed-kind").value = "tunnel";
+      if ($("managed-kind")) $("managed-kind").value = "tcp";
       buildManagedFields();
     }
     m.value = value;
@@ -754,9 +757,10 @@
   $("managed-form")?.addEventListener("submit", async (event) => {
     event.preventDefault();
     if (!managedEditable() || $("managed-submit").disabled) return;
-    const kind = $("managed-kind").value;
+    const selection = $("managed-kind").value;
+    const kind = ["tcp", "udp"].includes(selection) ? "tunnel" : selection;
     const item = Object.fromEntries(Object.entries(state.managed.fields).map(([key, input]) => [key, input.value.trim()]));
-    if (kind === "tunnel") item.remote_port = Number(item.remote_port);
+    if (kind === "tunnel") { item.remote_port = Number(item.remote_port); item.protocol = selection; }
     if (kind === "export") item.allowed_peers = item.allowed_peers.split(/[,，]/).map(value => value.trim()).filter(Boolean);
     await mutateManaged({ action: "add", kind, item });
   });

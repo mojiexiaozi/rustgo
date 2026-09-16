@@ -7,7 +7,7 @@ function setup() {
   const nodes = new Map();
   const element = () => ({ children: [], dataset: {}, value: '', addEventListener(e, f) { this[e] = f; }, append(...a) { this.children.push(...a); }, replaceChildren(...a) { this.children = a; }, reset() {}, });
   for (const id of ['managed-status', 'managed-operation-status', 'managed-rows', 'managed-form', 'managed-fields', 'managed-kind', 'managed-submit']) nodes.set(id, element());
-  nodes.get('managed-kind').value = 'tunnel';
+  nodes.get('managed-kind').value = 'tcp';
   const location = { hash: '#client/node' };
   const posts = [];
   const ctx = { crypto: webcrypto, location, AbortController, URLSearchParams, clearTimeout, window: { location, addEventListener() {} }, document: { hidden: true, getElementById: id => nodes.get(id), querySelector: () => null, querySelectorAll: () => [], createElement: element, addEventListener() {} }, fetch: async (path, opts) => { posts.push({path, body: JSON.parse(opts.body)}); return {ok: true, json: async () => ({})}; } };
@@ -61,7 +61,8 @@ test('unsupported client and unsynced client disable mutations', async () => {
 });
 test('type-specific forms post numeric ports, ACL arrays and forward targets', async () => {
   for (const [kind, values, expected] of [
-    ['tunnel', {name:'web',protocol:'udp',local_addr:'127.0.0.1:80',remote_port:'8080'}, {remote_port:8080}],
+    ['tcp', {name:'web',local_addr:'127.0.0.1:80',remote_port:'8080'}, {remote_port:8080,protocol:'tcp'}],
+    ['udp', {name:'dns',local_addr:'127.0.0.1:53',remote_port:'8053'}, {remote_port:8053,protocol:'udp'}],
     ['export', {name:'share',protocol:'tcp',local_addr:'127.0.0.1:80',allowed_peers:'one, two'}, {allowed_peers:['one','two']}],
     ['forward', {name:'use',peer:'other',export:'share',listen_addr:'127.0.0.1:9000'}, {peer:'other',export:'share'}],
   ]) {
@@ -69,7 +70,8 @@ test('type-specific forms post numeric ports, ACL arrays and forward targets', a
     app.nodes.get('managed-kind').value = kind; app.nodes.get('managed-kind').change();
     for (const [key,value] of Object.entries(values)) app.state.managed.fields[key].value = value;
     await app.nodes.get('managed-form').submit({preventDefault() {}});
-    assert.equal(app.posts[0].body.kind,kind);
+    assert.equal(app.posts[0].body.kind,['tcp','udp'].includes(kind) ? 'tunnel' : kind);
+    if (['tcp','udp'].includes(kind)) assert.equal(app.state.managed.fields.protocol,undefined);
     for (const [key,value] of Object.entries(expected)) assert.deepEqual(app.posts[0].body.item[key],value);
   }
 });
