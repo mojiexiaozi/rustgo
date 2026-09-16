@@ -1,6 +1,6 @@
 # Rustgo
 
-Rustgo V0.4 is a self-hosted, fixed-port TCP, UDP, and authenticated P2P tunnel with optional embedded observability. A private-network client (`rustgoc` CLI or `rustgoc-gui`) connects to a public relay server (`rustgos`) over TLS 1.3, authenticates with an independent Ed25519 device key, and exposes explicitly configured ports.
+Rustgo V1.0 is a self-hosted, fixed-port TCP, UDP, and authenticated P2P tunnel with optional embedded observability. A private-network client (`rustgoc` CLI or `rustgoc-gui`) connects to a public relay server (`rustgos`) over TLS 1.3, authenticates with an independent Ed25519 device key, and exposes explicitly configured ports.
 
 V0.4 adds a cross-platform GUI client (`rustgoc-gui`) with real-time connection monitoring, tunnel display, traffic charts, P2P path visibility, and bounded resource usage. The GUI shares the same headless `rustgoc` library and connects to V0.1/V0.2/V0.3 servers without modification. On Windows, the GUI provides a system tray with minimize-to-tray support.
 
@@ -55,27 +55,30 @@ All GUI-owned collections are bounded: 1,000 log lines, 300 telemetry chart poin
 
 ## Releases
 
-Pushing a version tag such as `v1.0.0` builds `rustgoc` and `rustgos` for Windows
+Pushing a version tag such as `v1.0.0` builds `rustgoc`, `rustgoc-gui`, and `rustgos` for Windows
 x86_64, Linux x86_64, and Linux ARM64. The GitHub Release contains:
 
 ```text
 rustgoc-win-x86-v1.0.0.zip
+rustgoc-gui-win-x86-v1.0.0.zip
 rustgos-win-x86-v1.0.0.zip
 rustgoc-linux-x86-v1.0.0.zip
+rustgoc-gui-linux-x86-v1.0.0.zip
 rustgos-linux-x86-v1.0.0.zip
 rustgoc-linux-arm64-v1.0.0.zip
+rustgoc-gui-linux-arm64-v1.0.0.zip
 rustgos-linux-arm64-v1.0.0.zip
 SHA256SUMS
 ```
 
 Each ZIP contains one conventionally named executable and its matching
-`client.toml` or `server.toml`. Linux ZIPs also contain
-`docker-compose.yaml`. The configuration is an example: replace endpoints
+`client.toml` or `server.toml`. Linux CLI and server ZIPs also contain
+`docker-compose.yaml`; GUI ZIPs do not. The configuration is an example: replace endpoints
 before startup. On its first normal startup, `rustgos` generates its TLS
 certificate and private key when both configured files are absent. Releases
 never contain generated credentials.
 
-Verify checksums after downloading all seven assets. On Linux:
+Verify checksums after downloading all ten assets. On Linux:
 
 ```text
 sha256sum --check SHA256SUMS

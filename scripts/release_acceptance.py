@@ -16,12 +16,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 RELEASE = ROOT / "scripts" / "release.py"
-PRODUCTS = {"rustgoc": "client.toml", "rustgos": "server.toml"}
-PLATFORMS = {
-    "win-x86": ("rustgoc.exe", "rustgos.exe"),
-    "linux-x86": ("rustgoc", "rustgos"),
-    "linux-arm64": ("rustgoc", "rustgos"),
+PRODUCTS = {
+    "rustgoc": ("client.toml", True),
+    "rustgoc-gui": ("client.toml", False),
+    "rustgos": ("server.toml", True),
 }
+PLATFORMS = ("win-x86", "linux-x86", "linux-arm64")
 
 
 def run(*arguments: str, success: bool = True) -> subprocess.CompletedProcess[str]:
@@ -58,8 +58,9 @@ def assert_version_contract(temporary: Path, tag: str) -> None:
 
 
 def package_all(tag: str, binary_dirs: dict[str, Path], output: Path) -> None:
-    for platform, executable_names in PLATFORMS.items():
-        for binary, executable_name in zip(PRODUCTS, executable_names, strict=True):
+    for platform in PLATFORMS:
+        for binary in PRODUCTS:
+            executable_name = f"{binary}.exe" if platform == "win-x86" else binary
             run(
                 "package",
                 "--tag", tag,
@@ -71,15 +72,15 @@ def package_all(tag: str, binary_dirs: dict[str, Path], output: Path) -> None:
 
 
 def assert_archive(path: Path, binary: str, platform: str) -> None:
-    config_name = PRODUCTS[binary]
+    config_name, includes_compose = PRODUCTS[binary]
     executable_name = f"{binary}.exe" if platform == "win-x86" else binary
     expected = {executable_name, config_name}
-    if platform != "win-x86":
+    if platform != "win-x86" and includes_compose:
         expected.add("docker-compose.yaml")
     with zipfile.ZipFile(path) as archive:
         assert set(archive.namelist()) == expected, path.name
         assert archive.read(config_name) == (ROOT / "examples" / config_name).read_bytes()
-        if platform != "win-x86":
+        if platform != "win-x86" and includes_compose:
             assert archive.read("docker-compose.yaml") == (ROOT / "packaging" / "compose" / f"{binary}.yaml").read_bytes()
             mode = (archive.getinfo(executable_name).external_attr >> 16) & 0o777
             assert mode == 0o755, f"{path.name} executable mode is {oct(mode)}"
@@ -89,10 +90,10 @@ def assert_complete_release(tag: str, input_dir: Path, final_dir: Path) -> None:
     run("finalize", "--tag", tag, "--input-dir", str(input_dir), "--output-dir", str(final_dir))
     expected_names = {f"{binary}-{platform}-{tag}.zip" for binary in PRODUCTS for platform in PLATFORMS}
     assert {path.name for path in final_dir.glob("*.zip")} == expected_names
-    assert all("rustgoc-gui" not in name for name in expected_names)
     for name in expected_names:
         stem = name.removesuffix(f"-{tag}.zip")
-        binary, platform = stem.split("-", 1)
+        platform = next(value for value in PLATFORMS if stem.endswith(f"-{value}"))
+        binary = stem.removesuffix(f"-{platform}")
         assert_archive(final_dir / name, binary, platform)
     checksum_lines = (final_dir / "SHA256SUMS").read_text(encoding="ascii").splitlines()
     assert [line.split("  ", 1)[1] for line in checksum_lines] == sorted(expected_names)
@@ -105,7 +106,7 @@ def assert_negative_paths(tag: str, binary_dirs: dict[str, Path], input_dir: Pat
     empty = temporary / "empty"
     empty.touch()
     run("package", "--tag", tag, "--platform", "linux-x86", "--binary", "rustgoc", "--executable", str(empty), "--output-dir", str(temporary / "empty-out"), success=False)
-    run("package", "--tag", tag, "--platform", "linux-x86", "--binary", "rustgoc-gui", "--executable", str(binary_dirs["linux-x86"] / "rustgoc"), "--output-dir", str(temporary / "gui-out"), success=False)
+    run("package", "--tag", tag, "--platform", "linux-x86", "--binary", "rustgo-unknown", "--executable", str(binary_dirs["linux-x86"] / "rustgoc"), "--output-dir", str(temporary / "unknown-out"), success=False)
 
     link = temporary / "linked-rustgoc"
     try:
@@ -141,7 +142,7 @@ def main() -> int:
         package_all(arguments.tag, binary_dirs, release_input)
         assert_complete_release(arguments.tag, release_input, temporary / "final")
         assert_negative_paths(arguments.tag, binary_dirs, release_input, temporary)
-    print("release acceptance passed: 6 archives, checksums, contents, and fail-closed paths")
+    print("release acceptance passed: 9 archives, checksums, contents, and fail-closed paths")
     return 0
 
 

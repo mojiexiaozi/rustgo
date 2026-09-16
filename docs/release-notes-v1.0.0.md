@@ -55,6 +55,7 @@ client.
 
 ## Release artifacts
 
-The release workflow publishes `rustgoc` and `rustgos` archives for Windows
-x86_64, Linux x86_64, and Linux ARM64, plus `SHA256SUMS`. Verify the checksum
-manifest before installation.
+The release workflow publishes `rustgoc`, `rustgoc-gui`, and `rustgos` archives
+for Windows x86_64, Linux x86_64, and Linux ARM64, plus `SHA256SUMS`. GUI
+archives contain the executable and `client.toml`; they do not contain a
+Compose template. Verify the checksum manifest before installation.

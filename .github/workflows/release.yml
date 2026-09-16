@@ -33,17 +33,17 @@ jobs:
           - runner: windows-latest
             target: x86_64-pc-windows-msvc
             platform: win-x86
-            build_command: cargo build --locked --release --target x86_64-pc-windows-msvc -p rustgoc -p rustgos
+            build_command: cargo build --locked --release --target x86_64-pc-windows-msvc -p rustgoc -p rustgoc-gui -p rustgos
             exe_suffix: .exe
           - runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             platform: linux-x86
-            build_command: cargo build --locked --release --target x86_64-unknown-linux-gnu -p rustgoc -p rustgos
+            build_command: cargo build --locked --release --target x86_64-unknown-linux-gnu -p rustgoc -p rustgoc-gui -p rustgos
             exe_suffix: ""
           - runner: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             platform: linux-arm64
-            build_command: cross build --locked --release --target aarch64-unknown-linux-gnu -p rustgoc -p rustgos
+            build_command: cross build --locked --release --target aarch64-unknown-linux-gnu -p rustgoc -p rustgoc-gui -p rustgos
             exe_suffix: ""
     runs-on: ${{ matrix.runner }}
     steps:
@@ -78,6 +78,14 @@ jobs:
           --binary rustgos
           --executable "target/${{ matrix.target }}/release/rustgos${{ matrix.exe_suffix }}"
           --output-dir release-input
+      - name: Package rustgoc-gui
+        run: >-
+          python scripts/release.py package
+          --tag "${{ github.ref_name }}"
+          --platform "${{ matrix.platform }}"
+          --binary rustgoc-gui
+          --executable "target/${{ matrix.target }}/release/rustgoc-gui${{ matrix.exe_suffix }}"
+          --output-dir release-input
       - name: Upload platform archives
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -106,7 +114,7 @@ jobs:
       - name: Validate complete release
         run: |
           python scripts/release.py finalize --tag "${{ github.ref_name }}" --input-dir release-input --output-dir release-out
-          test "$(find release-out -maxdepth 1 -type f | wc -l)" -eq 7
+          test "$(find release-out -maxdepth 1 -type f | wc -l)" -eq 10
       - name: Create, audit, and publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -114,6 +122,6 @@ jobs:
           gh release create "${{ github.ref_name }}" release-out/* --verify-tag --generate-notes --title "Rustgo ${{ github.ref_name }}" --draft
           mkdir release-audit
           gh release download "${{ github.ref_name }}" --dir release-audit
-          test "$(find release-audit -maxdepth 1 -type f | wc -l)" -eq 7
+          test "$(find release-audit -maxdepth 1 -type f | wc -l)" -eq 10
           (cd release-audit && sha256sum --check SHA256SUMS)
           gh release edit "${{ github.ref_name }}" --draft=false

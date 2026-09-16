@@ -24,6 +24,10 @@ PRODUCTS = {
         "config": "examples/client.toml",
         "compose": "packaging/compose/rustgoc.yaml",
     },
+    "rustgoc-gui": {
+        "config": "examples/client.toml",
+        "compose": None,
+    },
     "rustgos": {
         "config": "examples/server.toml",
         "compose": "packaging/compose/rustgos.yaml",
@@ -133,7 +137,7 @@ def package_release(
     executable_name = f"{binary}.exe" if bool(platform_spec["windows"]) else binary
     members.append((executable_name, executable, 0o755 if not bool(platform_spec["windows"]) else 0o644))
     members.append((config.name, config, 0o644))
-    if bool(platform_spec["compose"]):
+    if bool(platform_spec["compose"]) and product["compose"] is not None:
         compose = (root / str(product["compose"])).resolve(strict=True)
         _require_regular_file(compose, "Compose template")
         members.append(("docker-compose.yaml", compose, 0o644))
@@ -162,7 +166,7 @@ def validate_archive(path: Path, binary: str, platform: str) -> None:
     executable_name = f"{binary}.exe" if bool(platform_spec["windows"]) else binary
     config_name = Path(str(PRODUCTS[binary]["config"])).name
     expected = {executable_name, config_name}
-    if bool(platform_spec["compose"]):
+    if bool(platform_spec["compose"]) and PRODUCTS[binary]["compose"] is not None:
         expected.add("docker-compose.yaml")
     try:
         with zipfile.ZipFile(path) as archive:
@@ -198,7 +202,9 @@ def _find_input_archives(input_dir: Path) -> dict[str, Path]:
 
 
 def _validate_named_archive(path: Path, tag: str) -> None:
-    match = re.fullmatch(r"(rustgoc|rustgos)-(win-x86|linux-x86|linux-arm64)-(.+)\.zip", path.name)
+    binaries = "|".join(re.escape(name) for name in sorted(PRODUCTS, key=len, reverse=True))
+    platforms = "|".join(re.escape(name) for name in PLATFORMS)
+    match = re.fullmatch(rf"({binaries})-({platforms})-(.+)\.zip", path.name)
     if match is None or match.group(3) != tag:
         raise ReleaseError(f"unexpected archive name {path.name!r}")
     validate_archive(path, match.group(1), match.group(2))

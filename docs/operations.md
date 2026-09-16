@@ -356,9 +356,9 @@ rollback.
 4. Create an annotated tag, for example `git tag -a v1.0.0 -m "Rustgo v1.0.0"`,
    then push that tag.
 5. Require the Release workflow to build all three targets. It creates a draft,
-   downloads all seven assets again, verifies `SHA256SUMS`, and only then makes
+   downloads all ten assets again, verifies `SHA256SUMS`, and only then makes
    the Release public.
-6. Download the public assets and independently verify the six ZIP names,
+6. Download the public assets and independently verify the nine ZIP names,
    checksum manifest, archive members, executable help output, and real config
    checks.
 
