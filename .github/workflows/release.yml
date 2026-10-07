@@ -54,8 +54,8 @@ jobs:
       - name: Install Rust target
         shell: bash
         run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup default 1.98.1
           rustup target add "${{ matrix.target }}"
       - name: Install cross
         if: matrix.platform == 'linux-arm64'
