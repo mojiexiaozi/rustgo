@@ -36,7 +36,7 @@ jobs:
         with:
           node-version: '22'
       - name: Dashboard management regression tests
-        run: node --test crates/rustgos/tests/web_management.test.cjs
+        run: node --test crates/rustgos/tests/web_management.test.cjs crates/rustgos/web/managed.test.cjs
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Linux pidfd supervisor integration
         run: |

@@ -37,6 +37,9 @@
   function formatRate(value) {
     return value == null ? "不可用" : `${formatBytes(value)}/s`;
   }
+  function formatUsage(used, total) {
+    return used == null ? "不可用" : total == null ? formatBytes(used) : `${formatBytes(used)} / ${formatBytes(total)}`;
+  }
 
   function formatPercent(basisPoints) {
     return basisPoints == null ? "不可用" : `${(basisPoints / 100).toFixed(1)}%`;
@@ -117,9 +120,9 @@
     text("snapshot-summary", `快照时间 ${formatTime(overview.generated_unix_millis)} · ${server.online_clients} 个客户端在线 · ${server.active_sessions.active} 个活跃会话`);
     text("server-cpu", formatPercent(metrics.cpu_basis_points));
     text("server-cpu-note", metricNote(metrics));
-    text("server-memory", metrics.memory_used_bytes == null ? "不可用" : `${formatBytes(metrics.memory_used_bytes)} / ${formatBytes(metrics.memory_total_bytes)}`);
+    text("server-memory", formatUsage(metrics.memory_used_bytes, metrics.memory_total_bytes));
     text("server-memory-note", metricNote(metrics));
-    text("server-storage", metrics.disk_used_bytes == null ? "不可用" : `${formatBytes(metrics.disk_used_bytes)} / ${formatBytes(metrics.disk_total_bytes)}`);
+    text("server-storage", formatUsage(metrics.disk_used_bytes, metrics.disk_total_bytes));
     text("server-storage-note", metricNote(metrics));
     text("server-upload", formatRate(metrics.network_sent_bytes_per_second));
     text("server-upload-note", `逻辑发送量 ${formatBytes(server.traffic.sent_bytes)}`);
@@ -243,14 +246,61 @@
     updateManagedControls();
   }
 
+  function editManaged(kind, item, row) {
+    if (!managedEditable() || state.managed.editing) return;
+    const editing = { kind, name: item.name, row, fields: {}, revision: state.managed.value.snapshot.revision };
+    state.managed.editing = editing;
+    const field = (column, name, label, type = "text") => {
+      const input = document.createElement(type === "select" ? "select" : "input");
+      input.setAttribute("aria-label", label);
+      if (type === "select") {
+        for (const value of ["tcp", "udp"]) { const option = document.createElement("option"); option.value = value; option.textContent = value.toUpperCase(); input.append(option); }
+      } else { input.type = type; input.required = name !== "allowed_peers"; }
+      if (type === "number") { input.min = "1"; input.max = "65535"; input.step = "1"; }
+      input.value = Array.isArray(item[name]) ? item[name].join(", ") : String(item[name] ?? "");
+      editing.fields[name] = input;
+      row.children[column].append(input);
+    };
+    for (const column of [1, 3, 4]) row.children[column].replaceChildren();
+    field(1, "name", "名称");
+    if (kind !== "forward") { row.children[2].replaceChildren(); field(2, "protocol", "协议", "select"); }
+    field(3, kind === "forward" ? "listen_addr" : "local_addr", kind === "forward" ? "监听地址" : "本地服务地址");
+    if (kind === "tunnel") field(4, "remote_port", "服务器端口", "number");
+    else if (kind === "export") field(4, "allowed_peers", "允许的客户端（逗号分隔）");
+    else { field(4, "peer", "目标客户端"); field(4, "export", "目标导出名称"); }
+    const save = document.createElement("button"); save.type = "button"; save.className = "button"; save.textContent = "保存";
+    save.addEventListener("click", async () => {
+      if (!managedEditable() || state.managed.editing !== editing) return;
+      for (const input of Object.values(editing.fields)) if (input.reportValidity && !input.reportValidity()) return;
+      const updated = Object.fromEntries(Object.entries(editing.fields).map(([key, input]) => [key, input.value.trim()]));
+      if (kind === "tunnel") updated.remote_port = Number(updated.remote_port);
+      if (kind === "export") updated.allowed_peers = updated.allowed_peers.split(/[,，]/).map(value => value.trim()).filter(Boolean);
+      await mutateManaged({ action: "update", kind, name: editing.name, item: updated, expected_revision: editing.revision });
+    });
+    const cancel = document.createElement("button"); cancel.type = "button"; cancel.className = "button button-quiet"; cancel.textContent = "取消";
+    cancel.addEventListener("click", () => {
+      if (state.managed.busy) return;
+      state.managed.editing = null;
+      if (state.managed.value) renderManaged(state.managed.name, state.managed.value);
+      else requestPoll();
+    });
+    row.children[6].replaceChildren(save, cancel);
+    row.className = "managed-editing";
+    updateManagedControls();
+  }
+
   function updateManagedControls() {
     const allowed = Boolean(managedEditable());
     const p2p = state.managed.value?.snapshot?.configuration.p2p_enabled;
-    if ($("managed-submit")) $("managed-submit").disabled = !allowed || (["export", "forward"].includes($("managed-kind").value) && !p2p);
-    if ($("managed-kind")) $("managed-kind").disabled = !allowed;
-    for (const input of Object.values(state.managed.fields)) input.disabled = !allowed;
+    const editing = state.managed.editing;
+    if ($("managed-submit")) $("managed-submit").disabled = !allowed || Boolean(editing) || (["export", "forward"].includes($("managed-kind").value) && !p2p);
+    if ($("managed-apply")) $("managed-apply").disabled = !allowed || Boolean(editing);
+    if ($("managed-kind")) $("managed-kind").disabled = !allowed || Boolean(editing);
+    for (const input of Object.values(state.managed.fields)) input.disabled = !allowed || Boolean(editing);
+    for (const input of Object.values(editing?.fields || {})) input.disabled = !allowed;
     for (const row of $("managed-rows")?.children || []) {
-      const button = row.children[row.children.length - 1]?.children[0]; if (button) button.disabled = !allowed;
+      for (const button of row.children[row.children.length - 1]?.children || []) button.disabled = !allowed || Boolean(editing && row !== editing.row);
+      if (row === editing?.row) row.children[6].children[1].disabled = Boolean(state.managed.busy);
     }
     text("managed-p2p-note", p2p ? "" : "客户端未启用 P2P，无法添加导出或转发；请先在客户端启用 P2P。");
   }
@@ -258,7 +308,7 @@
   function renderManaged(name, value) {
     const m = state.managed;
     if (m.name !== name) {
-      m.name = name; m.value = null;
+      m.name = name; m.value = null; m.editing = null;
       text("managed-operation-status", "");
       if ($("managed-kind")) $("managed-kind").value = "tcp";
       buildManagedFields();
@@ -268,7 +318,7 @@
     text("managed-status", value.supported === false ? "客户端版本不支持远程配置，请升级客户端。" : !snapshot ? "尚无配置快照，等待客户端首次连接并同步。" : `${value.online ? "在线" : "离线 · 修改将在下次连接时应用"} · 期望版本 ${snapshot.revision} · ${value.online && snapshot.applied_revision === snapshot.revision ? "已收到应用结果" : "等待应用"}`);
     const rows = $("managed-rows");
     if (rows) {
-      rows.replaceChildren();
+      const nextRows = [];
       for (const [kind, collection, label] of [["tunnel", "tunnels", "隧道"], ["export", "exports", "导出"], ["forward", "forwards", "转发"]]) {
         for (const item of snapshot?.configuration[collection] || []) {
           const result = snapshot.results?.find(r => r.kind === kind && r.name === item.name);
@@ -276,14 +326,30 @@
           const failure = result?.state === "failed" && snapshot.applied_revision === snapshot.revision;
           const status = failure ? `${value.online ? "失败" : "上次失败"}：${result.error || "未知错误"}` : !current || !result ? "等待应用" : result.state === "ready" ? "已就绪" : `等待应用${result.error ? `：${result.error}` : ""}`;
           const description = kind === "tunnel" ? `服务器端口 ${item.remote_port}` : kind === "export" ? `允许：${item.allowed_peers.length ? item.allowed_peers.join("、") : "所有已授权客户端"}` : `目标 ${item.peer} / ${item.export}`;
+          if (m.editing?.kind === kind && m.editing.name === item.name) {
+            m.editing.row.children[5].textContent = status;
+            nextRows.push(m.editing.row);
+            continue;
+          }
           const row = document.createElement("tr");
           for (const value of [label, item.name, kind === "forward" ? "P2P" : protocolLabel(item.protocol), item.local_addr || item.listen_addr, description, status]) { const cell = document.createElement("td"); cell.textContent = value; row.append(cell); }
-          const cell = document.createElement("td"); const button = document.createElement("button");
-          button.type = "button"; button.className = "button button-danger"; button.textContent = `删除 ${item.name}`;
-          button.addEventListener("click", () => mutateManaged({ action: "delete", kind, name: item.name }));
-          cell.append(button); row.append(cell); rows.append(row);
+          const cell = document.createElement("td");
+          const edit = document.createElement("button"); edit.type = "button"; edit.className = "button"; edit.textContent = "编辑"; edit.setAttribute("aria-label", `编辑 ${item.name}`);
+          edit.addEventListener("click", () => editManaged(kind, item, row));
+          const remove = document.createElement("button"); remove.type = "button"; remove.className = "button button-danger"; remove.textContent = "删除"; remove.setAttribute("aria-label", `删除 ${item.name}`);
+          remove.addEventListener("click", () => mutateManaged({ action: "delete", kind, name: item.name }));
+          cell.append(edit, remove); row.append(cell); nextRows.push(row);
         }
       }
+      if (m.editing && !nextRows.includes(m.editing.row)) {
+        m.editing.row.children[5].textContent = "条目已从服务器移除，请取消编辑并刷新。";
+        nextRows.push(m.editing.row);
+      }
+      // Keep the editor attached: detaching a focused input loses keyboard focus.
+      for (const row of Array.from(rows.children)) if (!nextRows.includes(row)) rows.removeChild(row);
+      nextRows.forEach((row, index) => {
+        if (rows.children[index] !== row) rows.insertBefore(row, rows.children[index] || null);
+      });
     }
     updateManagedControls();
   }
@@ -315,7 +381,12 @@
       await managementRequest(`/api/v1/clients/${encodeURIComponent(name)}/tunnels`, { expected_revision: revision, ...mutation });
       if (activeRoute().name === name && generation === m.generation) {
         text("managed-operation-status", "已保存，等待客户端重新连接并应用。该客户端的其他连接也可能短暂中断。");
-        if (mutation.action === "add") buildManagedFields();
+        if (["add", "update"].includes(mutation.action)) {
+          m.editing = null;
+          if ($("managed-submit")) $("managed-submit").textContent = "新增";
+          buildManagedFields();
+          renderManaged(name, m.value);
+        }
       }
     } catch (error) {
       if (activeRoute().name === name && generation === m.generation) text("managed-operation-status", error.message);
@@ -407,13 +478,22 @@
     const first = values[0];
     const latest = values[values.length - 1];
     const trend = latest > first ? "上升" : latest < first ? "下降" : "平稳";
-    return `${label}：最新 ${formatValue(latest)}，最低 ${formatValue(Math.min(...values))}，最高 ${formatValue(Math.max(...values))}，趋势${trend}`;
+    return `${label}：当前 ${formatValue(latest)}，最低 ${formatValue(Math.min(...values))}，最高 ${formatValue(Math.max(...values))}，趋势${trend}`;
+  }
+
+  function visibleSeriesSummary(label, points, formatValue, className) {
+    const values = points.map((point) => point.value).filter(Number.isFinite);
+    if (!values.length) return null;
+    const summary = document.createElement("span");
+    summary.className = `chart-series ${className}`;
+    summary.textContent = `${label}：当前 ${formatValue(values.at(-1))} · 最低 ${formatValue(Math.min(...values))} · 最高 ${formatValue(Math.max(...values))}`;
+    return summary;
   }
 
   function chartNode(id, primary, secondary, options) {
     const container = $(id);
     if (!container) return;
-    const { title, unit, range, primaryLabel, secondaryLabel = "", formatValue } = options;
+    const { title, unit, range, primaryLabel, secondaryLabel = "", formatValue, maxValue = null } = options;
     const summary = [
       `${title}。范围：${range}。单位：${unit}。`,
       describeSeries(primaryLabel, primary, formatValue),
@@ -429,14 +509,15 @@
       container.append(empty);
       return;
     }
-    const width = 620; const height = 180; const padding = 16;
+    const width = 620; const height = 180;
+    const plot = { left: 66, right: 12, top: 12, bottom: 22 };
     const minX = Math.min(...all.map((point) => point.timestamp_unix_millis));
     const maxX = Math.max(...all.map((point) => point.timestamp_unix_millis));
-    const minY = Math.min(...all.map((point) => point.value));
-    const maxY = Math.max(...all.map((point) => point.value));
+    const minY = 0;
+    const maxY = Math.max(1, maxValue || 0, ...all.map((point) => point.value));
     const pointFor = (point) => {
-      const x = padding + ((point.timestamp_unix_millis - minX) / Math.max(1, maxX - minX)) * (width - padding * 2);
-      const y = height - padding - ((point.value - minY) / Math.max(1, maxY - minY)) * (height - padding * 2);
+      const x = plot.left + ((point.timestamp_unix_millis - minX) / Math.max(1, maxX - minX)) * (width - plot.left - plot.right);
+      const y = height - plot.bottom - ((point.value - minY) / Math.max(1, maxY - minY)) * (height - plot.top - plot.bottom);
       return `${x.toFixed(1)},${y.toFixed(1)}`;
     };
     const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
@@ -447,6 +528,17 @@
     const description = document.createElementNS("http://www.w3.org/2000/svg", "desc");
     description.textContent = summary;
     svg.append(svgTitle, description);
+    for (const value of [maxY, maxY / 2, 0]) {
+      const y = height - plot.bottom - ((value - minY) / Math.max(1, maxY - minY)) * (height - plot.top - plot.bottom);
+      const grid = document.createElementNS("http://www.w3.org/2000/svg", "line");
+      grid.setAttribute("class", "chart-grid-line");
+      grid.setAttribute("x1", String(plot.left)); grid.setAttribute("x2", String(width - plot.right));
+      grid.setAttribute("y1", y.toFixed(1)); grid.setAttribute("y2", y.toFixed(1));
+      const label = document.createElementNS("http://www.w3.org/2000/svg", "text");
+      label.setAttribute("class", "chart-axis-label"); label.setAttribute("x", "2");
+      label.setAttribute("y", Math.max(12, y + 4).toFixed(1)); label.textContent = formatValue(value);
+      svg.append(grid, label);
+    }
     const makeLine = (points, className) => {
       if (!points.length) return;
       const line = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
@@ -456,10 +548,20 @@
     };
     makeLine(primary, "primary");
     makeLine(secondary, "secondary");
+    const details = document.createElement("div");
+    details.className = "chart-details";
+    const context = document.createElement("span");
+    context.className = "chart-context";
+    context.textContent = `单位：${unit} · 范围：${range}`;
+    details.append(context);
+    const primarySummary = visibleSeriesSummary(primaryLabel, primary, formatValue, "primary");
+    const secondarySummary = secondaryLabel ? visibleSeriesSummary(secondaryLabel, secondary, formatValue, "secondary") : null;
+    if (primarySummary) details.append(primarySummary);
+    if (secondarySummary) details.append(secondarySummary);
     const caption = document.createElement("span");
     caption.className = "sr-only";
     caption.textContent = summary;
-    container.append(svg, caption);
+    container.append(svg, details, caption);
   }
 
   async function loadHistory(scope, client, metric, range, key) {
@@ -510,8 +612,8 @@
       if (state.serverHistory.generation !== generation) return true;
       markHistorySuccess(state.serverHistory, key);
       const rangeLabel = historyRangeLabel(range);
-      chartNode("chart-cpu", cpu.points, [], { title: "服务器 CPU 历史", unit: "百分比", range: rangeLabel, primaryLabel: "CPU", formatValue: formatPercent });
-      chartNode("chart-memory", memory.points, [], { title: "服务器内存历史", unit: "字节", range: rangeLabel, primaryLabel: "内存", formatValue: formatBytes });
+      chartNode("chart-cpu", cpu.points, [], { title: "服务器 CPU 历史", unit: "%", range: rangeLabel, primaryLabel: "CPU", formatValue: formatPercent, maxValue: 10000 });
+      chartNode("chart-memory", memory.points, [], { title: "服务器内存历史", unit: "容量", range: rangeLabel, primaryLabel: "内存", formatValue: formatBytes, maxValue: state.overview.server.telemetry.memory_total_bytes });
       chartNode("chart-network", received.points, sent.points, { title: "服务器网络历史", unit: "字节/秒", range: rangeLabel, primaryLabel: "下载", secondaryLabel: "上传", formatValue: formatRate });
       chartNode("chart-traffic", trafficReceived.points, trafficSent.points, { title: "服务器 Rustgo 流量历史", unit: "字节", range: rangeLabel, primaryLabel: "逻辑下载", secondaryLabel: "逻辑上传", formatValue: formatBytes });
       return true;
@@ -541,7 +643,7 @@
     const metrics = $("client-detail-metrics");
     if (metrics) {
       metrics.replaceChildren();
-      const values = [["CPU", formatPercent(client.telemetry.cpu_basis_points), metricNote(client.telemetry)], ["内存", formatBytes(client.telemetry.memory_used_bytes), metricNote(client.telemetry)], ["存储", formatBytes(client.telemetry.disk_used_bytes), metricNote(client.telemetry)], ["上传", formatRate(client.telemetry.network_sent_bytes_per_second), `逻辑发送量 ${formatBytes(client.traffic.sent_bytes)}`], ["下载", formatRate(client.telemetry.network_received_bytes_per_second), `逻辑接收量 ${formatBytes(client.traffic.received_bytes)}`], ["路径", activePathLabel(client.active_path), `重连 ${client.reconnects} 次`]];
+      const values = [["CPU", formatPercent(client.telemetry.cpu_basis_points), metricNote(client.telemetry)], ["内存", formatUsage(client.telemetry.memory_used_bytes, client.telemetry.memory_total_bytes), metricNote(client.telemetry)], ["存储", formatUsage(client.telemetry.disk_used_bytes, client.telemetry.disk_total_bytes), metricNote(client.telemetry)], ["上传", formatRate(client.telemetry.network_sent_bytes_per_second), `逻辑发送量 ${formatBytes(client.traffic.sent_bytes)}`], ["下载", formatRate(client.telemetry.network_received_bytes_per_second), `逻辑接收量 ${formatBytes(client.traffic.received_bytes)}`], ["路径", activePathLabel(client.active_path), `重连 ${client.reconnects} 次`]];
       for (const [label, value, note] of values) {
         const card = document.createElement("article"); card.className = "metric-card";
         const heading = document.createElement("h2"); heading.textContent = label;
@@ -576,7 +678,7 @@
       if (state.clientHistory.generation !== generation) return true;
       markHistorySuccess(state.clientHistory, key);
       const rangeLabel = historyRangeLabel(range);
-      chartNode("client-chart-cpu", cpu.points, [], { title: "客户端 CPU 历史", unit: "百分比", range: rangeLabel, primaryLabel: "CPU", formatValue: formatPercent });
+      chartNode("client-chart-cpu", cpu.points, [], { title: "客户端 CPU 历史", unit: "%", range: rangeLabel, primaryLabel: "CPU", formatValue: formatPercent, maxValue: 10000 });
       chartNode("client-chart-traffic", received.points, sent.points, { title: "客户端流量历史", unit: "字节", range: rangeLabel, primaryLabel: "逻辑下载", secondaryLabel: "逻辑上传", formatValue: formatBytes });
       return true;
     } catch (error) {
@@ -769,7 +871,15 @@
     try { await deleteClient(client); }
     catch (error) { text("client-management-status", error.message); }
   });
-  $("managed-kind")?.addEventListener("change", buildManagedFields);
+  $("managed-kind")?.addEventListener("change", () => {
+    state.managed.editing = null;
+    if ($("managed-submit")) $("managed-submit").textContent = "新增";
+    buildManagedFields();
+  });
+  $("managed-apply")?.addEventListener("click", async () => {
+    if (!managedEditable() || $("managed-apply").disabled) return;
+    await mutateManaged({ action: "apply", kind: "configuration" });
+  });
   $("managed-form")?.addEventListener("submit", async (event) => {
     event.preventDefault();
     if (!managedEditable() || $("managed-submit").disabled) return;
@@ -778,7 +888,8 @@
     const item = Object.fromEntries(Object.entries(state.managed.fields).map(([key, input]) => [key, input.value.trim()]));
     if (kind === "tunnel") { item.remote_port = Number(item.remote_port); item.protocol = selection; }
     if (kind === "export") item.allowed_peers = item.allowed_peers.split(/[,，]/).map(value => value.trim()).filter(Boolean);
-    await mutateManaged({ action: "add", kind, item });
+    const editing = state.managed.editing;
+    await mutateManaged(editing ? { action: "update", kind: editing.kind, name: editing.name, item } : { action: "add", kind, item });
   });
   $("history-range")?.addEventListener("change", () => { resetHistory(); requestPoll(); });
   $("session-filters")?.addEventListener("submit", (event) => { event.preventDefault(); abortSupersededViewRequests(); if (activeRoute().view === "sessions") requestPoll(); });

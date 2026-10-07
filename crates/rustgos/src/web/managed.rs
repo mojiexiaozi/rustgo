@@ -119,6 +119,28 @@ fn mutate(
     }
     let invalid = || ManagedError::Invalid("invalid tunnel operation".into());
     match (request.action.as_str(), request.kind.as_str()) {
+        ("apply", "configuration") => {}
+        ("update", "tunnel") => replace_named(
+            &mut configuration.tunnels,
+            request.name.as_deref().ok_or_else(invalid)?,
+            serde_json::from_value::<TunnelConfig>(request.item.clone().ok_or_else(invalid)?)
+                .map_err(|_| invalid())?,
+            |item| &item.name,
+        )?,
+        ("update", "export") => replace_named(
+            &mut configuration.exports,
+            request.name.as_deref().ok_or_else(invalid)?,
+            serde_json::from_value::<ExportConfig>(request.item.clone().ok_or_else(invalid)?)
+                .map_err(|_| invalid())?,
+            |item| &item.name,
+        )?,
+        ("update", "forward") => replace_named(
+            &mut configuration.forwards,
+            request.name.as_deref().ok_or_else(invalid)?,
+            serde_json::from_value::<ForwardConfig>(request.item.clone().ok_or_else(invalid)?)
+                .map_err(|_| invalid())?,
+            |item| &item.name,
+        )?,
         ("add", "tunnel") => configuration.tunnels.push(
             serde_json::from_value::<TunnelConfig>(request.item.clone().ok_or_else(invalid)?)
                 .map_err(|_| invalid())?,
@@ -161,6 +183,20 @@ fn unavailable() -> Response {
     )
 }
 
+fn replace_named<T>(
+    items: &mut [T],
+    name: &str,
+    replacement: T,
+    item_name: impl Fn(&T) -> &str,
+) -> Result<(), ManagedError> {
+    let item = items
+        .iter_mut()
+        .find(|item| item_name(item) == name)
+        .ok_or(ManagedError::NotFound)?;
+    *item = replacement;
+    Ok(())
+}
+
 fn failure(error: ManagedError) -> Response {
     let (status, code, message) = match error {
         ManagedError::Invalid(message) => (
@@ -181,4 +217,83 @@ fn failure(error: ManagedError) -> Response {
         ManagedError::Storage(_) => return unavailable(),
     };
     json_response(status, &json!({"error":{"code":code,"message":message}}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_preserves_the_current_configuration() {
+        let configuration = rustgo_config::ManagedConfiguration {
+            tunnels: vec![TunnelConfig {
+                name: "ssh".into(),
+                protocol: rustgo_config::TunnelProtocol::Tcp,
+                local_addr: "127.0.0.1:22".into(),
+                remote_port: 10022,
+            }],
+            exports: vec![],
+            forwards: vec![],
+            p2p_enabled: false,
+        };
+        let snapshot = ManagedSnapshot {
+            identity: "identity".into(),
+            name: "node".into(),
+            revision: 7,
+            configuration: configuration.clone(),
+            applied_revision: Some(7),
+            results: json!([]),
+        };
+        let request = Mutation {
+            _operation_id: None,
+            expected_revision: 7,
+            action: "apply".into(),
+            kind: "configuration".into(),
+            name: None,
+            item: None,
+        };
+
+        assert_eq!(mutate(snapshot, &request).unwrap(), configuration);
+    }
+
+    #[test]
+    fn update_replaces_an_existing_tunnel() {
+        let snapshot = ManagedSnapshot {
+            identity: "identity".into(),
+            name: "node".into(),
+            revision: 7,
+            configuration: rustgo_config::ManagedConfiguration {
+                tunnels: vec![TunnelConfig {
+                    name: "ssh".into(),
+                    protocol: rustgo_config::TunnelProtocol::Tcp,
+                    local_addr: "127.0.0.1:22".into(),
+                    remote_port: 10022,
+                }],
+                exports: vec![],
+                forwards: vec![],
+                p2p_enabled: false,
+            },
+            applied_revision: Some(7),
+            results: json!([]),
+        };
+        let request = Mutation {
+            _operation_id: None,
+            expected_revision: 7,
+            action: "update".into(),
+            kind: "tunnel".into(),
+            name: Some("ssh".into()),
+            item: Some(json!({
+                "name": "ssh-new",
+                "protocol": "tcp",
+                "local_addr": "127.0.0.1:2222",
+                "remote_port": 10023
+            })),
+        };
+
+        let updated = mutate(snapshot, &request).unwrap();
+        assert_eq!(updated.tunnels.len(), 1);
+        assert_eq!(updated.tunnels[0].name, "ssh-new");
+        assert_eq!(updated.tunnels[0].local_addr, "127.0.0.1:2222");
+        assert_eq!(updated.tunnels[0].remote_port, 10023);
+    }
 }
